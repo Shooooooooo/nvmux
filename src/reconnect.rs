@@ -21,9 +21,10 @@ use std::time::Duration;
 use crate::error::{NvmuxError, SshError};
 use crate::transport::{Reconnect, Transport};
 
-/// Wait before each retry; a failure after the last ends the series. About a
-/// minute in all: enough for a machine to regain its network after a sleep,
-/// without an unattended terminal spawning `ssh` all day.
+/// Wait before each retry; a failure after the last ends the series. Short
+/// at first, as a link a second late is common. About a minute in all: enough
+/// for a machine to regain its network after a sleep, without an unattended
+/// terminal spawning `ssh` all day.
 pub const DELAYS: [Duration; 6] = [
     Duration::from_secs(1),
     Duration::from_secs(2),

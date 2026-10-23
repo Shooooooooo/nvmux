@@ -62,7 +62,8 @@ pub(crate) fn ensure_dir_secure(dir: &Path) -> Result<(), PathError> {
         error,
     };
 
-    // Only a create/remove race with another nvmux loops.
+    // Bounded: a create loops once to re-check; more only in a create/remove
+    // race with another nvmux.
     for _ in 0..8 {
         // `lstat`, not `stat`: a symlink to a directory passes `is_dir()`
         // through `stat` (the classic /tmp symlink attack).
@@ -222,7 +223,7 @@ pub fn client_log(dir: &Path) -> PathBuf {
 /// Write `contents` to `path` atomically via a synced sibling temp file and
 /// `rename(2)`. The temp file is removed on failure.
 ///
-/// The temp name is `<ext>.tmp<pid>`, so a glob on the extension does not
+/// The temp file is `<path>.tmp<pid>`, so a glob on the extension does not
 /// match it.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     write_atomic_as(path, contents, None)

@@ -56,9 +56,9 @@ pub enum Request {
     Kill(String),
     /// Every visible session with the number to store. The whole arrangement,
     /// not a diff: a stored [`Session::num`] can differ from the shown one
-    /// (`finish_listing` re-derives duplicates and legacy `num == 0`), and a
-    /// skipped row could then collide with a number just written. Never
-    /// empty; a no-op grab returns [`Request::None`].
+    /// (`finish_listing` numbers rows by position), and a skipped row could
+    /// then collide with a number just written. Never empty; a no-op grab
+    /// returns [`Request::None`].
     Reorder(Vec<(String, u32)>),
     Help,
     Settings,
@@ -83,16 +83,19 @@ pub struct App {
     pending: Option<u32>,
     /// The session `Esc` returns to (see [`App::set_came_from`]).
     came_from: Option<String>,
-    /// See [`App::select_session`].
+    /// Session asked for before it was listed, and the row the cursor was on
+    /// (see [`App::select_session`]).
     wanted: Option<(String, usize)>,
     pressed: Option<Pressed>,
     /// Reused: building a `Matcher` allocates its whole matrix, and
     /// [`App::visible`] (`&self`) runs several times per keystroke.
     matcher: RefCell<Matcher>,
-    /// `[effects.move] enabled`, read once at open, like the flags below.
+    /// `[effects.move] enabled`: trails, swap and landing. Cached like the
+    /// flags below (see [`App::reload_effects`]).
     trail: bool,
     /// Trails off each end of a moved row (see [`starfield`]); two fields so
-    /// the ends are not mirror images.
+    /// the ends are not mirror images. Kept across grabs so each grab draws
+    /// new stars.
     after: Starfield,
     before: Starfield,
     landing: Option<Landing>,
@@ -342,7 +345,7 @@ impl App {
     }
 
     /// Replace the session list, keeping the selection on the same session
-    /// (by id, not position, so a re-sorting rename does not move it).
+    /// (by id, not position, so it follows the session when rows shift).
     ///
     /// Ends any effect on the old rows (erase, glow, fade, ...).
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
@@ -368,8 +371,9 @@ impl App {
     }
 
     /// Select this session if visible. If not, the next listing selects it
-    /// if present and the cursor has not moved: a client ended by `:detach`
-    /// is missing from the held rows though its session lives (see `main`).
+    /// if present, the cursor has not moved and no key, click or scroll came
+    /// since: a client ended by `:detach` is missing from the held rows
+    /// though its session lives (see `main`).
     pub fn select_session(&mut self, id: &str) {
         match self.visible().iter().position(|s| s.id == id) {
             Some(at) => {
@@ -387,7 +391,7 @@ impl App {
     }
 
     /// The [`App::set_came_from`] session while still listed; also what the
-    /// settings float over when opened with `,`.
+    /// settings opened with `,` float over if switched to floating.
     pub fn came_from(&self) -> Option<&Session> {
         self.came_from.as_deref().and_then(|id| self.session(id))
     }
@@ -549,8 +553,8 @@ impl App {
     /// will put the new session, showing the numbers it will assign. Returns
     /// whether the effect is on.
     ///
-    /// Ends other effects so only the gap moves. Lasts until
-    /// [`App::close_room`] or a fresh listing.
+    /// Ends the glow, fade, strike and swap so only the gap moves. Lasts
+    /// until [`App::close_room`] or a fresh listing.
     pub fn make_room(&mut self, name: &str) -> bool {
         if !self.create {
             return false;
@@ -731,8 +735,9 @@ impl App {
         self.selected_session().map(|s| s.id.as_str())
     }
 
-    /// Sorted `char` indices of `name` the filter matched. The matcher counts
-    /// graphemes, so combining marks may shift the underline.
+    /// Sorted `char` indices of `name` the filter matched; empty with no
+    /// filter or when only the folder matched. The matcher counts graphemes,
+    /// so combining marks may shift the underline.
     pub fn matched(&self, name: &str) -> Vec<usize> {
         if self.filter.is_empty() {
             return Vec::new();
@@ -2517,7 +2522,7 @@ mod tests {
             assert_eq!(a.message(), None, "{gesture:?}");
             assert_eq!(a.pending(), None, "{gesture:?}");
         }
-        // Drag and release are not deliberate enough.
+        // Hover, drag and release are not deliberate enough.
         for gesture in [
             Mouse::Hover(Some(1)),
             Mouse::Hover(None),
@@ -3030,7 +3035,6 @@ mod tests {
         );
     }
 
-    /// Also with no rows at all.
     #[test]
     fn a_new_session_after_the_last_row_stores_nothing() {
         let mut a = app(&["aaa", "bbb"]);

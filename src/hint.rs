@@ -4,13 +4,15 @@
 //! named.
 //!
 //! nvmux owns no cells while attached, so the bar is drawn over Neovim's
-//! message row and put back. It goes up at a lull ([`SETTLE`]), the only time
-//! the child cannot be mid-sequence. While it is up the relay follows the
-//! terminal's parser ([`crate::boundary`]) and redraws the bar on the same
-//! pass the session draws over it, between its sequences; otherwise a
-//! statusline redrawing faster than a lull would keep it down. Following the
-//! parser has costs (see `Attachment::write_session_frame` in [`crate::pty`]),
-//! so it stops once the bar is down.
+//! message row and put back. It goes up at a lull ([`SETTLE`]): with no parser
+//! followed, the only time the child cannot be mid-sequence. While it is up,
+//! the relay follows the terminal's parser ([`crate::boundary`]) and redraws
+//! the bar on the same pass the session draws over it, between its sequences;
+//! otherwise a statusline redrawing faster than a lull would keep it down.
+//! Following the parser has costs (see `Attachment::write_session_frame` in
+//! [`crate::pty`]), so it stops once the bar is down. Unlike the attach notice
+//! there is no fade (the bar must be up as the prefix arms) and no give-up
+//! clock (the prefix bounds its life).
 //!
 //! When the prefix resolves without ending the relay, the row is restored from
 //! [`crate::shadow`], or failing that by the server (see [`Act::Blanked`]).
@@ -155,6 +157,7 @@ pub struct Bar {
     /// Whether the terminal matches `want`; false means a write is owed.
     agreed: bool,
     watched: bool,
+    /// Rows and columns only: a pixel-size change moves no cell.
     size: (u16, u16),
     /// Handed in, not read from the global, so tests can reach every state.
     palette: Option<Palette>,
@@ -270,7 +273,8 @@ impl Bar {
         }
     }
 
-    /// Only a shown bar can be covered, or output would cause wake-ups.
+    /// Only a shown bar can be covered; otherwise every output would cause a
+    /// wake-up.
     fn may_have_been_covered(&mut self) {
         self.agreed &= self.shown.is_none();
     }
@@ -281,6 +285,7 @@ impl Bar {
 /// have the relay ask the server.
 fn erase(over: &Over, under: Option<&Shadow>, palette: Option<&Palette>) -> Act {
     match (under.filter(|s| s.is_usable()), palette) {
+        // At `t = 1.0` none of the bar is drawn, so its colour is moot.
         (Some(shadow), Some(palette)) => Act::Write(shadow.under(over, palette, palette.fg, 1.0)),
         _ => Act::Blanked(announce::plain_bytes(&blank(over), None)),
     }
@@ -346,12 +351,12 @@ mod tests {
             }
         }
 
-        /// Parser not followed.
+        /// A pass `SETTLE` later, the child quiet; parser not followed.
         fn quiet(&mut self, pending: Option<Pending>, size: PtySize) -> Act {
             self.step(false, pending, size)
         }
 
-        /// Parser not followed.
+        /// A pass `SETTLE` later, the child writing; parser not followed.
         fn busy(&mut self, pending: Option<Pending>, size: PtySize) -> Act {
             self.step(true, pending, size)
         }

@@ -8,9 +8,6 @@
 //! terminal at once, before [`GRACE`]: only a key from its client can unblock
 //! it.
 //!
-//! The screen is one centred dim line where the picker draws its list, and the
-//! dim hint row ([`draw::screen`], [`draw::centre_vertically`]).
-//!
 //! Nothing is drawn or read for the first [`GRACE`]. Most attaches finish
 //! sooner (ms locally, a few hundred over ssh), and keys typed meanwhile must
 //! stay queued for the editor: a `:` typed right after `Enter` on the picker
@@ -189,8 +186,7 @@ fn run_on(
 /// a send does not stall the loop, and one failure means the session is
 /// unreachable.
 ///
-/// Only keys [`notation`] can spell are sent; `Esc` and `Ctrl-c` never get
-/// here.
+/// Only keys [`notation`] spells are sent; `Esc` and `Ctrl-c` never get here.
 struct Forward<'a> {
     sock: &'a Path,
     /// Opened on the first key; most attaches see none.
@@ -234,10 +230,10 @@ impl<'a> Forward<'a> {
     }
 }
 
-/// `key` in Neovim's notation, or `None` if it cannot be spelled. [`Key`] is
-/// lossy (chords and function keys arrive as [`Key::Other`]), so the list is
-/// short rather than invent keystrokes; any key ends a wait anyway. `<` opens
-/// every named key, so it is spelled `<lt>`.
+/// `key` in Neovim's notation, or `None` for a key not sent. [`Key`] is lossy
+/// (chords and function keys arrive as [`Key::Other`]), so the list is short
+/// rather than invent keystrokes; any key ends a wait anyway. `<` opens every
+/// named key, so it is spelled `<lt>`.
 fn notation(key: Key) -> Option<String> {
     match key {
         Key::Char('<') => Some("<lt>".into()),

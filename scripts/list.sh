@@ -60,9 +60,10 @@ if [ -d "$dir" ]; then
   done
 fi
 
-# Sweep metadata whose socket is gone, or a self-exited session's <id>.json and
-# unbounded <id>.log stay forever. Safe because the socket is created before
-# the metadata, so a .json without a .sock means the session is over.
+# Sweep metadata whose socket is gone; otherwise a self-exited session's
+# <id>.json and unbounded <id>.log stay forever. Safe because the socket is
+# created before the metadata, so a .json without a .sock means the session is
+# over.
 if [ -d "$dir" ]; then
   for meta in "$dir"/*.json; do
     [ -e "$meta" ] || continue

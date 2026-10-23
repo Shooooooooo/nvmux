@@ -9,8 +9,9 @@
 //! 3. The session opens out from the name's row, with the name as an overlay
 //!    that dissolves out ([`crate::shadow::Shadow::under`]).
 //!
-//! No frames are added, so this needs both the fade and `[effects.fade]
-//! session`; with either off, or `NO_COLOR`, an attach is plain.
+//! It adds no frames, only rides the fades' own, so it needs both the fade and
+//! `[effects.fade] session`; with either off, or `NO_COLOR`, an attach is
+//! plain.
 //!
 //! A switch by key carries its [`crate::card`] the same way, except that the
 //! new client redraws it in place before fading in ([`crate::shadow::Kept`])

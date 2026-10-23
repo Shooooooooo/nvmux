@@ -449,8 +449,8 @@ impl Terminal {
             .expect("size the pty");
 
         let mut cmd = Command::new(std::env::current_exe().expect("current exe"))
-            // Otherwise the child's diagnostics stay in libtest's capture
-            // buffer and never reach this pty.
+            // `--nocapture`, or the child's diagnostics stay in libtest's
+            // capture buffer and never reach this pty.
             .args(["--ignored", "--exact", "relay_child", "--nocapture"])
             .env(CHILD_SOCK, sock)
             .env(CHILD_ID, id)
@@ -776,9 +776,10 @@ fn row_of(screen: &vt100::Screen, row: u16) -> String {
         .to_string()
 }
 
-/// Every distinct state `row` could be presented in, with its offset: after
-/// each byte outside a synchronized update, and at each update's end. Unlike
-/// [`row_on_screen`], this catches a row wiped and restored by every frame.
+/// Each state `row` could be presented in, with its offset, consecutive
+/// repeats merged: after each byte outside a synchronized update, and at each
+/// update's end. Unlike [`row_on_screen`], this catches a row wiped and
+/// restored by every frame.
 fn presented(out: &[u8], row: u16) -> Vec<(usize, String)> {
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     let mut moments: Vec<(usize, String)> = Vec::new();
@@ -1677,8 +1678,8 @@ fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
     let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
-    // Every row rewritten every 5 ms: several KB per frame, a megabyte well
-    // within the hold.
+    // Every row rewritten every 5 ms: several KB per frame, so a megabyte
+    // (`nvmux::pty::AHEAD_MAX`) in well under the hold.
     rpc.command(
         "setlocal noswapfile | lua vim.g.ticks = 0; vim.fn.timer_start(5, function() \
          vim.g.ticks = vim.g.ticks + 1; local d = tostring(vim.g.ticks % 10); \

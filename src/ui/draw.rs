@@ -735,7 +735,7 @@ pub(super) fn list_width(app: &App) -> u16 {
 /// See [`list_layout`].
 struct ListLayout {
     block: Rect,
-    /// The visible row on the block's first line.
+    /// Index into [`App::rows`] of the block's first line.
     offset: usize,
     num_width: usize,
 }
@@ -1129,8 +1129,8 @@ mod tests {
             for c in typed.chars() {
                 a.on_key(Key::Char(c));
             }
-            // Wide enough for all of `HINTS`, or the `quit` check below would
-            // pass regardless.
+            // `HINTS` is 79 columns, so at 70 `quit` is already cut and the
+            // `quit` check below cannot fail.
             let lines = render(&a, 70, 8);
             assert!(
                 lines[7].contains(expected),
@@ -1436,7 +1436,7 @@ mod tests {
             .any(|c| (0x2801..=0x28ff).contains(&(c as u32)))
     }
 
-    /// [`reordering`] with the trails on whatever the config says.
+    /// [`reordering`] with the trails on, whatever the config says.
     fn trailing(names: &[&str], row: usize) -> App {
         let mut a = reordering(names, row);
         a.set_trail(true);

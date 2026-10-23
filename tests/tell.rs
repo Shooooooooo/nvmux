@@ -158,8 +158,8 @@ fn a_listener_hears_the_news_once_a_read_names_it() {
 /// The session in front gets a card as it happens for what other sessions'
 /// terminals say, titled with that session and going there; for its own
 /// terminals, only those off screen, titled `here`; and nothing while nvmux's
-/// own screens are up. On returning to front, a session that still keeps news
-/// is posted as its mark alone, and forgotten once it keeps nothing.
+/// own screens are up. Back from those screens, another session that still
+/// keeps news is posted as its mark alone, and forgotten once it keeps nothing.
 #[test]
 fn the_notifier_posts_cards_for_the_session_in_front() {
     require_nvim!();

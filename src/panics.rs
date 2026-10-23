@@ -5,11 +5,12 @@
 //! adds the one hook that does this.
 //!
 //! The third-party parsers following a session's bytes for the shadow and the
-//! ledger may panic on editor output; that only retires what they kept (see
-//! [`crate::shadow`] and [`crate::ledger`]) while the relay continues. The
-//! hook runs before that catch too, and must then do nothing: restoring the
-//! terminal under a live session would drop it off the alternate screen and
-//! print over it. [`caught`] marks the panics it catches for the hook to skip.
+//! ledger may panic on editor output. That panic is caught and only retires
+//! what they kept (see [`crate::shadow`] and [`crate::ledger`]) while the
+//! relay continues. The hook still runs for it, before the catch, and must do
+//! nothing: restoring the terminal under a live session would drop it off the
+//! alternate screen and print over it. [`caught`] marks the panics it catches
+//! for the hook to skip.
 //!
 //! Screens open the terminal without ratatui's `try_init` (see `ui::Screen`),
 //! which would add a restoring hook per screen and never remove it.

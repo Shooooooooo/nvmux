@@ -92,7 +92,7 @@ pub struct Facts {
 }
 
 impl Facts {
-    /// Parse the agent's array into `(buf, facts)`, in the index order below.
+    /// Parse the agent's array into `(buf, facts)`.
     /// `matchpairs` and `conceals` are raw option values; `classes` has one
     /// digit per character code: `0` blank, `1` punctuation, `2` word.
     pub fn read(v: &[ValueRef<'_>]) -> Option<(i64, Self)> {
@@ -611,7 +611,7 @@ pub fn sits(text: &str, shape: &Shape, byte: usize) -> usize {
 /// Rebuild Neovim's drawn `row` (cells past the gutter) for `new`, where `put`
 /// bytes replaced `old[from..from + gone]`, cursor on display column `cursor`.
 ///
-/// Glyphs come from the client's layout (`predict::render`); unchanged
+/// Glyphs come from the client's layout (`predict::line`); unchanged
 /// characters keep Neovim's colours by glyph kind, new `'list'` glyphs take
 /// the row's (or `look`'s) colour for their kind, and new text [`colour`]'s.
 /// Past the end ([`Past`]), virtual text moves with the end; fill,
@@ -1513,9 +1513,9 @@ mod tests {
         assert!(refused("ö", e, (text, 1, 1), &f, &shape).is_some());
     }
 
-    /// Refused: softtabstop or `'smarttab'` indent blanks, a combining mark
-    /// with `'delcombine'`, line start, and past the Insert start without
-    /// `start` in `'backspace'`.
+    /// Refused: blanks with `'softtabstop'`, indent blanks with `'smarttab'`, a
+    /// combining mark with `'delcombine'`, line start, and past the Insert
+    /// start without `start` in `'backspace'`.
     #[test]
     fn bs_over_more_than_a_character_is_left_to_neovim() {
         let sts = Facts {
@@ -1771,7 +1771,8 @@ mod tests {
         );
     }
 
-    /// `unseen_entered`/`unseen_left` are the last two fields.
+    /// `unseen_entered`/`unseen_left` are fields 21 and 22; later ones may be
+    /// missing.
     #[test]
     fn what_entering_and_leaving_insert_mode_set_off_is_read() {
         use rmpv::Value;

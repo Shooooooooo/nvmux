@@ -91,8 +91,8 @@ const WINDOWS: Windows = Windows {
 pub struct Windows {
     /// Floats, the message area and rearranged windows ([`motion`]).
     pub slide: f32,
-    /// Splits resizing, opening and closing ([`layout`]), and buffer
-    /// switches fading ([`switch`]).
+    /// Splits resizing; `open` and `close` are splits opening and closing
+    /// ([`layout`]), `switch` a buffer switch fading ([`switch`]).
     pub resize: f32,
     pub open: f32,
     pub close: f32,
@@ -794,7 +794,8 @@ impl Animator {
         std::mem::take(&mut self.dropped)
     }
 
-    /// Window grids scrolled ahead further than they can show.
+    /// Window grids with scrolls ahead not drawn yet (see
+    /// [`Animator::fill_in`]).
     pub fn held(&self) -> Vec<u64> {
         self.scrolls
             .iter()
@@ -1192,7 +1193,8 @@ impl Animator {
             || self.effects.blink
     }
 
-    /// Paint the cursor and particles over `frame`; returns the terminal's.
+    /// Paint the cursor and particles over `frame`; returns how to leave the
+    /// terminal's cursor.
     pub fn paint(&self, frame: &mut Frame, model: &Model, now: Instant) -> Cursor {
         let colors = model.colors();
         let mode = self.mode_info(model);
@@ -1238,7 +1240,7 @@ impl Animator {
     /// Record each visible grid's text inset. Text moving in or out within
     /// an unchanged window (its grid resized for centred text; see
     /// `crate::client::wide`) slides there ([`motion`]); a new or moved grid
-    /// just appears.
+    /// gets no shift, as its window's own animation moves it.
     pub fn insets(&mut self, model: &Model, now: Instant) {
         // Step from now, not from when the last animation ended.
         if !self.moving() {
@@ -1342,9 +1344,10 @@ fn inner(g: &Grid, m: Margins) -> Option<(usize, usize, usize, usize)> {
 }
 
 /// Without `ext_multigrid`, the only animatable scroll: a `grid_scroll` of
-/// grid 1 whose rows match the current window's `scroll_delta`, summed over
-/// the batch. Anything else (a region scrolled to insert or delete lines, a
-/// scroll no window claims) is not a view moving; Neovide skips it too.
+/// grid 1 whose rows match the `scroll_delta` of the one window that
+/// scrolled, each summed over the batch. Anything else (a region scrolled to
+/// insert or delete lines, a scroll no window claims) is not a view moving;
+/// Neovide skips it too.
 fn linegrid_scroll(model: &Model, batch: &[Event]) -> Option<Snap> {
     let mut wins: HashMap<i64, i64> = HashMap::new();
     let mut rects: Vec<((usize, usize, usize, usize), i64)> = Vec::new();
@@ -1789,7 +1792,7 @@ mod tests {
         }
     }
 
-    /// With slides off. The cursor is kept in by `'scrolloff'`; Neovim's
+    /// Scroll slides off. The cursor stays within `'scrolloff'`; Neovim's
     /// matching scroll lands on it, and one Neovim never makes expires.
     #[test]
     fn a_window_scrolled_ahead_of_neovim_shows_at_once() {

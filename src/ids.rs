@@ -12,14 +12,14 @@ fn b32_40(bytes: &[u8; 5]) -> String {
         | u64::from(bytes[2]) << 16
         | u64::from(bytes[3]) << 8
         | u64::from(bytes[4]);
-    // MSB first, so ids sort like their bit patterns.
+    // MSB first, per RFC 4648.
     (0..8)
         .map(|i| ALPHABET[((n >> (35 - i * 5)) & 0x1f) as usize] as char)
         .collect()
 }
 
-/// Eight random base32 characters (40 bits). The crate's only randomness: used
-/// for session ids and the [`crate::proc::Shell`] output-framing secret.
+/// Eight random base32 characters (40 bits): session ids, SSH master socket
+/// names and the [`crate::proc::Shell`] output-framing secret.
 pub fn nonce() -> std::io::Result<String> {
     let mut bytes = [0u8; 5];
     getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
@@ -56,8 +56,8 @@ impl Id {
 ///
 /// Not `DefaultHasher`, which may change across Rust releases and orphan live
 /// sockets. FNV-1a with the 64-bit offset basis, but the multiplier is **not**
-/// the FNV-64 prime (`0x100000001b3`; it has an extra nibble). Do not fix it:
-/// forwarded socket names on disk depend on it.
+/// the FNV-64 prime (`0x100000001b3`): it has an extra zero nibble. Do not fix
+/// it: forwarded socket names on disk depend on it.
 pub fn host_token(host: &str) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x1000_0000_01b3;

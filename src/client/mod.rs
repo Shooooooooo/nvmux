@@ -33,9 +33,9 @@
 //! second UI without `ext_multigrid` ([`refresh`]). Tab pages shown for the
 //! first time get the same. Drawing waits up to [`HOLD_LIMIT`] for both.
 //!
-//! The UI protocol does not say which buffer a window shows or how windows
-//! are laid out, so a multigrid attach installs autocommands that report both
-//! to this client ([`AGENT_LUA`]).
+//! The UI protocol does not say which buffer a window shows or the options
+//! that lay windows out, so a multigrid attach installs autocommands that
+//! report both to this client ([`AGENT_LUA`]).
 //!
 //! # Cards
 //!
@@ -151,8 +151,8 @@ const REPLY_WAIT: Duration = Duration::from_secs(1);
 /// Max ms a lone `ESC` is held for the rest of a sequence, whatever
 /// `'ttimeoutlen'` says ([`input`]). The relay already held it as long
 /// (`crate::pty`'s `SEQUENCE_TIMEOUT`); a key's bytes split only at buffer
-/// boundaries. Waiting `'ttimeoutlen'` (60 ms default) too would delay every
-/// `<Esc>` leaving Insert mode.
+/// boundaries. Waiting `'ttimeoutlen'` (50 ms default) on top would delay
+/// every `<Esc>` leaving Insert mode.
 const RELAYED_ESCAPE: u64 = 10;
 
 /// Delay before listing UIs again after finding one only passing through
@@ -235,8 +235,8 @@ return out";
 /// For a predicting client it also sends what [`predict`] draws from:
 ///
 /// - `lines` (window, buffer, `b:changedtick`, first line, lines, whether
-///   they replace the client's, longest line in bytes): the view and lines
-///   either side of it as it moves, for as many windows as the fifth
+///   they replace the client's, per-line byte cap): the view and lines
+///   either side of it as it moves, as many window heights as the fifth
 ///   argument (or a later `User` `nvmux_client_reach_<chan>` autocommand)
 ///   allows: two at first, the rest a moment later, a few hundred lines at
 ///   a time. Only lines the client lacks, by [`predict`]'s rule, each cut to
@@ -245,7 +245,7 @@ return out";
 ///   few thousand lines the client keeps, trimmed away from those being sent.
 /// - `splice` (window, buffer, old and new `b:changedtick`, first line, past
 ///   last replaced, replacement count, the replacing lines that touch the
-///   client's, longest line in bytes): each edit once typing pauses, or fresh
+///   client's, per-line byte cap): each edit once typing pauses, or fresh
 ///   `lines` when the edits are too many.
 /// - `spans` (window, buffer, `b:changedtick`, first line, per line a list of
 ///   start byte, end byte or -1 for the line's end, group): highlights, with
@@ -740,7 +740,7 @@ if predict then
   -- Per buffer, edits since the client's lines were sent, in order: each
   -- replaced lines a..b with a..c, whose text it keeps; one adjacent to the
   -- last is merged into it. Sent as splices on the next push so an edit
-  -- costs only its lines; past 2000 lines, lines are resent instead.
+  -- costs only its lines; past 2000 lines or 100 edits, lines are resent.
   local edits, ticks, attached = {}, {}, {}
   local function edited(buf, tick, first, last, new)
     local shown = false
@@ -1018,10 +1018,10 @@ if predict then
   -- On SafeState (typed-ahead keys taken, before their frame): curswant
   -- when it or the window changes, or with acks the full `ack` when
   -- anything changed (SafeState repeats after every request). Edits are
-  -- flushed first so the client's lines match its b:changedtick
-  -- (predict::Predictor::fresh). Widths of blank-ended lines are sent
-  -- because blank virtual text there is invisible. Mappings are rechecked
-  -- a second later.
+  -- flushed first so the client's lines match the ack's b:changedtick
+  -- (predict::Predictor::fresh). The ack carries Neovim's widths of the
+  -- cursor line and of blank-ended lines in view, since blank virtual text
+  -- is invisible on screen. Mappings are rechecked a second later.
   local wanted, said, fixed, decorated, recheck, rehooked
   local function remapped()
     recheck = false
@@ -1502,8 +1502,8 @@ enum Ask {
 }
 
 /// What made a predicted scroll: keys (Normal/Visual, or Insert-mode
-/// scrolling keys), predicted once Neovim has caught up with earlier keys;
-/// a page-wise wheel turn (Normal/Visual); or a line-wise one (Insert too).
+/// scrolling keys), predicted only when [`sure`]; a page-wise wheel turn
+/// (Normal/Visual); or a line-wise one (Insert too).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum By {
     Keys,
@@ -1564,8 +1564,8 @@ pub struct App {
     /// Terminal size as (columns, rows).
     size: (usize, usize),
     attach: Attach,
-    /// Some effect needs per-window grids, so attach with `ext_multigrid`
-    /// when possible.
+    /// An effect, predictions or centring need per-window grids, so attach
+    /// with `ext_multigrid` when possible.
     multigrid_wanted: bool,
     /// Whether the client is on a terminal, as told to Neovim.
     tty: term::Tty,
@@ -1618,7 +1618,7 @@ pub struct App {
     /// Bytes for the terminal before the next frame (bell, title, the
     /// server's own), in order.
     say: Vec<u8>,
-    /// The server is gone or was told to go.
+    /// The server said it is exiting.
     done: bool,
     predict: Option<Predictor>,
     /// The latest ack, for the frame it preceded: the sequence number of the
@@ -1626,7 +1626,7 @@ pub struct App {
     ack: Option<(u64, predict::Ack)>,
     /// Send times of requests that measure the round trip.
     asked_at: HashMap<u32, Instant>,
-    /// Last typing, wheel turn or paste: the round trip is measured only
+    /// Last key, mouse input or paste: the round trip is measured only
     /// while the user is active.
     typed: Option<Instant>,
     /// Views' new first columns per the agent, for the next frame
@@ -1781,7 +1781,6 @@ impl App {
         self
     }
 
-    /// Not with no width limit.
     fn centring(&self) -> bool {
         self.centre != Centre::Off && self.window_width != 0
     }
@@ -2129,8 +2128,6 @@ impl App {
             Arg::Int(self.reach),
             Arg::Bool(acks),
         ];
-        // Only passed when typing ahead, so the agent otherwise behaves as
-        // before the option existed.
         if typing {
             args.push(Arg::Bool(true));
         }
@@ -2254,8 +2251,8 @@ impl App {
     }
 
     /// A new shape for `win`: a window distrusted for drawing differently may
-    /// match now, and steps made with another gutter width are off by a
-    /// column, so they are dropped.
+    /// match now, and steps made with another gutter width are misplaced,
+    /// so they are dropped.
     fn reshaped(&mut self, win: i64, now: Instant) {
         let Some(p) = self.predict.as_mut() else {
             return;
@@ -3146,8 +3143,9 @@ impl App {
 
     /// Makes a predicted scroll or cursor motion in `grid` at once if the
     /// client can tell what Neovim will do. One made (or with nothing to do)
-    /// already matches Neovim's screen ([`predict::Sent::made`]); later
-    /// predictions wait for Neovim to draw one that is not. See [`predict`].
+    /// shows what Neovim will draw and is not replayed
+    /// ([`predict::Sent::made`]); later predictions wait for Neovim to draw
+    /// one that is not. See [`predict`].
     fn predict_command(&mut self, grid: u64, command: Command, cause: Cause, now: Instant) {
         let entering = matches!(command, Command::Enter(_));
         let made = self.make(grid, command, cause, now);
@@ -3311,7 +3309,8 @@ impl App {
     /// land the cursor themselves). It continues from the newest step, which
     /// must use the same window, gutter and view (a mismatched step is
     /// dropped once heard of), or from the ack if the view is still the
-    /// ack's and the client's lines match it.
+    /// ack's; unless the steps typed, the client's lines must be at the ack's
+    /// tick.
     fn onward(&self, grid: u64, now: Instant) -> Option<Onward> {
         let p = self.predict.as_ref().filter(|p| p.acks() && p.known())?;
         if !self.steps_in(grid, now) {
@@ -4286,8 +4285,8 @@ impl App {
                 return false;
             }
         }
-        // With motions predicted, a Normal-mode scroll key, or a wheel turn
-        // over cursor steps, is itself a step.
+        // With acks, a Normal-mode scroll key, or a wheel turn over cursor
+        // steps, is itself a step.
         if let Some(made) = self.scroll_step(grid, command, cause, now) {
             return made;
         }
@@ -4437,7 +4436,7 @@ impl App {
         true
     }
 
-    /// With motions predicted, makes a Normal-mode scroll key a cursor step
+    /// With acks, makes a Normal-mode scroll key a cursor step
     /// ([`anim::chain`]), scrolling as Neovim would ([`predict::outcome`])
     /// and landing as a vertical motion does ([`moves::onto`]), so motions
     /// and scrolls chain. Returns whether it was made, or `None` to make a
@@ -4915,10 +4914,10 @@ impl App {
     ///   lines also its text, [`Predictor::fresh`]). Steps up to `k` are
     ///   dropped. If a mode change's autocommands edited the buffer
     ///   ([`App::edited`]), the kind must prove itself again
-    ///   ([`predict::Trust::edited`]) and later steps are remade. If fresh
-    ///   and the frame draws the cursor or typed line differently, the window
-    ///   is distrusted for a while; a difference only past the line's end
-    ///   drops later steps for relayout.
+    ///   ([`predict::Trust::edited`]); if they did or may have, later steps
+    ///   are remade. If fresh and the frame draws the cursor or typed line
+    ///   differently, the window is distrusted for a while; a difference only
+    ///   past the line's end drops later steps for relayout.
     /// - *Wrong*: the cursor reverts at once, the window's steps are dropped
     ///   and the kind must prove itself again ([`predict::Trust`]).
     /// - Nothing to judge (no step for `k`, buffer changed, typed text
@@ -5080,8 +5079,8 @@ impl App {
         drawn.unwrap_or((false, false))
     }
 
-    /// Whether Neovim's cursor is where step `s` drew it, at `(textoff,
-    /// vcol)`.
+    /// Whether Neovim's cursor is where step `s` drew it, with a gutter
+    /// `textoff` wide and the step at display column `vcol`.
     fn drawn_at(&self, grid: u64, s: &chain::Step, (textoff, vcol): (usize, usize)) -> bool {
         let c = self.model.cursor;
         let (Some(view), Some((top, ..))) = (
@@ -5117,7 +5116,7 @@ impl App {
         }
     }
 
-    /// [`App::forget`]s steps the animator dropped itself
+    /// Forgets ([`App::forget`]) steps the animator dropped itself
     /// ([`anim::Animator::take_dropped`]); returns whether there were any.
     fn forget_dropped(&mut self) -> bool {
         let seqs = self.anim.take_dropped();
@@ -7116,8 +7115,8 @@ mod tests {
         assert!(a.wake_at(front).is_some(), "back in front, it blinks again");
     }
 
-    /// A card up when going away (e.g. a switch's) neither wakes the client
-    /// nor is drawn; it is cleared on return.
+    /// A card up when going away (e.g. a switch's) stops waking the client
+    /// or drawing frames; it is cleared on return.
     #[test]
     fn a_client_away_draws_no_card_on_its_clock() {
         use crate::card::Command::{Away, Clear, Show};
@@ -8018,8 +8017,8 @@ mod tests {
         assert_eq!(p.reach(), 3, "a fast link now: a page each way, and two");
     }
 
-    /// The reach (pages a held key covers in a round trip) is sent at
-    /// install and only when it changes.
+    /// The reach ([`Predictor::reach`]) is sent at install and only when it
+    /// changes.
     #[test]
     fn the_agent_is_told_how_far_a_round_trip_pages() {
         let t0 = Instant::now();
@@ -8070,7 +8069,7 @@ mod tests {
         assert!(measure(&mut a, rtt).is_empty(), "the same round trip");
         // 1 s, smoothed to 300 ms: fifteen pages.
         assert_eq!(measure(&mut a, Duration::from_secs(1)), [17]);
-        // Down to instant: never below 3 (the view, the next page, and two).
+        // Down to instant: never below 3 (one page, rounded up, and two).
         let mut told = Vec::new();
         for _ in 0..60 {
             told.extend(measure(&mut a, Duration::ZERO));
@@ -8528,9 +8527,9 @@ mod tests {
         assert_eq!(a.anim.ahead(2), (0, 0), "not heard from");
     }
 
-    /// [`acking`] with a full ack-mode shape (including
-    /// [`predict::Stepping`]) and `mapped` keys, so motions are predicted;
-    /// cursor on `line 0` of `line 0` to `line 19`.
+    /// [`acking`] with an ack-mode shape ([`predict::Stepping`] only up to
+    /// `widths`, so no `'scrolljump'`) and `mapped` keys, so motions are
+    /// predicted; cursor on `line 0` of `line 0` to `line 19`.
     fn stepping_with(rtt: Duration, mapped: &[&str]) -> App {
         stepping_as(MOTIONS, rtt, mapped)
     }
@@ -8957,9 +8956,9 @@ mod tests {
         }
     }
 
-    /// [`stepping`] with the full shape (`'scrolljump'` 1, no concealing)
-    /// and no decorated lines, so motions past the edge scroll ahead and
-    /// scroll keys are steps.
+    /// [`stepping`] reshaped with `'scrolljump'` 1 and no concealing, and no
+    /// decorated lines, so motions past the edge scroll ahead and scroll
+    /// keys are steps.
     fn scrolling(rtt: Duration) -> App {
         scrolling_as(
             rtt,
@@ -9536,7 +9535,7 @@ mod tests {
         }
     }
 
-    /// Sends lines `text` then `line N`, and draws the first five as `drawn`.
+    /// Sends lines `text` then `line N` up to 20, and draws rows `drawn`.
     fn lined(a: &mut App, text: &[&str], drawn: &[&str], now: Instant) {
         let lines: Vec<Value> = text
             .iter()
@@ -9767,7 +9766,7 @@ mod tests {
         a.anim.cursor_at(&a.model)
     }
 
-    /// [`shaped`] plus the remaining ack-mode fields and default
+    /// [`shaped`] extended as [`scrolling`] does, plus the default
     /// `'iskeyword'` classes ([`predict::Stepping::classes`]).
     fn worded() -> Vec<Value> {
         let mut shape = shaped(0, (false, false, true), (false, 0), &[], Vec::new());

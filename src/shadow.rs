@@ -104,6 +104,8 @@ pub struct Kept {
 }
 
 impl Kept {
+    /// `spans` are `(row, first col, last col)`, `glyphs` `(row, col, char)`,
+    /// all 0-based.
     pub fn new(
         spans: impl IntoIterator<Item = (usize, usize, usize)>,
         glyphs: impl IntoIterator<Item = (usize, usize, char)>,
@@ -677,15 +679,17 @@ impl Shadow {
 
     /// The bytes that cross-fade `over` with the session's cells under it:
     /// overlay glyphs `t` dissolved from `ink` (see [`crate::theme`]), session
-    /// cells `1 - t`. At `t = 0` it looks like the notice's own spaces; at
-    /// `t = 1` the screen is as found, so the notice needs no repaint to go.
+    /// cells `1 - t`. At `t = 0` the cells under the notice look like its own
+    /// spaces; at `t = 1` the screen is as found, so the notice needs no
+    /// repaint to go.
     ///
     /// Unlike [`Shadow::frame`], it paints over a session that owns the
     /// screen, so it leaves cursor and attributes as found (`DECSC`/`DECRC`,
     /// and no cursor hide, which would blink), keeps no diff, and never
     /// writes outside the rectangle. The shared save slot is safe as in
-    /// [`crate::announce`]: output only goes between the session's sequences
-    /// (see [`crate::boundary`]). Cells past the grid's end paint as blanks.
+    /// [`crate::announce`]: output only goes between the session's sequences,
+    /// never between its own `DECSC` and `DECRC` (see [`crate::boundary`]).
+    /// Cells past the grid's end paint as blanks.
     pub fn under(&self, over: &Over, palette: &Palette, ink: Rgb, t: f32) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(SYNC_BEGIN);
@@ -776,8 +780,8 @@ impl Shadow {
 
 impl Shadow {
     /// A frame of the session with `laid` (the floating settings) over it and
-    /// every other cell as `shade` says. Without `laid`, its cells are shaded
-    /// too, which is how they blank for it to come up on.
+    /// every other cell as `shade` says. Without `laid`, the cells where it
+    /// goes are shaded too, which is how they blank for it to come up on.
     ///
     /// A diff like [`Shadow::frame`]'s, in full after a [`feed`], [`resize`]
     /// or [`invalidate`] (so after any session output). Always at least the
@@ -2639,7 +2643,7 @@ mod tests {
     fn a_wide_character_the_settings_cut_is_blanked() {
         let mut shadow = Shadow::new(2, 12);
         shadow.feed("ab漢cd漢".as_bytes());
-        // Columns 3..6, 0-based: the first 漢 is at 2 and 3, the second at 6 and 7.
+        // Columns 3..6, 0-based: one 漢 at 2 and 3, the other at 6 and 7.
         let panel = laid(3, 0, 3, 1, "xyz");
         let frame = shadow.frame_under(
             &|_, _| Shade::Toward(0.0),

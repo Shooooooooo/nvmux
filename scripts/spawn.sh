@@ -12,7 +12,6 @@
 #                    not confirm it (see the safety note below)
 #   SOCK ok|timeout  whether the listen socket appeared
 #   NVMUX_END
-#
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 usage='usage: spawn.sh <runtime_dir> <id> <cwd> <cmd> [args...]'
@@ -70,8 +69,8 @@ rm -f "$sock"
 # RPC after spawn: it is in place before nvim starts and cannot fail silently.
 export NVMUX="$sock"
 
-# Before `command -v` below, which resolves a relative command like `./nvim`
-# against the current directory.
+# Enter <cwd> before `command -v` below, which resolves a relative command
+# like `./nvim` against the current directory.
 #
 # Two steps, for two errors: not a directory, or one we cannot enter. Both
 # refuse rather than launch somewhere else, which would look right and be

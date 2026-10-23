@@ -178,8 +178,9 @@ struct Pieces {
     mask: f32,
     /// Whether its words still take their rows.
     words: bool,
-    /// Arrival only: how far its row has slid, and its overall strength.
+    /// Arrival only: how far its row has slid.
     slide: f32,
+    /// Arrival only: its overall strength.
     whole: f32,
 }
 
@@ -1142,8 +1143,8 @@ impl Sheet {
     }
 }
 
-/// Fade `cell` `amount` of the way to the background, emptying it from
-/// [`EMPTIED`]. A terminal-default background is kept.
+/// Fade `cell` `amount` of the way to the background; empty it at
+/// [`EMPTIED`] or more. A terminal-default background is kept.
 fn hush(cell: &mut Out, amount: f32, pens: &Pens, colors: &Colors) {
     if amount >= EMPTIED {
         *cell = Out::blank(pens.blank);

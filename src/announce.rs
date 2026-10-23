@@ -15,8 +15,9 @@
 //! never presents the box wiped. No gap within [`GIVE_UP`] means no box.
 //!
 //! The box cross-fades ([`crate::fade`]) with the session's cells from
-//! [`crate::shadow`]; without a shadow its interior is blank until the
-//! repaint. The relay cannot sleep between frames, so the popup holds a
+//! [`crate::shadow`]. The repaint still runs, as the shadow lacks undercurl
+//! and strikethrough; without a shadow the interior is blank until then. The
+//! relay cannot sleep between frames, so the popup holds a
 //! [`fade::Schedule`] and is asked for one clock-paced frame at a time. With
 //! [`fade::enabled`] false there is no fade phase.
 
@@ -62,8 +63,9 @@ pub fn label(name: &str) -> String {
 pub struct Pass {
     /// The session wrote, so the box may have been drawn over.
     pub wrote: bool,
-    /// The terminal is between the session's escape sequences with none of
-    /// nvmux's own open, so nvmux may write. See [`crate::boundary`].
+    /// The terminal is between the session's escape sequences, outside any
+    /// session span or saved cursor, so nvmux may write. See
+    /// [`crate::boundary`].
     pub between: bool,
 }
 
@@ -381,8 +383,8 @@ pub fn overlay(label: &str, size: PtySize) -> Option<Over> {
 /// * a synchronized-update span, so the block is never seen half-drawn;
 /// * `DECSC`/`DECRC` (`ESC 7` / `ESC 8`) around it all, restoring the cursor
 ///   and the editor's SGR. The single save slot is safe only because nvmux
-///   writes between the child's sequences, never between a save of its own
-///   and its restore ([`crate::boundary`]);
+///   writes between the child's sequences, never between the child's own
+///   save and restore ([`crate::boundary`]);
 /// * an SGR reset leading every row, since spaces erase with the current
 ///   background, which the editor set. `sgr` extras ride on that reset's CSI,
 ///   as `shadow::write_sgr` does;
@@ -402,8 +404,8 @@ pub(crate) fn placed(over: &Over, sgr: &str) -> Vec<u8> {
 }
 
 /// The box alone in foreground `fg`, or in no colour at all (the box at rest
-/// without a theme). Used whenever there is no session screen to dissolve
-/// into (see [`Popup::step`]).
+/// without a theme). Used at rest and whenever there is no session screen to
+/// dissolve into (see [`Popup::step`]).
 ///
 /// Only the foreground is ever set: the interior is spaces, which erase with
 /// the terminal's own background after [`placed`]'s reset (as `fade::apply`
@@ -730,8 +732,8 @@ mod tests {
         );
     }
 
-    /// The last frame is the session's cells at full colour, so the screen is
-    /// back before the repaint is even requested.
+    /// The last frame is the session's cells at nearly full colour, so the
+    /// screen is back before the repaint is even requested.
     #[test]
     fn the_box_leaves_back_into_the_screen_it_was_covering() {
         let t0 = Instant::now();

@@ -13,7 +13,8 @@ use nvmux::{
     ui,
 };
 
-/// How long exiting waits for the left session's notes to be cleared.
+/// How long exiting waits for the left session's notes to be cleared: enough
+/// for an ssh round trip, short enough that a detach feels instant.
 const SEEN_ON_THE_WAY_OUT: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn main() -> Result<()> {
@@ -145,8 +146,8 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
     let mut looked_at: Option<String> = None;
     // Posts other sessions' reports as cards (see `nvmux::tell`).
     let notifier = nvmux::tell::Notifier::start();
-    // Whether the next attach follows a dropped link or a client-kind change,
-    // which decides what a `Revival` restarts (see `Again`).
+    // Clients restarting behind the front session, and whether the next
+    // attach follows a dropped link or a client-kind change (see `Again`).
     let mut revival: Option<Revival> = None;
     let mut after_a_drop = false;
     let mut new_kind = false;
@@ -209,6 +210,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             }
             let opened = match attached.take() {
                 Some(a) if a.session_id == current.id => Ok(Some(a)),
+                // Retiring a client leaves its headless server running.
                 // Hung up first and reaped after the new spawn, so the two
                 // run in parallel. Nothing reads the old pty again, so its
                 // restore sequence never reaches the terminal.
@@ -223,7 +225,8 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                         &mut hand_off,
                         &mut after_a_drop,
                     )?;
-                    // Explicit, on failure too: the wait the hangup deferred.
+                    // The reap the hangup deferred: explicit, so it stays
+                    // after the spawn, a failed attach included.
                     drop(other);
                     spawned
                 }
@@ -345,7 +348,8 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     .in_row(row_of(&listing, session, step));
                     // Not for a session with a kept client, live or exited:
                     // an exited one may need the link recovered first (see
-                    // `resume_or_attach`).
+                    // `resume_or_attach`). Revived clients are collected
+                    // first so they count as kept.
                     if let Some(r) = &revival {
                         r.collect(&mut pool, Some(&current.id));
                     }
@@ -435,7 +439,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     }
                 }
                 (pty::Outcome::CreateNew, held) => {
-                    // Held rather than killed, so a cancelled prompt resumes it.
+                    // Held, not killed, so a cancelled prompt resumes it.
                     attached = pool.set_aside(held);
                     if let ui::prompt::Outcome::Created(session) = ui::prompt::run(transport)? {
                         // `highest` decides how long a digit waits.
@@ -620,7 +624,8 @@ fn resume_or_attach(
             Ok(Some(*kept))
         }
         // It may have gone with the link: recover that (bounded) before the
-        // fresh attach, whose connect is unbounded.
+        // fresh attach, whose connect is unbounded. `hand_off` comes down
+        // first, since the recovery prints on the plain terminal.
         pool::Taken::Left => {
             if let Some(h) = hand_off.take() {
                 h.take_down();
@@ -684,8 +689,8 @@ fn describe_attach_failure(location: &transport::Location, e: &nvmux::NvmuxError
     }
 }
 
-/// The first line explains itself: a bare ssh error would read as failure,
-/// not recovery.
+/// The first attempt adds a line saying what is happening: a bare ssh error
+/// would read as failure, not recovery.
 fn describe_retry(host: &str, retry: &reconnect::Retry<'_>) -> String {
     let mut lines = String::new();
     if retry.attempt == 1 {
@@ -772,6 +777,8 @@ fn row_of(
 /// attach, so a switch can run it under the fade. Dropping it retires the
 /// client.
 struct Begun {
+    /// The switch uses this rather than resolving its target again, which
+    /// could give another session.
     session: nvmux::session::Session,
     sock: std::path::PathBuf,
     attachment: pty::Attachment,
@@ -805,7 +812,8 @@ fn begin_attachment(
 
 /// Start a client for every session and hold each in the pool until its first
 /// visit (`[client] lazy = false`). Probes are not waited for: each is answered
-/// on its client's thread. Returns the listing for the picker to open on.
+/// on its client's thread. Returns the listing for the picker to open on,
+/// saving a second listing.
 ///
 /// Nothing is reported: the picker reports a failed listing, and a client that
 /// cannot start leaves its session to a normal first attach.
@@ -840,7 +848,8 @@ fn start_every_client(
     Some(listing)
 }
 
-/// A session waiting for a key may not paint until it gets one.
+/// Longest a [`Revival`] waits for the front session to paint: one waiting
+/// for a key may not paint until it gets one.
 const REVIVE_AFTER_AT_MOST: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Clients restarted behind the front session, with `[client] lazy` off:
@@ -884,7 +893,8 @@ impl Revival {
         let spawned = std::thread::Builder::new()
             .name("nvmux-revive".into())
             .spawn(move || {
-                // A forward sends nothing until a client connects.
+                // Before the paint wait: a forward sends nothing until a
+                // client connects.
                 transport.reach_all(&sessions);
                 revive(&sessions, &painted, &stopped, &handing, |session| {
                     let Begun {
@@ -1034,8 +1044,8 @@ fn revive<T>(
     }
 }
 
-/// Retire a client without waiting for it: a switch about to fade cannot
-/// afford the wait.
+/// Retire a client on a thread: dropping one waits for its thread to hand it
+/// over, which a switch about to fade cannot afford.
 fn let_go(held: pty::Parked) {
     let _ = std::thread::Builder::new()
         .name("nvmux-let-go".into())

@@ -36,7 +36,7 @@ pub struct SshTransport {
     remote_home: String,
     forwarded: Mutex<HashSet<String>>,
     /// The greeting's listing, taken once by the first listing to save a
-    /// script run. Nothing changes sessions in the milliseconds before that.
+    /// script run. nvmux changes no sessions in the milliseconds before that.
     first_listing: Mutex<Option<String>>,
 }
 
@@ -62,8 +62,9 @@ impl SshTransport {
         let host_token = ids::host_token(&host);
         let control_path = paths::control_path(&local_dir, &host_token)?;
 
-        // Judged first: an `ssh` too old for nvmux also fails on the master's
-        // options, which would hide the real cause.
+        // Runs alongside the connection and is judged before its result: an
+        // `ssh` too old for nvmux also fails on the master's options, which
+        // would hide the real cause.
         let version = crate::ssh::check_local();
 
         let ssh = Ssh::new(host.clone(), control_path);
@@ -150,8 +151,8 @@ impl SshTransport {
             if live.iter().any(|s| s.id == id) {
                 continue;
             }
-            // Cancel before unlinking, or a later re-forward is a silent no-op
-            // that never recreates the file.
+            // Cancel before unlinking, or the master keeps the forward and a
+            // later re-forward is a silent no-op that never recreates the file.
             if let Ok(remote) = self.remote_sock(id) {
                 self.ssh.cancel(&path, &remote);
             } else {
@@ -197,6 +198,7 @@ impl SshTransport {
     /// started over a master just seen alive; asking the shell is a
     /// zero-timeout poll where `ssh -O check` is a fork, so this is cheap per
     /// attach. A reachable `ControlPath` is not implied; see [`Self::forward`].
+    /// A wedged (not dead) master is left to its `ServerAlive` options.
     fn reconnect_if_needed(&self, connect_timeout: Option<u64>) -> Result<Reconnect> {
         // A locked slot has a script running, so the shell is alive.
         let vouched_for_by_a_shell = match self.shell.try_lock() {
@@ -383,9 +385,9 @@ impl Transport for SshTransport {
         transport::kill(self, s)
     }
 
-    /// Writes the picker's record rather than re-reading the remote file. A
-    /// session killed meanwhile gets stray metadata, which the next sweep
-    /// removes.
+    /// Writes the picker's record with only the name changed, rather than
+    /// re-reading the remote file. A session killed meanwhile gets stray
+    /// metadata, which the next sweep removes.
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()> {
         plan_rename(&self.list_sessions()?, new_name, &s.id)?;
 

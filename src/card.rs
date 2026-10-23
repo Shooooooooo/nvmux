@@ -166,7 +166,7 @@ pub struct Row {
 /// A step along the [`Row`]: its direction and the name leaving the row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
-    /// `<prefix> n`; false for `<prefix> p`.
+    /// True for `<prefix> n`, false for `<prefix> p`.
     pub forward: bool,
     /// The session beyond the one left, on the far side from the one landed
     /// in: in the row before the step, not after.
@@ -292,10 +292,11 @@ pub enum Command {
     /// Drop all cards: this client is back in front and what it showed is
     /// stale. Also ends [`Command::Away`].
     Clear,
-    /// This client is in the back (parked or started ahead), unseen until
-    /// [`Command::Clear`]: it stops animating and redraws changes only now and
-    /// then, for nvmux's copy of its screen. On `Clear` it draws at once, even
-    /// with nothing changed: the relay waits for that frame.
+    /// This client is in the back (parked, or started before its first
+    /// visit), unseen until [`Command::Clear`]: it stops animating and redraws
+    /// changes only now and then, for nvmux's copy of its screen. On `Clear`
+    /// it draws at once, even with nothing changed: the relay waits for that
+    /// frame.
     Away,
     /// Whether the prefix is held; while it is, the card the key acts on says
     /// so.
@@ -684,8 +685,9 @@ impl Desk {
         }
     }
 
-    /// Everything queued, if the stream is between keys; otherwise nothing. A
-    /// card about the same as one up replaces it, for the key too.
+    /// Everything queued, if a card may go in now ([`Forwarded::clear`]);
+    /// otherwise nothing. A card about the same as one up replaces it, for the
+    /// key too.
     pub fn ready(&mut self, now: Instant) -> Vec<Command> {
         if self.queue.is_empty() || !self.forwarded.clear(now) {
             return Vec::new();
@@ -1031,7 +1033,7 @@ mod tests {
         assert_eq!(desk.go(), Some((5, Go::Buffer(7))), "an hour on or now");
     }
 
-    /// For the key as on screen; and forgetting drops cards up or queued.
+    /// Replaced for the key as on screen; forgetting drops cards up or queued.
     #[test]
     fn the_newer_card_about_a_session_takes_the_olders_place() {
         let t0 = Instant::now();

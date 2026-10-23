@@ -154,7 +154,7 @@ impl Hangup {
         }
         HANGUP_FD.store(write.as_raw_fd(), Ordering::Relaxed);
         for sig in [libc::SIGHUP, libc::SIGTERM] {
-            // SAFETY: the handler performs a single `write(2)` and nothing else.
+            // SAFETY: the handler does a single `write(2)` and nothing else.
             unsafe {
                 libc::signal(sig, on_hangup as *const () as libc::sighandler_t);
             }
@@ -198,8 +198,8 @@ mod tests {
         );
     }
 
-    /// A retired client's output is discarded, so a query in the closing
-    /// would be answered by the real terminal into the shell.
+    /// A query in the closing could be answered after the client exits, into
+    /// the shell.
     #[test]
     fn the_closing_leaves_the_alternate_screen_last_and_asks_nothing() {
         assert!(CLOSING.ends_with(b"\x1b[?1049l"));

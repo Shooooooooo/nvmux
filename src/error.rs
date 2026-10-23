@@ -125,7 +125,7 @@ pub enum SessionError {
         reason: &'static str,
     },
 
-    /// The socket appeared but nothing answered on it.
+    /// The socket never appeared, or nothing answered on it.
     #[error("session {name:?} did not become ready within {timeout:?}\n--- tail of {} ---\n{log_tail}", .log.display())]
     NotReady {
         name: String,
@@ -205,7 +205,7 @@ pub enum ConfigError {
     #[error("{}: config file not found (named by $NVMUX_CONFIG)", .0.display())]
     ExplicitMissing(PathBuf),
 
-    /// Exists but unreadable (permissions, broken symlink, a directory).
+    /// Exists but unreadable (e.g. permissions, or a directory).
     #[error("{}: {error}", .path.display())]
     Read {
         path: PathBuf,
@@ -238,7 +238,7 @@ pub enum ConfigError {
 /// are one line, for the hint row, with the path as the user would type it.
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
-    /// Neither `$HOME` nor `$XDG_CONFIG_HOME` is set.
+    /// `$NVMUX_CONFIG`, `$XDG_CONFIG_HOME` and `$HOME` are all unset or empty.
     #[error("not saved: there is no $HOME to keep a config file in")]
     Nowhere,
 

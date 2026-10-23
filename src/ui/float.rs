@@ -45,7 +45,8 @@ pub trait Floating {
 
     fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did;
 
-    /// A press outside the screen is handled by the relay, which closes it.
+    /// Gets events outside the screen too, except a left press there, which
+    /// the relay handles by closing the screen.
     fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did;
 
     /// When it next changes on its own, if ever.
@@ -68,8 +69,8 @@ pub trait Floating {
         None
     }
 
-    /// Whether it wants to close without a key or mouse event: the picker's
-    /// half-typed number timing out, or the gap `c` opens once it is up.
+    /// Whether it wants to close without a key or mouse event: the picker
+    /// once a half-typed number times out, or once the gap `c` opened is up.
     fn closing(&self) -> bool {
         false
     }

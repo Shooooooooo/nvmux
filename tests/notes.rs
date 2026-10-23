@@ -141,8 +141,8 @@ fn a_session_says_what_runs_in_it_and_what_its_terminals_ask_for() {
             "vim.api.nvim_echo({ { 'indexing' } }, false, { kind = 'progress', \
              source = 'lsp', title = 'lua_ls', status = 'running', percent = 42 })",
         );
-        // The latest-started message is shown; within one second either may
-        // be.
+        // The last-started message is shown, or either if both started in the
+        // same second.
         let latest = read_until(&sock, |n| n.is_some_and(|n| n.kind == Kind::Busy(Some(42))));
         assert!(latest.is_some());
 
@@ -281,8 +281,8 @@ end"#,
 }
 
 /// A write's progress begins and ends within `:write`, and a failed one never
-/// ends, which would leave the session busy forever. Entries an older watcher
-/// kept are dropped on upgrade.
+/// ends, which would leave the session busy forever. Neovim's own entries kept
+/// by an older watcher are dropped on upgrade.
 #[test]
 fn neovims_own_progress_messages_are_never_busy() {
     require_nvim!();

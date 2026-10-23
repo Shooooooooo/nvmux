@@ -1,5 +1,5 @@
-//! Pure parsing and argument building for the session-host scripts, with no
-//! I/O so it can be tested heavily.
+//! Pure parsing of the session-host scripts' output, with no I/O so it can be
+//! tested heavily.
 //!
 //! Local/remote differences do not belong here; they go in a script or in
 //! [`crate::transport::Transport::local_socket_for`].
@@ -109,8 +109,8 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
 /// Read the outcome of `write_meta.sh` or `renumber.sh`; `what` names the
 /// script for the error.
 ///
-/// An `ERROR` line wins, as in [`parse_spawn`]; otherwise a failed write would
-/// reach `ssh::classify` and be reported as a connection problem.
+/// An `ERROR` line wins, as in [`parse_spawn`]; without one a failed write
+/// would reach `ssh::classify` and be reported as a connection problem.
 pub fn parse_write(stdout: &str, what: &str) -> Result<()> {
     for line in stdout.lines() {
         if let Some(("ERROR", reason)) = line.trim_end_matches('\r').split_once(' ') {
@@ -225,7 +225,7 @@ pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
 pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
     rows.into_iter()
         .filter(|row| {
-            // Not ours; never turn it into a path.
+            // A malformed id is not ours; never turn it into a path.
             let ok = crate::ids::is_valid_id(&row.id);
             if !ok {
                 tracing::warn!(id = %row.id, "ignoring a file with a malformed session id");
@@ -367,8 +367,8 @@ mod tests {
 
     #[test]
     fn names_with_tabs_cannot_break_the_record_format() {
-        // `splitn(4)` keeps tabs inside the json field. list.sh strips them
-        // too.
+        // list.sh passes tabs through; `splitn(4)` keeps them in the json
+        // field.
         let out = listing(
             "S\tabcdefgh\t1\t{\"id\":\"abcdefgh\",\"name\":\"a\tb\",\"created\":1,\"pid\":2}\n",
         );

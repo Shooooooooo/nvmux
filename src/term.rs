@@ -34,7 +34,8 @@ pub(crate) fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
 struct Saved(libc::termios);
 
 // SAFETY: `libc::termios` is a plain-data struct with no pointers or interior
-// mutability; sharing a copy across threads (and into a signal handler) is safe.
+// mutability; sharing a copy across threads (and into a signal handler) is
+// safe.
 unsafe impl Send for Saved {}
 unsafe impl Sync for Saved {}
 
@@ -156,7 +157,8 @@ const ERASE_LINE: &[u8] = b"\r\x1b[2K";
 /// prints. Neovim restores the terminal (leaving the alternate screen) before
 /// printing it, so it lands on the user's screen. The detach path relays that
 /// restore on purpose (see [`crate::pty::Attachment::drain_until_eof`]): it
-/// pops kitty keyboard, bracketed paste and the title, which nvmux does not.
+/// carries the kitty keyboard pop and the bracketed paste and title restores,
+/// which nvmux does not send.
 ///
 /// Called after the client is gone and [`RESET`] has left the alternate
 /// screen, which puts the cursor back on that line. The client's output is not

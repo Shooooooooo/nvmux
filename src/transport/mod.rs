@@ -94,14 +94,14 @@ pub trait Transport {
 /// What [`Transport::reconnect`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reconnect {
-    /// The link never dropped: the session itself ended.
+    /// The link never dropped: whatever exited did so on its own.
     Unneeded,
     /// The link dropped and is back; its forwards must be remade.
     Restored,
 }
 
-/// Lent to the picker's background listing thread (see
-/// [`crate::ui::Listing`]); the shell lock makes other scripts wait for it.
+/// A transport threads can share, such as the picker's background listing
+/// (see [`crate::ui::Listing`]). The shell lock serialises their scripts.
 pub type Shared = std::sync::Arc<dyn Transport + Send + Sync>;
 
 pub fn open(location: Location) -> Result<Shared> {
@@ -139,8 +139,8 @@ pub(crate) trait Host {
     /// Undo [`Host::reach`]. Always safe to call.
     fn unreach(&self, _id: &str) {}
 
-    /// Remove what the kill script could not, which would otherwise resurrect
-    /// the session in the next listing.
+    /// After a successful kill, remove what the script could not, which would
+    /// otherwise resurrect the session in the next listing.
     fn sweep(&self, _id: &str) {}
 
     fn write_meta(&self, session: &Session) -> Result<()>;
@@ -219,7 +219,8 @@ pub(crate) fn create(
         .started_in(directory);
 
     // The metadata write (its own round trip) runs in parallel with reaching
-    // the socket; a session that never answers is killed after both finish.
+    // the socket; a session that never answers is killed after both finish,
+    // so the kill also removes the metadata.
     let (local, reached, written) = std::thread::scope(|scope| {
         let writing = std::thread::Builder::new()
             .name("nvmux-meta".into())
@@ -265,7 +266,8 @@ fn numbered_in(existing: Vec<Session>, session: &Session) -> u32 {
         .map_or(session.num, |s| s.state.num)
 }
 
-/// End a session that never came up.
+/// End a session that never came up. `pid` is only a hint: the script finds
+/// the process by its socket.
 fn discard(h: &impl Host, id: &str, pid: Option<u32>) {
     h.unreach(id);
     let pid = opt_pid_arg(pid);
@@ -416,8 +418,8 @@ fn opt_pid_arg(pid: Option<u32>) -> String {
     pid.map(pid_arg).unwrap_or_default()
 }
 
-/// Reporting success unless the session is gone would hide a running Neovim
-/// from the picker.
+/// Success only if the session is gone: otherwise the picker would drop a
+/// still-running Neovim.
 fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result<()> {
     use protocol::KillOutcome;
     match outcome {
@@ -439,7 +441,8 @@ fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result<()> {
 /// `command!` requires an uppercase name, so this cannot shadow `:q`.
 const DETACH_ALIAS: &str = "command! -bar Detach detach";
 
-/// Sort sessions by rank and number them by position.
+/// Sort sessions by rank (not name, so renames do not reshuffle) and number
+/// them by position.
 ///
 /// Displayed numbers are dense and recomputed per listing. The stored
 /// [`Session::num`] is a rank, used only to sort; ranks may have gaps. Missing

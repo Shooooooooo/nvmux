@@ -1,6 +1,7 @@
 //! The nested-launch guard, end to end: `scripts/spawn.sh` marks a session's
-//! editor, and nvmux refuses to start when it finds that mark. These drive the
-//! real binary, since a guard not wired into `main` would pass the unit tests.
+//! editor, and nvmux refuses to start when it finds that mark. The first test
+//! checks a real Neovim gets the mark; the rest drive the real binary, since a
+//! guard not wired into `main` would pass the unit tests.
 
 #[macro_use]
 mod common;

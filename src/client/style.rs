@@ -8,8 +8,7 @@
 //!
 //! Animations mix colours, so a [`Style`] can also be resolved to the RGB it
 //! looks like ([`Colors::visual_fg`], [`Colors::visual_bg`]) using the
-//! terminal's palette (see [`crate::palette`]). Animated cells are the only
-//! ones drawn in colours Neovim did not name.
+//! terminal's palette (see [`crate::palette`]).
 //!
 //! With `ext_multigrid` the client draws `'winblend'` itself;
 //! [`blend_over`] and [`blend_through`] follow Neovim's `hl_blend_attrs`

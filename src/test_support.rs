@@ -46,8 +46,8 @@ pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
 /// Leave a socket at `path` that refuses every connection, like a dead
 /// server's. Not a bound-and-dropped listener: a child forked by a parallel
 /// test could inherit it (on macOS for its whole life, as std cannot create
-/// it close-on-exec atomically) and accept connects. A datagram socket never
-/// listens.
+/// it close-on-exec atomically) and connects would land in its backlog. A
+/// stream connect to a datagram socket is refused whoever holds it.
 pub(crate) fn dead_socket(path: &Path) {
     drop(std::os::unix::net::UnixDatagram::bind(path).expect("bind"));
 }
@@ -112,8 +112,8 @@ pub(crate) fn screen(rows: u16, cols: u16) -> Shadow {
 
 /// Seeded client output aimed at [`crate::ledger::OscCap`], with read sizes:
 /// text, escapes, DCS/APC, stray `ESC`s, `ESC` + C0 + `]` (vte still opens
-/// an OSC), and OSCs around [`crate::ledger::OSC_SHOWN`] in length, ended
-/// every way vte accepts or left open.
+/// an OSC), and OSCs from short to far past [`crate::ledger::OSC_SHOWN`],
+/// ended every way vte accepts or left open.
 pub(crate) fn osc_noise(seed: u64) -> (Vec<u8>, Vec<usize>) {
     // xorshift64*, as in `ui::starfield`.
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;

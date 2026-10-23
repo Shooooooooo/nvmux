@@ -19,7 +19,8 @@ clap = { version = "4", default-features = false, features = [
 ] }
 getrandom = "0.4"
 libc = "0.2"
-# Fixed-string search in the relay. Already in the tree; 2.4 adds `memmem`.
+# Fixed-string search in the relay and `src/ledger.rs`. Already in the tree;
+# 2.4 adds `memmem`.
 memchr = "2.4"
 # Ranks directory completions; adds only itself to the build graph.
 nucleo-matcher = "0.3"
@@ -50,7 +51,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # links a regex engine.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 unicode-width = "0.2.2"
-# Used by `src/ledger.rs`; already in the tree as `vt100`'s parser.
+# Used by `src/ledger.rs`; at `vt100`'s version, so it adds no crate.
 vte = "0.15"
 # Shadow copy of the attached screen for the dissolve (see `src/shadow.rs`).
 vt100 = "0.16"

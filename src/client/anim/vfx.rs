@@ -2,8 +2,8 @@
 //!
 //! Trail modes (`railgun`, `torpedo`, `pixiedust`) leave braille-dot particles
 //! along the cursor's path; mark modes (`sonicboom`, `ripple`, `wireframe`)
-//! draw a shape where it lands. Over text, anything drawn tints the cell's
-//! background instead, so text is never hidden.
+//! draw a shape where it lands. Marks, and particles over text, tint the
+//! cell's background instead of drawing a glyph, so text is never hidden.
 //!
 //! Particles move in a space where a row is [`ASPECT`] columns tall, so
 //! spirals stay round on non-square cells.
@@ -60,7 +60,8 @@ pub struct Settings {
     pub speed: f32,
 }
 
-/// Railgun spiral turns per row travelled: Neovide's `vfx_particle_phase`.
+/// Railgun spiral turns, times the square root of the distance in rows:
+/// Neovide's `vfx_particle_phase`.
 const PHASE: f32 = 1.5;
 
 /// Path bend in radians per second: Neovide's `vfx_particle_curl`.
@@ -69,10 +70,10 @@ const CURL: f32 = 1.0;
 /// Cap so a cursor jump across a large screen does not cost a frame.
 const MAX_PARTICLES: usize = 400;
 
-/// Seconds.
+/// Mark lifetime, in seconds.
 const MARK: f32 = 0.25;
 
-/// In rows.
+/// Mark's final diameter, in rows.
 const MARK_SIZE: f32 = 3.0;
 
 /// Over text, a particle tints by this fraction of its alpha.
@@ -261,7 +262,7 @@ fn glow(colors: &Colors, cell: &mut crate::client::compose::Out, color: Rgb, amo
 }
 
 fn paint_mark(frame: &mut Frame, colors: &Colors, color: Rgb, s: &Settings, m: Mark) {
-    // Grows while fading, fast at first, as Neovide eases it.
+    // Grows to full size as it fades.
     let radius = m.t * MARK_SIZE * ASPECT / 2.0;
     let alpha = s.opacity * (1.0 - m.t * m.t);
     if radius <= 0.0 || alpha <= 0.0 {

@@ -53,8 +53,8 @@ pub(super) fn render(w: u16, h: u16, draw: impl FnMut(&mut Frame)) -> Vec<String
 /// fixed viewport: [`Terminal::new`] queries the real terminal's size, which
 /// fails under `cargo test`.
 pub(super) fn emitted(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> String {
-    /// Keeps what was written; this ratatui's backend does not return its
-    /// writer.
+    // Keeps what was written: ratatui's backend hands its writer back only
+    // under an unstable feature.
     #[derive(Clone)]
     struct Tap(Rc<RefCell<Vec<u8>>>);
 

@@ -8,7 +8,7 @@
 //! - `Progress` messages (0.12+, except Neovim's own) and `LspProgress`;
 //! - via `TermRequest`: OSC 777 `notify` (Ghostty, urxvt), OSC 9 (iTerm2),
 //!   OSC 99 (kitty, multi-part), and OSC 133 shell command exits;
-//! - via `TermClose`: a terminal program's exit, 0 finished, else failed.
+//! - via `TermClose`: a terminal program's exit, positive failed, 0 finished.
 //!
 //! A program's own OSC 9;4 is ignored (Claude Code's stays busy through its
 //! permission prompts). The watcher outlives nvmux, since recording unattended
@@ -63,12 +63,14 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// - running progress by source and id (title, text, start time, percent;
 ///   Neovim 0.12 sends 0 for none);
 /// - LSP work by client and token: server name as title, e.g.
-///   `indexing 3/120` as text (a report carries only changes). Kept until it
-///   ends or the server goes, checked on read, as a dying server never ends
-///   its work;
+///   `indexing 3/120` as text (a report carries only changes, so a missing
+///   message or percentage stands). Kept until it ends or the server goes,
+///   checked on read, as a dying server never ends its work;
 /// - the last notification or failure (failed progress, non-zero terminal
 ///   exit or shell command) and, separately, the last finished command, each
-///   until [`SEEN`]. These carry the fields of [`News`].
+///   until [`SEEN`].
+///
+/// Text has control characters blanked and is cut to 200 characters.
 ///
 /// A command is named by the shell's OSC 133;C `cmdline_url` if given, else by
 /// the terminal's program from the buffer name (`term://…//1234:cargo build`,
@@ -945,7 +947,7 @@ mod tests {
         assert_eq!(note.text, "exited with code 1");
     }
 
-    /// Both kept items, oldest first; an older watcher's lack `seq` and
+    /// Both kept items, oldest first; an older watcher's items lack `seq` and
     /// `shown`.
     #[test]
     fn the_news_is_both_of_what_is_kept_by_number() {

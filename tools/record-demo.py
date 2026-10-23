@@ -31,7 +31,8 @@ editor state is read or written.
 Session notes (`src/notes.rs`) are staged off camera through each session's
 socket (`rpc`): api-server gets a progress message left running, dotfiles a
 finished install script in a hidden terminal. The build typed on camera runs
-the demo's `cargo` (CARGO), which finishes when the take says so.
+the demo's `cargo` (CARGO; there is no crate), which finishes when the take
+says so.
 
 The GIF is drawn larger than shown (see SCALE): the README shows it ~880 px
 wide, 1760 device px on a high-density screen, where agg's 15px text came out
@@ -641,11 +642,11 @@ class Terminal:
         """Answer the queries in this chunk in the order they were asked.
 
         nvmux ends its colour query with a DSR (`ESC [ 5 n`), whose reply tells
-        it the colour replies have all arrived (see `src/palette.rs`). Answered
-        first, it leaves the OSC replies to be read as keystrokes: the picker
-        took the `/` in `rgb:cdcd/d0d0/d4d4` as its filter key and the script
-        hung. Matched spans are cut out so nothing is answered twice, and a
-        short tail is kept so a query split across reads is still seen.
+        it the colour replies have all arrived (see `src/palette.rs`). If the
+        DSR is answered first, the OSC replies are read as keystrokes: the
+        picker took the `/` in `rgb:cdcd/d0d0/d4d4` as its filter key and the
+        script hung. Matched spans are cut out so nothing is answered twice,
+        and a short tail is kept so a query split across reads is still seen.
         """
         self.qbuf += data
         row, col = self.screen.cursor()
@@ -1009,9 +1010,9 @@ class Devbox:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        # The masters' ControlPath and forwards in the runtime directory, named
-        # by HOST's token. Otherwise nvmux would clear them on its next
-        # connection to a devbox, which would be someone else's.
+        # Remove the masters' ControlPath and forwards (named by HOST's token)
+        # from the runtime directory; otherwise nvmux would clear them on its
+        # next connection to a devbox, which would be someone else's.
         token = host_token(HOST)
         time.sleep(0.5)
         for entry in os.listdir(RUNTIME) if os.path.isdir(RUNTIME) else []:

@@ -531,9 +531,9 @@ mod tests {
         );
     }
 
-    /// Sessions inherit the umask nvmux was launched with; a mask set here
-    /// would silently make their files more private than asked. Matched at
-    /// line start so the script's comment naming it does not count.
+    /// Sessions inherit the umask nvmux was launched with; a mask set in
+    /// `spawn.sh` would silently make their files more private than asked.
+    /// Matched at line start so the script's comment naming it does not count.
     #[test]
     fn the_spawn_script_imposes_no_umask_on_the_session() {
         assert!(
@@ -542,8 +542,8 @@ mod tests {
         );
     }
 
-    /// This replaced the umask as the socket's protection, along with the
-    /// 0700 directory `spawn.sh` requires (see `paths::ensure_dir_secure`).
+    /// `chmod 600` protects the socket, along with the 0700 directory
+    /// `spawn.sh` requires (see `paths::ensure_dir_secure`).
     #[test]
     fn the_spawn_script_makes_the_socket_private_itself() {
         assert!(

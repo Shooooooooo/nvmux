@@ -14,9 +14,9 @@
 //! sequence boundary. So [`Boundary::relay`] holds back any incomplete tail
 //! until the rest arrives (usually microseconds later), leaving the terminal
 //! always between sequences. Kept bytes are never dropped, reordered or
-//! changed, and are held for at most [`KEPT_FOR`] or [`KEPT_MAX`] bytes,
-//! since a client stopped mid-sequence may be waiting for the terminal's
-//! answer.
+//! changed, and go out unfinished after [`KEPT_FOR`] or at [`KEPT_MAX`]
+//! bytes, since a client stopped mid-sequence may be waiting for the
+//! terminal's answer.
 //!
 //! `pty` keeps a `Boundary` only while something is drawn: a notice (about a
 //! second at the start of a relay) or the prefix's hint bar
@@ -34,9 +34,10 @@
 //! slot too, so it must not write between the client's `DECSC` and `DECRC`.
 //!
 //! Both block only nvmux's writes; the session's own bytes pass through.
-//! Both are common: `nvim --remote-ui` queries `CSI ? 2026 $ p` and brackets
-//! every frame once a terminal answers, which nearly all do. nvmux's own
-//! client brackets every frame unless `'termsync'` is off.
+//! Both occur in practice: `nvim --remote-ui` queries `CSI ? 2026 $ p` and
+//! brackets every frame once a terminal answers, which nearly all do. To a
+//! terminal that does not answer, it sends neither, so test with one that
+//! does. nvmux's own client brackets every frame unless `'termsync'` is off.
 
 use std::time::{Duration, Instant};
 
@@ -66,7 +67,7 @@ pub struct Boundary {
     parser: Parser,
     /// The incomplete tail.
     kept: Vec<u8>,
-    /// When the oldest kept byte was kept.
+    /// When `kept` last became non-empty.
     since: Option<Instant>,
     /// Length of the session's frame close held at the front of `kept` so
     /// the notice can be written before it.
@@ -88,10 +89,11 @@ impl Boundary {
     /// unfinished: the session's output matters more than the notice.
     ///
     /// **A frame close is held ahead of that timeout check.** The tail's age
-    /// counts from the first kept byte, so on a busy session the deadline has
-    /// nearly always passed, and the relay flushes before offering the notice
-    /// its turn. Without this, the close (the notice's only chance on a
-    /// bracketing session) was flushed and the box missing in 3 runs of 8.
+    /// counts from when `kept` last became non-empty, so on a busy session the
+    /// deadline has nearly always passed, and the relay flushes before
+    /// offering the notice its turn. Without this, the close (the notice's
+    /// only chance on a bracketing session) was flushed and the box missing in
+    /// 3 runs of 8.
     ///
     /// Reads without a close still flush unfinished every [`KEPT_FOR`], as on
     /// terminals without `?2026`. Counting age from the last hand-out instead
@@ -218,7 +220,7 @@ impl Boundary {
         self.parser.at_rest() || self.holding_the_sessions_close()
     }
 
-    /// Whether the session has ever opened a synchronized update.
+    /// Whether the session has ever opened or closed a synchronized update.
     ///
     /// If so, nvmux must not wrap relayed writes in its own (see
     /// `Attachment::write_session_frame` in [`crate::pty`]): terminals treat
@@ -984,7 +986,7 @@ mod tests {
     }
 
     /// The invariant [`Parser::take`] relies on: at a boundary, only the
-    /// counters and `seen_sync` differ from a default parser.
+    /// counters and `seen_sync` carry state (`params` is reset per CSI).
     #[test]
     fn a_parser_between_sequences_carries_only_its_counters() {
         let mut parser = Parser::default();

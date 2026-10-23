@@ -136,7 +136,7 @@ pub enum Event {
     /// Raw bytes for the terminal, Neovim's way of reaching it through a UI:
     /// an OSC 52 copy, or a query of its own (0.12 on).
     UiSend(Vec<u8>),
-    /// The server is going, and says with what status.
+    /// The server is exiting with this status.
     ErrorExit(i64),
 }
 
@@ -290,7 +290,7 @@ pub fn decode_bytes(params: &[u8], into: &mut Vec<Event>) -> usize {
                         }
                         continue;
                     }
-                    // Anything else odd: read the slow way, which says what it is.
+                    // Anything else odd: the slow path says what it is.
                     None => rd.at = start,
                 }
             }
@@ -664,7 +664,7 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
 }
 
 /// The cells of a `grid_line`: `[text]`, `[text, hl]` or `[text, hl, repeat]`
-/// each, the highlight carried over from the run before when it is left out.
+/// each. A left-out highlight is `None`: the run before's carries over.
 fn line_cells(v: &ValueRef<'_>) -> Option<Vec<LineCell>> {
     let runs = v.as_array()?;
     let mut cells = Vec::with_capacity(runs.len());
@@ -1066,7 +1066,7 @@ mod tests {
         );
     }
 
-    /// Read from the last two of its eleven parameters.
+    /// The position is read from the last two of its eleven parameters.
     #[test]
     fn a_float_is_placed_where_neovim_resolved_it() {
         let call = arr(vec![
@@ -1109,8 +1109,8 @@ mod tests {
         assert_eq!(handle(&v), Some(-1));
     }
 
-    /// Neighbours in its batch and the next still arrive; an unknown name
-    /// likewise.
+    /// A bad call's neighbours, in its batch and the next, still arrive; an
+    /// unknown name likewise.
     #[test]
     fn what_cannot_be_read_is_dropped_alone() {
         let good = arr(vec![Value::from(1), Value::from(5), Value::from(6)]);
@@ -1187,7 +1187,7 @@ mod tests {
         assert_eq!(cterm.fg, Some(10));
     }
 
-    /// `default_colors_set` cterm colours, with 0 for none.
+    /// `default_colors_set` sends cterm colours 1-based, with 0 for none.
     #[test]
     fn default_cterm_colours_are_one_based() {
         let call = arr(vec![
@@ -1237,7 +1237,6 @@ mod tests {
         assert!(!modes[1].blinks());
     }
 
-    /// UTF-8 or not.
     #[test]
     fn ui_send_keeps_its_bytes() {
         let call = arr(vec![Value::from("\x1b]52;c;aGk=\x1b\\")]);

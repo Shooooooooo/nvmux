@@ -117,7 +117,7 @@ impl Value {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Setting {
-    /// E.g. `effects.fade` and `enabled`.
+    /// Table and key in the file, e.g. `effects.fade` and `enabled`.
     pub table: &'static str,
     pub key: &'static str,
     /// The screen's name: the key, or enough of the table to tell it apart

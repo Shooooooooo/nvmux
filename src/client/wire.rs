@@ -8,9 +8,9 @@
 //! msgpack has no length prefix, so [`frame_len`] walks a message to find its
 //! end; only whole frames are decoded. Output is queued in an [`Outbox`]: a
 //! server busy in `:!make` stops reading its socket, and a blocking write
-//! would stall input and drawing. Everything sent is a notification except
-//! the two requests `super::App` needs answered, as Neovim's TUI does; errors
-//! then arrive as `nvim_error_event` notifications.
+//! would stall input and drawing. Input goes as notifications, as Neovim's
+//! TUI sends it, so an error arrives as an `nvim_error_event` notification;
+//! requests are used only where `super::App` needs the reply.
 
 use std::io::{self, Read, Write};
 
@@ -125,7 +125,7 @@ pub struct Inbox {
     end: usize,
 }
 
-/// Capacity kept once every frame is taken. A larger frame (a whole file
+/// Largest buffer kept once every frame is taken. A larger frame (a whole file
 /// copied to the clipboard arrives as one `redraw`) grows the buffer only
 /// until it is taken.
 const KEEP: usize = 4 * READ_CHUNK;
@@ -441,7 +441,6 @@ mod tests {
         }
     }
 
-    /// Never a shorter frame, and never an error.
     #[test]
     fn a_frame_cut_short_anywhere_is_still_arriving() {
         let v = Value::Array(vec![

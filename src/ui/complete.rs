@@ -25,7 +25,8 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use crate::dirs::{self, DirSource, Lister};
 use crate::transport::protocol::Listing;
 
-/// Directories to remember.
+/// Directories to remember: a few trees' worth of path components. A miss
+/// costs one round trip.
 const CACHE: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,8 +58,7 @@ struct Shown {
 }
 
 pub(super) struct Completer {
-    /// `None` only in tests, which drive the channels themselves. Dropping it
-    /// ends the worker.
+    /// Dropping it ends the worker.
     tx: Option<Sender<Request>>,
     rx: Receiver<Reply>,
     /// The current request; a reply with another `seq` is stale.

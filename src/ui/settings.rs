@@ -2,7 +2,7 @@
 //! tab per table and one row per [`crate::settings`] entry, so none can be
 //! left out.
 //!
-//! Over the full-screen picker it takes the terminal like [`super::help`].
+//! From the full-screen picker it takes the terminal, like [`super::help`].
 //! From a session (or the picker floating over one) it floats over the
 //! running session in a relay-drawn [`Panel`] (see `crate::pty::panel`),
 //! unless `[style] float` is off or the terminal is too small
@@ -80,7 +80,7 @@ const BAR: Style = Style::new().add_modifier(Modifier::REVERSED.union(Modifier::
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
-    /// Moving between rows; switches and choices change in place.
+    /// Moving between rows; `←`/`→` change a value in place.
     Browse,
     /// Changing the prefix: the chord pressed so far, kept by `Enter`.
     Chord(Option<u8>),
@@ -122,7 +122,8 @@ fn press(k: KeyEvent) -> Press {
     }
 }
 
-/// What the pointer is over: a tab, or a row by its index on screen.
+/// What the pointer is over: a tab, or a row by its index among the rows on
+/// screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hit {
     Tab(Tab),
@@ -1075,7 +1076,7 @@ impl Floating for Panel {
         self.after(step, now)
     }
 
-    /// By the screen's rules; presses outside the panel are the relay's.
+    /// By the screen's rules; a left press outside the panel is the relay's.
     fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did {
         let at = hit(&self.state, self.drawn, mouse.column, mouse.row);
         let Some(g) = gesture(mouse, at) else {
@@ -1164,8 +1165,8 @@ fn layout(area: Rect) -> Option<Layout> {
     }
     let (_, hint) = draw::split_hint_row(area);
     let h = area.height;
-    // Blank rows around the tabs and above the help where there is room,
-    // dropped one at a time as the height shrinks.
+    // The blank rows around the tabs and above the help need 8 rows, the help
+    // 4 and the tabs 2.
     let (tabs, body, help) = if h >= 8 {
         (Some(area.y + 1), (area.y + 3, h - 6), Some(area.y + h - 2))
     } else if h >= 4 {
@@ -1605,8 +1606,9 @@ fn hints(state: &State, current: Option<&Setting>, width: usize) -> (String, boo
     (text, true)
 }
 
-/// Join `entries` within `width`, dropping the highest-ranked whole, one at
-/// a time, as the hint bar does. Also used by the floating picker.
+/// Join `entries` within `width`, dropping whole ones (as the hint bar
+/// does), highest `rank` (least needed) first. Also used by the floating
+/// picker.
 pub(super) fn fit(entries: &[(Option<&str>, u8)], width: usize) -> String {
     let mut kept: Vec<(&str, u8)> = entries
         .iter()

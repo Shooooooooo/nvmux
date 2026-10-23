@@ -224,7 +224,7 @@ impl Drop for Ear {
 /// Posts cards with other sessions' news (and the front session's
 /// off-screen terminals) for the front relay's client to draw.
 ///
-/// While a session is in front, every session is read every [`notes::POLL`];
+/// While a session is in front, every session is read on a timer;
 /// while nvmux's own screens are up, none are (the picker has its own
 /// reader). So on return, news from meanwhile counts as told and the first
 /// round only sets each session's baseline. Reads use [`notes::hear`], which
@@ -233,7 +233,7 @@ impl Drop for Ear {
 /// Each session also gets a listener thread ([`notes::listen`]); a push
 /// triggers a read, at most once per [`SPACING`]. A session whose watcher is
 /// found pushing to its listener is polled only every [`SAFETY`]; the rest
-/// every [`notes::POLL`], each read passing the listener's channel to the
+/// every [`notes::POLL`]. Each read passes the listener's channel to the
 /// watcher. A timer read finding news the listener missed restarts it.
 ///
 /// Does nothing with `[client] ui = "nvim"` (no client to draw cards).
@@ -287,8 +287,8 @@ impl Notifier {
 }
 
 impl Drop for Notifier {
-    /// The thread's listeners hold senders, so its channel never disconnects:
-    /// it must be told to stop.
+    /// The thread holds a sender to its own inbox (for its listeners), so the
+    /// channel never disconnects: it must be told to stop.
     fn drop(&mut self) {
         self.send(Command::Quit);
     }

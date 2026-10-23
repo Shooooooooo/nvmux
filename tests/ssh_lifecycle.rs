@@ -27,7 +27,7 @@ fn host() -> String {
     std::env::var("NVMUX_TEST_SSH_HOST").unwrap_or_else(|_| "selftest".to_string())
 }
 
-/// Skips are silent on purpose.
+/// ssh's output is captured on purpose: a skip prints one line.
 fn reachable() -> bool {
     std::process::Command::new("ssh")
         .args([
@@ -54,8 +54,8 @@ macro_rules! require_ssh {
     };
 }
 
-/// Kills the named sessions on drop. Connects only in `drop`, to spare each
-/// test an extra ssh connect and probe.
+/// On drop, kills every session whose name starts with one of these. Connects
+/// only in `drop`, to spare each test an extra ssh connect and probe.
 struct Cleanup(Vec<String>);
 
 impl Cleanup {
@@ -430,8 +430,9 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
-        // Otherwise masters outlive the test by `ControlPersist`. Match by
-        // name: forwarded sockets here are answered by Neovim, not ssh.
+        // Exit the masters so they do not outlive the test by
+        // `ControlPersist`. By name only: forwarded sockets here are answered
+        // by Neovim, not ssh.
         for entry in std::fs::read_dir(&self.0).into_iter().flatten().flatten() {
             if entry.file_name().to_string_lossy().starts_with("cm") {
                 exit_master_at(&entry.path());

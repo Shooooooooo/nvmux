@@ -117,9 +117,10 @@ fn unattended(ctl: &Path) -> Vec<String> {
 /// leaves the socket file and the next forward onto that path fails (rc 255,
 /// `mux_client_forward: forwarding request failed`), breaking reattach.
 ///
-/// `connect_timeout` (seconds): `None` for the first connect, which the user
-/// watches. Reconnects need it: a down link drops packets rather than
-/// refusing, so each attempt would hang for minutes (see [`crate::reconnect`]).
+/// `connect_timeout` (seconds): `None`, the system's TCP timeout, for the
+/// first connect, which the user watches. Reconnects need it: a down link
+/// drops packets rather than refusing, so each attempt would hang for minutes
+/// (see [`crate::reconnect`]).
 /// `ipqos`: see [`master_ipqos`].
 fn master_args(
     host: &str,
@@ -167,7 +168,7 @@ const MASTER_IPQOS: &str = "af21 cs0";
 /// if it needs changing. A `-N` master is non-interactive, so ssh uses the
 /// second value, by default `cs1` up to 10.0: Wi-Fi queues that behind all
 /// other traffic, and on the master it is every keystroke and frame. `cs0` is
-/// the unmarked class.
+/// the unmarked class. The first value is kept: a master never uses it.
 ///
 /// Only ssh's own default is changed (Debian/Ubuntu ship another pair, 10.1+
 /// uses `cs0`, `~/.ssh/config` is the user's, and before 8.7 it wins over

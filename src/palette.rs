@@ -1,5 +1,5 @@
 //! The terminal's colours (OSC 10, 11 and 4), queried once at startup for the
-//! fade ([`crate::fade`]).
+//! fade ([`crate::fade`]), the picker's effects and nvmux's own client.
 //!
 //! Replies arrive on stdin, and one reaching the picker would be read as keys.
 //! So the request ends with a DSR (`ESC [ 5 n`), which every terminal answers
@@ -177,7 +177,8 @@ fn parse_replies(bytes: &[u8]) -> Replies {
     replies
 }
 
-/// The payload and the index past its terminator; `None` if unterminated.
+/// `bytes` starts just past `ESC ]`. Returns the payload and the index past
+/// its terminator; `None` if unterminated.
 fn osc_payload(bytes: &[u8]) -> Option<(&[u8], usize)> {
     for (i, &b) in bytes.iter().enumerate() {
         match b {
@@ -252,7 +253,7 @@ pub fn query() -> Option<Palette> {
         }
     };
     // Checked in raw mode: before it, typed keys sit in the canonical buffer,
-    // invisible to `poll`.
+    // invisible to `poll`. Leaving raw mode does not flush them.
     if readable_now(fd) {
         tracing::debug!("palette: a key is already waiting; not asking the terminal");
         return None;

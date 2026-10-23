@@ -297,7 +297,7 @@ fn csi(bytes: &[u8]) -> Parsed {
     }
 }
 
-/// A sequence's parameters, each its sub-parameters: `1;5:3` is `[[1], [5, 3]]`.
+/// Parameters split into sub-parameters: `1;5:3` is `[[1], [5, 3]]`.
 fn fields(params: &[u8]) -> Vec<Vec<u32>> {
     let text = std::str::from_utf8(params).unwrap_or_default();
     text.split(';')
@@ -333,7 +333,7 @@ fn modifiers(field: Option<&Vec<u32>>) -> (KeyModifiers, KeyEventKind) {
     (m, kind)
 }
 
-/// The kitty protocol's spelling: `CSI key[:shifted[:base]] ; modifiers[:event] u`.
+/// Kitty protocol: `CSI key[:shifted[:base]] ; modifiers[:event] u`.
 fn kitty(params: &[u8]) -> Option<Input> {
     let fields = fields(params);
     let code = *fields.first()?.first()?;
@@ -584,7 +584,6 @@ mod tests {
         assert!(d.flush().is_empty(), "an unfinished reply is dropped");
     }
 
-    /// `ESC ESC [B` is Escape then Down; Alt+x is dropped.
     #[test]
     fn escape_then_a_sequence_and_alt_keys() {
         assert_eq!(

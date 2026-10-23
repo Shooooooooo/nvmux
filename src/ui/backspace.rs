@@ -16,7 +16,8 @@ use std::time::Duration;
 /// Time to delete the whole row, whatever its length.
 pub const ERASE: Duration = Duration::from_millis(240);
 
-/// How long the cursor stays on the emptied row.
+/// How long the cursor stays on the emptied row, so it reads as cleared
+/// rather than skipped.
 pub const LINGER: Duration = Duration::from_millis(50);
 
 pub const LENGTH: Duration =

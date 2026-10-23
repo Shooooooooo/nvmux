@@ -29,12 +29,12 @@ use rmpv::Value;
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
-/// The client's DA1 (its last start-up query) and a VT220's answer; the kitty
-/// keyboard query and "supported, no flags set".
+/// The client's DA1 (its last start-up query) and a VT220's answer.
 const DA1: &[u8] = b"\x1b[c";
 const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
 /// A DA1 answer advertising OSC 52 (attribute 52), as kitty and others send.
 const DA1_REPLY_OSC52: &[u8] = b"\x1b[?62;22;52c";
+/// The kitty keyboard query and "supported, no flags set".
 const KITTY_QUERY: &[u8] = b"\x1b[?u";
 const KITTY_REPLY: &[u8] = b"\x1b[?0u";
 
@@ -939,8 +939,8 @@ fn slow_link(dir: &Path, to: &Path, delay: Duration) -> PathBuf {
 /// [`slow_link`], and what it carries (see [`Link`]).
 fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Link) {
     use std::os::unix::net::{UnixListener, UnixStream};
-    /// One direction of connection `conn`: read as it comes, written `delay`
-    /// later.
+    // One direction of connection `conn`: read as it comes, written `delay`
+    // later.
     fn carry(
         mut from: UnixStream,
         mut to: UnixStream,
@@ -1934,14 +1934,14 @@ fn pages_typed_further_ahead_than_lines_go_wait_only_for_them() {
 
 /// As on a busy machine: Neovim takes typed-ahead keys before anything
 /// scheduled, yet lines still come as its view moves, not once it catches
-/// up. Its first frame comes later than the first page would be given up on,
-/// unless the client hears Neovim is still working: the view never goes back.
+/// up. Its first frame comes after the first page would be given up if the
+/// client did not hear Neovim is still working: the view never goes back.
 #[test]
 fn pages_typed_faster_than_neovim_scrolls_bring_their_lines_as_it_goes() {
     require_nvim!();
     let scratch = Scratch::new("client-behind");
     // Each scroll takes Neovim this long; with a page every 10 ms, its 28
-    // scrolls put its frame past two link round trips, 250 ms after the
+    // scrolls put its frame over two link round trips plus 250 ms after the
     // first page. Sleeps rather than spins to spare cores on small machines,
     // and records each scroll's time once asked to.
     const SCROLL: Duration = Duration::from_millis(30);
@@ -2189,7 +2189,7 @@ const NOTHING: &str = "\
     predict_motions = \"off\"\n\
     predict_typing = \"off\"\n";
 
-/// Scrolls only; motions and typing default to `"auto"`.
+/// Scrolls only: motions and typing (`"auto"` by default) off.
 const SCROLLS: &str = "predict_motions = \"off\"\npredict_typing = \"off\"\n";
 
 /// Scrolls and motions, not typing.
@@ -2908,7 +2908,7 @@ fn typing_beside_virtual_text_is_drawn_where_neovim_draws_it() {
 
 /// Typing waits for Neovim under `'digraph'` (char, `<BS>`, char make one),
 /// `'vartabstop'` (tabs not `'tabstop'` wide) and in a prompt buffer (text
-/// goes after the prompt), and is predicted again once each is off.
+/// goes after the prompt); with either option off again, it is predicted.
 #[test]
 fn keys_typed_where_neovim_types_otherwise_wait_for_it() {
     require_nvim!();
@@ -4746,7 +4746,7 @@ fn columns(n: i64, wins: &[i64]) -> Value {
 }
 
 /// Neovim has the whole terminal width; a window wider than the text width
-/// shows it centred, with the status line's words above it. On exit the
+/// shows it centred, the status line's words aligned with it. On exit the
 /// client restores the windows' widths.
 #[test]
 fn a_wide_window_has_its_text_centred_in_it() {

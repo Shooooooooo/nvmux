@@ -117,8 +117,9 @@ impl Pool {
         }
     }
 
-    /// Retire clients of sessions missing from a fresh listing; they can
-    /// never be returned to.
+    /// Retire clients of sessions missing from a fresh listing: they can
+    /// never be returned to, and where the host could not inspect a session,
+    /// its client may still hold the session's screen to its size.
     pub fn keep_only(&mut self, listing: &[Session]) {
         self.parked
             .retain(|p| listing.iter().any(|s| s.id == p.session_id()));
@@ -378,8 +379,9 @@ mod tests {
         );
     }
 
-    /// Each stand-in takes 80 ms to exit once hung up, so eight retired in
-    /// series would take at least 640 ms.
+    /// Each stand-in takes 80 ms (under `RETIRE_WAIT`) to exit once hung up:
+    /// eight in series take at least 640 ms, in parallel up to 250 ms on a
+    /// busy runner.
     #[test]
     fn dropping_the_pool_retires_every_client_side_by_side() {
         let mut pool = Pool::new(true);

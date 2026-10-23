@@ -52,12 +52,12 @@
 //! not inferred from the path, so `pro` beside `projects` is not stepped into
 //! just because it exists.
 //!
-//! The field opens at the home directory as editable text. `//` discards
-//! everything up to and including it (`/home/shu//etc` is `/etc`), so typing
-//! `/` first means the root; in an empty field a single `/` is the root. The
-//! discarded part is drawn dim. [`crate::dirs::anchored`] resolves this here,
-//! because POSIX reads `a//b` as `a/b` and the session would silently start
-//! elsewhere.
+//! The field opens at the home directory, with a trailing `/`, as editable
+//! text. The last `//` discards everything before its second slash
+//! (`/home/shu//etc` is `/etc`), so typing `/` first means the root; in an
+//! empty field a single `/` is the root. The discarded part is drawn dim.
+//! [`crate::dirs::anchored`] resolves this here, because POSIX reads `a//b`
+//! as `a/b` and the session would silently start elsewhere.
 //!
 //! Listing runs on a worker thread from the moment the prompt opens (see
 //! [`super::complete`]). One listing serves a whole directory (fuzzy matching
@@ -300,9 +300,9 @@ struct Menu {
     selected: usize,
     /// Only `Tab` opens it.
     open: bool,
-    /// The last `Tab` accepted, so the next steps into the accepted directory.
-    /// Cleared by any other key. A flag, not inferred from the path (see the
-    /// module docs).
+    /// The last key accepted from the menu, so the next `Tab` steps into the
+    /// accepted directory. Cleared by any other key. A flag, not inferred
+    /// from the path (see the module docs).
     stepped: bool,
     /// The host's listing was truncated.
     partial: bool,
@@ -504,7 +504,8 @@ impl Prompt {
                 self.close_menu(false);
                 Step::None
             }
-            // Cancel, not quit: quitting would leave the live session.
+            // Cancel, not quit: quitting would pull the user out of a live
+            // session.
             Key::Esc | Key::CtrlC => Step::Cancel,
             _ => Step::None,
         }
@@ -699,7 +700,7 @@ pub struct Panel {
     transport: Option<Shared>,
     /// The session to switch to after closing, if one was made.
     leave: Option<Leave>,
-    /// Last tick; completer polling is scheduled from it.
+    /// Last tick or key; the next completer poll is scheduled from it.
     ticked: Instant,
 }
 
@@ -989,8 +990,8 @@ pub(super) enum Arrival {
 /// leave once. Sharing it also hides the handover, since `Terminal::draw`
 /// resets the frame each pass.
 ///
-/// Every `arrival` but [`Arrival::Cut`] fades out on cancel; a create always
-/// fades out, since a client spawn follows.
+/// Every `arrival` but [`Arrival::Cut`] fades out on cancel; a completed
+/// create always fades out, since a client spawn follows.
 pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
@@ -1089,7 +1090,7 @@ pub(super) fn run_on(
     }
 }
 
-/// Create or rename; errors are the transport's.
+/// Create or rename the session.
 ///
 /// Names are validated only by `session::validate_name` and the transport's
 /// duplicate check, so no UI copy can drift. The command is parsed here only
@@ -1184,8 +1185,8 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
 
 /// `session N`, where `N` is the number the session will get (made between
 /// 2 and 3, it is `session 3`). If taken, the next free number above, else
-/// the first free one below. Case-insensitive, as transports reject
-/// duplicates.
+/// the first free one below. Case-insensitive, like the transports'
+/// duplicate check.
 fn next_name(taken: &[String], number: u32) -> String {
     let number = number.max(1);
     for n in (number..number.saturating_add(1000)).chain(1..number) {

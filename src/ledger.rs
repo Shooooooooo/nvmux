@@ -36,8 +36,8 @@ static OSC_START: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
 ///
 /// Matches vte's OSC framing: `ESC ]` from any state, payload up to `BEL`,
 /// `CAN`, `SUB` or `ESC`. Enders always pass, so the parser exits the string
-/// where it would have. An OSC with a C0 control between `ESC` and `]` is not
-/// recognised and passes whole.
+/// where it would have. vte also opens an OSC on `ESC`, C0 control, `]`; this
+/// does not, so such an OSC passes whole.
 #[derive(Debug, Default, Clone)]
 pub struct OscCap {
     /// Last byte was `ESC`.
@@ -211,7 +211,7 @@ impl Ledger {
     }
 
     /// Whether output is not inside an escape sequence, a UTF-8 character, a
-    /// synchronized update or a cursor save.
+    /// synchronized update or a cursor save. True once broken.
     pub fn between_frames(&self) -> bool {
         self.broken || self.stream.between_sequences()
     }

@@ -11,7 +11,8 @@
 //!
 //! A wide character is drawn from its left cell; the right cell draws nothing.
 //! When an overlay covers one half, [`Frame::mend`] blanks the other half in
-//! its own colours, as Neovim's compositor does. It runs after every overlay.
+//! its own colours, as Neovim's compositor does. It runs once all overlays
+//! are drawn.
 
 use super::grid::{Cell, Grid, Text};
 use super::model::{Model, Place};
@@ -257,7 +258,7 @@ fn put_together(
         rows,
     );
 
-    // Status lines (grid 1) are realigned over text drawn narrower than its
+    // Status lines (grid 1) are realigned over text drawn narrower than their
     // window (see `super::wide`). They should never land in a window's place,
     // but if one does, the places are blanked again.
     if status_lines_over_text(frame, model, view, rows) {
@@ -990,7 +991,7 @@ mod tests {
         assert_eq!(shown.text(), " WWWW \n WWWW \n efgh ");
     }
 
-    /// Not even when the window is drawn elsewhere for a frame.
+    /// Even when the window is drawn elsewhere for a frame.
     #[test]
     fn what_grid_1_has_under_a_window_stays_hidden() {
         struct Away;

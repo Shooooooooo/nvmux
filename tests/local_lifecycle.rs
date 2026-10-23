@@ -77,7 +77,7 @@ fn create_list_and_kill_a_session() {
     assert!(!sock.exists(), "kill must unlink the socket");
 }
 
-/// When create returns the session answers and already has `:Detach` and its
+/// When create returns, the session already answers and has `:Detach` and its
 /// metadata.
 #[test]
 fn a_created_session_answers_and_has_its_alias_and_its_metadata() {
@@ -918,7 +918,6 @@ fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
     assert!(!sock.exists(), "the socket should have been removed");
 }
 
-/// The first `tool` on `$PATH`.
 #[cfg(target_os = "linux")]
 fn which(tool: &str) -> Result<std::path::PathBuf, ()> {
     std::env::var_os("PATH")

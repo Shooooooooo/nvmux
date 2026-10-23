@@ -80,8 +80,8 @@ impl LocalTransport {
     }
 
     /// Parse `<id>.json`, or `None` if missing: a session reaped since the
-    /// listing, or an orphan (live socket, no metadata). Callers handle the
-    /// two differently.
+    /// listing, or an orphan (live socket, no metadata). Not an error: each
+    /// caller handles `None` its own way.
     fn read_meta(&self, json: &Path) -> Result<Option<Session>> {
         let bytes = match std::fs::read(json) {
             Ok(b) => b,
@@ -184,8 +184,6 @@ impl Host for LocalTransport {
         Ok(host_sock.to_path_buf())
     }
 
-    /// A socket the script could not remove would resurrect the session in
-    /// the next listing.
     fn sweep(&self, id: &str) {
         if let Ok(paths) = self.paths(id) {
             if paths.sock.exists() && self.is_reapable(&paths.sock) {

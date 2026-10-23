@@ -7,12 +7,12 @@
 //! the shown rows, and each match votes for a shift. For the top-voted shifts,
 //! a band is a run of rows equal cell by cell to the shown row that far away;
 //! the band saving the most writes is moved, and the search repeats on the
-//! rest. A scroll empties rows that must then be written, so a band moves only
-//! if it saves [`MIN_SAVED`] rows more than that.
+//! rest. A scroll empties rows, and those already right must be rewritten, so
+//! a band moves only if it saves [`MIN_SAVED`] rows more than that.
 //!
 //! - **Whole rows**: left/right margins (`DECSLRM`) are not widely supported.
 //! - **Never the last row**: the relay's hint bar may be there (see
-//!   `crate::hint`).
+//!   `crate::hint`), and a scroll would carry it into the editor's rows.
 //! - **A plain pen**: emptied rows take the pen's background on some
 //!   terminals, so the pen is reset first.
 
@@ -66,8 +66,8 @@ impl Bands {
     }
 
     /// Append to `out` the bytes that move bands `new` has shifted from `old`
-    /// (the shown frame); returns whether any moved. Rows `changed` marks
-    /// unchanged are taken as `old`'s without comparing.
+    /// (the shown frame, same size); returns whether any moved. Rows `changed`
+    /// marks unchanged are taken as `old`'s without comparing.
     pub fn moved(
         &mut self,
         out: &mut Vec<u8>,
@@ -143,6 +143,7 @@ impl Bands {
         }
     }
 
+    /// Call once the frame given to [`Bands::moved`] is drawn.
     pub fn shown(&mut self) {
         std::mem::swap(&mut self.prints, &mut self.next);
         self.next.clear();

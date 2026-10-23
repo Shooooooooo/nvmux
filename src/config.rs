@@ -172,7 +172,7 @@ pub struct ClientSettings {
     /// off locally. `"on"` includes local sessions; `"off"` waits for Neovim.
     /// Even a 20-30 ms round trip is felt with keys held or typed fast; a local
     /// one is a fraction of a millisecond, so Neovim's frame beats any
-    /// prediction, and `"auto"` leaves those clients predicting nothing.
+    /// prediction.
     ///
     /// Costs: uncovered rows lack signs and virtual text until Neovim's frame,
     /// a round trip later, and get tree-sitter and buffer highlights but not
@@ -719,8 +719,8 @@ impl EffectsSettings {
         self.enabled && self.filter.enabled
     }
 
-    /// Whether the picker then closes onto the gap or cuts away is the fade's
-    /// say (see [`crate::ui::app::App::make_room`]).
+    /// Whether the picker closes onto the gap `c` opens or cuts away is up to
+    /// the fade (see [`crate::ui::app::App::make_room`]).
     pub fn create_enabled(&self) -> bool {
         self.enabled && self.create.enabled
     }
@@ -1207,7 +1207,7 @@ enum ConfigSource {
     Explicit(PathBuf),
     /// A default search path; may be absent.
     Default(PathBuf),
-    /// No path could be formed (no `$HOME`); use the defaults.
+    /// Neither `$XDG_CONFIG_HOME` nor `$HOME` is set; use the defaults.
     None,
 }
 
@@ -2074,8 +2074,8 @@ pub fn set_saved(settings: Settings) {
 
 static REMOTE: AtomicBool = AtomicBool::new(false);
 
-/// Whether the sessions are on another machine, over ssh. Set once by `main`
-/// before starting a client. Clients receive it with their settings
+/// Record whether the sessions are on another machine, over ssh. Called once
+/// by `main` before starting a client. Clients receive it with their settings
 /// (`"auto"` predicts only when remote, see [`Drawing`]), and the settings
 /// screen checks `[client] ui` changes against it.
 pub fn set_remote(remote: bool) {
@@ -2981,7 +2981,8 @@ mod tests {
         assert_eq!(ours, readme, "not the README's settings: {uncommented}");
     }
 
-    /// `remote` included; the client's other settings come back as defaults.
+    /// `remote` included; settings other than `[client]` and `[effects]` come
+    /// back as defaults.
     #[test]
     fn what_a_client_draws_with_survives_its_environment() {
         let mut settings = Settings::default();

@@ -2,7 +2,7 @@
 //! second of the key; the in-flight trail is [`super::starfield`].
 //!
 //! 1. **Pull** ([`PULL`]): both trails' stars are drawn back into the row,
-//!    which keeps its in-flight look (`⇕`, blank number) until the end.
+//!    which keeps its in-flight look (`⇕`, blank number) until the pull ends.
 //! 2. **Bounce** ([`BOUNCE`]): the reversed bar extends two cells at each
 //!    end, snaps back, extends one, and rests. The marker and numbers return
 //!    on its first frame.
@@ -50,7 +50,8 @@ const STAGGER: f32 = 0.04;
 const FAR: f32 = 0.45;
 
 /// A grain's glyph through its life, flying right, for each of the two lanes:
-/// both middle rows of dots, then one, then a single dot at the leading edge.
+/// both middle rows of dots, then one, then a single dot, trailing and then
+/// leading.
 const UPPER: [char; 5] = ['⠶', '⠒', '⠒', '⠂', '⠐'];
 const LOWER: [char; 5] = ['⠶', '⠤', '⠤', '⠄', '⠠'];
 
@@ -81,7 +82,7 @@ const _: () = assert!(SPLASH_SHORTEST + SPLASH_LONGER <= SHORTEST + LONGER);
 pub enum Side {
     /// Off the marker, flying left.
     Before,
-    /// Off the end of the name, flying right.
+    /// Off the row's right end, flying right.
     After,
 }
 
@@ -102,7 +103,7 @@ pub struct Grain {
     pub side: Side,
     pub tier: Tier,
     /// Cells out from the row's end; 1 leaves the adjacent cell clear, as the
-    /// spray always does. The splash, a row away, may start beside it.
+    /// spray always does. The splash, a row away, starts at 0, beside it.
     pub offset: u16,
     pub glyph: char,
     pub dim: bool,

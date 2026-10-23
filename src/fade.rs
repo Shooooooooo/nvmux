@@ -33,7 +33,8 @@ use crate::palette::{self, Palette, Rgb};
 use crate::shadow::{Cursor, Kept, Over, Shadow};
 
 /// A synchronized update: the terminal presents nothing between these.
-/// Nesting is harmless, which matters where a relay stopped inside Neovim's.
+/// Opening one inside another is harmless, which matters where a relay stopped
+/// inside Neovim's.
 pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 pub const SYNC_END: &[u8] = b"\x1b[?2026l";
 
@@ -449,7 +450,7 @@ pub fn fade_out_session(
 
 /// Called between a session fade's frames with the shadow and the next frame's
 /// due time: [`wait`], or read the session's output into the shadow so later
-/// frames show it (a moving card under the `kept` cells, see [`crate::pty`]).
+/// frames show it (a card in motion on the `kept` cells, see [`crate::pty`]).
 pub type Between<'a> = &'a mut dyn FnMut(&mut Shadow, Instant);
 
 /// A [`Between`] that only sleeps until the next frame.
@@ -473,7 +474,7 @@ pub fn standing(shadow: &Shadow, kept: &Kept) -> Vec<u8> {
 /// the client's own bytes follow and win.
 ///
 /// `over`, the name the picker handed off (see [`crate::handoff`]), fades out
-/// as the session fades in, and the session then opens as an [`Iris`] from
+/// as the session fades in; with it, the session opens as an [`Iris`] from
 /// the name's line. The `kept` cells (the card the session's client drew)
 /// stay at full colour. Calls `between` between frames (see [`Between`]).
 pub fn fade_in_session(

@@ -5,8 +5,8 @@
 //! drops every chord it does not bind. Chords are validated by
 //! [`crate::keys::parse_prefix`], as in the config file.
 //!
-//! `Enter` keeps what is shown; `Esc` and `Ctrl-c` skip. `C-c`/`C-z` can
-//! still be set as prefixes in the config.
+//! `Enter` keeps what is shown; `Esc` and `Ctrl-c` skip, so `C-c` can be the
+//! prefix only by editing the config.
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
@@ -20,7 +20,7 @@ use crate::error::Result;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The pressed key, or the default on a bare Enter.
+    /// The chosen prefix byte, or the default on a bare Enter.
     Chosen(u8),
     /// Run on defaults this time and ask again next time.
     Skipped,
@@ -47,7 +47,7 @@ pub(super) fn interpret(code: KeyCode, ctrl: bool) -> Step {
     match code {
         KeyCode::Enter => Step::Confirm,
         KeyCode::Esc => Step::Skip,
-        // Reserved for skipping, as on every other nvmux screen.
+        // The way out, as on every other nvmux screen.
         KeyCode::Char('c') if ctrl => Step::Skip,
         KeyCode::Char(c) if ctrl => {
             let key = match c {
@@ -88,7 +88,6 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
         if !event::poll(super::TICK)? {
             continue;
         }
-        // Raw event: `translate` drops every chord but the three it binds.
         let (code, ctrl) = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 (k.code, k.modifiers.contains(KeyModifiers::CONTROL))

@@ -478,8 +478,8 @@ impl Scroll {
             at += a.rows;
             self.drawn += 1;
             if self.animate {
-                // A sequenced scroll draws the cursor line itself (see
-                // `crate::client::App::repaint`); a sub-row remainder of
+                // For a sequenced scroll the client draws the cursor line
+                // (see `crate::client::App::repaint`); a sub-row remainder of
                 // earlier slides would hold back its first row and draw the
                 // cursor over the wrong line.
                 if a.seq.is_some() && self.glide.cells() == 0 {

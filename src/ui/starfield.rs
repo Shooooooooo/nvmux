@@ -14,6 +14,9 @@
 //! [`Starfield::ignite`] holds every star at the name and releases them over
 //! [`IGNITE`] at a rising rate, so the trail builds up rather than appearing.
 //!
+//! Stars start straight off the name's bar: ramps between the two (quadrant
+//! blocks, `▓▒░`, fading braille) and more stars were tried and read worse.
+//!
 //! Advanced by elapsed time, not frames (see [`crate::fade`]). Stateful, since
 //! positions depend on every pick so far.
 
@@ -22,7 +25,7 @@ use std::time::Duration;
 /// Trail length, in cells.
 pub const TRAIL: usize = 6;
 
-/// Star speed range, in dots per second.
+/// Star speed range, with [`FASTEST`], in dots per second.
 const SLOWEST: f32 = 15.0;
 
 const FASTEST: f32 = 80.0;
@@ -36,7 +39,8 @@ const OVERSHOOT: f32 = 4.0;
 /// Max distance before the left edge a new star starts, in dots.
 const STAGGER: f32 = 2.0;
 
-/// Time for every star to leave the name after [`Starfield::ignite`].
+/// Time for every star to leave the name after [`Starfield::ignite`]. Short
+/// enough to finish before the first move, long enough to be seen to build.
 pub const IGNITE: Duration = Duration::from_millis(300);
 
 /// More would turn the crowd by the name into a solid block.
@@ -70,7 +74,8 @@ pub struct Starfield {
 }
 
 impl Starfield {
-    /// Empty until the first [`Starfield::scatter`] or [`Starfield::advance`].
+    /// Empty until the first [`Starfield::scatter`], [`Starfield::ignite`] or
+    /// [`Starfield::advance`].
     pub fn new(seed: u64) -> Self {
         Self {
             stars: Vec::new(),
@@ -190,7 +195,7 @@ fn dots(cells: usize) -> f32 {
     (cells * 2) as f32
 }
 
-/// xorshift64*; also used by [`super::landing`].
+/// xorshift64*; also used by [`super::landing`] and [`super::swap`].
 pub(super) struct Rng(u64);
 
 impl Rng {

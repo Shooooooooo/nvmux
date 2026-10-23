@@ -1,10 +1,11 @@
 //! Recognising the prefix chord in a terminal's escape sequences.
 //!
 //! Neovim's TUI (and nvmux's own client, see [`crate::client`]) requests the
-//! kitty keyboard protocol if the terminal answers `CSI ? u` (`CSI > 1 u`;
-//! `CSI > 3 u` from Neovim 0.12, adding repeat and release events), else
-//! xterm's `modifyOtherKeys` (`CSI > 4 ; 2 m`). nvmux relays that negotiation
-//! untouched (see [`crate::pty`]), so stdin may carry any of three spellings:
+//! kitty keyboard protocol if the terminal answers its `CSI ? u` query
+//! (`CSI > 1 u`; `CSI > 3 u` from Neovim 0.12, adding repeat and release
+//! events), else xterm's `modifyOtherKeys` (`CSI > 4 ; 2 m`). nvmux relays
+//! that negotiation untouched (see [`crate::pty`]), so stdin may carry any of
+//! three spellings:
 //!
 //! ```text
 //! Ctrl-Space, legacy:          0x00
@@ -84,7 +85,7 @@ pub fn classify(seq: &[u8], code: u8) -> Sequence {
         Some(_) => return Sequence::Other(1),
     }
 
-    // A private marker first means a reply; key reports start with a digit.
+    // A private marker first means a reply; no key report starts with one.
     let reply = matches!(seq.get(2), Some(b'?' | b'>' | b'='));
     for (i, &b) in seq.iter().enumerate().skip(2) {
         match b {
@@ -217,7 +218,6 @@ mod tests {
         }
     }
 
-    /// A missing modifier field is a plain key.
     #[test]
     fn only_ctrl_and_the_lock_keys_spell_the_prefix() {
         for m in 1u32..=256 {
@@ -230,6 +230,7 @@ mod tests {
                 assert_eq!(got, Sequence::Other(seq.len()), "modifiers {m}");
             }
         }
+        // A missing modifier field is a plain key.
         assert_eq!(classify(b"\x1b[32u", SPACE), Sequence::Other(5));
         // Ctrl-Shift-Space, Ctrl-Alt-Space, Ctrl-Super-Space: not the prefix.
         for seq in [&b"\x1b[32;6u"[..], b"\x1b[32;7u", b"\x1b[32;13u"] {

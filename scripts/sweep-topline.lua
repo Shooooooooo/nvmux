@@ -4,13 +4,14 @@
 --
 --   nvim --clean -n --headless -c 'luafile scripts/sweep-topline.lua'
 --
--- For each window height h in 4..60 and 'scrolloff' in 0..h/2, the cursor
--- starts on the last row 'scrolloff' allows (bottom minus 'scrolloff' for a
--- move down, top plus it for a move up) of a view from line 400 of a
--- 1000-line buffer, and moves N lines (N in 1..h) by `Nj`, `Ngj`, `Nk` and
--- `Ngk`. Each entry is the largest N for which Neovim scrolls just enough to
--- keep 'scrolloff' (`scroll_cursor_top`/`scroll_cursor_bot`) instead of
--- centring the cursor (`scroll_cursor_halfway`), or h if it never centres.
+-- For each window height h from 4 to 60 and 'scrolloff' from 0 to h/2, the
+-- cursor starts on the last row 'scrolloff' allows (bottom minus 'scrolloff'
+-- for a move down, top plus it for a move up) of a view from line 400 of a
+-- 1000-line buffer, and moves N lines (N from 1 to h) by `Nj`, `Ngj`, `Nk`
+-- and `Ngk`. Each entry is the N before the first one for which Neovim
+-- scrolls more than just enough to keep 'scrolloff' (`scroll_cursor_top`/
+-- `_bot`), centring the cursor instead (`scroll_cursor_halfway`), or h if
+-- none does.
 -- Up, that is half the window less one, at least two; down, more.
 
 vim.o.lines = 100

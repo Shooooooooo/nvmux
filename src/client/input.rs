@@ -19,9 +19,9 @@
 //! ([`Parser::waiting`]) until more arrives or `'ttimeoutlen'` passes, as in
 //! Neovim's TUI, but no longer than the relay's own wait, which it was already
 //! held for (see `super::RELAYED_ESCAPE`). A sequence cut by a read is held
-//! the same way. A known reply (an OSC or DCS whose first bytes no key makes,
-//! [`Parser::in_reply`]) is held longer, since an OSC 52 paste can be hundreds
-//! of KB; one longer than the client keeps is dropped through its end.
+//! the same way. A known reply (an OSC, DCS or APC whose first bytes no key
+//! makes, [`Parser::in_reply`]) is held longer, since an OSC 52 paste can be
+//! hundreds of KB; one longer than the client keeps is dropped through its end.
 
 use std::fmt::Write as _;
 
@@ -114,8 +114,8 @@ impl Parser {
         !self.pending.is_empty() && self.paste.is_none()
     }
 
-    /// Whether what is held is a partial reply (an OSC or DCS string known not
-    /// to be a key) or the rest of one being dropped.
+    /// Whether what is held is a partial reply (an OSC, DCS or APC string known
+    /// not to be a key) or the rest of one being dropped.
     pub fn in_reply(&self) -> bool {
         self.paste.is_none() && (self.skipping.is_some() || string_opener(&self.pending).is_some())
     }
@@ -427,8 +427,8 @@ fn string_end(bytes: &[u8], kind: u8) -> Option<usize> {
     })
 }
 
-/// An OSC or DCS reply up to its terminator (BEL or `ESC \`), passed on
-/// without it.
+/// An OSC, DCS or APC reply up to its terminator (BEL for an OSC, or
+/// `ESC \`), passed on without it.
 fn string(bytes: &[u8], kind: u8, final_: bool) -> Step {
     let mut i = 2;
     while i < bytes.len() {
@@ -618,8 +618,8 @@ impl Params {
 }
 
 /// A modifier parameter as Neovim's prefix. The parameter is 1 + a mask:
-/// shift 1, alt 2, ctrl 4, super 8, hyper 16, meta 32, plus lock bits, which
-/// are ignored.
+/// shift 1, alt 2, ctrl 4, super 8, hyper 16, meta 32, plus lock bits. Hyper
+/// and the locks are ignored; meta is written as alt.
 fn modifiers(param: u32) -> String {
     let m = param.saturating_sub(1);
     let mut s = String::new();

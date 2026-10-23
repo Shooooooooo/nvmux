@@ -1,9 +1,9 @@
 //! Sub-cell shapes drawn with block elements.
 //!
-//! A cell is sampled at 8×8 points and matched against each block element
-//! (`U+2580`–`U+259F`), normal or inverted; the nearest wins. Block elements
-//! are drawn edge to edge by every monospace font; legacy-computing sextants
-//! and octants are not in enough fonts.
+//! A cell is sampled at 8×8 points and matched against each of [`BLOCKS`]
+//! (from `U+2580`–`U+259F`), normal or inverted; the nearest wins. Block
+//! elements are drawn edge to edge by every monospace font; legacy-computing
+//! sextants and octants are not in enough fonts.
 
 const SAMPLES: usize = 8;
 

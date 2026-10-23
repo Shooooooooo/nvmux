@@ -107,7 +107,7 @@ pub struct Viewport {
 
 impl Viewport {
     /// Whether `rows` rows show one buffer line each (no folds, wraps or
-    /// virtual lines), judging by `botline`: one past the last shown line,
+    /// virtual lines), judging by `botline`: `topline + rows + 1`,
     /// `line_count` if the view ends exactly on the last line, or
     /// `line_count + 1` if there are rows past the end.
     pub fn one_to_one(&self, rows: usize) -> bool {
@@ -160,8 +160,8 @@ pub struct Changes {
     pub reshaped: Vec<u64>,
     /// Scroll deltas by grid, from `win_viewport`.
     pub scrolled: HashMap<u64, i64>,
-    /// The same by window handle: all `win_viewport` names without
-    /// `ext_multigrid`.
+    /// The same by window handle: without `ext_multigrid`, the only way
+    /// `win_viewport` tells windows apart.
     pub scrolled_win: HashMap<i64, i64>,
     /// Each `grid_scroll`: grid, top, bot, left, right, rows.
     pub region_scrolls: Vec<(u64, usize, usize, usize, usize, i64)>,
@@ -368,7 +368,8 @@ pub struct Model {
     pub mouse: bool,
     pub title: String,
     pub defaults: DefaultColors,
-    /// `hl_group_set`: UI-drawn groups, by client id (see [`Highlights`]).
+    /// `hl_group_set`: client id of each UI-drawn group, by name (see
+    /// [`Highlights`]).
     pub groups: HashMap<String, u32>,
     /// `'laststatus'` as reported by the editor's measure (see
     /// [`super::wide::MEASURE_LUA`]); `None` until reported.
@@ -997,9 +998,9 @@ impl Model {
             .collect()
     }
 
-    /// Visible window grids Neovim has not fully drawn since the client
-    /// created them: kept from an earlier UI, which Neovim assumes this one
-    /// has. See `super::App`.
+    /// Shown or named-but-unplaced window grids Neovim has not fully drawn
+    /// since the client created them: kept from an earlier UI, which Neovim
+    /// assumes this one has. See `super::App`.
     pub fn lacking(&self) -> Vec<u64> {
         let undrawn = |grid: &u64| !self.grids.get(grid).is_some_and(Grid::whole);
         let shown = self.layout.iter().filter(|(grid, p)| {
@@ -1242,6 +1243,7 @@ mod tests {
         assert!(!m.unchanged_since(since), "a grid the client cut");
     }
 
+    /// Values Neovim sends for a 22-row window over 30 lines.
     #[test]
     fn a_view_one_to_one_is_told_by_its_botline() {
         let v = |topline, botline| Viewport {

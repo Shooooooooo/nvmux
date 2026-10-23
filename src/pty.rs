@@ -14,16 +14,17 @@
 //! bracketed paste, kitty keys, truecolor, undercurl, titles, OSC 52 and
 //! DA1/XTGETTCAP work. The shadow grid ([`crate::shadow`], for the fade) and
 //! a kept client's ledger ([`crate::ledger`]) get copies; while an overlay is
-//! up, the boundary ([`crate::boundary`]) may delay a trailing partial escape
-//! sequence until the child writes the rest.
+//! up, the boundary ([`crate::boundary`]) may briefly hold back a trailing
+//! partial sequence.
 //!
 //! Output is *held* only for a fading first paint ([`Hold`]), for a client
 //! started ahead ([`Attachment::start_ahead`]) and, a frame at a time, under
-//! the floating settings ([`panel`]). **A held byte is never dropped,
-//! reordered or changed.**
+//! a floating panel ([`panel`]). **A held byte is never reordered or
+//! changed**; only synchronized-update ends are dropped, where held bytes go
+//! out in one update of nvmux's.
 //!
 //! nvmux's own output (fade frames, the notice and hint bar, a kept client's
-//! repainted screen, the settings panel) is never fed to the shadow. Overlays
+//! repainted screen, floating panels) is never fed to the shadow. Overlays
 //! drawn during a relay go between the child's escape sequences, found by a
 //! decoder rather than a lull (a session repainting at 60 fps never pauses
 //! 25 ms), in one synchronized update with the session's bytes (see
@@ -175,15 +176,15 @@ pub struct Attachment {
     /// end of the SSH forward), so a resume can query the server directly.
     sock: PathBuf,
     /// What to announce when this client first takes the terminal; `None` once
-    /// done. `Some` means the session changed (`spawn` runs only then, as does
-    /// [`Attachment::announce_on_arrival`] for a returning kept client).
+    /// done. `Some` means the session changed: `spawn` runs only then, and
+    /// [`Attachment::announce_on_arrival`] sets it for a returning kept client.
     announce: Option<String>,
     /// The name the picker left on screen, taken down as the session takes the
     /// terminal (see [`crate::handoff`]). Only for attaches from the picker.
     hand_off: Option<HandOff>,
     child: Child,
     master: Pty,
-    /// Set after a full relay: a resume must force a repaint and restore the
+    /// Set by its first relay: later ones must force a repaint and restore the
     /// alternate screen, which the client will not re-enter.
     resumed: bool,
     /// Set once the child has been waited for, so `Drop` does not wait again.
@@ -192,7 +193,7 @@ pub struct Attachment {
     /// the fade off or `effects.fade.session` false; `screen` is used instead.
     shadow: Option<shadow::Shadow>,
     /// The client's own screen copy when there is no shadow, to repaint a kept
-    /// client and to draw under the floating settings.
+    /// client and to draw under floating panels.
     screen: Option<shadow::Shadow>,
     /// The first paint, held back until it can fade in. `None` once released,
     /// and always without a shadow.
@@ -200,7 +201,9 @@ pub struct Attachment {
     /// The terminal parser's state, tracked only while the notice or hint bar
     /// is up. Every byte written to the terminal must be shown to it exactly
     /// once, tagged as the session's or nvmux's, or nvmux's next drawing lands
-    /// inside a sequence.
+    /// inside a sequence. Except nvmux's spans around relayed writes: seen,
+    /// they would read as the session holding the terminal and shut the
+    /// overlay out.
     boundary: Option<boundary::Boundary>,
     /// A synchronized update nvmux opened around a relayed write and must still
     /// close. Kept open if the session's bytes stopped mid-sequence (see
@@ -210,8 +213,9 @@ pub struct Attachment {
     /// return. `Some` exactly when clients are kept (`[client] per_session`).
     ledger: Option<Ledger>,
     /// The terminal has answered the client's DA1, the last of its startup
-    /// queries. Until then it is not parked: kept without the answers, it would
-    /// lack the keyboard protocol, synchronized updates and in-band sizes.
+    /// queries (terminals answer in order). Until then it is not parked: kept
+    /// without the answers, it would lack the keyboard protocol, synchronized
+    /// updates and in-band sizes.
     startup_answered: bool,
     /// After in-band size reports are re-enabled: the current size, and until
     /// when the terminal's matching report is swallowed.
@@ -270,7 +274,7 @@ static EXITS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 ///
 /// Released once something is drawn and the client has been quiet for
 /// [`HOLD_SETTLE`], or at [`HOLD_CAP`] or [`HOLD_MAX`]. The release writes the
-/// held bytes up to the alternate-screen entry, fades the shadow in on that
+/// held bytes through the alternate-screen entry, fades the shadow in on that
 /// screen, then writes the rest in one synchronized update.
 #[derive(Debug)]
 struct Hold {
@@ -406,8 +410,9 @@ const REAP_STEP: Duration = Duration::from_millis(1);
 /// How long the teardown paths relay a departing client's restore sequence.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Quiet time after which a switch counts as painted, for the `timing:` log
-/// only; bridges a heavy config's redraw bursts (~100 ms).
+/// Quiet time after which a relay's session counts as painted, for the
+/// `timing:` log and [`Attachment::tell_when_painted`]; bridges a heavy
+/// config's redraw bursts (~100 ms).
 const PAINT_SETTLED: Duration = Duration::from_millis(150);
 
 /// A DA1 request, which a departing client sends (see
@@ -421,8 +426,8 @@ const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 /// How long a resumed kept client gets to finish a frame it was caught in.
 const FRAME_WAIT: Duration = Duration::from_millis(50);
 
-/// How long a resumed kept client gets to draw a requested card (or its
-/// pending redraw after a crawl) before its backlog is read. Normally ~1 ms.
+/// How long a client gets to draw a requested card (or, back from a crawl,
+/// its pending redraw). Normally ~1 ms.
 const CARD_WAIT: Duration = Duration::from_millis(30);
 
 /// The most backlog a resume reads after a whole frame. A parked client is
@@ -481,7 +486,8 @@ impl Attachment {
     /// replacement meanwhile; `reap` (from `Drop`) waits. Not `Child::kill`
     /// (SIGKILL), which gives no chance to restore the terminal. SIGCONT too:
     /// SIGHUP is not delivered to a stopped process (see `check_child`). Safe
-    /// to repeat: nothing waits in between, so the pid cannot be recycled.
+    /// to repeat: nothing reaps in between (the peek in `check_child` passes
+    /// `WNOWAIT`), so the pid cannot be recycled.
     pub fn hang_up(&mut self) {
         if self.reaped {
             return;
@@ -518,7 +524,7 @@ impl Attachment {
         Ok(())
     }
 
-    /// Feed bytes that reached the terminal to the shadow or `screen`.
+    /// Feed the session's bytes, relayed or not, to the shadow or `screen`.
     fn shadow_saw(&mut self, bytes: &[u8]) {
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.feed(bytes);
@@ -539,7 +545,9 @@ impl Attachment {
     /// answered, and swallow the size report a resume triggered. That report
     /// repeats the client's current size; passed on, the server would resize to
     /// the same size, which in `input()` or `getchar()` clears to the prompt
-    /// row and wipes the `:mode` repaint. Other sizes go through.
+    /// row and wipes the `:mode` repaint. Swallowing it loses nothing: a size
+    /// changed while parked was sent by [`Attachment::tell_its_size`]. Other
+    /// sizes (a resize since) go through.
     fn saw_input(&mut self, step: &mut Step) {
         if self.ledger.is_none() {
             return;
@@ -594,7 +602,7 @@ impl Attachment {
     /// Have the client draw `card` (this switch's landing card) over the screen
     /// it is leaving, read into the shadow for the fade out. Returns the card's
     /// cells, for the fade to leave alone, and when it went up. `None` without
-    /// a fade or a card-drawing client.
+    /// a fade or a card-drawing client, or if it is not drawn in time.
     fn stand_landing(&mut self, card: &card::Card) -> Option<(shadow::Kept, Instant)> {
         if !self.draws_cards || !fade::enabled() || !fade::session() || self.shadow.is_none() {
             return None;
@@ -883,7 +891,7 @@ impl Attachment {
     }
 
     /// Send the desk's opening commands if the input stream is between keys,
-    /// with the landing card aged by the time since the key (see
+    /// with the landing card aged by how long it has been up (see
     /// [`card::Card::up_ms`]). Returns whether they went in.
     fn put_in_opening(&mut self, now: Instant) -> bool {
         if self.opening.is_empty() || !self.desk.as_ref().is_some_and(|d| d.forwarded.clear(now)) {
@@ -927,7 +935,7 @@ impl Attachment {
     }
 
     /// `<prefix> Enter`: act on the newest card with a destination (switch to
-    /// its session, or show that session's terminal) and take it down.
+    /// its session, or show its terminal buffer in this one) and take it down.
     fn go(&mut self, now: Instant) -> Option<Outcome> {
         let (_, go) = self.desk.as_mut()?.go()?;
         self.send_cards(now);
@@ -981,12 +989,13 @@ impl Attachment {
         self.write_terminal(chunk)
     }
 
-    /// Relay session bytes followed by the notice's frame (or the hint bar) in
-    /// one synchronized update, so the overlay stays on screen. Otherwise the
-    /// terminal presents mid-repaint prefixes with the box wiped (measured: the
-    /// whole box showed in 10% of frames under a busy `:terminal`). `wrap` is
-    /// false for a client that brackets its own frames, where nvmux's span
-    /// would end at the client's reset.
+    /// Relay session bytes in a synchronized update left open for the notice's
+    /// frame (or the hint bar) until [`Attachment::close_span`], so the
+    /// overlay stays on screen. Otherwise the terminal presents mid-repaint
+    /// prefixes with the box wiped (measured: the whole box showed in 10% of
+    /// frames under a busy `:terminal`). `wrap` is false for a client that
+    /// brackets its own frames, where nvmux's span would end at the client's
+    /// reset.
     fn write_session_frame(&mut self, bytes: &[u8], wrap: bool) -> std::io::Result<()> {
         if !wrap {
             return self.write_terminal(bytes);
@@ -1041,7 +1050,7 @@ impl Attachment {
                 .is_some_and(boundary::Boundary::between_sequences)
     }
 
-    /// When a tail held back for the notice must be written even if unfinished.
+    /// When a tail held back for an overlay must be written even if unfinished.
     fn kept_due(&self) -> Option<Instant> {
         self.boundary.as_ref().and_then(boundary::Boundary::due)
     }
@@ -1111,7 +1120,7 @@ impl Attachment {
     }
 
     /// Release the held first paint: fade the shadow in if `dissolve` and
-    /// something is drawn, then write everything held as it came. Bytes up to
+    /// something is drawn, then write everything held as it came. Bytes through
     /// the alternate-screen entry go first, so the fade lands on the client's
     /// screen; the rest goes in one synchronized update.
     fn release_hold(&mut self, dissolve: bool) -> std::io::Result<()> {
@@ -1321,9 +1330,10 @@ impl Attachment {
     /// actually read (an early reply is eaten by the startup handler), and only
     /// to a hung-up client (a reply split into pieces is read as keys).
     fn answer_device_attributes(&mut self) -> bool {
-        // Skipped if there is no room, never waited for: both callers run from
-        // `Drop` and must not block. Room can vanish for a few ms while Linux
-        // moves a burst out of its tty flip buffer, so callers retry.
+        // Skipped if there is no room, never waited for: blocked, `reap` would
+        // miss its deadline and `drain_until_eof` would hold the terminal raw.
+        // Room can vanish for a few ms while Linux moves a burst out of its tty
+        // flip buffer, so those two retry.
         let fd = self.master.as_raw_fd();
         if !writable(fd) {
             tracing::debug!("the departing client's input queue is full; not answering yet");
@@ -1350,8 +1360,8 @@ impl Attachment {
     /// client ignoring termination would hold the terminal in raw mode.
     ///
     /// nvmux answers the DA1 request (else `<prefix> d` costs a second) and
-    /// strips it from the output, the one exception to the module's rule: the
-    /// real terminal's answer would land in the shell as text after we exit.
+    /// strips it from the output, an exception to the module's rule: the real
+    /// terminal's answer would land in the shell as text after we exit.
     fn drain_until_eof(&mut self) {
         let fd = self.master.as_raw_fd();
         let deadline = Instant::now() + DRAIN_TIMEOUT;
@@ -1366,7 +1376,6 @@ impl Attachment {
             match read_fd(fd, &mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(len) => {
-                    // Read before the write, because the write borrows `self`.
                     owed |= asks_for_device_attributes(&buf[..len]);
                     let _ = write_stdout(&without_device_attributes_request(&buf[..len]));
                     if owed {
@@ -1389,7 +1398,8 @@ impl Drop for Attachment {
 
 impl Attachment {
     /// Park a kept client while something else is in front, telling it to draw
-    /// at a crawl. `None` if no thread could be had; it is then retired.
+    /// at a crawl. `None` if no socket pair or thread could be had; it is then
+    /// retired.
     pub fn park(mut self) -> Option<Parked> {
         self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
         // The last fade's diff is for a terminal another session is about to
@@ -1417,7 +1427,9 @@ impl Attachment {
     }
 
     /// Tell a card-drawing client it is out of sight, so it stops animating and
-    /// draws at a crawl until a relay sends [`card::Command::Clear`].
+    /// draws at a crawl until a relay sends [`card::Command::Clear`]. Done
+    /// here, not as the relay ends, where a switch first has it draw the
+    /// landing card ([`Attachment::stand_landing`]).
     fn go_away(&mut self) {
         if self.draws_cards {
             self.tell_client(&card::Command::Away);
@@ -1459,7 +1471,8 @@ impl Attachment {
 
     /// Whether the session's screen is back for a panel to float over: no held
     /// paint, and the client on the alternate screen (or drawn on the primary).
-    /// `true` if the copy cannot tell.
+    /// Before then, panel frames would stay on the primary screen the shell
+    /// returns to. `true` if the copy cannot tell.
     fn screen_is_back(&self) -> bool {
         if self.hold.is_some() {
             return false;
@@ -1617,8 +1630,9 @@ impl Drop for Parked {
 /// **A parked client that sends DA1 or leaves the alternate screen is
 /// finishing**: both end Neovim's exit and its `suspend` (which `Ctrl-Z` in
 /// any UI sends to every attached client). Kept, it would hang or lose its
-/// startup answers for good, so it is hung up, answered and reaped (measured
-/// on 0.11.0 and 0.12.5). A stopped client is retired too; only
+/// startup answers for good, so it is hung up first (a suspending client then
+/// finds the hangup waiting), answered and reaped (measured on 0.11.0 and
+/// 0.12.5). A stopped client is retired too; only
 /// [`peek_child`] is used, since [`check_child`] consumes a stop.
 fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachment> {
     let id = attachment.session_id.clone();
@@ -1693,12 +1707,14 @@ fn leaves_alt_screen(chunk: &[u8]) -> bool {
 }
 
 /// The most a started-ahead client may write before its first visit; past
-/// it, it is retired. A hold's worth; an idle session writes a few KB, so
-/// only a busy `:terminal` gets here.
+/// it, it is retired. A hold's worth, so what is kept goes out as one first
+/// paint; an idle session writes a few KB, so only a busy `:terminal` gets
+/// here.
 pub const AHEAD_MAX: usize = HOLD_MAX;
 
 /// How often a started-ahead client's thread checks its probe, which
-/// answers over a channel `poll` cannot watch.
+/// answers over a channel `poll` cannot watch. Nothing waits on it: it only
+/// bounds how soon a refused client is retired.
 const PROBE_POLL_MS: libc::c_int = 100;
 
 /// The thread of a started-ahead client: keep all its output in
@@ -1944,8 +1960,8 @@ fn spawn_with(
     // Probe the session while the client connects.
     let t_probe = std::time::Instant::now();
     let verdict = Probe::start(session_id, sock).and_then(|mut probe| {
-        // A wait that runs out gives the old timeout error. Dropping the
-        // probe ends its worker.
+        // A wait that runs out gives the timeout error callers expect.
+        // Dropping the probe ends its worker.
         probe
             .wait(rpc::PROBE_TIMEOUT)
             .unwrap_or(Err(NvmuxError::Rpc(crate::error::RpcError::Timeout(
@@ -2057,10 +2073,12 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<An
     // Both questions go out at once: over SSH each is a round trip (150 ms
     // RTT: 302 ms in series, 151 ms together). The deferred `list_uis` is
     // awaited only once the mode says the queue runs; a server waiting for a
-    // key never answers it. Only a *key* must never be sent ahead of a fresh
-    // mode reading. nvmux ends only a hit-enter prompt itself (see
+    // key answers it only after one. Only a *key* must never be sent ahead of
+    // a fresh mode reading. nvmux ends only a hit-enter prompt itself (see
     // `rpc::Mode::at_hit_enter`), re-reading the mode after each `<CR>`, since
-    // prompts stack. Another attached UI loses its prompt too.
+    // prompts stack. Another attached UI loses its prompt too. Not pipelined:
+    // a mode asked right behind a `<CR>` is answered before the key is
+    // consumed, and would earn a second `<CR>`.
     let mut asking_mode = client.ask_mode()?;
     let counting = client.ask_uis()?;
 
@@ -2110,7 +2128,8 @@ const MAX_PROMPTS: usize = 4;
 /// client, awaited only once the mode says the queue runs. Unbounded on
 /// purpose: a session in `:!make` answers when done (`ui::attaching` shows a
 /// spinner). Not `unwrap_or(0)`: guessing zero is how the 17th attach
-/// happens. `>`, not `>=`: our own client may already be counted.
+/// happens. `>`, not `>=`: our own client may already be counted; `MAX_UIS`,
+/// half Neovim's limit, absorbs the off-by-one either way.
 fn ui_count(
     client: &mut rpc::Client<UnixStream>,
     session_id: &str,
@@ -2148,7 +2167,8 @@ fn spawn_client_with(
     // Before the child starts, so the pty never echoes what the relay writes.
     take_input_as_written(&master);
 
-    // The client gets nvmux's launch umask, as the session does.
+    // nvmux runs under umask 077; the client gets the launch umask back, as
+    // the session does (see `paths::restrict_umask`).
     let umask = crate::paths::launch_umask().map(|mask| mask.bits());
     // Asked here, because `sysconf` is not a call the child may make.
     let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
@@ -2174,7 +2194,7 @@ fn spawn_client_with(
         resumed: false,
         reaped: false,
         // A shadow costs a parse of all output, so only with the fade; one of
-        // the two always exists, for the settings to float over.
+        // the two always exists, for panels to float over.
         shadow,
         screen: (!fades).then(|| shadow::Shadow::new(size.rows, size.cols)),
         hold: None,
@@ -2286,9 +2306,10 @@ fn pty_error(doing: &str, e: pty_process::Error) -> NvmuxError {
 }
 
 /// Put the pty in raw input mode before the client starts, as it would
-/// itself a few ms later. Otherwise a card written meanwhile was echoed
-/// (`ESC` as `^[`) onto the primary screen, `Ctrl-C` killed the client and
-/// `Enter` arrived as `Ctrl-J`. Output flags are left alone.
+/// itself a few ms later. Otherwise a card written meanwhile is echoed
+/// (`ESC` as `^[`) onto the primary screen, `Ctrl-C` kills the client and
+/// `Enter` arrives as `Ctrl-J`. Output flags are left alone. Set through the
+/// master, which works on Linux and macOS.
 fn take_input_as_written(master: &Pty) {
     use nix::sys::termios::{self, SetArg};
 
@@ -2538,8 +2559,9 @@ pub fn relay(
             let faded = std::mem::take(&mut attachment.dark) || attachment.fade_out(&kept);
             raw.restore();
             // Clear now, not after the next client spawns, or the old session
-            // stays up meanwhile; not shown to the shadow. A card the fade left
-            // standing stays for the next relay to take down.
+            // stays up meanwhile. Not shown to the shadow: a switch naming
+            // this session resumes it and fades that screen back in. A card
+            // the fade left standing stays for the next relay to take down.
             if held.leads_straight_into_another_relay() {
                 let standing = stood.filter(|_| faded).and_then(|(kept, since)| {
                     let drawn = fade::standing(attachment.shadow.as_ref()?, &kept);
@@ -2613,16 +2635,16 @@ fn pump(
     // Re-read only on a `SIGWINCH` or after a floating panel: each read
     // costs 3x the syscalls of the rest of a pass.
     let mut size = term::terminal_size();
-    // The hint bar shares `erasing` (the notice's repaint, see
-    // [`Erasing`]) when free, since a `:mode` repaints its row too.
-    // The row that says what the next key does while a `<prefix>` waits.
+    // The row that says what the next key does while a `<prefix>` waits. It
+    // shares `erasing` (the notice's repaint) when free, since a `:mode`
+    // repaints its row too.
     let mut bar = hint::Bar::new(Instant::now(), size, keys.bind);
     // `<prefix> d` with unsaved settings asks first, on the bar's row,
     // and takes the keyboard until answered.
     let mut leaving: Option<Leaving> = None;
     let mut buf = [0u8; 8192];
-    // Diagnostics only: times the session's redraw from the moment the
-    // terminal became its.
+    // The session's redraw, timed from the moment the terminal became its,
+    // for the `timing:` log and `Attachment::painted`.
     let relay_started = Instant::now();
     let mut first_byte: Option<Duration> = None;
     let mut painted_bytes = 0usize;
@@ -2654,8 +2676,7 @@ fn pump(
             bar = hint::Bar::new(Instant::now(), size, keys.bind);
         }
 
-        // Every clock (prefix, notice, hold, held tail, cards) folds into one
-        // absolute `poll` deadline.
+        // Every clock folds into one absolute `poll` deadline.
         let now = Instant::now();
         let next = [
             deadline,
@@ -2869,9 +2890,9 @@ fn pump(
                     // file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         if let Some(outcome) = take_step(attachment, step)? {
-                            // `<prefix> ,`, `?` or `Space`: float the panel and
-                            // return here, unless it cannot float or leads to
-                            // the session loop.
+                            // `<prefix> ,`, `?`, `Space` or `c`: float the
+                            // panel and return here, unless it cannot float or
+                            // leads to the session loop.
                             let outcome = match float_over(attachment, master_fd, winch, outcome)? {
                                 Some(outcome) => outcome,
                                 None => {
@@ -3201,6 +3222,7 @@ enum ChildState {
 /// Notice a child that has exited, and continue one that has stopped:
 /// `Ctrl-z` is forwarded as a byte, and a client that stops itself would
 /// freeze the screen. Each stop is consumed when read, so this cannot loop.
+/// Not `Child::try_wait`, which lacks `WUNTRACED` and so misses a stop.
 fn check_child(attachment: &mut Attachment) -> ChildState {
     use nix::sys::signal::{kill, Signal};
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -3375,9 +3397,11 @@ fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]>
 }
 
 /// Repaint after one of nvmux's own screens cleared the terminal: `:mode`
-/// via RPC (see [`repaint_through_server`]), or failing that a [`nudge`].
-/// The pty is resized first. On a resume the client's mouse mode is
-/// restored as the server reports it, or Neovim's default from a busy one.
+/// via RPC (see [`repaint_through_server`]), the only way that reaches a
+/// client ignoring `SIGWINCH` (DEC mode 2048), or failing that a [`nudge`].
+/// The pty is resized first. On a resume the mouse mode, which the client
+/// sets only at startup, is restored as the server reports it, or Neovim's
+/// default from a busy one.
 fn repaint(attachment: &mut Attachment, why: Repaint) {
     attachment.resize_to(term::terminal_size());
     let served = repaint_through_server(&attachment.sock, why);
@@ -3460,7 +3484,7 @@ fn kept_clients_repaint(attachment: &mut Attachment) -> Option<Erasing> {
 /// The repaint that removes the attach notice, on its own thread: two round
 /// trips (measured 123 ms over a 60 ms link, 303 ms over 150 ms) would stall
 /// the relay. The repaint arrives as session output; the answer only decides
-/// the fallback. Also used for a kept client's return.
+/// the fallback. Also used for the hint bar and a kept client's return.
 struct Erasing {
     rx: mpsc::Receiver<Served>,
 }
@@ -3669,7 +3693,8 @@ mod tests {
     }
 
     /// The shadow must keep what the client drew under an overlay, the only
-    /// copy left; the bar's erase is composited from it too.
+    /// copy left; the bar's erase is composited from it too. Fed the box,
+    /// `has_contents` would also release a hold before the client drew.
     #[test]
     fn nothing_written_over_the_session_reaches_the_shadows_grid() {
         let mut a = attached_to("exit 0");
@@ -4388,7 +4413,8 @@ mod tests {
             .expect("a non-blocking listener");
         std::thread::spawn(move || {
             let mut asked = Vec::new();
-            // Set by the first `nvim_input` where the prompt is one that ends.
+            // Set by the first `nvim_input`; ends the prompt if
+            // `clears_on_input`.
             let mut typed_at = false;
             let deadline = Instant::now() + Duration::from_secs(5);
             let stream = loop {
@@ -4411,8 +4437,8 @@ mod tests {
                 .expect("a bounded read");
             let mut reader = std::io::BufReader::new(&stream);
             let mut out = &stream;
-            // Ends on EOF, when `spawn` drops the client after its last call,
-            // so joining waits for the whole probe.
+            // Ends on EOF, when the caller drops its client after its last
+            // call, so joining waits for the whole exchange.
             while let Ok(frame) = rmpv::decode::read_value(&mut reader) {
                 let Some(request) = frame.as_array() else {
                     break;
@@ -4971,7 +4997,7 @@ mod tests {
     #[test]
     fn a_client_waiting_on_its_terminal_is_answered_and_goes() {
         // `stty raw`: the reply has no newline, so a canonical read would
-        // block for a line and the test would pass for the wrong reason.
+        // block for a line and the test would fail for the wrong reason.
         let mut a = attached_to(
             r#"stty raw -echo; trap 'printf "\033[c"; dd bs=1 count=1 >/dev/null 2>&1; exit 0' HUP; printf r; while :; do sleep 0.05; done"#,
         );
@@ -5631,7 +5657,7 @@ mod tests {
     fn peek_reports_stopped_and_gone_without_consuming_either() {
         use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
-        /// Kill and reap the child however the test ends.
+        // Kill and reap the child however the test ends.
         struct Guard(std::process::Child);
         impl Drop for Guard {
             fn drop(&mut self) {

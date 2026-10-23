@@ -6,7 +6,7 @@
 //! [`REACH`] columns, a row counting as [`ASPECT`] columns. At [`EMPTIED`] or
 //! more a cell is blanked.
 
-/// In columns.
+/// Where the fade ends, in columns.
 pub const REACH: f32 = 18.0;
 
 /// Strength right beside the overlay: a cell keeps a tenth of itself.

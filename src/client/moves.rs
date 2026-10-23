@@ -5,11 +5,12 @@
 //! `'whichwrap'` allows, see [`wrapped`]); `0` `^` `$` `g_` `|` `<Home>`;
 //! `j` `k` and kin, keeping the wanted column (`curswant`); `+` `-` `_`;
 //! word motions (see [`super::words`]); `f` `t` `F` `T`; `}` `{` (see
-//! [`paragraph`]); `H` `M` `L` (see [`window`]); `gg` `G`. A motion that
-//! cannot move leaves the wanted column as it was.
+//! [`paragraph`]); `H` `M` `L` (see [`window`]); `gg` `G`. `h`, `l` and
+//! finds that cannot move keep the wanted column.
 //!
-//! After a sideways move the cursor wants the column it is drawn in (a
-//! character's first, or a tab's last). Moving past `'scrolloff'` scrolls as
+//! After other sideways moves the cursor wants the column it is drawn in (a
+//! character's first, or a tab's last), except after `$` (the line end) and
+//! `|` or `<Home>` (the column asked). Moving past `'scrolloff'` scrolls as
 //! Neovim's `update_topline` does: just far enough for a short move, centring
 //! the cursor for a long one (see [`keep_in_view`]). Views that do not wrap
 //! scroll sideways per [`predict::showing`].
@@ -792,7 +793,7 @@ impl Default for Scrolling {
 /// The top line Neovim 0.12.6's `update_topline` gives a view of `h` rows at
 /// `top` once a motion puts the cursor on `cursor` (buffer's last line
 /// `last`, `'scrolloff'` `so`, scrolling per `how`). The view stays if the
-/// cursor is at least `so` lines from its edges, or at the buffer's own; for a
+/// cursor is at least `so` lines from its edges (buffer edges aside); for a
 /// short move it scrolls just far enough, by at least `'scrolljump'`
 /// (`scroll_cursor_top`/`scroll_cursor_bot`); for a longer one it centres the
 /// cursor (`scroll_cursor_halfway`). Lines must take one row each: `None` if
@@ -2219,9 +2220,9 @@ mod tests {
 
     /// [`keep_in_view`] scrolls minimally exactly where [`TOPLINE`] says
     /// Neovim does, from the row nearest the edge `'scrolloff'` allows.
-    /// Upward that is counts below half the window less one (at least 2),
-    /// whatever `'scrolloff'`; beyond, it centres: 9 up in 21 rows onto the
-    /// middle row, 10 up in 22 onto the upper middle one.
+    /// Upward that is counts below half the window less one (at least 2), or
+    /// every count at the largest `'scrolloff'`; beyond, it centres: 9 up in
+    /// 21 rows onto the middle row, 10 up in 22 onto the upper middle one.
     #[test]
     fn motions_past_the_edges_scroll_as_neovim_does() {
         let (top, last) = (400, 999);

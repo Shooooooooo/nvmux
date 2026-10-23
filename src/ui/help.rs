@@ -9,9 +9,9 @@
 //! rows to the machine.
 //!
 //! Only named keys close it. `<prefix>` arrives as `Key::Other` (`translate`
-//! drops every control chord but `Ctrl-c`, `Ctrl-n`, `Ctrl-p`), so if any key
-//! closed it, typing "Ctrl-Space d" would close on the prefix and send a bare
-//! `d` to the session. Nothing typed here is forwarded.
+//! maps every control chord but `Ctrl-c`, `Ctrl-n`, `Ctrl-p` to it), so if
+//! any key closed it, typing "Ctrl-Space d" would close on the prefix and
+//! send a bare `d` to the session. Nothing typed here is forwarded.
 
 use std::time::Instant;
 
@@ -35,7 +35,7 @@ const HINTS: &str = "esc back";
 /// Columns between the key column and the description.
 const GAP: usize = 3;
 
-/// Minimum session left visible around the floating help.
+/// Minimum session left visible on each side of the floating help.
 const SESSION_COLS: u16 = 2;
 const SESSION_ROWS: u16 = 1;
 

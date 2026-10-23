@@ -196,9 +196,9 @@ can_inspect() {
 # Read a file into $nvmux_flat with its newlines removed, nothing else.
 #
 # Replaces `tr -d '\n'`, a fork per session: 88-110 ms of a five-session
-# listing where a fork costs 15 ms. Tabs and CRs are kept: the flattened file
-# is the last field of its record (see `parse_listing`) and both are JSON
-# whitespace. A file of only newlines flattens to nothing.
+# listing where a fork costs 15 ms. Tabs and CRs are kept: the file is the
+# last field of its record, so a tab splits nothing (see `parse_listing`), and
+# both are JSON whitespace. A file of only newlines flattens to nothing.
 flatten() {
   nvmux_flat=''
   while IFS= read -r nvmux_line || [ -n "$nvmux_line" ]; do

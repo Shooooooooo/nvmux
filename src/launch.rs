@@ -11,7 +11,7 @@ use crate::error::SessionError;
 /// Replaced by the session's socket path, unknown until it has an id.
 pub const PLACEHOLDER: &str = "{sock}";
 
-/// Also the default of [`crate::config::SessionSettings`].
+/// Also the default `command` of [`crate::config::SessionSettings`].
 pub const DEFAULT: &str = "nvim --headless --listen {sock}";
 
 /// Bounded like a name: the line reaches the terminal, logs and argv. Real

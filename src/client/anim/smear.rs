@@ -56,7 +56,7 @@ impl Rect {
 /// Corner directions from the centre: TL, TR, BR, BL.
 const OUTWARD: [Point; 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
 
-/// `[effects.smear]`.
+/// Timing and look, fixed by the client (`[effects.smear]` only turns it on).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     /// Seconds for a move to settle.

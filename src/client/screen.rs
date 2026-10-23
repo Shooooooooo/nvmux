@@ -11,15 +11,16 @@
 //!   A link is closed before every cursor jump and at frame end, as the TUI
 //!   does.
 //! - Moves and colour changes use the shortest form ([`move_to`],
-//!   [`recolour`]), as Neovim's TUI does. After an ambiguous-width character
-//!   or a last-column write, the next move is absolute, since terminals
-//!   disagree there. [`Screen::set_lean`] turns this off for tests.
+//!   [`recolour`]), as Neovim's TUI does. After a non-ASCII character or a
+//!   last-column write, the next move is absolute, since terminals disagree
+//!   there. [`Screen::set_lean`] turns this off for tests.
 //! - [`Screen::moving_rows`] has the terminal scroll moved rows first and diffs
 //!   against the result ([`super::region`]); [`Screen::new`] rewrites them.
 //! - Frames go inside a synchronized update (`?2026`) unless `'termsync'` is
-//!   off, with the cursor hidden while drawing for terminals that ignore it
-//!   (see [`crate::fade::SYNC_END`] and
-//!   `boundary::Boundary::session_brackets_its_own_frames`).
+//!   off, with the cursor hidden while drawing for terminals that ignore it.
+//!   The closing `?2026l` is [`crate::fade::SYNC_END`]; the relay leaves
+//!   bracketing to a client that does its own
+//!   (`boundary::Boundary::session_brackets_its_own_frames`).
 
 use std::io::Write as _;
 
@@ -120,7 +121,8 @@ impl Screen {
 
     /// The spare frame updated to equal the shown one, copying only differing
     /// rows, as a base for [`super::compose::compose_rows`]. `None` if either
-    /// is missing or not `width` x `height`.
+    /// is missing or not `width` x `height`, or the differing rows are
+    /// unknown.
     pub fn take_like_shown(&mut self, width: usize, height: usize) -> Option<Frame> {
         let size = |f: &Frame| (f.width, f.height) == (width, height);
         let shown = self.shown.as_ref().filter(|f| size(f))?;
@@ -172,8 +174,9 @@ impl Screen {
     ///
     /// A frame that changes no cell or cursor writes nothing, rather than an
     /// envelope that wakes the relay and terminal for nothing (e.g. animation
-    /// frames that round to the last, 40 times a second). Safe, since nvmux
-    /// restores the cursor after drawing over the session.
+    /// frames that round to the last, or `:terminal` output that changes
+    /// nothing, 40 times a second). Safe, since nvmux restores the cursor
+    /// after drawing over the session.
     pub fn draw_into(
         &mut self,
         out: &mut Vec<u8>,
@@ -380,7 +383,7 @@ impl Screen {
     }
 }
 
-/// Max gap cells rewritten instead of crossed; more cost more than a CUF.
+/// Max gap cells rewritten instead of crossed: from 4 on, a CUF is as short.
 const REWRITE_AT_MOST: usize = 3;
 
 /// Move the cursor from `at` (`None` if unknown) to `to` in the fewest bytes:

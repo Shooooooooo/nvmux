@@ -13,6 +13,7 @@ use crate::client::model::{Held, Model, Place};
 /// animate.nvim's `max_burst`.
 pub const MAX_BURST: usize = 3;
 
+/// A window's cells from just before the batch that draws its switch.
 #[derive(Debug)]
 pub struct Was {
     grid: u64,
@@ -61,7 +62,8 @@ pub struct Switch {
 }
 
 impl Switch {
-    /// `None` if `duration` is not positive or the window has moved.
+    /// `None` if `duration` is not positive or the window moved, resized or
+    /// hid.
     pub fn start(was: Was, model: &Model, duration: f32) -> Option<Switch> {
         if duration <= 0.0 || !was.still(model) {
             return None;

@@ -20,8 +20,9 @@
 //!
 //! A killed client restores nothing, and Neovim keeps a grid as asked until
 //! some UI asks for the full width. So once per attach the client asks for
-//! the full width of each window whose grid is narrower, unless it narrows
-//! that window itself. With two clients attached, the last to attach wins.
+//! the full width of each window whose grid is not the window's width, unless
+//! it narrows that window itself. With two clients attached, the last to
+//! attach wins.
 //!
 //! Neovim cuts end-of-line virtual text (diagnostics, blame) at the grid's
 //! edge. [`TAILS_LUA`] reports each such row's full tail and where it starts;
@@ -58,8 +59,8 @@ use super::redraw;
 ///
 /// With a channel, it stays installed and sends `measure` on `nvmux_client`
 /// with the same two values whenever they change (window, buffer, tab and
-/// relevant option events), but not while typing, which would make the width
-/// jump under the cursor. It removes itself on this UI's `UILeave` or once
+/// relevant option events), but not on text changes, which would make the
+/// width jump while typing. It removes itself on this UI's `UILeave` or once
 /// the channel is gone.
 pub const MEASURE_LUA: &str = "local most, smart, chan = ...
 local api = vim.api
@@ -236,7 +237,7 @@ pcall(vim.api.nvim_set_decoration_provider, vim.api.nvim_create_namespace(tails)
 ///
 /// Sent from a decoration provider at the end of the redraw, so it arrives
 /// before the `flush` the client applies it with. Lines in closed folds are
-/// skipped; after inline virtual text at a line's end, the tail follows it.
+/// skipped; the tail starts after any inline virtual text at the line's end.
 /// Removed on this UI's `UILeave` or once the channel is gone.
 ///
 /// Never makes a window current (as `nvim_win_call` would for
@@ -579,7 +580,7 @@ pub fn tails(rows: Option<&ValueRef<'_>>, sure: bool) -> BTreeMap<usize, Tail> {
 /// Lay out `(text, group)` pieces as Neovim draws them: each group over the
 /// default highlight ([`syntax_hl`]), wide characters as a cell plus a
 /// `Half`, combining marks joined to the previous cell, control characters
-/// as `^X`.
+/// as `^X` or `<xx>`.
 fn cells<'a>(pieces: impl Iterator<Item = (&'a str, u32)>) -> Vec<Cell> {
     let mut out: Vec<Cell> = Vec::new();
     for (text, group) in pieces {

@@ -6,7 +6,8 @@
 //! A batch's change to the windows drawn last is then one of:
 //!
 //! - resized, same arrangement (`<C-w>>`, `:resize`, `<C-w>=`): edges ease in
-//!   and out over 150 ms, a frame per cell for small moves, one cell at once;
+//!   and out over 150 ms, a frame per cell for small moves, a one-cell move
+//!   at once;
 //! - one window split off (`:split`, `:vsplit`, a sidebar): it grows from a
 //!   one-cell sliver on its side (right/below with `'splitright'` and
 //!   `'splitbelow'`) as its text fades in, over 200 ms, easing out;
@@ -2287,7 +2288,7 @@ mod tests {
         s
     }
 
-    /// Gradually, status words included.
+    /// The text and its status line's words reach the edge gradually.
     #[test]
     fn centred_text_of_a_window_split_narrower_than_it_goes_to_its_edge() {
         let mut s = split_narrower_than_its_text();
@@ -2389,7 +2390,7 @@ mod tests {
         assert_eq!(rows[0], "cccccccccc│bbbbbbbbbb");
     }
 
-    /// Over the closed window's ghost, which stays put, dimming.
+    /// It moves over the closed window's ghost, which stays put, dimming.
     #[test]
     fn the_window_after_a_first_one_closed_moves_into_its_place() {
         let mut s = Scene::new(Options {
@@ -2417,7 +2418,7 @@ mod tests {
         assert_eq!(last.lines().next(), Some("bbbbbbbbbbbbbbbbbbbbb"));
     }
 
-    /// Eased, a cell at a time.
+    /// The separator moves a cell at a time, eased.
     #[test]
     fn a_resize_moves_the_separator_there() {
         let mut s = Scene::new(Options {
@@ -2532,7 +2533,7 @@ mod tests {
     }
 
     /// A buffer switch fades through the background: old text dims, then new
-    /// text rises. A window that moved meanwhile is not faded.
+    /// text rises.
     #[test]
     fn a_buffer_switch_fades_through_the_background() {
         let mut s = Scene::new(Options::default());

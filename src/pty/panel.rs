@@ -11,10 +11,10 @@
 //! screen (see [`crate::shadow::Shadow::frame_under`]) with the panel over
 //! it. Client output is held and written at the front of the next frame, in
 //! the same synchronized update, split only between sequences (see
-//! [`crate::boundary::Boundary::relay_whole`]), so the session never shows
-//! through. Keys go to the panel via [`crate::input`]; terminal replies go to
-//! the client. Mouse reporting is on while it is up; a press outside closes
-//! it, like `Esc`.
+//! [`crate::boundary::Boundary::relay_whole`]), so on a terminal with
+//! synchronized updates the session never shows through. Keys go to the panel
+//! via [`crate::input`]; terminal replies go to the client. Mouse reporting is
+//! on while it is up; a press outside closes it, like `Esc`.
 //!
 //! It comes and goes over nvmux's fade like a card: the session dims, then
 //! the panel rises. From the picker ([`Leave`]), a switch fades panel and
@@ -56,7 +56,8 @@ use crate::{card, config, fade, falloff, winch};
 /// it.
 const BEHIND: f32 = 0.5;
 
-/// Minimum gap between frames caused only by session output.
+/// Minimum gap between frames caused only by session output, as each
+/// repaints the whole session.
 const SESSION_FRAME: Duration = Duration::from_millis(33);
 
 /// Most session output held while it is mid-sequence (no frame can follow).
@@ -395,7 +396,6 @@ pub(super) fn float(
             sequence_due = None;
             inputs.extend(decoder.flush());
         }
-        // Whether it was already going before this round's input.
         let was_going = going;
         // A key or mouse event gets a frame at once (see `due`).
         let mut asked = false;
@@ -595,8 +595,9 @@ fn gap(lively: bool, session_drew: bool) -> Duration {
 }
 
 /// Whether a frame may go out: a [`gap`] after `last`, or at once for a key
-/// or mouse event (`asked`). Otherwise the bar's fading row would be part
-/// gone when first seen, and a held key's glow would beat with the frames.
+/// or mouse event (`asked`). Otherwise the row the bar just left would be
+/// part faded when first seen, and a held key's glow would beat with the
+/// frames.
 fn due(now: Instant, last: Option<Instant>, lively: bool, session_drew: bool, asked: bool) -> bool {
     asked || last.is_none_or(|last| now >= last + gap(lively, session_drew))
 }
@@ -1040,9 +1041,9 @@ mod tests {
         }
     }
 
-    /// However closed, unless a prompt made a session (gone to). Without a
-    /// set-aside picker, back to the session; with `[style] float` turned
-    /// off, out with the session.
+    /// However they close, unless a prompt made a session (then gone to).
+    /// With no picker set aside, back to the session; with `[style] float`
+    /// turned off, out with the session.
     #[test]
     fn the_help_the_settings_and_the_prompts_go_back_to_the_picker() {
         assert_eq!(Way::going(None, true, false), Way::Across(What::Picker));
