@@ -1853,6 +1853,11 @@ pub struct App {
     /// said ahead of: the client's number for the last key it covers, and
     /// the ack (see [`App::heard_ack`]).
     ack: Option<(u64, predict::Ack)>,
+    /// The client's number for the last key before one Neovim may count as
+    /// two, where the agent has said it counted past it, for the frame that
+    /// was said ahead of: Neovim's word that it has taken every key to it,
+    /// and no more of them (see [`predict::Sync::passed`]).
+    passed: Option<u64>,
     /// When each question asked to measure the round trip by was asked.
     asked_at: HashMap<u32, Instant>,
     /// When the user last typed, turned the wheel or pasted: the round trip
@@ -1965,6 +1970,7 @@ impl App {
             done: false,
             predict: predict.then(Predictor::default),
             ack: None,
+            passed: None,
             asked_at: HashMap::new(),
             typed: None,
             lefts: Vec::new(),
@@ -2829,7 +2835,7 @@ impl App {
                             p.typed.answered(sent, mode);
                             if p.acks() {
                                 let taken = result.and_then(redraw::int).unwrap_or(-1);
-                                upto = p.answered(fenced, taken);
+                                upto = p.answered(fenced, taken).or_else(|| p.sync.passed());
                             }
                         }
                         if let Some(upto) = upto {
@@ -2991,6 +2997,7 @@ impl App {
         self.hold_since = None;
         self.pressed = None;
         self.ack = None;
+        self.passed = None;
         if let Some(p) = self.predict.as_mut() {
             p.reset();
             p.attached();
@@ -5345,6 +5352,15 @@ impl App {
             return;
         };
         let Some(k) = p.heard(&ack, now) else {
+            // Past a key Neovim may count as two: the steps for the keys
+            // before it are let go of with the frame that shows them taken,
+            // and at once where Neovim has drawn it already.
+            if let Some(upto) = p.sync.passed() {
+                self.passed = self.passed.max(Some(upto));
+                if self.shows(&ack) {
+                    self.take_acks(now);
+                }
+            }
             self.forget_unsure(now);
             return;
         };
@@ -5385,6 +5401,9 @@ impl App {
     /// time after the frame. And what the keys sent since make is made out
     /// again from there (see [`App::replay`]).
     fn take_acks(&mut self, now: Instant) {
+        if let Some(upto) = self.passed.take() {
+            self.floor(upto, now);
+        }
         let Some((k, ack)) = self.ack.take() else {
             return;
         };
@@ -5696,7 +5715,8 @@ impl App {
     /// taken for a key of the client's (see [`predict::Sync`]), and no step
     /// can be judged: every one is let go of. From a key Neovim may count as
     /// two on only, the steps for the keys before it are judged by what the
-    /// agent says of them as before, and drawn till then: let go of, they
+    /// agent says of them as before, and drawn till then — or till its frame
+    /// once it counts past them (see [`App::floor`]): let go of now, they
     /// would take the screen back to Neovim's last frame, behind them, for a
     /// key that leaves them as they were. Not where a paste only holds
     /// the acks back till a fence after it — Neovim taking it in Normal
@@ -5724,12 +5744,14 @@ impl App {
         }
     }
 
-    /// A fence answered, Neovim having taken the client's keys up to `upto`:
-    /// a step for one of them still drawn is one Neovim took without going
-    /// to wait for a key between — an operator pending, completion — and
-    /// said nothing of, its frame the last word. Every step is let go of,
-    /// and the client is blind from the first key after Neovim's last word
-    /// till it says another.
+    /// A fence answered, Neovim having taken the client's keys up to `upto`
+    /// — or an ack or a fence that counted past a key Neovim may count as
+    /// two, `upto` the key before it: a step for one of them still drawn is
+    /// one Neovim took without going to wait for a key between — an
+    /// operator pending, completion, the key it may count as two read with
+    /// it — and said nothing of, its frame the last word. Every step is let
+    /// go of, and the client is blind from the first key after Neovim's
+    /// last word till it says another.
     fn floor(&mut self, upto: u64, now: Instant) {
         let taken = self.anim.chained().into_iter().any(|grid| {
             self.anim
@@ -11104,6 +11126,46 @@ mod tests {
         answer(&mut a, fence, Value::from(3), t1);
         a.keys(b"l", t1);
         assert_eq!(drawn(&a), (0, 2), "tied again");
+    }
+
+    /// Neovim's word on a key with Alt read with the key before it, which
+    /// says nothing of that key alone but that Neovim has taken it: the step
+    /// for it is let go of with the frame the word was said ahead of, which
+    /// shows Neovim past it — not before, which would take the screen back
+    /// behind it, nor never, which would leave it drawn over what Neovim
+    /// draws after it.
+    #[test]
+    fn a_count_past_a_key_with_alt_lets_go_of_the_steps_before_it_with_its_frame() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        assert_eq!(drawn(&a), (0, 1));
+        a.keys(b"\x1bj", t1);
+        ack(&mut a, 3, "l<Esc>j", "n", (1, 1, 1, 0), t1);
+        assert!(a.anim.chain(2).is_some(), "drawn till the frame");
+        assert_eq!(drawn(&a), (0, 1));
+        redraw(&mut a, cursor_to(1, 1), t1);
+        assert!(a.anim.chain(2).is_none(), "let go of with it");
+        assert_eq!(drawn(&a), (1, 1));
+    }
+
+    /// [`a_count_past_a_key_with_alt_lets_go_of_the_steps_before_it_with_its_frame`],
+    /// said by a fence with keys after it, and no ack: Neovim has drawn its
+    /// frame by the time it answers one, and the step is let go of at once.
+    #[test]
+    fn a_fence_past_a_key_with_alt_lets_go_of_the_steps_before_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"l", t1);
+        calls(&mut a);
+        a.keys(b"\x1bj", t1);
+        let asked = request(&calls(&mut a), "nvim_eval", "luaeval");
+        a.keys(b"l", t1);
+        redraw(&mut a, cursor_to(1, 1), t1);
+        assert!(a.anim.chain(2).is_some(), "nothing says Neovim took it yet");
+        answer(&mut a, asked, Value::from(3), t1);
+        assert!(a.anim.chain(2).is_none(), "the fence does");
+        assert_eq!(drawn(&a), (1, 1));
     }
 
     /// A frame of Neovim's that changes what the window shows elsewhere than
