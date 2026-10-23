@@ -2217,18 +2217,43 @@ fn pages_typed_faster_than_the_link_answers_keep_up_told_the_motions() {
 /// did not — not two round trips and more after — the view back by that
 /// page alone, and the pages after it made again from there, on to where
 /// Neovim ends.
+///
+/// Neovim taking each page in 30 ms, slower than they come: it takes them
+/// all before it goes to wait for a key, and says what it made of them
+/// once, with the frame that draws them.
 #[test]
 fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
+    given_up_at_its_ack("client-unturn-ack", Duration::from_millis(30));
+}
+
+/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`], Neovim taking
+/// each page in 20 ms: part way through them it goes to wait for a key now
+/// and then, and the agent says what it made of the keys so far — as the
+/// next key has come in already, which Neovim goes on to without waiting,
+/// and so without flushing the frame that draws them. The agent flushes
+/// that frame behind its word. Without it, the word was taken with the next
+/// frame Neovim flushed, one for keys after it, in which the page Neovim
+/// did not turn looked turned — a later page made up the rows — and the
+/// page was given up on only once Neovim had caught up, as on a macOS
+/// runner, where Neovim is slower.
+#[test]
+fn a_page_neovim_does_not_turn_is_given_up_at_an_ack_part_way_through() {
+    given_up_at_its_ack("client-unturn-mid", Duration::from_millis(20));
+}
+
+/// Pages typed every 10 ms, the fifth of which Neovim throws away, to a
+/// session whose Neovim takes `scroll` over each: see
+/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`].
+fn given_up_at_its_ack(tag: &str, scroll: Duration) {
     require_nvim!();
-    let scratch = Scratch::new("client-unturn-ack");
-    const SCROLL: Duration = Duration::from_millis(30);
+    let scratch = Scratch::new(tag);
     let (mut rpc, mut term, link) = drawn_slowly_with(
         &scratch,
-        "client-unturn-ack",
+        tag,
         &format!(
             "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
              autocmd WinScrolled * lua vim.uv.sleep({})",
-            SCROLL.as_millis()
+            scroll.as_millis()
         ),
         MOTIONS,
     );
