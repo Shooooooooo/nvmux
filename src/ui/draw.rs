@@ -86,8 +86,9 @@ const SIGN_OUT: u16 = 2;
 /// The picker's hints, in the order the row gives them, each ranked by how
 /// much it is needed: on a screen too narrow for all of them the row drops the
 /// least needed whole, one at a time (see [`super::settings::fit`]). The
-/// picker floating over a session has the same row, fitted the same way to
-/// the panel it is drawn in ([`hints`]).
+/// picker floating over a session has the same row, where this one is: along
+/// the bottom of the screen, under the panel ([`hint_line`], and see
+/// [`super::float`]).
 ///
 /// Seventy-nine columns, so it fits the eighty a terminal opens at, and it
 /// used to be sixty exactly — the widest row that still fit a small terminal
@@ -155,9 +156,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// The hint row where the picker is at rest with nothing else to say there,
 /// on a screen `width` columns wide: as many of [`HINTS`] as fit it, and
 /// [`BACK`] where `Esc` goes back to a session. One row whether the picker
-/// floats or not, so turning `[style] float` changes where it is drawn and
-/// nothing it says.
-pub(super) fn hints(app: &App, width: u16) -> String {
+/// floats or not, on the screen's last row either way, so turning
+/// `[style] float` changes nothing on it.
+fn hints(app: &App, width: u16) -> String {
     let back = app.came_from().is_some().then_some(&BACK);
     let entries: Vec<(Option<&str>, u8)> = HINTS
         .iter()
@@ -165,14 +166,6 @@ pub(super) fn hints(app: &App, width: u16) -> String {
         .map(|&(text, rank)| (Some(text), rank))
         .collect();
     super::settings::fit(&entries, usize::from(width))
-}
-
-/// How wide the hint row is with every hint on it, [`BACK`] among them: what
-/// the picker floating over a session is made wide enough for, where there is
-/// room (see [`super::picker`]).
-pub(super) fn widest_hints() -> u16 {
-    let all: Vec<&str> = HINTS.iter().chain([&BACK]).map(|(t, _)| *t).collect();
-    all.join("  ").width() as u16
 }
 
 /// Every full-screen view is the same shape: a body, then one hint row on the
@@ -784,9 +777,11 @@ fn draw_trail(frame: &mut Frame, area: Rect, spans: Vec<Span<'static>>) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// What the hint row says, and whether it is dim: a hint when nothing is being
-/// asked or typed, and otherwise the thing being asked or typed, at full weight.
-fn hint_line(app: &App, width: u16) -> (String, bool) {
+/// What the hint row says on a screen `width` columns wide, and whether it is
+/// dim: a hint when nothing is being asked or typed, and otherwise the thing
+/// being asked or typed, at full weight. The picker floating over a session
+/// says it along the bottom of the screen too (see [`super::picker`]).
+pub(super) fn hint_line(app: &App, width: u16) -> (String, bool) {
     match app.mode() {
         Mode::Confirm { prompt, .. } | Mode::Leave { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
@@ -1401,10 +1396,6 @@ mod tests {
         assert_eq!(
             render(&a, 120, 6)[5].trim(),
             format!("{}  esc back", all_hints())
-        );
-        assert_eq!(
-            widest_hints() as usize,
-            render(&a, 120, 6)[5].trim().width()
         );
     }
 

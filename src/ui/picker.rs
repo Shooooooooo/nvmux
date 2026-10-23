@@ -6,11 +6,13 @@
 //! It is the picker: its [`App`], drawn by [`super::draw`] — rows, signs, the
 //! note under the list, the effects — into the panel rather than onto the
 //! terminal, on its own keys and the mouse. What changes is where it is drawn
-//! — its hint row the full screen's, as much of it as the panel has room for
-//! ([`draw::hints`]) — and where a key that leads off it goes: another
-//! session, the create prompt, the rename prompt, the help, the settings, out
-//! of nvmux, which is the relay's to follow ([`Leave`]). The help, the settings and the prompts come up in
-//! its place, and go back to it, as they do full screen.
+//! — all of it but its hint row, which stays where the full screen's is,
+//! along the bottom of the screen, and is the full screen's
+//! ([`Floating::draw_hints`]) — and where a key that leads off it goes:
+//! another session, the create prompt, the rename prompt, the help, the
+//! settings, out of nvmux, which is the relay's to follow ([`Leave`]). The
+//! help, the settings and the prompts come up in its place, and go back to
+//! it, as they do full screen.
 //!
 //! # Rows in hand
 //!
@@ -64,25 +66,20 @@ const SESSION_ROWS: u16 = 1;
 /// signs left of the list, and for what flies off the ends of a row in flight.
 const ROOM: u16 = 8;
 
-/// The narrowest the panel is where the screen has room: the whole of the
-/// hint row the picker full screen has over a session ([`draw::widest_hints`]),
-/// a column off either side of the panel's inside — so that turning
-/// `[style] float` changes where the row is and nothing it says — and so room
-/// for what a session's note says under the list as well: Claude Code's asking
-/// for a permission, whole, and how long ago. A longer note is cut, as the
-/// picker's is on a terminal too narrow for it.
+/// The narrowest the panel is where the screen has room: what a session's note
+/// says under the list — Claude Code's asking for a permission, whole, and how
+/// long ago — and a column off either side of the panel's inside. A longer
+/// note is cut, as the picker's is on a terminal too narrow for it.
 ///
-/// Narrower where the screen is, the panel's row gives up hints as the full
-/// screen's does on a narrower terminal, least needed first: on the eighty
-/// columns a terminal opens at, both keep the same eight, `, settings` among
-/// them — the way to the settings that nothing else on the panel shows.
-fn min_width() -> u16 {
-    draw::widest_hints() + 4
-}
+/// The hint row is no measure of it: that is the screen's last row, as wide
+/// as the screen, as it is full screen (see [`Floating::draw_hints`]).
+const MIN_WIDTH: u16 = 50;
 
-/// The panel's rows that are not the list's: one over it; one, and the note,
-/// under it; one more, the hint row and the panel's last.
-const AROUND_LIST: u16 = 7;
+/// The panel's rows that are not the list's: two over it, the list being
+/// centred; one, and the note, under it; and the panel's last, where the
+/// picker has its hint row full screen — blank here, the hint row being along
+/// the bottom of the screen (see [`float::inside`]).
+const AROUND_LIST: u16 = 5;
 
 /// What lists, kills and renumbers the sessions, lent once as nvmux starts:
 /// the panel is opened by the relay, which has no transport of its own.
@@ -384,24 +381,26 @@ impl Panel {
 }
 
 impl Floating for Panel {
-    /// In the middle: as wide as the list and room either side of it, or
-    /// [`min_width`]; as tall as every session and the rows round them —
-    /// every session, not the ones a filter leaves, so the panel holds still
-    /// as one is typed. Smaller where that leaves too little of the session
-    /// round it, and nowhere where even that is too small.
+    /// In the middle of the room above the hint row: as wide as the list and
+    /// room either side of it, or [`MIN_WIDTH`]; as tall as every session and
+    /// the rows round them — every session, not the ones a filter leaves, so
+    /// the panel holds still as one is typed. Smaller where that leaves too
+    /// little of the session round it, and nowhere where even that is too
+    /// small.
     fn area(&self, screen: Rect) -> Option<Rect> {
+        let (room, _) = float::split(screen);
         let list = draw::list_width(&self.app);
         let rows = self.app.sessions().len().max(1) as u16;
         let width = (list + 2 * ROOM + 2)
-            .max(min_width())
-            .min(screen.width.saturating_sub(2 * SESSION_COLS));
-        let height = (rows + AROUND_LIST).min(screen.height.saturating_sub(2 * SESSION_ROWS));
+            .max(MIN_WIDTH)
+            .min(room.width.saturating_sub(2 * SESSION_COLS));
+        let height = (rows + AROUND_LIST).min(room.height.saturating_sub(2 * SESSION_ROWS));
         if width < list + 6 || height < AROUND_LIST + 1 {
             return None;
         }
         Some(Rect::new(
-            screen.x + (screen.width - width) / 2,
-            screen.y + (screen.height - height) / 2,
+            room.x + (room.width - width) / 2,
+            room.y + (room.height - height) / 2,
             width,
             height,
         ))
@@ -426,8 +425,8 @@ impl Floating for Panel {
     }
 
     /// A gesture, as the picker takes it, against the rows where they were
-    /// last drawn; a press outside the panel is the relay's. None while the
-    /// gap `c` opened comes up, as no key is.
+    /// last drawn; a press on the session is the relay's. None while the gap
+    /// `c` opened comes up, as no key is.
     fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did {
         if self.creating.is_some() {
             return Did::Stay;
@@ -540,7 +539,7 @@ impl Floating for Panel {
 
     /// The picker drawn into `area`: as it draws itself on a terminal of the
     /// panel's inside, with the theme's colour on it and whatever is passing
-    /// over it, and laid into a buffer of `area`.
+    /// over it, and laid into a buffer of `area` — all but its hint row.
     fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         let inside = float::inside(area);
@@ -558,12 +557,18 @@ impl Floating for Panel {
             crate::theme::paint(f.buffer_mut());
             effects::paint(f, app, colours);
         });
-        let drawn = terminal.backend().buffer();
-        for y in 0..inside.height {
-            for x in 0..inside.width {
-                buf[(inside.x + x, inside.y + y)] = drawn[(x, y)].clone();
-            }
-        }
+        float::lay(&mut buf, inside, terminal.backend().buffer());
+        buf
+    }
+
+    /// The picker's hint row drawn into `row`, as the picker full screen
+    /// draws its own on a terminal as wide: what it says at rest, or what is
+    /// being asked or typed, in the theme's colour.
+    fn draw_hints(&self, row: Rect) -> Buffer {
+        let mut buf = Buffer::empty(row);
+        let (text, dim) = draw::hint_line(&self.app, row.width);
+        draw::hint_row_on(&mut buf, row, &text, dim);
+        crate::theme::paint(&mut buf);
         buf
     }
 
@@ -756,57 +761,123 @@ mod tests {
         hand(&[], None);
     }
 
+    /// What is on each row of `area` of `buf`.
+    fn rows_of(buf: &Buffer, area: Rect) -> Vec<String> {
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
     /// The panel's hint row is the one the picker full screen has over the
-    /// same session on the same terminal: on the eighty columns a terminal
-    /// opens at, the eight hints that matter most, `esc back` among them; given
-    /// the room, every one, `r rename` and `q quit` as well.
+    /// same session on the same terminal, cell for cell, where that one is:
+    /// the last row of the screen, the whole width of it. On the eighty
+    /// columns a terminal opens at, the eight hints that matter most,
+    /// `esc back` among them; given the room, every one, `r rename` and
+    /// `q quit` as well.
     #[test]
     fn the_panels_hint_row_is_the_full_screens() {
         let _turn = lock(&crate::ui::test_support::PANELS);
         let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
         hand(&rows(&[other, behind]), None);
-        let mut panel = Panel::open(behind);
+        let panel = Panel::open(behind);
         let mut full = App::new(rows(&[other, behind]));
         full.set_came_from(behind);
         for (width, height) in [(80, 24), (120, 36), (200, 50)] {
-            let area = panel
-                .area(Rect::new(0, 0, width, height))
-                .expect("room to float");
-            let buf = panel.draw(area);
-            let floating: String = (area.x..area.x + area.width)
-                .map(|x| buf[(x, area.y + area.height - 2)].symbol())
-                .collect();
-            let screen = crate::ui::test_support::render(width, height, |f| draw::draw(f, &full));
-            let whole = &screen[usize::from(height) - 1];
-            assert_eq!(floating.trim(), whole.trim(), "{width}x{height}");
-            assert!(whole.contains("esc back"), "{width}x{height}: {whole:?}");
+            let (_, row) = float::split(Rect::new(0, 0, width, height));
+            assert_eq!(row, Rect::new(0, height - 1, width, 1));
+            let floating = panel.draw_hints(row);
+            let whole = crate::ui::test_support::buffer(width, height, |f| draw::draw(f, &full));
+            for x in 0..width {
+                assert_eq!(
+                    floating[(x, row.y)],
+                    whole[(x, row.y)],
+                    "{width}x{height}, column {x}"
+                );
+            }
+            let hints = &rows_of(&floating, row)[0];
+            assert!(hints.contains("esc back"), "{width}x{height}: {hints:?}");
             if width == 80 {
                 assert_eq!(
-                    whole.trim(),
+                    hints.trim(),
                     "↑↓ move  ⏎ attach  c new  x kill  ␣ order  / find  , settings  esc back"
                 );
             } else {
-                assert!(whole.contains("r rename") && whole.contains("q quit"));
+                assert!(hints.contains("r rename") && hints.contains("q quit"));
             }
         }
         hand(&[], None);
     }
 
-    /// Drawn where it floats, on the eighty columns a terminal opens at and on
-    /// a wider one, the panel's hint row says how to reach the settings.
+    /// On the eighty columns a terminal opens at and on a wider one, the hint
+    /// row says how to reach the settings.
     #[test]
     fn the_panel_says_how_to_reach_the_settings() {
         let _turn = lock(&crate::ui::test_support::PANELS);
-        let mut panel = Panel::open("abcd2345");
+        let panel = Panel::open("abcd2345");
         for (width, height) in [(80, 24), (200, 50)] {
-            let area = panel
-                .area(Rect::new(0, 0, width, height))
-                .expect("room to float");
-            let buf = panel.draw(area);
-            let hints: String = (area.x..area.x + area.width)
-                .map(|x| buf[(x, area.y + area.height - 2)].symbol())
-                .collect();
+            let (_, row) = float::split(Rect::new(0, 0, width, height));
+            let hints = &rows_of(&panel.draw_hints(row), row)[0];
             assert!(hints.contains(", settings"), "{width}x{height}: {hints:?}");
         }
+    }
+
+    /// The panel is the picker but for its hint row: it floats above that,
+    /// a row of the session between them, and nothing on it says what a key
+    /// does — its last row, where the hint row is full screen, blank.
+    #[test]
+    fn the_panel_leaves_its_hint_row_to_the_bottom_of_the_screen() {
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        let screen = Rect::new(0, 0, 80, 24);
+        let (_, row) = float::split(screen);
+        let area = panel.area(screen).expect("room to float");
+        assert!(area.bottom() + SESSION_ROWS <= row.y, "{area:?}");
+        let rows = rows_of(&panel.draw(area), area);
+        assert_eq!(rows.len(), 2 + AROUND_LIST as usize, "{rows:#?}");
+        assert!(
+            rows[2].contains("s1") && rows[3].contains("s2"),
+            "{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("move") || r.contains("esc")),
+            "{rows:#?}"
+        );
+        assert!(rows[rows.len() - 1].trim().is_empty(), "{rows:#?}");
+        hand(&[], None);
+    }
+
+    /// At its least width the panel has room for what a session's note says
+    /// under the list: Claude Code's asking for a permission, whole, and how
+    /// long ago.
+    #[test]
+    fn at_its_least_width_the_panel_says_a_note_whole() {
+        use crate::notes::{Kind, Note};
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        let note = Note {
+            kind: Kind::Notified,
+            title: "Claude Code".into(),
+            text: "Claude needs your permission".into(),
+            age: Duration::from_secs(59 * 60),
+            read_at: Instant::now(),
+        };
+        panel.app.set_notes(std::collections::HashMap::from([(
+            behind.to_string(),
+            note,
+        )]));
+        let area = panel.area(Rect::new(0, 0, 80, 24)).expect("room to float");
+        assert_eq!(area.width, MIN_WIDTH, "a list narrower than its note");
+        let rows = rows_of(&panel.draw(area), area);
+        let caption = "Claude Code · Claude needs your permission · 59m";
+        assert!(rows.iter().any(|r| r.contains(caption)), "{rows:#?}");
+        hand(&[], None);
     }
 }
