@@ -8,8 +8,8 @@
 //! terminal at once, before [`GRACE`]: only a key from its client can unblock
 //! it.
 //!
-//! Nothing is drawn or read for the first [`GRACE`]. Most attaches finish
-//! sooner (ms locally, a few hundred over ssh), and keys typed meanwhile must
+//! Nothing is drawn or read for the first [`GRACE`]. An idle session attaches
+//! in ms locally, a few hundred over ssh, and keys typed meanwhile must
 //! stay queued for the editor: a `:` typed right after `Enter` on the picker
 //! opens its command line, and a poll would consume it. Unlike other screens,
 //! this one never enables the mouse, so pointer reports stay out of that

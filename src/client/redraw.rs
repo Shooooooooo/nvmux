@@ -2,8 +2,8 @@
 //!
 //! A notification carries batches, each a name and one or more argument
 //! lists: `["grid_line", [1, 0, 0, …], [1, 1, 0, …]]`. Each list becomes one
-//! [`Event`]. Neovim adds parameters over time (`win_float_pos` went from
-//! eight to eleven), so extra arguments are ignored; a list too short or
+//! [`Event`]. Neovim adds parameters over time (`win_float_pos` has gained
+//! four), so extra arguments are ignored; a list too short or
 //! malformed, or an unknown event, is dropped alone rather than with its
 //! batch. The client asks for its event set (see `super::App`), so unknown
 //! events come from a newer Neovim.
@@ -522,7 +522,7 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
             rgb_fg: colour(a.first()?),
             rgb_bg: colour(a.get(1)?),
             rgb_sp: colour(a.get(2)?),
-            // One-based, with nought for none: unlike every other cterm colour
+            // One-based, with 0 for none: unlike every other cterm colour
             // the protocol carries.
             cterm_fg: a
                 .get(3)
@@ -683,7 +683,7 @@ fn line_cells(v: &ValueRef<'_>) -> Option<Vec<LineCell>> {
             Some(v) => Some(u32::try_from(uint(v)?).ok()?),
             None => None,
         };
-        // A repeat of nought is sent, and means no cells: the highlight still
+        // A repeat of 0 is sent, and means no cells: the highlight still
         // carries over.
         let repeat = match run.get(2) {
             Some(v) => size(v)?,

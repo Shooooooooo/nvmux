@@ -18,9 +18,9 @@
 //! bytes, since a client stopped mid-sequence may be waiting for the
 //! terminal's answer.
 //!
-//! `pty` keeps a `Boundary` only while something is drawn: a notice (about a
-//! second at the start of a relay) or the prefix's hint bar
-//! ([`crate::hint`]).
+//! `pty` keeps a `Boundary` only while something is drawn: the prefix's hint
+//! bar ([`crate::hint`]), or the notice ([`crate::announce`], not armed at
+//! present).
 //!
 //! # Non-sequences that also block a write
 //!

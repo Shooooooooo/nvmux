@@ -3103,8 +3103,8 @@ impl Predictor {
 
     /// When a prediction made `now` is dropped unconfirmed: two round trips
     /// plus [`GRACE`] (or 4× the variation) plus [`LOSS`]. With acks, at least
-    /// the smoothed ack lag plus the same slack, since keys typed faster than
-    /// Neovim takes them wait in its typeahead.
+    /// the smoothed ack lag plus [`GRACE`] (or 4× its variation), since keys
+    /// typed faster than Neovim takes them wait in its typeahead.
     pub fn deadline(&self, now: Instant) -> Instant {
         let (srtt, rttvar) = (
             self.srtt.unwrap_or_default(),
@@ -5178,7 +5178,7 @@ mod tests {
             (&wide, 0, 1, 0, (79, 0), 1),
             // 'sidescrolloff' from the edges.
             (&long, 5, 1, 0, (42, 40), 37),
-            // 'sidescroll' columns at least, or with it nought, centred.
+            // 'sidescroll' columns at least, or, with it 0, centred.
             (&wide, 0, 10, 0, (39, 40), 30),
             ("line 3", 0, 0, 0, (5, 40), 0),
             // Past the end of the line, in Insert mode.

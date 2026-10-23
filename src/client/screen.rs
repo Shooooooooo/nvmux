@@ -13,7 +13,7 @@
 //! - Moves and colour changes use the shortest form ([`move_to`],
 //!   [`recolour`]), as Neovim's TUI does. After a non-ASCII character or a
 //!   last-column write, the next move is absolute, since terminals disagree
-//!   there. [`Screen::set_lean`] turns this off for tests.
+//!   there. `Screen::set_lean` turns this off for tests.
 //! - [`Screen::moving_rows`] has the terminal scroll moved rows first and diffs
 //!   against the result ([`super::region`]); [`Screen::new`] rewrites them.
 //! - Frames go inside a synchronized update (`?2026`) unless `'termsync'` is

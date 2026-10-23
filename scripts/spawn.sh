@@ -9,7 +9,7 @@
 #
 # Output:
 #   PID <pid>        the *validated* pid of the new nvim, or empty if we could
-#                    not confirm it (see the safety note below)
+#                    not confirm it (see the note on `pid` below)
 #   SOCK ok|timeout  whether the listen socket appeared
 #   NVMUX_END
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"

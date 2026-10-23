@@ -120,7 +120,7 @@ static LAUNCH_UMASK: OnceLock<Mode> = OnceLock::new();
 ///
 /// This covers only files nvmux writes itself (config, session metadata).
 /// Spawned editors get the original mask back (see [`launch_umask`],
-/// `proc::sh_command`, `pty::client_command`) so they create the user's files
+/// `proc::sh_command`, `pty::spawn_client_with`) so they create the user's files
 /// as the shell would. The listen socket is protected not by the umask but by
 /// the 0700 runtime directory ([`ensure_dir_secure`], also checked by
 /// `scripts/spawn.sh` before every spawn) and an explicit `chmod 600`.

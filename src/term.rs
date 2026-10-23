@@ -217,7 +217,8 @@ impl RawMode {
 
         let mut raw = saved.clone();
         termios::cfmakeraw(&mut raw);
-        // cfmakeraw leaves VSUSP set, which could suspend nvmux mid-session.
+        // cfmakeraw leaves VSUSP set: on a terminal whose VSUSP is not Ctrl-z,
+        // that could suspend nvmux mid-session.
         raw.control_chars[SpecialCharacterIndices::VSUSP as usize] = termios::_POSIX_VDISABLE;
 
         // TCSANOW, not TCSAFLUSH: keep keys typed while the session starts.

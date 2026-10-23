@@ -100,9 +100,9 @@ fn sh_command() -> Command {
     cmd.arg("-s");
     if let Some(mask) = crate::paths::launch_umask() {
         let mask = mask.bits();
-        // Set between fork and exec so only the child gets it: the parent's
-        // mask is process-wide and cannot be swapped around a spawn. `umask(2)`
-        // neither allocates nor locks, as a pre-exec hook requires.
+        // SAFETY: `umask(2)` neither allocates nor locks, as a pre-exec hook
+        // requires. Set between fork and exec so only the child gets it: the
+        // parent's mask is process-wide and cannot be swapped around a spawn.
         unsafe {
             cmd.pre_exec(move || {
                 libc::umask(mask);
