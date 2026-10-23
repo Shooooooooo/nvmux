@@ -17,8 +17,9 @@
 //! It opens on the rows the session loop has in hand ([`hand`]), at once, and
 //! lists behind them on a thread, as the picker does after `<prefix> Space`
 //! (see [`super::Listing`]). A kill or a move made on it lists again, and the
-//! session loop takes the rows that leaves back ([`take_changed`]), so a
-//! `<prefix>` switch afterwards names what is there.
+//! session loop takes the rows that leaves back once the relay is over
+//! ([`take_changed`]), so a `<prefix>` switch afterwards names what is there.
+//! Until then, the next panel over the session opens on them ([`rows`]).
 //!
 //! # The prompts
 //!
@@ -111,7 +112,7 @@ static IN_HAND: Mutex<Vec<Session>> = Mutex::new(Vec::new());
 static ON: Mutex<Option<String>> = Mutex::new(None);
 
 /// The rows as a panel left them, where it changed them, for the session loop
-/// to take back.
+/// to take back, and the next panel to open on.
 static CHANGED: Mutex<Option<Vec<Session>>> = Mutex::new(None);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -203,11 +204,18 @@ pub struct Panel {
 }
 
 impl Panel {
-    /// The picker over session `behind`, on the rows in hand, the cursor on
-    /// the session handed with them or else on that one — and a listing
-    /// begun behind them.
+    /// The picker over session `behind`, on the rows as they stand, the
+    /// cursor on the session handed with them or else on that one — and a
+    /// listing begun behind them.
+    ///
+    /// As they stand, not as they were handed over: a panel taken down with
+    /// `Esc` leaves the relay going, and the session loop takes back what it
+    /// changed only once the relay is over. On the rows handed over, a panel
+    /// opened again over the same session showed a session just moved where
+    /// it had been, until the listing behind them came and put it where it
+    /// went.
     pub fn open(behind: &str) -> Self {
-        let rows = lock(&IN_HAND).clone();
+        let rows = rows();
         // Taken: the next panel over the session, `<prefix> Space`'s, opens
         // on the session again.
         let on = lock(&ON).take();
@@ -640,6 +648,11 @@ mod tests {
         panel.app.visible()[panel.app.selected_index()].id.clone()
     }
 
+    /// The ids of the panel's rows, top to bottom.
+    fn ids(panel: &Panel) -> Vec<String> {
+        panel.app.sessions().iter().map(|s| s.id.clone()).collect()
+    }
+
     fn press(panel: &mut Panel, c: char) -> Did {
         key(panel, KeyCode::Char(c))
     }
@@ -672,6 +685,35 @@ mod tests {
         let esc = back.app.came_from().map(|s| s.id.as_str());
         assert_eq!(esc, Some(behind), "Esc goes back to the session");
         assert_eq!(cursor(&Panel::open(behind)), behind);
+        hand(&[], None);
+    }
+
+    /// A panel opened again over the same session, `Esc` having taken the
+    /// last one down, opens on the rows that one left — a move made on it,
+    /// listed again — and not on the ones handed over before it, which the
+    /// session loop puts right only once the relay is over: on those, the
+    /// session moved is where it was until the listing behind the panel comes.
+    #[test]
+    fn a_panel_opened_again_opens_on_the_rows_the_last_one_left() {
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (one, two, behind) = ("aaaaaaaa", "bbbbbbbb", "cccccccc");
+        hand(&rows(&[one, two, behind]), None);
+        let mut panel = Panel::open(behind);
+        // `behind` put first, and listed again, as `place` leaves the rows.
+        let mut moved = rows(&[one, two, behind]);
+        moved.rotate_right(1);
+        for (s, num) in moved.iter_mut().zip(1..) {
+            s.num = num;
+            s.state.num = num;
+        }
+        panel.app.set_sessions(moved);
+        panel.changed();
+        assert_eq!(key(&mut panel, KeyCode::Esc), Did::Close);
+        assert_eq!(panel.leave(), None, "back to the session");
+
+        let again = Panel::open(behind);
+        assert_eq!(ids(&again), [behind, one, two]);
+        assert_eq!(cursor(&again), behind);
         hand(&[], None);
     }
 
