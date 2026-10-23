@@ -1,99 +1,37 @@
 //! The PTY proxy.
 //!
-//! nvmux runs a Neovim client as a child on a PTY and sits in the byte stream
-//! between the user's terminal and that child. The client is nvmux's own,
-//! `nvmux --client <local_sock>` (see [`crate::client`]), unless `[client] ui
-//! = "nvim"` makes it Neovim's, `nvim --server <local_sock> --remote-ui`; the
-//! relay treats the two the same way in every respect below:
+//! nvmux runs a Neovim client (`nvmux --client <sock>`, see [`crate::client`],
+//! or `nvim --server <sock> --remote-ui` with `[client] ui = "nvim"`) on a PTY
+//! and sits between it and the user's terminal:
 //!
 //! ```text
 //! stdin  -> [ prefix state machine ] -> pty master
 //! stdout <-      (untouched)        <- pty master
 //! ```
 //!
-//! **The child-to-terminal direction is never rewritten or acted on.** That
-//! is the entire reason this design works: bracketed paste, the kitty
-//! keyboard protocol, truecolor, undercurl, terminal titles, OSC 52 clipboard
-//! and DA1/XTGETTCAP round-trips all function because the child negotiates
-//! directly with the real terminal. Any "improvement" that changes this
-//! direction on the strength of what it sees breaks a subset of them. The
-//! relay likewise attaches no UI and reads no grid: the client on the pty is
-//! the UI. Where that is nvmux's own client, the grid handling is that
-//! client's, in a process of its own, and it negotiates with the terminal as
-//! Neovim's would — its bytes pass through here exactly as `nvim
-//! --remote-ui`'s do.
+//! **The child-to-terminal direction is never rewritten or acted on.** The
+//! child negotiates directly with the real terminal, which is what makes
+//! bracketed paste, kitty keys, truecolor, undercurl, titles, OSC 52 and
+//! DA1/XTGETTCAP work. The shadow grid ([`crate::shadow`], for the fade) and
+//! a kept client's ledger ([`crate::ledger`]) get copies; while an overlay is
+//! up, the boundary ([`crate::boundary`]) may delay a trailing partial escape
+//! sequence until the child writes the rest.
 //!
-//! Two readers of this direction. The shadow grid ([`crate::shadow`]) is
-//! shown a *copy* and can neither alter a write nor make one depend on what it
-//! saw; it exists for the fade, and with the fade off a copy of the same kind
-//! stands in for it (see below). The boundary ([`crate::boundary`]) is shown
-//! the bytes as they go and keeps back the few at the end of a write that
-//! would leave the terminal's parser inside a sequence — a delay of
-//! microseconds, until the client writes the rest of them, and only while
-//! there is a notice, a hint bar or the settings on screen to protect.
+//! Output is *held* only for a fading first paint ([`Hold`]), for a client
+//! started ahead ([`Attachment::start_ahead`]) and, a frame at a time, under
+//! the floating settings ([`panel`]). **A held byte is never dropped,
+//! reordered or changed.**
 //!
-//! A kept client (`[client] per_session`, the default) is watched by one more,
-//! shown a copy as the shadow is: its ledger ([`crate::ledger`]) notes what
-//! the client told the terminal, so that it can be told again — the client's
-//! own sequences, replayed, never rewritten — when the client comes back to
-//! the front (see [`Attachment::put_back_what_it_told`]). And with the fade
-//! off, every client's own copy of its screen stands in for the shadow: for a
-//! kept client to come back with, and for the settings to float over.
+//! nvmux's own output (fade frames, the notice and hint bar, a kept client's
+//! repainted screen, the settings panel) is never fed to the shadow. Overlays
+//! drawn during a relay go between the child's escape sequences, found by a
+//! decoder rather than a lull (a session repainting at 60 fps never pauses
+//! 25 ms), in one synchronized update with the session's bytes (see
+//! [`Attachment::write_session_frame`]).
 //!
-//! The direction is also *held* once per relay: with the fade on, a session's
-//! first paint is kept back from the terminal until it has settled, so the
-//! shadow can be dissolved in first, and is then written out exactly as it
-//! came, in one synchronized update, so the terminal ends in the state the
-//! client meant (see [`Hold`]). The queries in that paint reach the terminal
-//! that much later, and their answers reach the client that much later, which
-//! it takes as it takes any answer. **A held byte — by either of the two — is
-//! never dropped, reordered or changed.**
-//!
-//! And a client started ahead of its first visit (`[client] lazy = false`) is
-//! held from the moment it starts until that visit, its startup questions and
-//! all, and then relayed from its first byte, through the hold when there is
-//! one (see [`Attachment::start_ahead`]). The same rule holds, and the same
-//! reasoning: the terminal answers when it hears the questions, and the client
-//! takes the answers when they come.
-//!
-//! Four things ever *join* this direction. The attach notice (see
-//! [`crate::announce`]) — kept, and no longer armed, a card nvmux's own client
-//! draws saying which session this is instead (see [`crate::card`]): a box,
-//! drawn where the
-//! child's own bytes leave the
-//! terminal between escape sequences, which [`crate::boundary`] finds with a
-//! decoder rather than with a clock, and written inside a synchronized update
-//! that also carries the session's own bytes, so that the terminal has no
-//! moment at which it could present the one without the other (see
-//! [`Attachment::write_session_frame`]). Two answers, because the first one
-//! on its own was not enough: a lull — 25 ms of the child saying nothing — is
-//! something a session with a window repainting at sixty frames a second
-//! never gives, and writing the box after every repaint instead only wins the
-//! moments the terminal happens not to present in. And the fade's frames
-//! ([`crate::fade`]), written before the held first paint and after the relay
-//! has stopped. And the hint bar ([`crate::hint`]): the prefix's one-row bar,
-//! put up at a lull and from then on kept up as the notice is — written where
-//! the session's bytes leave the terminal between sequences, in the update
-//! that carries them — and put back from the shadow, and never fed to it
-//! either.
-//! And a kept client's screen, painted back from its copy as the client
-//! returns to the front with no fade to dissolve it in (see
-//! [`Attachment::paint_kept_screen`]).
-//! And the settings, floating over the session ([`panel`]): while they are
-//! up the client's bytes are held, a frame at a time, and go to the terminal
-//! at the front of the frame that paints the session dimmed under them again
-//! — every byte, in order, in one synchronized update with it.
-//!
-//! None of them is ever fed back to the shadow. All four are nvmux's own
-//! picture of the screen rather than the session's bytes, and the notice's
-//! frames are composited *out of* the shadow — so showing them to it would
-//! have it holding nvmux's drawing of the editor with a box in the middle, and
-//! nothing underneath to give back (see [`Attachment::write_over_session`]).
-//!
-//! One hazard that has no other home in the code: **the child's exit code
-//! carries no information.** A server killed while attached gives 0;
-//! terminating the child to detach gives 1; a failed attach gives 1. Teardown
-//! is driven off the master read result instead.
+//! **The child's exit code carries no information** (0 for a killed server, 1
+//! for a detach or a failed attach); teardown is driven off the master read
+//! result instead.
 
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, RawFd};
@@ -115,11 +53,8 @@ use crate::{announce, boundary, card, config, fade, hint, keyseq, rpc, shadow, t
 
 mod panel;
 
-/// A terminal's size as a pty is told it: the `winsize` of `TIOCSWINSZ`.
-///
-/// Ours rather than the pty crate's `Size`, whose fields are private, because
-/// everything that lays anything out over a session reads `rows` and `cols`
-/// off it.
+/// A terminal size as given to `TIOCSWINSZ`. Ours rather than the pty
+/// crate's `Size`, whose fields are private.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
     pub rows: u16,
@@ -129,7 +64,6 @@ pub struct PtySize {
 }
 
 impl Default for PtySize {
-    /// 24x80, what a terminal is taken to be when nothing says otherwise.
     fn default() -> Self {
         Self {
             rows: 24,
@@ -146,101 +80,68 @@ impl From<PtySize> for pty_process::Size {
     }
 }
 
-/// Neovim aborts on the seventeenth attached UI rather than returning an error
-/// (`src/nvim/ui.c`: `if (ui_count == MAX_UI_COUNT) { abort(); }`), which would
-/// SIGABRT the whole server and destroy the session. Refuse well before that.
+/// Neovim aborts on the 17th attached UI instead of returning an error
+/// (`src/nvim/ui.c`), killing the server and the session. Refuse well before.
 const MAX_UIS: usize = 8;
 
-// At compile time: getting this wrong does not fail a test, it SIGABRTs a
-// user's session.
+// Checked at compile time: getting this wrong SIGABRTs a user's session.
 const _: () = assert!(MAX_UIS < 16);
 
-/// What the notice adds for a session that is waiting for a key.
-///
-/// An em dash and four words, appended to the name the box already carries:
-/// the box is one line wide and up for a second, so this is the shortest thing
-/// that says both what is wrong and what to do about it. The card that says it
-/// now takes it off the label again, and says it in its own way (see
-/// [`Attachment::open_desk`]).
+/// Appended to the notice's session name while the session waits for a key;
+/// cards strip it and say it their own way.
 const WAITING: &str = " — press a key";
 
-/// How the relay ended. The attachment is handed back separately by [`relay`].
+/// How the relay ended; the attachment is handed back separately by
+/// [`relay`]. Outcomes that open a screen, switch or resettle leave the
+/// child running.
+///
+/// "Cannot float" below means `[style] float` is off, the terminal is too
+/// small, or nvmux keeps no copy of the session's screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `<prefix> Space` with `[style] float` off, on a terminal too small for
-    /// the picker to float over the session, or for a session nvmux keeps no
-    /// copy of: show the picker full screen. The child keeps running.
+    /// `<prefix> Space` where the picker cannot float: show it full screen.
     ToPicker,
-    /// `<prefix> d` — detach and exit, leaving the session running.
+    /// `<prefix> d`: detach and exit, leaving the session running.
     Detached,
-    /// `<prefix> c` with `[style] float` off, on a terminal too small for the
-    /// prompt to float over the session, or for a session nvmux keeps no copy
-    /// of — prompt for a name full screen and create a new session. The child
-    /// keeps running, so a cancelled prompt puts the user straight back.
+    /// `<prefix> c` where the prompt cannot float: prompt for a name full
+    /// screen and create a session. Cancelling returns to this one.
     CreateNew,
-    /// `c` on the picker floating over the session, where the prompt cannot
-    /// float in its place: on a terminal too small for it — prompt for a name
-    /// full screen and create a new session after the session named, the row
-    /// the picker's cursor was on, as the picker full screen places one; a
-    /// cancelled prompt comes back to this session with the picker floating
-    /// over it again (see [`Attachment::float_the_picker`]). The child keeps
-    /// running.
+    /// `c` on the floating picker where the prompt cannot float: create a
+    /// session placed after the one named (the picker's cursor row). Cancelling
+    /// returns here with the picker floating again (see
+    /// [`Attachment::float_the_picker`]).
     CreateAfter(Option<crate::ids::Id>),
-    /// `r` on the picker floating over the session, where the prompt cannot
-    /// float in its place — prompt full screen for a new name for the session
-    /// it names, and come back to this one with the picker floating over it
-    /// again (see [`Attachment::float_the_picker`]). The child keeps running.
+    /// `r` on the floating picker where the prompt cannot float: rename the
+    /// named session full screen, then return here with the picker floating.
     Rename(crate::ids::Id),
-    /// `<prefix> ?` with `[style] float` off, on a terminal too small for the
-    /// help to float over the session, or a session nvmux keeps no copy of:
-    /// show the key bindings full screen. The child keeps running.
+    /// `<prefix> ?` where the help cannot float: show it full screen.
     ShowHelp,
-    /// `<prefix> ,` with `[style] float` off, on a terminal too small for the
-    /// settings to float over the session, or a session nvmux keeps no copy
-    /// of; or the settings floating over the session, turned not to: show
-    /// them full screen. The child keeps running.
+    /// `<prefix> ,` where the settings cannot float, or the floating settings
+    /// were told not to float: show them full screen.
     ShowSettings,
-    /// The settings over the session changed which client draws a session
-    /// (`client.ui`), or whether clients are kept (`client.per_session`):
-    /// the session loop settles that, and attaches again. The child keeps
-    /// running.
+    /// The settings changed `client.ui` or `client.per_session`: the session
+    /// loop applies it and attaches again.
     Resettle,
-    /// `<prefix> <number>`, `<prefix> n` or `<prefix> p` — attach to the session
-    /// this names. The child keeps running, so a switch that names nothing puts
-    /// the user straight back.
+    /// `<prefix> <number>`, `<prefix> n` or `<prefix> p`. A target that names
+    /// nothing returns to this session.
     Switch(Target),
     /// The child exited on its own.
     ChildExited,
-    /// Our own stdin reached EOF: the terminal went away or the input was
-    /// redirected. The child is still running, so this is handled like a
-    /// detach — the session is left alone — rather than like a child exit,
-    /// which would wait on a child that has no reason to leave.
+    /// Our stdin hit EOF. The child is still running, so this is handled like a
+    /// detach; waiting on it as for a child exit would hang.
     StdinClosed,
 }
 
 impl Outcome {
-    /// Whether this leads from one relay straight into the next, with no
-    /// [`crate::ui`] screen in between to clear the outgoing frame on the way.
-    ///
-    /// Only a switch does — by number or by step. `ToPicker`, `CreateNew`,
-    /// `CreateAfter`, `Rename`, `ShowHelp` and `ShowSettings` all open a
-    /// screen, and a screen clears as it opens; `Resettle` comes back to the
-    /// session by the session loop; the rest end the relay for good.
+    /// Whether the next relay follows with no [`crate::ui`] screen in between
+    /// to clear the outgoing frame. Only a switch does.
     fn leads_straight_into_another_relay(self) -> bool {
         matches!(self, Outcome::Switch(_))
     }
 
-    /// The session this outcome names, for the caller that starts the next
-    /// attachment while the outgoing one dissolves (see [`relay`]). `None` for
-    /// every other way a relay can end: the six that open a screen have
-    /// nothing to start yet — a prompt from the picker comes back to this
-    /// session, whichever session it names — and the three that end it have
-    /// nowhere to go.
-    ///
-    /// Its own accessor rather than a `matches!` at the call site, so the one
-    /// rule it carries is pinned by a test — a new outcome that leads into
-    /// another relay must not be able to arrive here and silently begin
-    /// nothing, which would cost a fade's worth of overlap and no error.
+    /// The session to start attaching while the outgoing one fades (see
+    /// [`relay`]). A method so a test pins that only `Switch` gives one: an
+    /// outcome leading into another relay must not silently start nothing.
     fn switch_target(self) -> Option<Target> {
         match self {
             Outcome::Switch(target) => Some(target),
@@ -258,15 +159,8 @@ impl Outcome {
     }
 }
 
-/// Which session a `<prefix>` switch named: one by its number, the one next to
-/// this one in the picker's order, or — `<prefix> Enter` on a card — the one
-/// the card came from, by its id.
-///
-/// One outcome carrying which, rather than two outcomes, so the answer stays a
-/// value from the keypress all the way to the lookup instead of being spelled
-/// out again at every hand-off. Any can name nothing — a number nobody has,
-/// an empty listing, a session gone since — and that is the session loop's to
-/// settle, not the relay's.
+/// Which session a `<prefix>` switch named: by number, the neighbour in the
+/// picker's order, or by id (`<prefix> Enter` on a card). It may name none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Number(u32),
@@ -276,231 +170,131 @@ pub enum Target {
 
 /// A running client, and the PTY it is talking through.
 pub struct Attachment {
-    /// Which session this client is attached to.
     pub session_id: String,
-    /// The socket the client was attached through — locally the session's
-    /// own, over SSH the local end of the forward — so a resume can ask the
-    /// server a question without going back through the transport.
+    /// The socket the client attached through (the session's own, or the local
+    /// end of the SSH forward), so a resume can query the server directly.
     sock: PathBuf,
-    /// What to announce when this client first takes the terminal, and `None`
-    /// once it has. `spawn` runs exactly when the attached session changed —
-    /// `session_loop` reuses the client otherwise — so this being `Some` *is*
-    /// the "the session changed" test, with no flag threaded through anything.
-    /// A kept client coming back in place of another session's is the one
-    /// other change of session, and has it set again for that relay (see
-    /// [`Attachment::announce_on_arrival`]).
+    /// What to announce when this client first takes the terminal; `None` once
+    /// done. `Some` means the session changed (`spawn` runs only then, as does
+    /// [`Attachment::announce_on_arrival`] for a returning kept client).
     announce: Option<String>,
-    /// The name the picker left standing on the screen for this attach, to be
-    /// taken down as the session takes the terminal: dissolved out over the
-    /// session's first frames where there are frames, erased where there are
-    /// not (see [`crate::handoff`]). `None` for every attach but one from the
-    /// picker, and once the relay has taken it down.
+    /// The name the picker left on screen, taken down as the session takes the
+    /// terminal (see [`crate::handoff`]). Only for attaches from the picker.
     hand_off: Option<HandOff>,
     child: Child,
-    /// The pty's master: the client's output is read from it, and what is
-    /// written into the client goes in through it.
     master: Pty,
-    /// True once the child has been through a full relay, so a resume knows it
-    /// must force a repaint — and that the client is one that already entered
-    /// the alternate screen and will not enter it again, so the terminal has
-    /// to be put back there before it draws.
+    /// Set after a full relay: a resume must force a repaint and restore the
+    /// alternate screen, which the client will not re-enter.
     resumed: bool,
-    /// True once the child has been waited for, so `Drop` does not do it twice.
+    /// Set once the child has been waited for, so `Drop` does not wait again.
     reaped: bool,
-    /// The session's screen as its bytes have described it, kept so the
-    /// session can be dissolved in and out (see [`crate::shadow`]). `None`
-    /// with the fade off or `effects.fade.session` false, and then the client
-    /// parses into `screen` instead.
+    /// The session's screen, for the fade (see [`crate::shadow`]). `None` with
+    /// the fade off or `effects.fade.session` false; `screen` is used instead.
     shadow: Option<shadow::Shadow>,
-    /// The client's copy of its screen, where there is no shadow to be one:
-    /// fed exactly as the shadow is, by [`Attachment::shadow_saw`], and used
-    /// for two things — to put a kept client's screen back the moment it
-    /// returns to the front (see [`Attachment::paint_kept_screen`]), where
-    /// the shadow would have dissolved it in; and to draw the session behind
-    /// the settings when they float over it (see [`panel`]). `None` whenever
-    /// there is a shadow.
+    /// The client's own screen copy when there is no shadow, to repaint a kept
+    /// client and to draw under the floating settings.
     screen: Option<shadow::Shadow>,
-    /// The first paint, while it is being kept back from the terminal so it
-    /// can dissolve in. `None` once released, and always without a shadow.
+    /// The first paint, held back until it can fade in. `None` once released,
+    /// and always without a shadow.
     hold: Option<Hold>,
-    /// Where the terminal's parser stands, kept only while there is something
-    /// of nvmux's on the session's screen to keep there (see
-    /// [`crate::boundary`]): the notice, or the hint bar, from the lull it goes
-    /// up at to its erase (see [`Attachment::watch_the_terminal`]). `None` the
-    /// rest of the time, which is nearly all of a relay.
-    ///
-    /// While it is there, **every byte written to the terminal is shown to it
-    /// exactly once, and said whose it is**: [`Attachment::relay_output`]
-    /// hands it the session's through `relay`, the notice's frames and the
-    /// bar — nvmux's own — say `saw_own`, and the released first paint, the
-    /// session's by another route, says `saw_session`. A byte shown twice
-    /// moves the parser twice; one not shown leaves it describing a terminal
-    /// that no longer exists, and the next thing nvmux draws lands inside a
-    /// sequence.
+    /// The terminal parser's state, tracked only while the notice or hint bar
+    /// is up. Every byte written to the terminal must be shown to it exactly
+    /// once, tagged as the session's or nvmux's, or nvmux's next drawing lands
+    /// inside a sequence.
     boundary: Option<boundary::Boundary>,
-    /// A synchronized update nvmux has opened around a relayed write and
-    /// still owes the close of. Closed on the pass that opened it unless the
-    /// session's bytes ran out mid-sequence, where it is held open rather
-    /// than sawn through: see [`Attachment::close_span`].
+    /// A synchronized update nvmux opened around a relayed write and must still
+    /// close. Kept open if the session's bytes stopped mid-sequence (see
+    /// [`Attachment::close_span`]).
     span: bool,
-    /// What the client has told its terminal that it would not tell it again
-    /// (see [`crate::ledger`]). `Some` exactly when clients are kept one per
-    /// session (`[client] per_session`), which makes it this client's mark of
-    /// being one: a kept client is parked rather than left unread, and comes
-    /// back to the front with what it told the terminal put back — see
-    /// [`Parked`] and [`Attachment::put_back_what_it_told`].
+    /// What the client told the terminal and will not repeat, replayed on
+    /// return. `Some` exactly when clients are kept (`[client] per_session`).
     ledger: Option<Ledger>,
-    /// The terminal has answered this client's attributes request — the last
-    /// of the questions a client opens with, which a terminal answers in the
-    /// order they were asked. Until it has, the client is never parked (see
-    /// [`Attachment::is_parkable`]): cut off before its answers came, which a
-    /// switch typed within its first paint does, it would go without them —
-    /// no keyboard protocol, no synchronized updates, no in-band sizes — for
-    /// as long as it was kept, where a client replaced on the next switch, as
-    /// one not kept always is, simply asks again.
+    /// The terminal has answered the client's DA1, the last of its startup
+    /// queries. Until then it is not parked: kept without the answers, it would
+    /// lack the keyboard protocol, synchronized updates and in-band sizes.
     startup_answered: bool,
-    /// Its in-band size reports were just turned back on (see
-    /// [`Attachment::put_back_what_it_told`]): the size it already has, and
-    /// until when the terminal's answer — a report of that same size — is
-    /// looked for, to be kept from it (see [`Attachment::saw_input`]).
+    /// After in-band size reports are re-enabled: the current size, and until
+    /// when the terminal's matching report is swallowed.
     expecting_a_size_report: Option<(PtySize, Instant)>,
-    /// How many client exits had been relayed to the terminal when this one
-    /// was parked, against [`EXITS_RELAYED`] when it comes back: a difference
-    /// is some other client's exit sequence having turned off modes this one
-    /// set once and relies on (see [`crate::ledger::Ledger::put_back`]).
+    /// [`EXITS_RELAYED`] when parked; a change by its return means another
+    /// client's exit turned off modes this one relies on.
     exits_seen: u64,
-    /// Everything a client started ahead of its first visit has written, in
-    /// order, and nothing else has seen: not the terminal, not the shadow,
-    /// not the ledger (see [`Attachment::start_ahead`]). Relayed first when
-    /// that visit comes, as if it had just been read. `None` for every other
-    /// client, and once relayed.
+    /// A started-ahead client's output, not yet seen by anything; relayed first
+    /// on its first visit.
     unshown: Option<Vec<u8>>,
-    /// The attach probe of a client started ahead, until it answers (see
-    /// [`Attachment::start_ahead`]). One still out when the client is asked
-    /// for is handed over with it, to be waited for as a fresh client's is.
+    /// A started-ahead client's attach probe, until it answers.
     probe: Option<Probe>,
-    /// Whether the client is nvmux's own, which draws cards (see
-    /// [`crate::card`]): Neovim's would be typed what tells it to.
+    /// Whether the client is nvmux's own, which draws cards.
     draws_cards: bool,
-    /// The client has been told it is out of sight, and not yet that it is
-    /// back in front (see [`Attachment::go_away`]).
+    /// Told it is out of sight (see [`Attachment::go_away`]) and not yet back.
     away: bool,
-    /// Of `away`, told to draw at a crawl: what nvmux keeps of its screen may
-    /// be a second behind its session's, until it draws on its way back to
-    /// the front (see [`relay`]).
+    /// While `away`, drawing at a crawl; nvmux's copy may lag by up to 1 s.
     crawling: bool,
-    /// The settings generation the client last heard (see
-    /// [`crate::config::generation`]): the one it was started with, and then
-    /// the one it was last told. A relay that finds it stale tells it the
-    /// settings as they are now, before anything else (see
-    /// [`Attachment::open_desk`]).
+    /// The settings generation the client last heard; if stale, a relay sends
+    /// the current settings first.
     heard: u64,
-    /// What this relay has told its client to show, and what waits to go in:
-    /// one a relay, and only for a client that draws cards.
+    /// This relay's cards for the client; only for a client that draws cards.
     desk: Option<card::Desk>,
-    /// Where the session is among the ones `<prefix> n` and `<prefix> p` step
-    /// through, for the card that says where a switch landed (see
-    /// [`Attachment::place_in_row`]).
+    /// The session's place among those `<prefix> n`/`p` step through, for the
+    /// card showing where a switch landed (see [`Attachment::place_in_row`]).
     row: Option<card::Row>,
-    /// The cells that card stands on, which this relay's fade in leaves
-    /// standing: drawn by the client before the screen comes, it is on the
-    /// screen as it is from the fade's first frame (see [`shadow::Kept`]).
+    /// The cells under that card, which this relay's fade in leaves alone: the
+    /// client draws it before the screen arrives (see [`shadow::Kept`]).
     kept: shadow::Kept,
-    /// The card a switch by key lands with, left standing on the screen this
-    /// relay handed over, for the next to take down as it draws the card again
-    /// (see [`Attachment::take_left_standing`]).
+    /// The landing card left on the screen this relay handed over, for the next
+    /// relay to take down.
     left_standing: Option<HandOff>,
-    /// What the desk opened with (see [`card::Desk::open`]), until it goes
-    /// in: at once for a client whose screen is there already, and for one
-    /// whose first paint is held, as the paint is let through. No card goes
-    /// in while it is held: a row of names on the move, drawn again a frame
-    /// at a time, would keep it from ever settling (see [`Hold`]).
+    /// The desk's opening commands, until sent. Never during a hold: a row of
+    /// names redrawn each frame would keep the paint from settling.
     opening: Vec<card::Command>,
-    /// When the card a switch by key lands with went up, where the switch
-    /// left it standing (see [`HandOff::up_since`]): what it goes in timed
-    /// from.
+    /// When the landing card went up; its timing counts from here.
     landed_since: Option<Instant>,
-    /// The terminal is the background, with nothing of the session on it.
-    /// Set by a panel that went somewhere other than back to the session —
-    /// the picker's `Enter` on another session, say — taking the session out
-    /// to the background with it (see `panel`): the relay's own fade out has
-    /// nothing left to dissolve. And set by a resume that leaves it to the
-    /// settings or the picker, to float over the session at once, to bring
-    /// the session in with them (see [`Attachment::float_the_settings`]).
+    /// The terminal shows only the background: a panel took the session away
+    /// with it, or the settings or picker will float in and bring the session
+    /// with them. The fade out then has nothing to dissolve.
     dark: bool,
-    /// Who is waiting for the session to have painted in front, told on the
-    /// first lull after the next relay has relayed anything — and let go,
-    /// untold, by a relay that ends before then (see
-    /// [`Attachment::tell_when_painted`]).
+    /// Notified on the first lull after the next relay relays anything; dropped
+    /// if that relay ends first.
     painted: Option<mpsc::Sender<()>>,
-    /// What is to come up floating over the session as soon as the next relay
-    /// has the session's screen back, as the command that ends a relay in it
-    /// brings it: the settings, as `<prefix> ,` does, or the picker, as
-    /// `<prefix> Space` does (see [`Attachment::float_the_settings`] and
-    /// [`Attachment::float_the_picker`]).
+    /// The settings or picker to float over the session once the next relay has
+    /// its screen back.
     to_float: Option<Outcome>,
 }
 
-/// How many clients have had their exit sequences relayed to the terminal:
-/// the ones whose sessions ended while in front. Such a sequence turns off,
-/// for the whole terminal, modes every Neovim client sets once and relies on,
-/// which a kept client coming back afterwards must have put back.
+/// How many clients' exit sequences have been relayed (sessions that ended
+/// in front). Each turns off terminal-wide modes every Neovim client sets
+/// once, which a kept client returning afterwards must put back.
 static EXITS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A session's first paint, held back from the terminal.
+/// A session's first paint, held back so it can fade in finished.
 ///
-/// A fade in needs the finished screen before any of it is shown, and a
-/// client paints as it likes: startup queries, the alternate screen, then the
-/// grid in bursts. So from the start of a fresh relay the client's output is
-/// kept here — and shown to the shadow — rather than written, until the
-/// screen has been drawn on and the client has been quiet for [`HOLD_SETTLE`].
-/// The lull is the whole of the test here, and it is the right one: what this
-/// is waiting for is a *finished picture*, which is a question about the
-/// client and not about its bytes, so [`crate::boundary`] — which answers a
-/// question about the bytes — has nothing to say about it. Failing a lull,
-/// [`HOLD_CAP`] after the first byte, so a session that never stops drawing
-/// still appears; failing both, [`HOLD_MAX`] bytes, so a hold can never be a
-/// leak. No card goes in while it is held, so that what one draws as it
-/// comes does not keep the client from going quiet (see
-/// [`Attachment::opening`]).
-///
-/// The release dissolves the shadow in and then writes everything held, in
-/// the order it came and inside one synchronized update, so the terminal
-/// processes the client's paint as one frame over nvmux's last one. The
-/// client's alternate-screen entry is written *before* the frames, so they
-/// land on the screen the session will draw on rather than on the primary
-/// screen the shell comes back to (see [`Attachment::release_hold`]).
+/// Released once something is drawn and the client has been quiet for
+/// [`HOLD_SETTLE`], or at [`HOLD_CAP`] or [`HOLD_MAX`]. The release writes the
+/// held bytes up to the alternate-screen entry, fades the shadow in on that
+/// screen, then writes the rest in one synchronized update.
 #[derive(Debug)]
 struct Hold {
     bytes: Vec<u8>,
-    /// When the first byte arrived, or `None` until it has.
+    /// When the first byte arrived.
     first: Option<Instant>,
-    /// When the client last wrote.
     last: Instant,
 }
 
-/// How long the client must have been quiet, with something drawn, before
-/// its first paint is called complete. The same number as `hint::SETTLE`, and
-/// for the same reason given there: a pty whose buffer filled leaves the
-/// master unreadable for microseconds in the middle of a frame, and this
-/// steps over that gap.
+/// Quiet time after which a drawn first paint is complete. Same as
+/// `hint::SETTLE`: it bridges a full pty buffer's brief gaps mid-frame.
 const HOLD_SETTLE: Duration = Duration::from_millis(25);
 
 /// The longest a first paint is held after its first byte. A local session
-/// settles in about 100 ms; over a distant SSH forward the grid can take a
-/// few round trips to start arriving. A session still drawing at the cap is
-/// dissolved in as far as it has got, and finishes live.
+/// settles in ~100 ms; over SSH it can take a few round trips.
 const HOLD_CAP: Duration = Duration::from_millis(750);
 
-/// The most a hold keeps before releasing regardless. Far past any first
-/// paint — a full 200×50 grid in truecolor is a few tens of KB.
+/// Release at this size regardless (a 200×50 truecolor grid is tens of KB).
 const HOLD_MAX: usize = 1 << 20;
 
-/// The alternate-screen entry a client sends before it draws. The one
-/// sequence a hold looks for, as a fixed string like the DA1 request below.
+/// The alternate-screen entry a client sends before it draws.
 const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 
-/// And its exit, which a parked client sends only on its way out.
+/// Sent by a parked client only on its way out.
 const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
 
 impl Hold {
@@ -512,17 +306,14 @@ impl Hold {
         }
     }
 
-    /// Keep a chunk the client wrote.
     fn take(&mut self, chunk: &[u8], now: Instant) {
         self.bytes.extend_from_slice(chunk);
         self.first.get_or_insert(now);
         self.last = now;
     }
 
-    /// When the relay must next wake up on the hold's account, once there is
-    /// something to wait on. `drawn` is whether the shadow has a glyph yet:
-    /// until it has, a lull releases nothing, so waking for one would spin
-    /// the relay on a `poll` that returns at once until the cap.
+    /// When the relay must next wake for the hold. Undrawn, only the cap: a
+    /// lull would release nothing, and waking for it would spin `poll`.
     fn wake_at(&self, drawn: bool) -> Option<Instant> {
         let first = self.first?;
         let cap = first + HOLD_CAP;
@@ -533,8 +324,6 @@ impl Hold {
         })
     }
 
-    /// Whether the paint is over: drawn on and quiet, or held long enough, or
-    /// large enough. `drawn` is whether the shadow has a glyph anywhere yet.
     fn due(&self, now: Instant, drawn: bool) -> bool {
         let Some(first) = self.first else {
             return false;
@@ -545,34 +334,21 @@ impl Hold {
     }
 }
 
-/// Where the held bytes split for the release: just past the client's
-/// alternate-screen entry, or at the start if it never sent one — a client
-/// whose `TERM` has no `smcup` draws on the primary screen, and so do the
-/// frames then.
+/// Where held bytes split: just past the alternate-screen entry, or 0 if none
+/// (a `TERM` without `smcup` draws on the primary screen).
 fn split_at_alt_screen_entry(bytes: &[u8]) -> usize {
     memmem::find(bytes, ALT_SCREEN_ENTER).map_or(0, |i| i + ALT_SCREEN_ENTER.len())
 }
 
-/// `bytes` with the ends of the synchronized updates in them taken out, so
-/// that all they draw is presented as one, in the update written around them:
-/// a held first paint, which a client draws a frame at a time, each in an
-/// update of its own (see [`Attachment::release_hold`]).
+/// `bytes` without synchronized-update ends, so a held paint presents as one
+/// frame inside the update around it.
 fn unsynced(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     without(bytes, fade::SYNC_END)
 }
 
-/// A first paint let out of its hold, as the release writes it: in one
-/// synchronized update, so that the terminal presents it as one frame (see
-/// [`Attachment::release_hold`]), up to where the client stopped — and what
-/// it was part way through after the update rather than inside it, for the
-/// client's next bytes to finish.
-///
-/// A hold is let go at a lull, or at the cap, and neither waits for the
-/// client to be between sequences: a client writing a screenful a pty's
-/// buffer at a time can stop for a moment in the middle of one. The
-/// update's close written there would land inside the client's sequence —
-/// a colour cut in two by nvmux's `CSI ? 2026 l` — and the terminal, made
-/// to give that sequence up, would print the rest of it as text.
+/// A released first paint in one synchronized update, closed before any
+/// trailing partial sequence: closing a hold released mid-sequence would cut,
+/// say, a colour in two, and the terminal would print the rest as text.
 fn replay(paint: &[u8]) -> Vec<u8> {
     let at = finished(paint);
     let mut out = Vec::with_capacity(paint.len() + fade::SYNC_BEGIN.len() + fade::SYNC_END.len());
@@ -583,11 +359,9 @@ fn replay(paint: &[u8]) -> Vec<u8> {
     out
 }
 
-/// How much of `paint`, a first paint let out of its hold, the client has
-/// finished: all of it, or what is before the frame it is part way through
-/// — which then goes out in an update of the client's own, presented once
-/// the client closes it — or, with no frame of its own open, what is before
-/// the character or sequence it is part way through.
+/// How much of a released paint is finished: up to an unclosed client frame
+/// (which then goes out in the client's own update), else up to a partial
+/// character or sequence.
 fn finished(paint: &[u8]) -> usize {
     if let Some(open) = memmem::rfind(paint, fade::SYNC_BEGIN) {
         if memmem::find(&paint[open..], fade::SYNC_END).is_none() {
@@ -597,8 +371,7 @@ fn finished(paint: &[u8]) -> usize {
     boundary::Boundary::new().relay_whole(paint).len()
 }
 
-/// `bytes` with every `needle` in them taken out and nothing else touched —
-/// the very bytes, borrowed, where there is none.
+/// `bytes` with every `needle` removed; borrowed if there is none.
 fn without<'a>(bytes: &'a [u8], needle: &[u8]) -> std::borrow::Cow<'a, [u8]> {
     let mut found = memmem::find_iter(bytes, needle).peekable();
     if found.peek().is_none() {
@@ -626,66 +399,41 @@ impl std::fmt::Debug for Attachment {
 /// How long a hung-up client gets to exit before it is killed outright.
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How often a hung-up client is looked at, and what it wrote thrown away,
-/// until it has exited. A client hung up goes in a few milliseconds, and every
-/// step of this past that is time the user waits: on a switch with clients not
-/// kept, and on the way out of nvmux, for every client kept out of sight.
+/// Poll interval while reaping a hung-up client. Clients exit within a few
+/// ms, and overshoot is user-visible on switches and on exit.
 const REAP_STEP: Duration = Duration::from_millis(1);
 
 /// How long the teardown paths relay a departing client's restore sequence.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// How long the session must have been quiet before a switch is called painted.
-///
-/// Diagnostics only, for the `timing:` record in [`pump`]. Long enough to step
-/// over the gaps between a heavy config's redraw chunks — an AstroNvim session
-/// on a 200x50 terminal paints in bursts over about 100 ms — and short enough
-/// that the record lands while the switch it describes is still the last thing
-/// that happened.
+/// Quiet time after which a switch counts as painted, for the `timing:` log
+/// only; bridges a heavy config's redraw bursts (~100 ms).
 const PAINT_SETTLED: Duration = Duration::from_millis(150);
 
-/// A DA1 request: `ESC [ c`. What a departing client sends, and what the two
-/// drains watch for — see [`Attachment::answer_device_attributes`].
+/// A DA1 request, which a departing client sends (see
+/// [`Attachment::answer_device_attributes`]).
 const DA1_REQUEST: &[u8] = b"\x1b[c";
 
-/// What a terminal answers a DA1 request with, and what nvmux answers one with
-/// in a terminal's place.
-///
-/// "VT100 with an advanced video option", which every terminal emulator in
-/// existence can claim to be. The content is not what is being asked for: the
-/// client asks at shutdown only to learn that its terminal has worked through
-/// everything it sent, so the arrival is the whole of the message.
+/// "VT100 with advanced video option". The content is irrelevant: a client
+/// asks at shutdown only to know the terminal has caught up.
 const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 
-/// The longest a kept client being resumed is given to finish a frame it
-/// was caught in the middle of (see `Attachment::drain_unrelayed`). A frame
-/// is written in one go, so the rest is microseconds behind; this is only the
-/// bound on a client that stopped half way through one for some other reason.
+/// How long a resumed kept client gets to finish a frame it was caught in.
 const FRAME_WAIT: Duration = Duration::from_millis(50);
 
-/// The longest a kept client being resumed is given to draw the card it was
-/// just asked to, or — back from drawing at a crawl — what it had yet to,
-/// before its backlog is read (see [`relay`]): it draws from what it has, so
-/// it takes a millisecond; this is only the bound on one that is busy with
-/// something else.
+/// How long a resumed kept client gets to draw a requested card (or its
+/// pending redraw after a crawl) before its backlog is read. Normally ~1 ms.
 const CARD_WAIT: Duration = Duration::from_millis(30);
 
-/// The most a resume reads of a kept client's backlog before handing the rest
-/// to the relay, once it has a whole frame: a parked client is read all the
-/// while it is parked, so anything more than a few frames is a client that is
-/// still writing, not one that is behind.
+/// The most backlog a resume reads after a whole frame. A parked client is
+/// read throughout, so more means it is still writing.
 const DRAIN_MAX: usize = 64 * 1024;
 
-/// How long after a resume turns a kept client's in-band size reports back
-/// on the terminal's answer is looked for (see `Attachment::saw_input`). A
-/// terminal answers as soon as it reads the mode; this only bounds how long
-/// one that does not leaves a report of the same size to be kept back.
+/// How long the answer to re-enabled in-band size reports is looked for.
 const SIZE_REPORT_WAIT: Duration = Duration::from_secs(1);
 
-/// The report a terminal with in-band resize reports on (DEC mode 2048)
-/// sends when its size changes: `CSI 48 ; rows ; cols ; height ; width t`,
-/// the last two in pixels, which a terminal that does not know them reports as
-/// zero — as `PtySize` does.
+/// DEC mode 2048's report: `CSI 48 ; rows ; cols ; height ; width t`, pixels
+/// zero when unknown.
 fn in_band_size_report(size: PtySize) -> Vec<u8> {
     format!(
         "\x1b[48;{};{};{};{}t",
@@ -695,27 +443,14 @@ fn in_band_size_report(size: PtySize) -> Vec<u8> {
 }
 
 impl Attachment {
-    /// Say on the notice that the session is waiting for a key.
-    ///
-    /// A blocked session draws nothing until one arrives, so what the user is
-    /// handed is a screen that looks broken — which is exactly how the bug
-    /// this exists for was reported. The notice is nvmux's own — a card its
-    /// client draws from what it has, asking the editor nothing (see
-    /// [`crate::card`]) — so it goes up on a wedged session as readily as an
-    /// idle one, and is the one thing that *can* be said here. Neovim's own
-    /// client draws no card, and with it nothing says so.
-    ///
-    /// Set between the probe and the relay, which is the only point at which
-    /// anyone knows: the label is chosen when the client is forked, a moment
-    /// before the probe has an answer. A no-op once the notice has been shown,
-    /// like everything else that reads `announce`.
+    /// Mark the notice to say the session is waiting for a key; otherwise it
+    /// looks broken, drawing nothing until one arrives. Known only between the
+    /// probe and the relay. No-op once the notice was shown.
     pub fn note_waiting_for_a_key(&mut self) {
         let Some(label) = self.announce.take() else {
             return;
         };
-        // Idempotent, so a caller that says it twice does not stutter. One
-        // attach only ever says it once; this is so that stays a property of
-        // the function rather than of every caller.
+        // Idempotent, so a second call does not repeat the suffix.
         self.announce = Some(if label.ends_with(WAITING) {
             label
         } else {
@@ -723,14 +458,8 @@ impl Attachment {
         });
     }
 
-    /// Arrive without the notice saying which session this is: for an attach
-    /// out of the picker back to the session the user was just in, which a
-    /// card naming it says nothing they do not know about. Out of the picker
-    /// to any other, the notice says it, as on a switch by key.
-    ///
-    /// Only the name goes. A session waiting for a key keeps its notice, which
-    /// is then the one thing that says why the screen is blank — news the
-    /// picker had no way to give (see [`Attachment::note_waiting_for_a_key`]).
+    /// Drop the session name from the notice, for a return from the picker to
+    /// the session just left. A "waiting for a key" notice is kept.
     pub fn arrive_unannounced(&mut self) {
         if self
             .announce
@@ -741,95 +470,43 @@ impl Attachment {
         }
     }
 
-    /// Terminate the client, leaving the session's server running. Verified:
-    /// killing a `--remote-ui` client — with SIGHUP, SIGTERM or SIGKILL — does
-    /// not kill a `--headless --listen` server; the "channel closes, Nvim
-    /// exits" rule is scoped to `--embed`.
+    /// Terminate the client; the server keeps running (killing a `--remote-ui`
+    /// client never kills a `--headless --listen` server).
     pub fn terminate(self) {
-        // `Drop` does the work, so every path that lets go of a live client —
-        // an explicit terminate, an early `?`, a `break` out of the session
-        // loop — retires it the same way.
+        // `Drop` does the work, so every path retires a client the same way.
         drop(self);
     }
 
-    /// Send the client its hangup and return *without waiting for it to go*, so
-    /// the caller can get on with something — spawning the replacement — while
-    /// it dies. SIGHUP is what the client would get if the terminal itself went
-    /// away. `reap` does the waiting and `Drop` calls it, so an attachment must
-    /// still be held until the client is genuinely wanted gone.
-    ///
-    /// Through `libc` rather than `Child::kill`, which is SIGKILL: no hangup at
-    /// all, so a client with a terminal to put back never gets to. Nor does
-    /// this wait: that is `reap`'s job, and a hangup that blocked would leave
-    /// the switch path nothing to overlap.
-    ///
-    /// SIGCONT as well, because SIGHUP is not delivered to a *stopped* process
-    /// at all, and a client that stopped itself (see `check_child`) can be
-    /// retired before the pump's idle poll has revived it. `reap`'s `try_wait`
-    /// does not pass `WUNTRACED` either, so without this a stopped client would
-    /// read as running for the whole of `REAP_TIMEOUT`. Hung up first and
-    /// continued second, it takes the pending hangup and goes.
-    ///
-    /// Sending it twice is harmless, which is what lets `Drop` run after an
-    /// explicit `hang_up`: nothing in between waits for the child — the peek in
-    /// `check_child` passes `WNOWAIT` — so the pid is still ours and cannot have
-    /// been recycled.
+    /// Send SIGHUP and return without waiting, so the caller can spawn the
+    /// replacement meanwhile; `reap` (from `Drop`) waits. Not `Child::kill`
+    /// (SIGKILL), which gives no chance to restore the terminal. SIGCONT too:
+    /// SIGHUP is not delivered to a stopped process (see `check_child`). Safe
+    /// to repeat: nothing waits in between, so the pid cannot be recycled.
     pub fn hang_up(&mut self) {
         if self.reaped {
             return;
         }
         let pid = self.child.id() as libc::pid_t;
-        // SAFETY: a pid this process spawned and has not waited for, so it names
-        // that child or nothing.
+        // SAFETY: our child's pid, not yet waited for: that child or nothing.
         unsafe {
             libc::kill(pid, libc::SIGHUP);
             libc::kill(pid, libc::SIGCONT);
         }
     }
 
-    /// Write to the terminal, then let the shadow see what was written.
-    ///
-    /// The plain path for the session's bytes — a relay with no notice up and
-    /// no first paint held — and for the tails the boundary lets go of
-    /// ([`Attachment::release_the_sessions_close`],
-    /// [`Attachment::release_kept`]). The two other paths write the session's
-    /// bytes themselves and show the shadow the same bytes:
-    /// [`Attachment::write_session_frame`] wraps a relayed piece in a
-    /// synchronized update and feeds the shadow after the write (or, for a
-    /// client that brackets its own frames, comes back through here), and a
-    /// held first paint is fed to the shadow as it is held
-    /// ([`Attachment::relay_output`]) and written later by
-    /// [`Attachment::release_hold`]. Across all three the shadow sees every
-    /// byte of the session's screen exactly once — the same rule the boundary
-    /// lives by — so what it holds is what the client drew. Here the write
-    /// comes first and the shadow after: nothing about the shadow may delay or
-    /// change what the user sees.
-    ///
-    /// nvmux's own notice does not come through here — see
-    /// [`Attachment::write_over_session`].
+    /// Write session bytes to the terminal, then feed the shadow, which must
+    /// never delay what the user sees. Across all write paths the shadow sees
+    /// each session byte exactly once.
     fn write_terminal(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         write_stdout(bytes)?;
         self.shadow_saw(bytes);
         Ok(())
     }
 
-    /// Write something of nvmux's own over the session's screen: the attach
-    /// notice, and the hint bar the prefix puts up ([`crate::hint`]).
-    ///
-    /// The shadow must not take these for the session's. Its grid is what the
-    /// *client* drew, not what the terminal shows, and keeping it that way is
-    /// exactly what lets the notice dissolve into the screen instead of into a
-    /// hole — the cells it is covering are still there to be given back (see
-    /// [`crate::shadow::Shadow::under`]). Shown the notice, the shadow would
-    /// hold the box and have nothing underneath it to restore.
-    ///
-    /// The terminal has still been written to behind the shadow's back, so the
-    /// diff its next frame would trust no longer matches the screen and has to
-    /// go — the same reason [`Attachment::release_hold`] invalidates after
-    /// replaying what it held.
-    ///
-    /// The boundary *is* shown them, because its subject is the terminal
-    /// rather than the session (see [`Attachment::boundary`]).
+    /// Write nvmux's own drawing over the session (notice, hint bar). Not fed
+    /// to the shadow, which must keep what the client drew so overlays can be
+    /// removed (see [`crate::shadow::Shadow::under`]); its diff is invalidated
+    /// instead. Fed to the boundary, which tracks the terminal.
     fn write_over_session(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         write_stdout(bytes)?;
         if let Some(shadow) = self.shadow.as_mut() {
@@ -841,8 +518,7 @@ impl Attachment {
         Ok(())
     }
 
-    /// Let the shadow see bytes something else wrote to the terminal — the
-    /// hand-off strings [`crate::term`] writes on the client's behalf.
+    /// Feed bytes that reached the terminal to the shadow or `screen`.
     fn shadow_saw(&mut self, bytes: &[u8]) {
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.feed(bytes);
@@ -852,29 +528,18 @@ impl Attachment {
         }
     }
 
-    /// Let the ledger see what the client wrote — every byte of it, once,
-    /// whichever way it went: relayed, held as a first paint, or read while
-    /// parked.
+    /// Feed client output to the ledger, each byte once.
     fn ledger_saw(&mut self, bytes: &[u8]) {
         if let Some(ledger) = self.ledger.as_mut() {
             ledger.saw(bytes);
         }
     }
 
-    /// Note what the user's terminal sends the client, for the two things a
-    /// kept client needs to know of it: that its opening questions have been
-    /// answered (see [`Attachment::startup_answered`]), and the size report a
-    /// resume set off — which is taken out.
-    ///
-    /// A terminal answers in-band size reports being turned back on with a
-    /// report of the size it has, which is the size the client has too.
-    /// Passed on, it has the client ask its server to resize to that same
-    /// size, and a server in `input()` or `getchar()` answers that with a
-    /// clear and nothing but the prompt's row — after the `:mode` the resume
-    /// asked for, as often as not, which is then wiped. Kept from the client
-    /// it changes nothing: a size that changed while the client was parked it
-    /// has been told already (see [`Attachment::tell_its_size`]). A report of
-    /// any other size is a resize made since, and goes through.
+    /// Watch terminal input to a kept client: note when its startup queries are
+    /// answered, and swallow the size report a resume triggered. That report
+    /// repeats the client's current size; passed on, the server would resize to
+    /// the same size, which in `input()` or `getchar()` clears to the prompt
+    /// row and wipes the `:mode` repaint. Other sizes go through.
     fn saw_input(&mut self, step: &mut Step) {
         if self.ledger.is_none() {
             return;
@@ -898,55 +563,38 @@ impl Attachment {
         }
     }
 
-    /// Whether this client is kept one per session (`[client] per_session`):
-    /// parked rather than left unread, and resumed with its screen painted
-    /// straight back.
+    /// Whether this client is kept (`[client] per_session`).
     pub fn is_kept(&self) -> bool {
         self.ledger.is_some()
     }
 
-    /// Whether this client may be parked: kept, and past the handshake a
-    /// client opens with (see [`Attachment::startup_answered`]).
+    /// Kept, and its startup queries answered.
     pub fn is_parkable(&self) -> bool {
         self.is_kept() && self.startup_answered
     }
 
-    /// Say on the next relay which session this is, as a fresh client does:
-    /// `label` is what [`announce::label`] made of the session's name, the one
-    /// place a name is made safe to reach a raw terminal.
-    ///
-    /// For a kept client coming back to the front in place of another
-    /// session's: that is as much a change of session as a spawn, and the
-    /// label is the session's name as it is now, which a rename since the
-    /// client started may have changed.
+    /// Announce the session on the next relay, for a kept client returning in
+    /// place of another's. `label` comes from [`announce::label`].
     pub fn announce_on_arrival(&mut self, label: String) {
         self.announce = Some(label);
     }
 
-    /// Where the session is among the ones `<prefix> n` and `<prefix> p` step
-    /// through, and for a step, which way it went: what the card that says
-    /// where a switch landed shows beside the name, if there is one to show.
+    /// The session's place among those `<prefix> n`/`p` step through, and a
+    /// step's direction, shown beside the name on the landing card.
     pub fn place_in_row(&mut self, row: card::Row) {
         self.row = Some(row);
     }
 
-    /// The card a switch by key landed with, as the relay that ended in the
-    /// switch left it standing on the screen it handed over: for the next
-    /// attach to carry, as it carries the picker's name ([`carry_name`]).
-    ///
-    /// [`carry_name`]: Attachment::carry_name
+    /// The landing card the last relay left on screen, for the next attach to
+    /// carry like the picker's name.
     pub fn take_left_standing(&mut self) -> Option<HandOff> {
         self.left_standing.take()
     }
 
-    /// Have the client draw `card` — what the switch this relay ended in
-    /// lands with — over the screen it is about to leave: off with what else
-    /// it shows, on with the card, and what it draws for it read into the
-    /// shadow, which the fade out is drawn from, as a kept client's return is
-    /// (see [`CARD_WAIT`]). The cells the card stands on, for the fade out to
-    /// leave standing, and when it went up, which is what it is timed from on
-    /// the screen it lands on too (see [`card::Card::up_ms`]); nothing where
-    /// there is no fade to stand it through, or no client to draw it.
+    /// Have the client draw `card` (this switch's landing card) over the screen
+    /// it is leaving, read into the shadow for the fade out. Returns the card's
+    /// cells, for the fade to leave alone, and when it went up. `None` without
+    /// a fade or a card-drawing client.
     fn stand_landing(&mut self, card: &card::Card) -> Option<(shadow::Kept, Instant)> {
         if !self.draws_cards || !fade::enabled() || !fade::session() || self.shadow.is_none() {
             return None;
@@ -965,14 +613,9 @@ impl Attachment {
         None
     }
 
-    /// Read what the client writes, as [`Attachment::drain_unrelayed`] does,
-    /// until the shadow shows `kept` — the card it was just told to draw — or
-    /// `deadline`. Says whether it does.
-    ///
-    /// Until the card, and not only until the client writes something: it is
-    /// told to come back and to show the card in two writes, and a client
-    /// that reads them apart answers the first with a frame of its own, a
-    /// moment before the one with the card.
+    /// Read client output until the shadow shows `kept` or `deadline`; returns
+    /// whether it did. Not just until any output: a client reading the return
+    /// and the card apart answers the first with a frame of its own.
     fn drain_until_shown(&mut self, kept: &shadow::Kept, deadline: Instant) -> bool {
         loop {
             self.await_output(deadline.saturating_duration_since(Instant::now()));
@@ -986,10 +629,8 @@ impl Attachment {
         }
     }
 
-    /// Dissolve the session out, from the shadow, leaving `kept` standing —
-    /// and where what stands moves, with what the client draws of it read
-    /// into the shadow between frames, so that it goes on moving as the
-    /// screen under it goes (see [`fade::Between`]). Says whether it did.
+    /// Fade the session out, leaving `kept` alone; a moving `kept` is read from
+    /// the client between frames. Returns whether it faded.
     fn fade_out(&mut self, kept: &shadow::Kept) -> bool {
         let Some(mut shadow) = self.shadow.take() else {
             return false;
@@ -1008,11 +649,8 @@ impl Attachment {
         })
     }
 
-    /// Between the frames of a fade that has the shadow out to draw from
-    /// (see [`fade::Between`]): wait until `until` for what the client
-    /// writes, and read all of it into `shadow` and the ledger, as
-    /// [`Attachment::saw_unrelayed`] does — and into `held` as well, where it
-    /// is still owed to the terminal (see [`Attachment::release_hold`]).
+    /// Between fade frames: until `until`, read client output into `shadow`,
+    /// the ledger and `held` (if still owed to the terminal).
     fn read_while_fading(
         &mut self,
         shadow: &mut shadow::Shadow,
@@ -1035,8 +673,7 @@ impl Attachment {
             if n == 0 {
                 return;
             }
-            // A client that has gone has nothing more to draw, and the fade
-            // goes on without it.
+            // The client is gone; the fade continues without it.
             if n < 0 || !ready(&p[0]) {
                 fade::wait(shadow, until);
                 return;
@@ -1059,10 +696,8 @@ impl Attachment {
         }
     }
 
-    /// Read what the client writes into the shadow and the ledger, and into
-    /// `held`, still owed to the terminal, until the shadow shows the card
-    /// this relay's fade in leaves standing (see [`Attachment::kept`]), or
-    /// `deadline`.
+    /// Read client output into the shadow, the ledger and `held` until the
+    /// shadow shows the landing card, or `deadline`.
     fn read_until_shown(&mut self, deadline: Instant, held: &mut Vec<u8>) {
         let Some(mut shadow) = self.shadow.take() else {
             return;
@@ -1079,9 +714,8 @@ impl Attachment {
         self.shadow = Some(shadow);
     }
 
-    /// The cells this relay's fade in leaves standing: its arrival's, where
-    /// the screen it dissolves in has the arrival on it (see
-    /// [`shadow::Shadow::shows`]), and none otherwise.
+    /// The cells this relay's fade in leaves alone: the landing card's, if the
+    /// shadow shows it.
     fn standing(&self) -> shadow::Kept {
         match self.shadow.as_ref() {
             Some(shadow) if shadow.shows(&self.kept) => self.kept.clone(),
@@ -1089,9 +723,8 @@ impl Attachment {
         }
     }
 
-    /// The name the picker left standing for this attach (see
-    /// [`crate::handoff`]): the relay takes it down as the session takes the
-    /// terminal, and from here nothing else may draw before it does.
+    /// The name the picker left on screen (see [`crate::handoff`]). The relay
+    /// takes it down as the session takes the terminal; nothing may draw first.
     pub fn carry_name(&mut self, hand_off: HandOff) {
         self.hand_off = Some(hand_off);
     }
@@ -1102,25 +735,12 @@ impl Attachment {
         self.hand_off.as_ref().and_then(|h| h.over(rows, cols))
     }
 
-    /// Read whatever the client has written since anything last did, and show
-    /// it to the shadow and the ledger rather than to the terminal.
-    ///
-    /// For a kept client being resumed, in place of [`discard_pending`]: those
-    /// bytes describe the screen the client believes the terminal has — which
-    /// is the one about to be painted back — and any word it said in them
-    /// about the mouse or the title is one it will not say again.
-    ///
-    /// And a client caught half way through a frame is let finish it here,
-    /// for up to [`FRAME_WAIT`]: the half already read went to the shadow,
-    /// not the terminal, so relaying the other half would hand the terminal
-    /// the tail of a sequence whose head it never saw — printed as text until
-    /// the repaint clears it. Only a client that was busy while parked — a
-    /// `:terminal` running something — is ever caught like that, and Neovim
-    /// writes a frame in one go, so the rest is already on its way.
-    ///
-    /// Bounded either way, by [`FRAME_WAIT`] and [`DRAIN_MAX`]: a client
-    /// parked with a `:terminal` running something never runs out of things
-    /// to say, and what it says after this is the relay's.
+    /// Read pending client output into the shadow and ledger, not the terminal:
+    /// on resuming a kept client it describes the screen about to be painted
+    /// back, and any mouse or title change in it will not be repeated. A client
+    /// caught mid-frame gets up to [`FRAME_WAIT`] to finish, or the rest would
+    /// print as text; bounded by [`DRAIN_MAX`], since a busy `:terminal` never
+    /// stops writing.
     fn drain_unrelayed(&mut self) {
         let fd = self.master.as_raw_fd();
         let mut buf = [0u8; 8192];
@@ -1140,8 +760,7 @@ impl Attachment {
             let wait_ms = wait.as_micros().div_ceil(1000) as libc::c_int;
             let mut p = [pollfd(fd)];
             let n = unsafe { libc::poll(p.as_mut_ptr(), 1, wait_ms) };
-            // The relay's `SIGWINCH` handler is in by now, and a resize during
-            // the wait is no reason to hand over half a frame.
+            // A `SIGWINCH` is no reason to hand over half a frame.
             if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
@@ -1159,28 +778,18 @@ impl Attachment {
         }
     }
 
-    /// What a client wrote that did not reach the terminal, and never will:
-    /// the shadow and the ledger keep up with it all the same, so the one
-    /// knows the screen the client will repaint and the other what it told
-    /// the terminal on the way.
+    /// Client output that never reaches the terminal, still tracked by the
+    /// shadow and the ledger.
     fn saw_unrelayed(&mut self, bytes: &[u8]) {
         self.shadow_saw(bytes);
         self.ledger_saw(bytes);
     }
 
-    /// Put back what the client told the terminal and would not tell it
-    /// again, before it draws on it: its mouse reporting, its title, its
-    /// keyboard protocol and its cursor's shape and colour — and, if another
-    /// client's exit has reached the terminal since this one was parked, the
-    /// modes that exit turned off (see [`crate::ledger::Ledger::put_back`]).
-    /// `size` is the size the client has now, the one the terminal answers
-    /// in-band size reports turned back on with (see
-    /// [`Attachment::saw_input`]).
-    ///
-    /// For a kept client's return, where it is exact — the ledger holds what
-    /// the client itself last wrote. A client that is not kept has its
-    /// server asked about the mouse instead, and the rest left alone (see
-    /// [`repaint_through_server`]).
+    /// Restore what the kept client told the terminal and will not repeat
+    /// (mouse, title, keyboard protocol, cursor), plus modes another client's
+    /// exit turned off while it was parked (see
+    /// [`crate::ledger::Ledger::put_back`]). `size` is its current size, which
+    /// the terminal will report back (see [`Attachment::saw_input`]).
     fn put_back_what_it_told(&mut self, size: PtySize) {
         let Some(ledger) = self.ledger.as_ref().filter(|l| l.is_usable()) else {
             return;
@@ -1196,39 +805,20 @@ impl Attachment {
         }
     }
 
-    /// Tell a kept client coming back to the front the size the terminal
-    /// has now, if it changed while the client was parked.
-    ///
-    /// Usually the pty is enough: `resize_to` gives it the new size and the
-    /// kernel signals the client. Not for a client that has turned in-band
-    /// resize reports on (DEC mode 2048: kitty, ghostty, foot) — it takes its
-    /// size from those and ignores `SIGWINCH` altogether, and the reports the
-    /// terminal sent while it was parked went to whatever was in front. So it
-    /// is sent the report the terminal would have sent, written to its input
-    /// in one write. Measured on 0.11.0 and 0.12.5: taken as a size, never as
-    /// keys, by a client that turned the mode on — the ledger says which kind
-    /// of client this is, from its own output.
-    ///
-    /// Only for a size that changed. The repaint is asked of the server with
-    /// `:mode` all the same (see [`relay`]): a client told its size asks its
-    /// server to resize, and a server answers a resize to the size it already
-    /// has with a clear and — in `input()` or `getchar()` — nothing but the
-    /// prompt's row, where `:mode` draws every row.
+    /// Tell a returning kept client a size that changed while it was parked.
+    /// One with in-band resize reports on (DEC mode 2048: kitty, ghostty, foot)
+    /// ignores `SIGWINCH`, so it is written the report the terminal would send
+    /// (Neovim 0.11.0 and 0.12.5 take it as a size, not keys). Unchanged sizes
+    /// are skipped: a same-size resize clears to the prompt row in `input()`.
     fn tell_its_size(&mut self, size: PtySize, resized: bool) {
         if resized && self.ledger.as_ref().is_some_and(Ledger::reads_size_in_band) {
             self.report_size_in_band(size);
         }
     }
 
-    /// Write an in-band size report into the client's input — `CSI 48 ; rows
-    /// ; cols ; height px ; width px t`, what a terminal with DEC mode 2048
-    /// sends on a resize — and say whether it went out whole.
-    ///
-    /// Only to a client that turned the mode on, which is one that reads this
-    /// as a report and not as keys. One `write` and never a `write_all`, for
-    /// the reason [`Attachment::answer_device_attributes`] gives: a report in
-    /// pieces *would* be read as keys, and a report that did not fit is
-    /// better not sent.
+    /// Write an in-band size report into the client's input; returns whether it
+    /// went out whole. One `write`, never `write_all`: a split report would be
+    /// read as keys, and one that does not fit is better not sent.
     fn report_size_in_band(&mut self, size: PtySize) -> bool {
         let fd = self.master.as_raw_fd();
         if !writable(fd) {
@@ -1244,10 +834,8 @@ impl Attachment {
         true
     }
 
-    /// Tell the client to do `cmd`, in its input: one write, as
-    /// [`Attachment::report_size_in_band`] makes one, for the same reason —
-    /// a sequence in pieces would be read as keys. Best effort: a client whose
-    /// input queue is full is not shown the card.
+    /// Send `cmd` into the client's input in one write: split, it would be read
+    /// as keys. Best effort: dropped if the input queue is full.
     fn tell_client(&mut self, cmd: &card::Command) {
         let fd = self.master.as_raw_fd();
         if !writable(fd) {
@@ -1261,10 +849,8 @@ impl Attachment {
         }
     }
 
-    /// Open this relay's desk, for a client that draws cards, with what to
-    /// tell the client first (see [`card::Desk::open`] and
-    /// [`Attachment::put_in_opening`]): whether that is a card saying where
-    /// the switch landed.
+    /// Open this relay's desk for a card-drawing client and queue its opening
+    /// commands. Returns whether they include a landing card.
     fn open_desk(&mut self) -> bool {
         if !self.draws_cards {
             return false;
@@ -1283,9 +869,8 @@ impl Attachment {
             shadow::Kept::arrival(card, size.cols, size.rows)
         });
         self.opening = desk.open(arrival);
-        // A client that last heard the settings before they changed — on
-        // the settings screen this relay is back from, or while it was kept —
-        // is told them as they are now, ahead of anything it is to show.
+        // A client that missed a settings change (on the settings screen this
+        // relay returns from, or while kept) is sent the current ones first.
         let generation = crate::config::generation();
         if self.heard != generation {
             self.heard = generation;
@@ -1297,12 +882,9 @@ impl Attachment {
         landed
     }
 
-    /// Tell the client what the desk opened with, if the stream to it is
-    /// between keys — as it is before anything has been passed on in this
-    /// relay, and may not be by the time a held paint is let through: the
-    /// card the switch landed with up as long as it has been since the key,
-    /// where the switch left it standing, so that it goes on from where it had
-    /// come to (see [`card::Card::up_ms`]). Says whether it went in.
+    /// Send the desk's opening commands if the input stream is between keys,
+    /// with the landing card aged by the time since the key (see
+    /// [`card::Card::up_ms`]). Returns whether they went in.
     fn put_in_opening(&mut self, now: Instant) -> bool {
         if self.opening.is_empty() || !self.desk.as_ref().is_some_and(|d| d.forwarded.clear(now)) {
             return false;
@@ -1320,9 +902,7 @@ impl Attachment {
         true
     }
 
-    /// Put in what waits on the desk, if the stream allows it now — what it
-    /// opened with before anything else — and nothing while the first paint
-    /// is held (see [`Attachment::opening`]).
+    /// Send queued cards, opening commands first; nothing during a hold.
     fn send_cards(&mut self, now: Instant) {
         if self.hold.is_some() || (!self.opening.is_empty() && !self.put_in_opening(now)) {
             return;
@@ -1335,10 +915,8 @@ impl Attachment {
         }
     }
 
-    /// When to look again for a moment to put in what waits for the client:
-    /// what the desk opened with, or what has come for it since. Not while
-    /// the first paint is held, which lets it all in as it lets the paint
-    /// through.
+    /// When to retry sending queued cards. `None` while the first paint is
+    /// held; its release sends them.
     fn cards_due(&self) -> Option<Instant> {
         let desk = self.desk.as_ref().filter(|_| self.hold.is_none())?;
         if self.opening.is_empty() {
@@ -1348,9 +926,8 @@ impl Attachment {
         }
     }
 
-    /// `<prefix> Enter`: go where the newest card that goes somewhere is
-    /// about — a switch to the session it came from, or that session's own
-    /// terminal shown — and take the card down.
+    /// `<prefix> Enter`: act on the newest card with a destination (switch to
+    /// its session, or show that session's terminal) and take it down.
     fn go(&mut self, now: Instant) -> Option<Outcome> {
         let (_, go) = self.desk.as_mut()?.go()?;
         self.send_cards(now);
@@ -1363,8 +940,7 @@ impl Attachment {
         }
     }
 
-    /// Wait up to `within` for the client to write something, without reading
-    /// it.
+    /// Wait up to `within` for client output, without reading it.
     fn await_output(&self, within: Duration) {
         let fd = self.master.as_raw_fd();
         let mut p = [pollfd(fd)];
@@ -1372,31 +948,18 @@ impl Attachment {
         let _ = unsafe { libc::poll(p.as_mut_ptr(), 1, ms) };
     }
 
-    /// Pass on what the client wrote ([`Attachment::show_output`]), and only
-    /// then show the ledger it.
-    ///
-    /// The ledger only watches, like the shadow, and no more than the shadow
-    /// may it hold up what the user sees: what it makes of a chunk is read
-    /// when the client is parked and when it is resumed, never on the way to
-    /// the terminal. It is shown the chunk as the client wrote it, all of it,
-    /// whether the terminal was written to, the boundary kept a tail back, the
-    /// first paint is held — or the write failed.
+    /// Pass on client output, then feed the whole chunk to the ledger, which
+    /// (like the shadow) must never delay what the user sees.
     fn relay_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
         let shown = self.show_output(chunk, now);
         self.ledger_saw(chunk);
         shown
     }
 
-    /// Show the terminal what the client wrote — or, while its first paint is
-    /// held, keep it and show only the shadow.
-    ///
-    /// While a notice or the hint bar is up the chunk goes through the
-    /// boundary first, which keeps back whatever would leave the terminal's
-    /// parser inside a sequence. A few bytes, for as long as it takes the
-    /// client to write the rest of them, and [`crate::boundary`] says why it is
-    /// worth it: it is what lets the notice, or the bar, go back up after
-    /// *every* write rather than after the one read in six that happens to end
-    /// where a sequence does.
+    /// Write client output to the terminal, or during a hold keep it and feed
+    /// only the shadow. While an overlay is up, the boundary holds back a
+    /// trailing partial sequence, so the overlay can go back up after every
+    /// write.
     fn show_output(&mut self, chunk: &[u8], now: Instant) -> std::io::Result<()> {
         if let Some(hold) = self.hold.as_mut() {
             hold.take(chunk, now);
@@ -1407,9 +970,8 @@ impl Attachment {
         }
         if let Some(boundary) = self.boundary.as_mut() {
             let ready = boundary.relay(chunk, now);
-            // A read that was all tail leaves nothing to do. Not merely a
-            // wasted write: the shadow throws its diff away on every feed, so
-            // an empty one would cost the next session fade a full repaint.
+            // A read that was all tail: skip the write. Every shadow feed drops
+            // its diff, so an empty one costs the next fade a full repaint.
             if ready.is_empty() {
                 return Ok(());
             }
@@ -1419,39 +981,12 @@ impl Attachment {
         self.write_terminal(chunk)
     }
 
-    /// Relay a piece of the session's screen with the notice's own frame — or
-    /// the hint bar — following it inside one synchronized update.
-    ///
-    /// **This is what keeps the notice on the screen rather than merely
-    /// putting it back there**, and the bar on its row: a statusline redrawn
-    /// under the bar would otherwise be presented over it, every time, for as
-    /// long as the bar took to go back up. Writing the box after the session's
-    /// repaint wins nothing on its own: a terminal parses asynchronously and
-    /// presents on its own clock, so what it puts on the glass is whatever
-    /// prefix of the stream it has reached — and most of those prefixes fall
-    /// in the middle of a repaint, with the box wiped and the rewrite not yet
-    /// arrived. Measured on a flight with a starfield in a `:terminal`
-    /// buffer: the whole box stood in 10% of them.
-    ///
-    /// A synchronized update takes the terminal's choice away. Between
-    /// `SYNC_BEGIN` and `SYNC_END` it presents nothing, so the only states it
-    /// can show are the ones nvmux ends a span on — and nvmux ends every one
-    /// of them with the notice, or the bar. The span is opened here, in front
-    /// of the session's bytes, and closed by [`Attachment::close_span`] before
-    /// this pass of the relay ends, whether or not anything of nvmux's went in
-    /// between.
-    ///
-    /// `wrap` is false for a client that brackets its own frames, where a
-    /// span of nvmux's would end at the client's reset rather than at its
-    /// own; see [`boundary::Boundary::session_brackets_its_own_frames`]. A
-    /// terminal that does not know `?2026` at all ignores both sequences and
-    /// gets what it got before any of this, which is the honest fallback:
-    /// there is no way to hold a frame back from a terminal that will not
-    /// hold one.
-    ///
-    /// The span's own two sequences are deliberately not shown to the
-    /// boundary — they are nvmux's rather than the session's, and the reason
-    /// is written down on [`boundary::Boundary`].
+    /// Relay session bytes followed by the notice's frame (or the hint bar) in
+    /// one synchronized update, so the overlay stays on screen. Otherwise the
+    /// terminal presents mid-repaint prefixes with the box wiped (measured: the
+    /// whole box showed in 10% of frames under a busy `:terminal`). `wrap` is
+    /// false for a client that brackets its own frames, where nvmux's span
+    /// would end at the client's reset.
     fn write_session_frame(&mut self, bytes: &[u8], wrap: bool) -> std::io::Result<()> {
         if !wrap {
             return self.write_terminal(bytes);
@@ -1463,14 +998,8 @@ impl Attachment {
         Ok(())
     }
 
-    /// Write the session's own frame close, held back so the notice, or the
-    /// hint bar, could be put in front of it.
-    ///
-    /// Called on every pass that could have held one, right after the notice
-    /// and the bar have had their chance at the screen — so the sequence is
-    /// delayed by a write or two of nvmux's and by nothing else, and the frame
-    /// the session presents is the frame with the box, or the bar, in it. See
-    /// [`boundary::Boundary::holding_the_sessions_close`].
+    /// Write the session's own frame close, held back so overlays could go in
+    /// front of it; called every pass, right after they are drawn.
     fn release_the_sessions_close(&mut self) -> std::io::Result<()> {
         let Some(boundary) = self.boundary.as_mut() else {
             return Ok(());
@@ -1482,29 +1011,11 @@ impl Attachment {
         self.write_terminal(&close)
     }
 
-    /// Close a synchronized update nvmux opened, if it has one open and the
-    /// terminal is in a state to be written to.
-    ///
-    /// Called at the end of every pass of the relay that could have opened
-    /// one, so a span does not outlive the pass that began it — a terminal
-    /// left inside one shows nothing until its own timeout runs out, which is
-    /// the one way this mechanism could be worse than no mechanism.
-    ///
-    /// Unconditional rather than conditional on the notice having painted:
-    /// the notice's own frame ends in a reset of its own, which is what
-    /// actually presents the frame with the box in it, and a second reset of
-    /// a mode already reset is nothing at all. Leaning on the notice's byte
-    /// shape instead would make this correct only by coincidence.
-    ///
-    /// The one thing it does wait for is the session finishing what it was
-    /// saying. These two sequences are nvmux's bytes like any other, and a
-    /// tail that ran out of patience mid-character hands the relay a write
-    /// that ends between a lead byte and its continuation — where a reset
-    /// dropped in leaves the terminal a character it cannot read and the rest
-    /// of one it never asked for. Measured over eight flights before it was
-    /// noticed: up to six such characters in one, in both colour paths.
-    /// Holding the span open across the pass instead costs the terminal one
-    /// more pass of not presenting, which is the wait it was opened for.
+    /// Close nvmux's open synchronized update unless the session is
+    /// mid-sequence. Called at the end of every pass, since a terminal left
+    /// inside a span shows nothing until its own timeout. Waits for a whole
+    /// character: a reset between a UTF-8 lead byte and its continuation
+    /// corrupts it (seen up to six times per run before this check).
     fn close_span(&mut self) -> std::io::Result<()> {
         if !self.span || self.mid_sequence() {
             return Ok(());
@@ -1513,17 +1024,15 @@ impl Attachment {
         write_stdout(fade::SYNC_END)
     }
 
-    /// Whether the session is half way through a character or a sequence, so
-    /// nothing of nvmux's may be written at all.
+    /// Whether the session is mid-character or mid-sequence.
     fn mid_sequence(&self) -> bool {
         self.boundary
             .as_ref()
             .is_some_and(boundary::Boundary::mid_sequence)
     }
 
-    /// Whether nvmux may write over the session right now: the terminal is
-    /// between the session's sequences, and its first paint is not still being
-    /// held back from it.
+    /// Whether nvmux may draw over the session now: the terminal is between the
+    /// session's sequences and the first paint is not held.
     fn between_sequences(&self) -> bool {
         self.hold.is_none()
             && self
@@ -1532,8 +1041,7 @@ impl Attachment {
                 .is_some_and(boundary::Boundary::between_sequences)
     }
 
-    /// When a tail kept back for the notice's sake must go to the terminal
-    /// whether or not the rest of it has arrived.
+    /// When a tail held back for the notice must be written even if unfinished.
     fn kept_due(&self) -> Option<Instant> {
         self.boundary.as_ref().and_then(boundary::Boundary::due)
     }
@@ -1550,36 +1058,25 @@ impl Attachment {
         self.write_terminal(&ready)
     }
 
-    /// Whether the terminal's parser is being followed: while the notice is
-    /// up, or the hint bar.
+    /// Whether the terminal's parser is tracked.
     fn watching(&self) -> bool {
         self.boundary.is_some()
     }
 
-    /// Start following the terminal's parser, for the hint bar: from the
-    /// write that puts it up, which it makes at a lull — the one moment
-    /// nothing parsing the session's output knows that the session cannot be
-    /// in the middle of a sequence, and so the one moment a parser that starts
-    /// between sequences starts right. Nothing at all if it is being followed
-    /// already, for the notice.
+    /// Start tracking the parser for the hint bar, at the lull it goes up at
+    /// (the session is then between sequences). No-op if already tracking.
     fn watch_the_terminal(&mut self) {
         self.boundary.get_or_insert_with(boundary::Boundary::new);
     }
 
-    /// Nothing nvmux draws over the session is up any more — neither the
-    /// notice nor the hint bar — so the terminal's parser need not be followed
-    /// any further: but every byte still being kept on its account goes out
-    /// first, or a client's frame would end a few bytes short for the rest of
-    /// the relay.
+    /// Stop tracking the parser once no overlay is up, flushing everything
+    /// held back for it.
     fn stop_watching_the_terminal(&mut self) -> std::io::Result<()> {
         self.close_span()?;
         self.release_the_sessions_close()?;
         self.release_kept()?;
-        // And a span the session's unfinished business held open goes now
-        // whatever state that business is in: there is no next pass to close
-        // it on, and a terminal left inside one shows nothing until its own
-        // timeout runs out. At worst that is one character cut in half, once,
-        // at the end of a notice — against a picture frozen for seconds.
+        // No next pass: close a span left open regardless, or the terminal
+        // freezes until its timeout. At worst one character is cut, once.
         if std::mem::take(&mut self.span) {
             write_stdout(fade::SYNC_END)?;
         }
@@ -1587,27 +1084,20 @@ impl Attachment {
         Ok(())
     }
 
-    /// The session's screen as nvmux keeps it: the shadow, or where there is
-    /// none the client's own copy (see [`Attachment::screen`]).
+    /// The session's screen as nvmux keeps it: the shadow, else `screen`.
     fn copy(&mut self) -> Option<&mut shadow::Shadow> {
         self.shadow.as_mut().or(self.screen.as_mut())
     }
 
-    /// Whether the shadow has a glyph anywhere yet — what a lull needs before
-    /// it counts as the first paint being over.
+    /// Whether the shadow has any glyph yet.
     fn drawn(&self) -> bool {
         self.shadow
             .as_ref()
             .is_some_and(shadow::Shadow::has_contents)
     }
 
-    /// Whether the held first paint is over and should be released now.
-    ///
-    /// Asked on every pass of the relay, and a hold is there only while a
-    /// first paint is, so the hold is looked for first: [`Attachment::drawn`]
-    /// searches the screen for a glyph, and on a screen with nothing at its
-    /// top — a `ui = "nvim"` client's, which leaves the rows a clear blanked
-    /// unwritten — that is most of the screen.
+    /// Whether the held first paint should be released now. Checks for a hold
+    /// first: [`Attachment::drawn`] scans the screen, slow when it is blank.
     fn hold_is_due(&self, now: Instant) -> bool {
         let Some(hold) = self.hold.as_ref() else {
             return false;
@@ -1615,20 +1105,15 @@ impl Attachment {
         hold.due(now, self.drawn())
     }
 
-    /// When the relay must next wake up for the held first paint, if it is
-    /// holding one. The hold first, as in [`Attachment::hold_is_due`].
+    /// When the relay must next wake for the held first paint, if any.
     fn hold_wake_at(&self) -> Option<Instant> {
         self.hold.as_ref()?.wake_at(self.drawn())
     }
 
-    /// Let the held first paint through: dissolve the shadow in, when asked
-    /// to and there is something drawn to dissolve, then write everything
-    /// held exactly as it came. Harmless without a hold.
-    ///
-    /// The bytes up to the client's alternate-screen entry go first and the
-    /// frames after, so they are drawn on the screen the client is about to
-    /// draw on; the rest is written inside one synchronized update, so the
-    /// client's own clear and paint replace the last frame in one step.
+    /// Release the held first paint: fade the shadow in if `dissolve` and
+    /// something is drawn, then write everything held as it came. Bytes up to
+    /// the alternate-screen entry go first, so the fade lands on the client's
+    /// screen; the rest goes in one synchronized update.
     fn release_hold(&mut self, dissolve: bool) -> std::io::Result<()> {
         let Some(hold) = self.hold.take() else {
             return Ok(());
@@ -1642,30 +1127,23 @@ impl Attachment {
             0
         };
         let mut dissolved = false;
-        // What the client writes from here as the release reads it, owed to
-        // the terminal after what was held (see below).
+        // Client output read during the release, owed after the held bytes.
         let mut later = Vec::new();
-        // In go the cards, now that nothing they draw holds the paint up: the
-        // one the switch landed with first.
+        // Send the cards now that they cannot hold up the paint.
         let opened = dissolve && self.put_in_opening(Instant::now());
-        // The name the picker left comes down here whichever way the paint
-        // goes out, and before any of it: it is on the primary screen, which
-        // the shell comes back to.
+        // The picker's name comes down first either way: it is on the
+        // primary screen, which the shell returns to.
         let hand_off = self.hand_off.take();
         if dissolve && drawn {
-            // Inside a span the dissolve's first frame closes, so the name is
-            // taken off the primary screen and drawn again over the client's
-            // in what the terminal presents as one moment. Without a frame to
-            // close it, the replay below does.
+            // Opened here and closed by the fade's first frame (or the
+            // replay), so the name moves screens in one presented moment.
             if let Some(h) = &hand_off {
                 let mut down = fade::SYNC_BEGIN.to_vec();
                 down.extend_from_slice(&h.erase());
                 write_stdout(&down)?;
             }
             write_stdout(&bytes[..split])?;
-            // The card is drawn a moment after it goes in, and waited for, so
-            // that the screen dissolves in with it on: it stands from the
-            // first frame.
+            // Wait for the card to be drawn so the screen fades in with it up.
             if opened && !self.kept.is_empty() {
                 self.read_until_shown(Instant::now() + CARD_WAIT, &mut later);
             }
@@ -1673,9 +1151,8 @@ impl Attachment {
             if let Some(mut shadow) = self.shadow.take() {
                 let (rows, cols) = shadow.size();
                 let over = hand_off.as_ref().and_then(|h| h.over(rows, cols));
-                // A card on the move goes on moving: what the client draws of
-                // it as the fade runs is read into the shadow for the frames
-                // after, and held with the rest for the replay below.
+                // A moving card keeps moving: output during the fade feeds
+                // the shadow for later frames and is held for the replay.
                 let faded = if kept.moves() {
                     fade::fade_in_session(
                         &mut shadow,
@@ -1689,8 +1166,7 @@ impl Attachment {
                     fade::fade_in_session(&mut shadow, over.as_ref(), &kept, &mut fade::wait)
                 };
                 self.shadow = Some(shadow);
-                // A frame that could not be written is not a reason to keep
-                // the paint: the replay below is what the user is waiting for.
+                // A failed fade frame is no reason to keep the paint.
                 dissolved = match faded {
                     Ok(faded) => faded,
                     Err(e) => {
@@ -1702,11 +1178,9 @@ impl Attachment {
         } else if let Some(h) = &hand_off {
             write_stdout(&h.erase())?;
         }
-        // One update, whatever the client wrote it in: a frame of its own
-        // presented on its way through would show the screen as it was a
-        // moment ago, over the dissolve's last frame, which has it as it is.
-        // Closed where the client stopped, which need not be between its
-        // sequences (see `replay`).
+        // One update regardless of the client's framing, so no stale client
+        // frame shows over the fade's last one. Closed where the client
+        // stopped (see `replay`).
         let mut paint = bytes[split..].to_vec();
         paint.extend_from_slice(&later);
         let mut out = std::io::stdout().lock();
@@ -1716,10 +1190,8 @@ impl Attachment {
         if let Some(shadow) = self.shadow.as_mut() {
             shadow.invalidate();
         }
-        // The held bytes are the only ones here that can leave the terminal's
-        // parser anywhere: the dissolve's frames and the synchronized update
-        // around the replay are nvmux's own and each ends where it began, and
-        // the split falls just past a whole `?1049h`.
+        // Only the held bytes can leave the parser mid-sequence; nvmux's own
+        // frames are balanced.
         if let Some(boundary) = self.boundary.as_mut() {
             boundary.saw_session(&bytes);
             boundary.saw_session(&later);
@@ -1733,10 +1205,8 @@ impl Attachment {
         Ok(())
     }
 
-    /// Dissolve the screen the shadow holds in from the background — for a
-    /// resumed client, whose last screen the shadow still has — ending with
-    /// the cursor back on the cell that screen had it on. Says whether it
-    /// did; if not, the terminal is as the hand-off left it, cursor included.
+    /// Fade in a resumed client's last screen from the shadow. Returns whether
+    /// it did; if not, the terminal is as the hand-off left it.
     fn dissolve_in(&mut self) -> bool {
         let Some(shadow) = self.shadow.as_ref().filter(|s| s.has_contents()) else {
             return false;
@@ -1746,9 +1216,7 @@ impl Attachment {
         let Some(mut shadow) = self.shadow.take() else {
             return false;
         };
-        // A card on the move goes on moving: what the client draws of it as
-        // the fade runs is read into the shadow for the frames after — and,
-        // as for a kept client's backlog, no further (see `relay`).
+        // A moving card keeps moving, read into the shadow only (see `relay`).
         let faded = if kept.moves() {
             fade::fade_in_session(&mut shadow, over.as_ref(), &kept, &mut |shadow, until| {
                 self.read_while_fading(shadow, until, None);
@@ -1777,9 +1245,8 @@ impl Attachment {
         }
     }
 
-    /// Leave the terminal's pen and cursor where the client's own last write
-    /// left them, after a fade in that did not: see
-    /// [`shadow::Shadow::hand_back`].
+    /// After a fade in, restore the terminal's pen and cursor to where the
+    /// client's last write left them (see [`shadow::Shadow::hand_back`]).
     fn hand_back_the_pen(&self) {
         let Some(shadow) = self.shadow.as_ref().filter(|s| s.is_usable()) else {
             return;
@@ -1789,20 +1256,11 @@ impl Attachment {
         }
     }
 
-    /// Put a kept client's screen back on the terminal at once, from its copy
-    /// of it, where there is no fade to dissolve it in. Says whether it did;
-    /// if not, the terminal is as the hand-off left it.
-    ///
-    /// What comes back is the screen as the client last drew it — kept
-    /// current while it was parked — in the colours and attributes it drew it
-    /// in (see [`shadow::Shadow::paint`]). The server's own repaint, asked for
-    /// next, lands on top of it a few round trips later; until then, and for
-    /// as long as a busy server or a prompt waiting for a key holds that
-    /// repaint up, the user is looking at the session rather than at a blank
-    /// screen.
+    /// Without a fade, paint a kept client's screen back at once from its copy,
+    /// so the user sees the session until the server's repaint lands. Returns
+    /// whether it did.
     fn paint_kept_screen(&mut self) -> bool {
-        // A client that was not kept was not read while it was away, and its
-        // copy is of a screen it has drawn over since.
+        // An unkept client was not read while away, so its copy is stale.
         if !self.is_kept() {
             return false;
         }
@@ -1819,31 +1277,21 @@ impl Attachment {
         true
     }
 
-    /// Wait for the client to be gone, escalating to SIGKILL after
-    /// [`REAP_TIMEOUT`] so a client that ignores SIGHUP cannot hold nvmux —
-    /// and the user's terminal — hostage.
-    ///
-    /// All of the waiting and all of the escalation is here, and nothing else
-    /// waits for the client: [`Attachment::hang_up`] only signals it.
+    /// Wait for the client to exit, sending SIGKILL after [`REAP_TIMEOUT`] so
+    /// one ignoring SIGHUP cannot hang nvmux.
     fn reap(&mut self) {
         if self.reaped {
             return;
         }
         self.reaped = true;
-        // Read the client out while waiting for it, and throw it away. What it
-        // writes on the way out describes a screen that has already been cleared
-        // or restored, so none of it is wanted — but it has to be *read*, because
-        // a client parked in `write` on a master nobody drains never reaches its
-        // own signal handler. That is not hypothetical on the switch path with
-        // clients not kept: the picker leaves the outgoing client unread for as
-        // long as it is up, and a client that was mid-repaint when the switch was
-        // typed fills the buffer and stops there. Without this it cannot act on the hangup at all, and
-        // a healthy client ends up killed by the deadline below.
+        // Drain and discard output while waiting: a client blocked in `write`
+        // on an undrained master never reaches its signal handler. The picker
+        // leaves an unkept outgoing client unread, so one caught mid-repaint
+        // fills the buffer and would otherwise be killed at the deadline.
         let master = self.master.as_raw_fd();
         let deadline = Instant::now() + REAP_TIMEOUT;
-        // Remembered rather than answered once: the request is seen on exactly
-        // one pass of this loop, and that pass is the likeliest moment for the
-        // client's input queue to be momentarily full.
+        // Remembered, not answered once: the request appears on one pass only,
+        // when the client's input queue is likeliest to be full.
         let mut owed = false;
         while Instant::now() < deadline {
             owed |= discard_pending(master);
@@ -1865,77 +1313,25 @@ impl Attachment {
         let _ = self.child.wait();
     }
 
-    /// Answer the DA1 request a departing client has just sent, as its terminal
-    /// would have.
+    /// Answer a departing client's DA1 request as its terminal would.
     ///
-    /// **This is worth a full second on every client retired**: at every
-    /// switch with `[client] per_session = false`, at a detach, and for every
-    /// kept client let go. Neovim's shutdown path (`tui.c`, `tui_stop`) emits
-    /// its terminal restore sequences, sends `ESC [ c`, and then *waits* for
-    /// the reply — `EXIT_TIMEOUT_MS`, one second — before it will exit, so
-    /// that it knows the terminal has processed everything it sent. A client
-    /// nvmux is retiring has no terminal left to ask: nothing relays its
-    /// output once it is let go, and a reply could not reach it through a
-    /// stopped pump in any case. So it waits out the whole timeout, every
-    /// time. Measured at 1003 ms, and it is the same second whether the
-    /// client is asked to leave with SIGHUP or with `:detach` — both arrive at
-    /// `tui_stop`.
-    ///
-    /// nvmux answers because, for this client, nvmux *is* the terminal. It then
-    /// goes in about 4 ms.
-    ///
-    /// Only ever in reply to a request that was actually read, and never
-    /// speculatively at hangup: a reply written before the client's shutdown
-    /// installs the callback waiting for it is consumed by the startup handler
-    /// instead, and the second is paid anyway. Measured both ways — answering
-    /// on sight is reliable, answering at hangup is a race that loses about as
-    /// often as it wins.
-    ///
-    /// One `write_all`, and only ever to a client that has been hung up. A
-    /// reply that reached a live client would be harmless — Neovim's input
-    /// parser consumes a DA1 response rather than typing it, in insert mode
-    /// too, which was checked — but one delivered in *pieces* is read as keys,
-    /// and `ESC [ ? 1 ;` followed later by `2 c` leaves the editor in
-    /// operator-pending. Seven bytes in one write to a pty cannot be torn.
+    /// **Saves a second per retired client.** Neovim's `tui_stop` sends
+    /// `ESC [ c` and waits up to 1 s for a reply no terminal will send
+    /// (measured: 1003 ms; answered, ~4 ms). Only in reply to a request
+    /// actually read (an early reply is eaten by the startup handler), and only
+    /// to a hung-up client (a reply split into pieces is read as keys).
     fn answer_device_attributes(&mut self) -> bool {
-        // Asked first, and skipped rather than waited for.
-        //
-        // What this is guarding: both callers run from `Drop`, and neither may
-        // block. `reap` cannot reach its own deadline from inside a parked
-        // write, and `drain_until_eof` holds the user's terminal in raw mode
-        // while it runs — so a park in either is an nvmux that never comes back.
-        // A pty master does stop accepting bytes: measured, a sustained writer
-        // stalls indefinitely once the slave's queue fills and nothing reads it.
-        //
-        // What it is *not*: a fix for an observed hang. This reply is seven
-        // bytes, and seven bytes were never seen to block — a line discipline
-        // with no reader discards what it has no room for, so the room comes
-        // back within milliseconds whatever the client does (measured: full,
-        // then writable again 50 ms later, with the client asleep). It is the
-        // cost of the guard that justifies it — a `poll` with a zero timeout —
-        // against a wait that has no bound at all if it ever does happen.
-        //
-        // The cost of skipping is the second this saves — the client waits out
-        // `EXIT_TIMEOUT_MS` as it did before the answer existed — so this
-        // reports whether the reply went out and both callers, which are loops,
-        // carry the debt to their next pass. Retried, never waited for.
-        //
-        // And the room can be missing for a moment without the client being
-        // wedged at all: the Linux tty layer stages a write in a flip buffer and
-        // moves it on from a work queue, so a master that has just taken a burst
-        // reports no room until that queue runs, a few milliseconds later. A
-        // one-shot answer would lose that coin toss; a retried one cannot.
+        // Skipped if there is no room, never waited for: both callers run from
+        // `Drop` and must not block. Room can vanish for a few ms while Linux
+        // moves a burst out of its tty flip buffer, so callers retry.
         let fd = self.master.as_raw_fd();
         if !writable(fd) {
             tracing::debug!("the departing client's input queue is full; not answering yet");
             return false;
         }
         tracing::debug!("answering the departing client's DA1 request");
-        // One `write`, not `write_all`: `writable` promises room for a byte,
-        // not for seven, and the loop `write_all` would do on a short write is
-        // the same park by another name. A torn reply cannot hurt this client —
-        // it is exiting, and the worst case is the wait it would have had
-        // anyway. (Which is why no live client is ever written to here.)
+        // One `write`: `writable` promises room for one byte, and `write_all`
+        // could block. A torn reply only costs the exiting client its wait.
         let n = unsafe {
             libc::write(
                 fd,
@@ -1949,30 +1345,13 @@ impl Attachment {
         true
     }
 
-    /// Relay whatever the client writes on its way out, then stop.
+    /// Relay the client's output on its way out, then stop. Unlike in
+    /// [`Attachment::reap`], the restore sequence is wanted. Bounded, or a
+    /// client ignoring termination would hold the terminal in raw mode.
     ///
-    /// The teardown counterpart to the drain in [`Attachment::reap`], and the
-    /// opposite policy: here the client's restore sequence *is* wanted, because
-    /// this runs on the paths that hand the terminal back to the shell.
-    ///
-    /// The DA1 request buried in that sequence still has to be answered, and
-    /// nvmux answers it, as on a switch: the pump that would carry a terminal's
-    /// reply back to the client has already stopped. Without this, `<prefix> d`
-    /// costs the same second a switch used to.
-    ///
-    /// The request itself is the one thing taken *out* of what is relayed —
-    /// the single exception to the module's rule, and only on this path. Left
-    /// in, it reaches the real terminal, which answers it, and nobody reads
-    /// that answer: the client has gone on nvmux's reply, and nvmux is out of
-    /// raw mode and gone a few milliseconds later. The reply then lands in the
-    /// shell as typed text, `^[[?61;4;6;…c` above the next prompt — seen, on
-    /// a terminal slow enough to answer after nvmux had exited, and possible on
-    /// any. A request split across two reads is missed here as it is by
-    /// `asks_for_device_attributes`, with the same consequence as before this
-    /// existed, and for the same reason it is survivable.
-    ///
-    /// Bounded, because a client that ignores its termination would otherwise
-    /// hold the terminal in raw mode indefinitely.
+    /// nvmux answers the DA1 request (else `<prefix> d` costs a second) and
+    /// strips it from the output, the one exception to the module's rule: the
+    /// real terminal's answer would land in the shell as text after we exit.
     fn drain_until_eof(&mut self) {
         let fd = self.master.as_raw_fd();
         let deadline = Instant::now() + DRAIN_TIMEOUT;
@@ -1999,8 +1378,8 @@ impl Attachment {
     }
 }
 
-/// The client is hung up and reaped before the fields go, the master among
-/// them: `reap` reads the client out through it while it waits.
+/// Hang up and reap before the fields drop: `reap` drains the client
+/// through the master.
 impl Drop for Attachment {
     fn drop(&mut self) {
         self.hang_up();
@@ -2009,17 +1388,12 @@ impl Drop for Attachment {
 }
 
 impl Attachment {
-    /// Put a kept client aside while something else has the front: see
-    /// [`Parked`]. `None` if it could not be parked — no stop channel or no
-    /// thread to be had for it — in which case it has been retired and the
-    /// next attach to its session is a fresh one. Told it is out of sight, to
-    /// draw at a crawl meanwhile (see [`Attachment::go_away`]).
+    /// Park a kept client while something else is in front, telling it to draw
+    /// at a crawl. `None` if no thread could be had; it is then retired.
     pub fn park(mut self) -> Option<Parked> {
         self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
-        // The last fade's diff describes a terminal another session is about
-        // to have, and the resize that brings the client back throws it out
-        // anyway: it goes now, rather than with the client's next byte, which
-        // an idle session may never write.
+        // The last fade's diff is for a terminal another session is about to
+        // use; drop it now, not on a next byte an idle session may never write.
         if let Some(copy) = self.copy() {
             copy.invalidate();
         }
@@ -2027,32 +1401,14 @@ impl Attachment {
         self.put_aside("nvmux-parked", keep_parked)
     }
 
-    /// Hold a client that has never been relayed until its session is first
-    /// visited: `[client] lazy = false`, which starts one for every session as
-    /// nvmux starts. `probe` is its attach probe, if that has still to answer.
-    /// `None` if it could not be held, in which case it has been retired, as
-    /// by [`Attachment::park`]; and told it is out of sight, as that is.
+    /// Hold a never-relayed client until its session's first visit
+    /// (`[client] lazy = false`), with its attach probe if still unanswered.
+    /// `None` if it could not be held; it is then retired.
     ///
-    /// Held as a parked client is — in a [`Parked`], on a thread that owns it
-    /// and reads it — but kept differently, because it is read for a
-    /// different reason. A parked client has been in front: the terminal has
-    /// answered its questions, and what it writes while away is wanted only
-    /// for the screen it describes and what it tells the terminal, so the
-    /// shadow and the ledger keep up with it and the bytes go. This one has
-    /// asked the terminal questions nothing has heard yet — its keyboard
-    /// protocol, its synchronized updates, its in-band sizes, the background
-    /// — and takes their answers whenever they come: measured on 0.12.5, five
-    /// seconds late exactly as at once. So what it writes is kept whole, in
-    /// [`Attachment::unshown`], and its first relay sends all of it before
-    /// anything else it says (see [`pump`]): the terminal hears the client's
-    /// startup as the client wrote it, later, and answers it then. Nothing
-    /// else sees those bytes until then, so the shadow and the ledger are
-    /// shown each of them once, on the way out, as for any client.
-    ///
-    /// Read rather than left to fill its pty, for the reason a parked client
-    /// is: a client nobody reads stops in its write while its server keeps
-    /// every frame for it, without bound. Kept whole, the bound is nvmux's
-    /// instead — see [`keep_unshown`].
+    /// Unlike a parked client's, its output is kept whole in
+    /// [`Attachment::unshown`] and relayed first on its first visit: its
+    /// startup queries are still unheard, and it accepts late answers (measured
+    /// on 0.12.5: five seconds late as well as at once).
     pub fn start_ahead(mut self, probe: Option<Probe>) -> Option<Parked> {
         self.unshown = Some(Vec::new());
         self.probe = probe;
@@ -2060,12 +1416,8 @@ impl Attachment {
         self.put_aside("nvmux-ahead", keep_unshown)
     }
 
-    /// Tell a client that draws cards that it is going to the back, where
-    /// nothing it draws is seen, until the relay that brings it back to the
-    /// front says so with the [`card::Command::Clear`] it opens with: it
-    /// stops animating and draws at a crawl ([`card::Command::Away`]). Here
-    /// and not as its relay ends, where a switch has it draw the card the
-    /// switch lands with first ([`Attachment::stand_landing`]).
+    /// Tell a card-drawing client it is out of sight, so it stops animating and
+    /// draws at a crawl until a relay sends [`card::Command::Clear`].
     fn go_away(&mut self) {
         if self.draws_cards {
             self.tell_client(&card::Command::Away);
@@ -2074,62 +1426,40 @@ impl Attachment {
         }
     }
 
-    /// Whether this client was started ahead of its session's first visit
-    /// and has not been relayed yet (see [`Attachment::start_ahead`]).
+    /// Whether this client was started ahead and not yet relayed.
     pub fn started_ahead(&self) -> bool {
         self.unshown.is_some()
     }
 
-    /// The attach probe of a client started ahead, if it had not answered by
-    /// the time the client was taken back: the caller waits it out as for a
-    /// fresh client, with the attaching screen up.
+    /// A started-ahead client's attach probe, if still unanswered when it was
+    /// taken back; the caller waits on it as for a fresh client.
     pub fn take_probe(&mut self) -> Option<Probe> {
         self.probe.take()
     }
 
-    /// Be told when the session has painted on this client's next relay: on
-    /// the first lull after the relay has relayed anything, the moment
-    /// `timing: session painted` is logged. A relay that ends before then
-    /// lets the receiver go, untold, rather than leave it for a later one.
-    ///
-    /// For what must not compete with that screen for the link it comes
-    /// over: the clients started again behind it, with `[client] lazy` off —
-    /// the ones a dropped link took, or every session's after a change of
-    /// `[client] ui`.
+    /// Get notified when the session has painted on this client's next relay
+    /// (`timing: session painted`); a relay ending first drops the sender.
     pub fn tell_when_painted(&mut self) -> mpsc::Receiver<()> {
         let (tx, rx) = mpsc::channel();
         self.painted = Some(tx);
         rx
     }
 
-    /// Have the settings come up floating over the session on this client's
-    /// next relay, as soon as it has the session's screen back, as `<prefix>
-    /// ,` brings them: for the settings full screen, turned to float (see
-    /// `ui::settings::Outcome::Float`). A relay that ends before then, or
-    /// where a command brings up something else first, forgets it.
+    /// Float the settings over the session once the next relay has its screen
+    /// back, for full-screen settings turned to float.
     pub fn float_the_settings(&mut self) {
         self.to_float = Some(Outcome::ShowSettings);
     }
 
-    /// Have the picker come up floating over the session on this client's
-    /// next relay, as [`Attachment::float_the_settings`] has the settings, as
-    /// `<prefix> Space` brings it: for the picker that went out with the
-    /// session to a prompt full screen, where the prompt could not float in its
-    /// place — the rename prompt ([`Outcome::Rename`]), or the create prompt,
-    /// cancelled ([`Outcome::CreateAfter`]) — back once it has been answered.
+    /// Likewise for the picker, back from a full-screen rename or a cancelled
+    /// create prompt.
     pub fn float_the_picker(&mut self) {
         self.to_float = Some(Outcome::ToPicker);
     }
 
-    /// Whether the session's screen is back for the settings or the picker to
-    /// float over (see [`Attachment::float_the_settings`]): nothing of a first
-    /// paint held back, and the client on the screen it draws on — the
-    /// alternate screen, which a resumed client was put back on as the relay
-    /// began and a fresh one enters as it starts, or for a client that draws
-    /// on the primary screen, something drawn there. Not before: frames drawn
-    /// ahead of a fresh client's entry would stay on the primary screen, which
-    /// the shell comes back to. A copy that cannot say has nothing to float
-    /// over, and the panel says so for itself.
+    /// Whether the session's screen is back for a panel to float over: no held
+    /// paint, and the client on the alternate screen (or drawn on the primary).
+    /// `true` if the copy cannot tell.
     fn screen_is_back(&self) -> bool {
         if self.hold.is_some() {
             return false;
@@ -2140,8 +1470,6 @@ impl Attachment {
         }
     }
 
-    /// The socket the client was attached through — locally the session's
-    /// own, over SSH the local end of the forward.
     pub fn sock(&self) -> &Path {
         &self.sock
     }
@@ -2169,8 +1497,8 @@ impl Attachment {
                 stop: Some(stop),
                 thread: Some(thread),
             }),
-            // The closure, and the client in it, went with the failed spawn:
-            // dropped, so hung up and reaped.
+            // The client went with the failed spawn's closure: dropped, so
+            // hung up and reaped.
             Err(e) => {
                 tracing::warn!(error = %e, "could not park a client; retired it");
                 None
@@ -2179,38 +1507,18 @@ impl Attachment {
     }
 }
 
-/// A kept client that is not in front, on a thread of its own until it is
-/// wanted back.
+/// A kept client out of the front, on its own thread until wanted back.
 ///
-/// With `[client] per_session` a client that leaves the front — for the
-/// picker, the prompt, the help, or another session — is not retired and not
-/// left unread. It stays attached to its server, which goes on sending it the
-/// session's screen; and something has to read what it writes meanwhile, or
-/// it stops at the pty's buffer while its server keeps every frame for it in
-/// memory, to be played back, stale, when it is next read.
-///
-/// That something is a thread that owns the whole [`Attachment`]. Owns, and
-/// not borrows, because ownership is what makes it true that one reader, and
-/// only one, is on a pty at any time — the rule [`relay`] is built on: the
-/// relay cannot have the master back until the thread has handed it over,
-/// which it does by ending. What it reads goes to the shadow (or the kept
-/// screen) and the ledger, never to the terminal — so that, wanted back, the
-/// screen it last had can go straight onto the terminal.
-///
-/// A client that leaves while parked — its session killed from the picker,
-/// quit from another UI, its ssh link gone — is retired on the thread and
-/// not handed back. Nothing else would notice: no transport call reports it.
-///
-/// A client started ahead of its session's first visit (`[client] lazy =
-/// false`) is held in one too, on a thread that keeps what it reads whole
-/// rather than reducing it to a screen: see [`Attachment::start_ahead`]. The
-/// rest — the taking back, the retiring, a client that leaves — is the same.
+/// Its server keeps sending it the screen, so its output must be read. The
+/// thread owns the [`Attachment`], keeping one reader per pty as [`relay`]
+/// requires, and feeds the shadow and ledger so the last screen can be
+/// painted back at once. A client that exits while parked is retired on the
+/// thread. Clients started ahead are held in one too.
 pub struct Parked {
     session_id: String,
     /// Dropped to stop the thread: the far end then reads as hung up.
     stop: Option<UnixStream>,
-    /// `Some` until joined. What it returns is the client, or `None` for one
-    /// that left.
+    /// `Some` until joined; returns the client, or `None` if it exited.
     thread: Option<std::thread::JoinHandle<Option<Attachment>>>,
 }
 
@@ -2224,30 +1532,22 @@ impl std::fmt::Debug for Parked {
 }
 
 impl Parked {
-    /// Which session this client is attached to.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
-    /// Whether the client is still there to be had back. The thread ends only
-    /// when told to or when the client has left, and only one of those can
-    /// have happened to a `Parked` nobody has taken back yet.
+    /// Whether the client can still be taken back.
     pub fn is_alive(&self) -> bool {
         self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
 
-    /// Have the client back, ready to be resumed — or, started ahead, to be
-    /// relayed for the first time — or `None` if it left while parked. The thread notices at once — it is in a `poll` on the other end
-    /// of `stop` — unless it is already retiring a client that was leaving,
-    /// which is its business and not worth waiting on: past [`UNPARK_WAIT`]
-    /// this gives up on it, and the thread finishes the retirement on its own.
+    /// Take the client back; `None` if it exited. Gives up after
+    /// [`UNPARK_WAIT`] if the thread is busy retiring an exiting client.
     pub fn unpark(mut self) -> Option<Attachment> {
         drop(self.stop.take());
         let attachment = self.join_within(UNPARK_WAIT)?;
-        // One that left in the moment before it was asked back — its session
-        // killed, its link gone — before the thread saw it go: the pty says
-        // so at once, and so does its pid. Handed back, it would put a dead
-        // session's last screen up only to lose it a moment later.
+        // It may have exited just before the thread noticed; handed back, it
+        // would show a dead session's screen.
         let mut p = [pollfd(attachment.master.as_raw_fd())];
         let n = unsafe { libc::poll(p.as_mut_ptr(), 1, 0) };
         let hung_up = n > 0 && p[0].revents & (libc::POLLHUP | libc::POLLERR) != 0;
@@ -2259,18 +1559,16 @@ impl Parked {
         Some(attachment)
     }
 
-    /// Tell the thread to retire its client — hang it up and reap it, on the
-    /// thread — and do not wait for it. Dropping the `Parked` then waits a
-    /// little (see its `Drop`); telling several first is what lets them go
-    /// side by side.
+    /// Tell the thread to retire its client (hang up and reap) without waiting.
+    /// Telling several before dropping any lets them exit in parallel.
     pub fn tell_to_retire(&mut self) {
         if let Some(stop) = self.stop.as_mut() {
             let _ = stop.write_all(b"R");
         }
     }
 
-    /// The thread's answer, if it gives one within `wait`. A thread that does
-    /// not is left to finish by itself: what it holds is its own to drop.
+    /// The thread's result, if it finishes within `wait`; otherwise it is left
+    /// to finish alone.
     fn join_within(&mut self, wait: Duration) -> Option<Attachment> {
         let thread = self.thread.take()?;
         let started = Instant::now();
@@ -2280,39 +1578,31 @@ impl Parked {
                 tracing::debug!(id = %self.session_id, "a parked client's thread is still busy");
                 return None;
             }
-            // A thread in its `poll` hands the client back in microseconds,
-            // and the first look comes too soon for it: a millisecond's sleep
-            // is most of a switch to a kept client. So it is only slept for
-            // once the thread has had half of one.
+            // A thread in `poll` hands back in microseconds, and a 1 ms sleep
+            // would be most of a switch, so spin first.
             if started.elapsed() < UNPARK_SPIN {
                 std::thread::yield_now();
             } else {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        // A panic on the thread dropped the client on its way out, and a
-        // dropped client is a retired one.
+        // A panic on the thread dropped, and so retired, the client.
         thread.join().ok().flatten()
     }
 }
 
-/// How long a parked client's thread is waited for without sleeping: see
-/// [`Parked::join_within`].
+/// How long [`Parked::join_within`] spins before sleeping.
 const UNPARK_SPIN: Duration = Duration::from_micros(500);
 
-/// How long a switch waits for a parked client's thread to hand it back.
-/// Instant for a thread in its `poll`; this bounds only one caught retiring a
-/// client that was on its way out, which the switch then treats as gone.
+/// How long a switch waits for a parked client's thread. Only a thread busy
+/// retiring an exiting client takes longer, and then counts as gone.
 const UNPARK_WAIT: Duration = Duration::from_millis(50);
 
-/// How long letting go of a parked client waits for its thread to have
-/// retired it. A client that goes quietly takes a few milliseconds.
+/// How long dropping a [`Parked`] waits for the client to be retired.
 const RETIRE_WAIT: Duration = Duration::from_millis(100);
 
-/// Dropping one retires the client — hung up and reaped on its own thread, as
-/// any `Attachment` is on its way out — and waits [`RETIRE_WAIT`] at most for
-/// that. Told first, then waited for, so that a pool letting go of several
-/// can tell them all before waiting on any (see [`crate::pool::Pool`]).
+/// Retires the client, waiting at most [`RETIRE_WAIT`]. A pool tells all
+/// its clients first, so they exit in parallel.
 impl Drop for Parked {
     fn drop(&mut self) {
         self.tell_to_retire();
@@ -2321,32 +1611,15 @@ impl Drop for Parked {
     }
 }
 
-/// The parked client's thread: read what the client writes until told to
-/// stop, and hand the client back — or retire it, if told to or if it is
-/// leaving anyway.
+/// The parked client's thread: read its output into the shadow and ledger
+/// until told to stop, then hand it back, or retire it.
 ///
-/// What it reads goes to the shadow and the ledger (see
-/// [`Attachment::saw_unrelayed`]). Never a byte to stdout, which belongs to
-/// whatever is in front, and never a write to the client — with one
-/// exception, on its way out.
-///
-/// **A parked client that asks for its terminal's attributes, or leaves the
-/// alternate screen, is finishing.** Healthy, it does neither: they are the
-/// ends of Neovim's exit sequence — and of its `suspend`, which any other UI
-/// on the session can set off with `Ctrl-Z` and which reaches every client
-/// attached. Unanswered, such a client waits for a reply forever and never
-/// repaints again; answered and left running, it starts over against a
-/// terminal that answers nothing else, and comes back without its keyboard
-/// protocol, its synchronized updates or its in-band sizes for the rest of
-/// its life. So it is retired instead: hung up first — so that a client that
-/// was suspending finds its hangup already waiting — then answered, which is
-/// what lets it go in milliseconds rather than a second, and reaped. The
-/// session's next visit is a fresh client. Measured on 0.11.0 and 0.12.5.
-///
-/// A client found stopped is retired likewise, and one that has exited is
-/// let go. Only ever with [`peek_child`], which changes nothing:
-/// [`check_child`] consumes a stop, and a pid is only this thread's to wait
-/// for.
+/// **A parked client that sends DA1 or leaves the alternate screen is
+/// finishing**: both end Neovim's exit and its `suspend` (which `Ctrl-Z` in
+/// any UI sends to every attached client). Kept, it would hang or lose its
+/// startup answers for good, so it is hung up, answered and reaped (measured
+/// on 0.11.0 and 0.12.5). A stopped client is retired too; only
+/// [`peek_child`] is used, since [`check_child`] consumes a stop.
 fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachment> {
     let id = attachment.session_id.clone();
     let mut buf = [0u8; 8192];
@@ -2362,8 +1635,8 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
             tracing::warn!(%id, "a parked client could not be watched; retiring it");
             return None;
         }
-        // The client first: whatever it has said is read before the thread
-        // lets go of it, and a client that has gone is not handed back.
+        // Client first: read what it said before letting go, and never
+        // hand back one that exited.
         if n > 0 && ready(&fds[1]) {
             match read_fd(master, &mut buf) {
                 Ok(len) if len > 0 => {
@@ -2389,8 +1662,8 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
             }
         }
         if n > 0 && ready(&fds[0]) {
-            // A byte is an order to retire the client; the end of the stream
-            // is the client wanted back.
+            // A byte orders a retire; end of stream means the client is
+            // wanted back.
             let mut order = [0u8; 1];
             return match read_fd(stop.as_raw_fd(), &mut order) {
                 Ok(1) => None,
@@ -2413,57 +1686,27 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
     }
 }
 
-/// Whether this chunk of a client's output leaves the alternate screen: the
-/// other half, with a DA1 request, of what a finishing client writes (see
-/// [`keep_parked`]). Written in one flush with the rest of the exit sequence,
-/// so, like the DA1 request, it arrives whole.
+/// Whether this output leaves the alternate screen. Written in one flush
+/// with the exit sequence, so it arrives whole.
 fn leaves_alt_screen(chunk: &[u8]) -> bool {
     memmem::find(chunk, ALT_SCREEN_LEAVE).is_some()
 }
 
-/// The most a client started ahead may write before its first visit (see
-/// [`Attachment::start_ahead`]): past it, the client is retired and its
-/// session started afresh on that visit. A hold's worth, so that what is
-/// kept is let through as one first paint (see [`Hold`]) — and far past
-/// what an idle session writes, which is its startup and one screen: a few
-/// kilobytes, a few tens on a large terminal. What reaches it is a session
-/// that keeps drawing, a `:terminal` running something, whose frames are of
-/// no use to anybody by the time it is visited.
+/// The most a started-ahead client may write before its first visit; past
+/// it, it is retired. A hold's worth; an idle session writes a few KB, so
+/// only a busy `:terminal` gets here.
 pub const AHEAD_MAX: usize = HOLD_MAX;
 
-/// How often the thread of a client started ahead looks for its probe's
-/// answer while it has none (see [`keep_unshown`]). The answer comes over a
-/// channel, which `poll` cannot wait on. Nothing waits on the thread's
-/// noticing it — a client asked for before it has is handed back with its
-/// probe, to be waited on there — so this is only how soon a refused client
-/// is let go, and how often a busy session's thread wakes for nothing.
+/// How often a started-ahead client's thread checks its probe, which
+/// answers over a channel `poll` cannot watch.
 const PROBE_POLL_MS: libc::c_int = 100;
 
-/// The thread of a client started ahead (see [`Attachment::start_ahead`]):
-/// keep everything it writes until it is asked for, and hand it back — or
-/// retire it, if told to, if it is leaving, if it has written more than
-/// [`AHEAD_MAX`], or if its probe says it is not to be shown after all.
-///
-/// Never a byte to stdout and never one to the shadow or the ledger: every
-/// byte goes into [`Attachment::unshown`], in the order it came, for the
-/// first relay to send on.
-///
-/// The probe, while it is out, is asked on every pass and never waited on.
-/// `Ready` is the client cleared to be shown, and the probe is let go.
-/// `Blocked` — a session waiting for a key, whose server serves the client
-/// nothing until one comes — and a refusal both retire the client: its
-/// session's first visit attaches afresh, with the attaching screen to say
-/// what is wrong, which nothing here could.
-///
-/// Leaving is told by half of what tells it on [`keep_parked`]: the client
-/// leaving the alternate screen. Not the DA1 request, which here is no sign
-/// of anything — a client's startup asks it, and asks it again once its first
-/// frame is out (measured on 0.12.5, with nothing answering either), and all
-/// of it is still to be put to the terminal. Looked for in what has been kept
-/// rather than in a single read, so one split across two reads is found. A
-/// client whose `TERM` has no alternate screen leaves without saying so, and
-/// is let go when it has exited — or retired when it is found stopped, which
-/// is where a suspend ends.
+/// The thread of a started-ahead client: keep all its output in
+/// [`Attachment::unshown`] until asked for; or retire it if told to, if it
+/// is exiting, if it wrote more than [`AHEAD_MAX`], or if its probe says
+/// `Blocked` or refuses (the first visit then attaches afresh). Exiting shows
+/// only as leaving the alternate screen (searched across reads): DA1 is part
+/// of a normal startup (asked again after the first frame on 0.12.5).
 fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachment> {
     let id = attachment.session_id.clone();
     let mut buf = [0u8; 8192];
@@ -2536,8 +1779,8 @@ fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachme
             }
         }
         if n > 0 && ready(&fds[0]) {
-            // A byte is an order to retire the client; the end of the stream
-            // is the client wanted.
+            // A byte orders a retire; end of stream means the client is
+            // wanted.
             let mut order = [0u8; 1];
             return match read_fd(stop.as_raw_fd(), &mut order) {
                 Ok(1) => None,
@@ -2560,17 +1803,14 @@ fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachme
     }
 }
 
-/// Where to look in a buffer just grown from `before` bytes for a `needle`
-/// the growth may have completed: far enough back for one whose head was
-/// already there, and no further — one that was whole before was looked for
-/// then.
+/// Where to search a buffer grown from `before` bytes for a `needle` the
+/// growth may have completed.
 fn tail_from(before: usize, needle: &[u8]) -> usize {
     before.saturating_sub(needle.len() - 1)
 }
 
-/// A stand-in kept client for the tests of what holds clients (see
-/// [`crate::pool`]): `sh -c script` on a real pty, as the tests here use,
-/// attached to nothing, with a ledger and no screen of its own.
+/// A stand-in kept client for the [`crate::pool`] tests: `sh -c script` on
+/// a real pty, attached to nothing, with a ledger and no screen.
 #[cfg(test)]
 pub(crate) fn kept_standin(session_id: &str, script: &str) -> Attachment {
     let cmd = Command::new("sh").arg("-c").arg(script);
@@ -2592,19 +1832,17 @@ pub(crate) fn kept_standin(session_id: &str, script: &str) -> Attachment {
 
 #[cfg(test)]
 impl Attachment {
-    /// The stand-in's pid, for a test asking what became of the process.
     pub(crate) fn pid_for_test(&self) -> i32 {
         child_pid(&self.child).as_raw()
     }
 
-    /// As if its terminal had not yet answered its opening questions.
+    /// As if its terminal had not yet answered its startup queries.
     pub(crate) fn cut_short_for_test(&mut self) {
         self.startup_answered = false;
     }
 
-    /// Wait for a stand-in whose script prints `r` once its traps are set,
-    /// so that a signal sent next meets them rather than the shell's own
-    /// startup disposition. Says whether it came.
+    /// Wait for a stand-in to print `r`, meaning its traps are set. Returns
+    /// whether it did.
     pub(crate) fn ready_for_test(&self) -> bool {
         let fd = self.master.as_raw_fd();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2620,61 +1858,30 @@ impl Attachment {
     }
 }
 
-/// Start a client for a session and wait for the probe to pass.
-///
-/// `sock` must already be reachable from *this* machine — locally the session
-/// socket, over SSH the local end of a forward.
-///
-/// `announce` is what the first relay says the session is (see
-/// [`crate::announce::label`]). Not an `Option`: every spawn is a change of
-/// session, and making that unrepresentable is the point.
-///
-/// The blocking form, with the probe on [`rpc::PROBE_TIMEOUT`]: what the
-/// integration tests drive, since a test wants an answer or a failure and
-/// nobody at a keyboard. The binary does not use it. There the attach is the
-/// same two halves — [`spawn_client`], then [`Probe::start`] — with the wait
-/// on a screen of its own (`ui::attaching`), which has no budget because the
-/// user is watching it and can give up whenever they choose.
-///
-/// A session waiting for a key is an attachment, not an error — [`Answer`] for
-/// why. It used to be one, by running the budget out, and that refusal was the
-/// bug: the way out of that state is a key pressed on the very client the
-/// refusal was throwing away. Only a session that cannot be reached, or one
-/// with too many UIs already, is still refused here.
+/// Start a client for a session and wait for the probe to pass. `sock` must
+/// be reachable from this machine. Blocking, bounded by
+/// [`rpc::PROBE_TIMEOUT`], for integration tests; the binary uses
+/// [`spawn_client`] and [`Probe::start`] with no time limit. A session
+/// waiting for a key is attached to (see [`Answer`]): the key that ends the
+/// wait is pressed on this client.
 pub fn spawn(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
     let (cmd, draws_cards) = client_command(sock);
     spawn_with(session_id, sock, announce, cmd, draws_cards)
 }
 
-/// Start a client for a session, and nothing else: the half of [`spawn`] that
-/// forks. The probe is the caller's, through [`Probe::start`].
-///
-/// The client is started *first* and the server probed while it connects.
-/// The two have nothing to say to each other — the probe asks the server what
-/// state it is in, the client asks it for a grid — and over an SSH forward
-/// each is a run of round trips: three for the probe, two for the client
-/// before its first paint. In series they were the whole of a switch on a
-/// distant host; overlapped, a switch costs the longer of the two.
-///
-/// The probe still decides. Nothing the client prints reaches the terminal
-/// before it has passed: the client writes into its pty, and only the relay
-/// copies a pty to the terminal, which the caller starts once the probe has
-/// said yes. A probe that fails — or a wait the user gives up on — ends the
-/// client by dropping the attachment it was building, through the same hangup
-/// and reap as any other retirement, and its output dies with the master.
-/// That matters over a forward whose remote end has gone: the client's own
-/// failure message there is empty, after ~165 bytes of escape sequences it
-/// has already written, and none of them are seen.
-///
-/// A client that could not be started at all is reported before any probe,
-/// since the message — `nvim` is not here — is the useful one.
+/// Start a client without probing: the forking half of [`spawn`]. The
+/// caller probes with [`Probe::start`] while it connects, so over SSH a
+/// switch costs the longer of the two. Client output reaches the terminal
+/// only through the relay, started once the probe passes. A client that
+/// cannot start is reported first: that error (`nvim` missing) is the
+/// useful one.
 pub fn spawn_client(session_id: &str, sock: &Path, announce: &str) -> Result<Attachment> {
     let (cmd, draws_cards) = client_command(sock);
     spawn_client_with(session_id, sock, announce, cmd, draws_cards)
 }
 
-/// [`spawn_client`], with nvmux's own client run from `exe` — the way a test
-/// that is not that binary runs the real thing.
+/// [`spawn_client`] with nvmux's own client run from `exe`, for tests that
+/// are not that binary.
 pub fn spawn_own_client(
     session_id: &str,
     sock: &Path,
@@ -2684,17 +1891,13 @@ pub fn spawn_own_client(
     spawn_client_with(session_id, sock, announce, own_client(exe, sock), true)
 }
 
-/// The client that draws a session, in our working directory: nvmux's own —
-/// this same binary, `--client <sock>` (see [`crate::client`]) — or with
-/// `[client] ui = "nvim"` Neovim's, `nvim --server <sock> --remote-ui`. And
-/// whether it draws cards, which nvmux's own does.
+/// The client command (nvmux's own, or `nvim --remote-ui` with
+/// `[client] ui = "nvim"`), and whether it draws cards.
 fn client_command(sock: &Path) -> (Command, bool) {
     match crate::config::get().client.ui {
         crate::config::Ui::Nvim => {
-            // A `Command` runs with our environment and in our working
-            // directory unless told otherwise, so `TERM`, `COLORTERM` and
-            // everything else the client negotiates with reach it without
-            // being copied by hand.
+            // A `Command` inherits our environment and working directory, so
+            // `TERM`, `COLORTERM` and the rest reach the client.
             let cmd = Command::new("nvim")
                 .arg("--server")
                 .arg(sock)
@@ -2702,8 +1905,7 @@ fn client_command(sock: &Path) -> (Command, bool) {
             (cmd, false)
         }
         crate::config::Ui::Nvmux => {
-            // The binary running now, wherever it was started from — not a
-            // `nvmux` looked up on `$PATH`, which may be another version.
+            // This binary, not a `nvmux` on `$PATH`, which may differ.
             let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nvmux"));
             (own_client(&exe, sock), true)
         }
@@ -2723,11 +1925,8 @@ fn own_client(exe: &Path, sock: &Path) -> Command {
     )
 }
 
-/// [`spawn`] with the client command supplied, which is how the tests run it
-/// against a stand-in client where there is no `nvim`.
-///
-/// The same sequence `main` runs under its spinner — the client, then the
-/// probe on its own thread — waited out here, with the budget a test expects.
+/// [`spawn`] with the client command supplied, so tests can use a stand-in
+/// where there is no `nvim`.
 fn spawn_with(
     session_id: &str,
     sock: &Path,
@@ -2742,13 +1941,11 @@ fn spawn_with(
         "timing: client spawn"
     );
 
-    // The round trips to the session — over ssh, through the forward — while
-    // the client makes its own.
+    // Probe the session while the client connects.
     let t_probe = std::time::Instant::now();
     let verdict = Probe::start(session_id, sock).and_then(|mut probe| {
-        // A wait that runs out is the timeout it used to be, so the callers
-        // that read the error see the shape they always did. The probe drops
-        // at the end of this closure, which is what ends its worker.
+        // A wait that runs out gives the old timeout error. Dropping the
+        // probe ends its worker.
         probe
             .wait(rpc::PROBE_TIMEOUT)
             .unwrap_or(Err(NvmuxError::Rpc(crate::error::RpcError::Timeout(
@@ -2756,15 +1953,10 @@ fn spawn_with(
             ))))
     });
     match verdict {
-        // A blocked session is attached to, as the binary attaches to one:
-        // the refusal it used to get helped nobody, since the way out of that
-        // state is a key the user presses on the client this is about to hand
-        // them. Only the notice differs, and this variant draws none.
+        // A blocked session is attached to, as in the binary.
         Ok(answer) => tracing::debug!(?answer, "attach probe answered"),
         Err(e) => {
-            // Explicitly, so the retirement is not left to a binding: the
-            // client must be gone, and its pty with it, before the error is
-            // shown.
+            // Explicitly, so the client is gone before the error is shown.
             drop(attachment);
             return Err(e);
         }
@@ -2776,30 +1968,11 @@ fn spawn_with(
     Ok(attachment)
 }
 
-/// The attach probe, in flight on a thread of its own.
-///
-/// The probe is a run of blocking calls to the session, and the last of them
-/// is deferred: a session in the middle of `:!make`, or of CPU-bound Lua,
-/// answers it when it is done and not before. It used to be given three
-/// seconds and then refused. Now it is given as long as it takes, and the
-/// screen that waits on it (`ui::attaching`) is what the user gives up from —
-/// which means that screen has to keep reading keys while the probe blocks,
-/// and a blocking read cannot share a thread with a key loop.
-///
-/// So this is the second thread in the crate, and the reasons
-/// [`crate::ui::complete`] gives for the first are the reasons here: the
-/// worker reads its own socket and nothing else, so it cannot split the
-/// terminal's stream, and it owns nothing the screen needs back. What it
-/// adds is a way to be stopped. A thread parked in a blocking read cannot be
-/// told to stop, and nothing waits for it — but the socket can be shut down
-/// under it, and then the read returns at once (see [`rpc::Interrupt`]).
-/// That happens on every way out, through `Drop`, and it is not tidiness: a
-/// worker left parked behind a `:!make` would get its answer when the make
-/// ended, and if the session were then at the make's own hit-enter prompt it
-/// would type `<CR>` into a prompt somebody else was reading.
-///
-/// Told the answer through a channel rather than joined, so the screen can
-/// poll it on the same tick it draws on.
+/// The attach probe, running on its own thread. Its last call is deferred,
+/// so a busy session (`:!make`, CPU-bound Lua) answers only when done; there
+/// is no time limit, since the user can give up from `ui::attaching`. `Drop`
+/// shuts the socket down under the worker (see [`rpc::Interrupt`]), or it
+/// could later type `<CR>` into someone else's hit-enter prompt.
 pub struct Probe {
     rx: mpsc::Receiver<Result<Answer>>,
     interrupt: rpc::Interrupt,
@@ -2807,35 +1980,25 @@ pub struct Probe {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// What the attach probe found, for a session it could reach at all.
-///
-/// The distinction is not how healthy the session is but whether anything
-/// deferred can be asked of it. A session waiting for a key runs its main loop
-/// with the event queue switched off, so `nvim_list_uis` — and the client's own
-/// `nvim_ui_attach` behind it — are not answered until a key arrives. The probe
-/// must therefore say so and get out of the way rather than join the queue: see
-/// [`probe_on`] for what nvmux will and will not type to end that wait itself.
+/// What the attach probe found, for a reachable session. A session waiting
+/// for a key runs with its event queue off, so deferred calls
+/// (`nvim_list_uis`, the client's `nvim_ui_attach`) wait for a key; the
+/// probe reports that instead of queueing behind it (see [`probe_on`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     /// The session answered a deferred call, and has room for this client.
     Ready,
-    /// Reachable, and waiting for a key nvmux may not press on the user's
-    /// behalf. No deferred call is served until one arrives, so the UI count
-    /// is unknown and the client's first paint is queued behind the same key.
+    /// Waiting for a key nvmux may not press for the user; the UI count is
+    /// unknown and the first paint waits on that key.
     Blocked {
-        /// The mode it is waiting in, as `nvim_get_mode` spells it, for the log.
+        /// The mode, as `nvim_get_mode` spells it, for the log.
         mode: String,
     },
 }
 
 impl Probe {
-    /// Connect to the session and start asking.
-    ///
-    /// The connect happens here, on the caller's thread: a unix socket connect
-    /// either finds a listener or does not, in no time at all, so a dead
-    /// socket — nothing listening, a file where the socket was — is refused at
-    /// once rather than from a thread a moment later. Only the calls, which
-    /// are where the waiting is, go to the worker.
+    /// Connect and start asking. The connect runs here, since a dead unix
+    /// socket is refused at once; only the calls go to the worker.
     pub fn start(session_id: &str, sock: &Path) -> Result<Self> {
         let mut client = rpc::Client::connect_with(sock, None)?;
         let interrupt = client.interrupt()?;
@@ -2845,8 +2008,7 @@ impl Probe {
             .name("nvmux-probe".into())
             .spawn(move || {
                 let verdict = probe_on(&mut client, &id);
-                // A receiver that has gone is a wait that was given up on,
-                // and there is nobody left to tell.
+                // A dropped receiver means the wait was given up on.
                 let _ = tx.send(verdict);
             })?;
         Ok(Self {
@@ -2856,10 +2018,8 @@ impl Probe {
         })
     }
 
-    /// Wait up to `timeout` for the verdict. `None` is "not yet"; an answer
-    /// is given once, after which the probe is done with. A worker that died
-    /// without answering is an error, not a `None`: a screen looping on this
-    /// must never be left spinning for a verdict that is not coming.
+    /// Wait up to `timeout` for the verdict (`None`: not yet). A worker that
+    /// died without one gives an error, so a poller never spins forever.
     pub fn wait(&mut self, timeout: Duration) -> Option<Result<Answer>> {
         match self.rx.recv_timeout(timeout) {
             Ok(verdict) => Some(verdict),
@@ -2870,8 +2030,8 @@ impl Probe {
         }
     }
 
-    /// Give up on the probe as `Drop` does, but hand the worker back so a
-    /// test can prove the interrupt ended it, and not only the connection.
+    /// Give up as `Drop` does, but return the worker so a test can prove the
+    /// interrupt ended it, not only the connection.
     #[cfg(test)]
     fn abandon(mut self) -> std::thread::JoinHandle<()> {
         self.thread.take().expect("the worker is taken once")
@@ -2880,12 +2040,8 @@ impl Probe {
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        // Every way out, the errors included — see the type's docs for why a
-        // worker must never be left parked. On the success path the worker
-        // has already closed its end and this shuts down a socket that is
-        // about to be dropped anyway, which is nothing. Not joined: the
-        // shutdown is what unparks the worker, and nothing here needs it gone
-        // before going on.
+        // On every way out. Not joined: the shutdown unblocks the worker, and
+        // nothing needs it gone first.
         self.interrupt.fire();
         if let Some(thread) = &self.thread {
             tracing::debug!(finished = thread.is_finished(), "attach probe retired");
@@ -2894,73 +2050,17 @@ impl Drop for Probe {
 }
 
 /// Ask the server whether it can take a client, and make it ready for one.
-///
-/// The `get_mode` here is the reachability check, and the only one. It is a
-/// fast call but still a full request/response round trip, so an answer
-/// proves a real Neovim is behind the socket, a forward whose remote end has
-/// gone resets instead, and a peer that is not Neovim fails on its reply
-/// shape — and `rpc` classifies all of that identically whichever method
-/// asked, which is what the `?` relies on.
-///
-/// An `api_info` used to run in front of it, and proved nothing more *here*:
-/// its result was discarded, nothing on this path reads a version (the gates
-/// are `nvim::check_local` and the remote `--version` banner), and the `?` on
-/// `get_mode` refuses what this path can actually meet. It does prove more
-/// *elsewhere* — it answers during `:!cmd`, where `get_mode` is queued like
-/// any other call, which is why `rpc::probe` asks both — so this is not a
-/// claim that the two are interchangeable. What it cost was a round trip on
-/// every attach, forwarded over SSH.
+/// `get_mode` is the reachability check: a real round trip, so a dead
+/// forward or a non-Neovim peer fails it. No `api_info`: nothing here reads
+/// a version, and it costs an SSH round trip per attach.
 fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<Answer> {
-    // Both questions go out before either answer is read. They are independent
-    // — what state the editor is in, and how many UIs it has — and over an SSH
-    // forward each answer is a round trip, so asking the second only once the
-    // first had come back cost two of them, on the one path the user is
-    // watching. Measured against 0.12.5 through a link with a 150 ms round
-    // trip: 302 ms in series, 151 ms asked together.
-    //
-    // A server waiting for a key cannot *answer* `list_uis`, a deferred call,
-    // until one arrives. So the mode is the reply that is read first, every
-    // time round, and nothing deferred is waited on until it says the queue is
-    // running. Waiting anyway is what this loop exists to stop: the connection
-    // has no budget (see [`Probe::start`]), so a deferred call to a session in
-    // that state is not a slow answer but no answer at all, and the screen
-    // waiting on it spins until the user gives up.
-    //
-    // Sending it early is not that hazard. `nvim_list_uis` reads a list and
-    // changes nothing, so a copy of it sitting in a blocked session's queue
-    // does nothing until the queue runs and nothing anyone can see when it
-    // does; if the probe has given up by then, the reply lands on a socket
-    // that has been shut down (see [`Probe::drop`]) and Neovim closes the
-    // channel, as it does for every client that hangs up. What must never be
-    // sent ahead of a fresh reading is a *key* — see the `<CR>` below.
-    //
-    // The one wait nvmux ends itself is the hit-enter prompt, with `<CR>`, the
-    // key it consumes without running anything — see `rpc::Mode::at_hit_enter`
-    // for why only that one. Usually there is nobody else to type it: the
-    // client that was showing the prompt is gone, and this is its replacement.
-    //
-    // Re-read rather than sent and forgotten, because one `<CR>` ends one
-    // prompt and Neovim stacks them: three scheduled callbacks that each raise
-    // an error leave three, and the count is not knowable in advance. Measured
-    // against 0.12.5, the round trip is its own settle — the mode read after a
-    // `<CR>` already reflects it, so exactly three are sent for three prompts
-    // and none is wasted. Each one is justified by its own fresh reading,
-    // which is a stricter licence than the single blind `<CR>` this replaces.
-    //
-    // A deliberate trade-off where another UI is still attached: that user's
-    // prompt ends too, and whatever it was showing — a `:!make` page, a Lua
-    // traceback — leaves their screen unread. `g<` brings the page back and
-    // `:messages` keeps the rest. Advisory, not a lock: a key from that other
-    // UI in the microseconds between two calls ends the prompt first, and the
-    // `<CR>` then runs in whatever mode it left.
-    //
-    // Which is why the loop itself is not pipelined, though it is two round
-    // trips a turn. `nvim_input` and `nvim_get_mode` are both fast calls,
-    // answered from the socket's read callback, so a mode asked behind a
-    // `<CR>` would be answered before the main loop had consumed the key and
-    // would report the prompt still up — earning a second `<CR>` for one
-    // prompt, which is the bug the fresh reading exists to prevent. The pair
-    // above are safe together only because neither is a key.
+    // Both questions go out at once: over SSH each is a round trip (150 ms
+    // RTT: 302 ms in series, 151 ms together). The deferred `list_uis` is
+    // awaited only once the mode says the queue runs; a server waiting for a
+    // key never answers it. Only a *key* must never be sent ahead of a fresh
+    // mode reading. nvmux ends only a hit-enter prompt itself (see
+    // `rpc::Mode::at_hit_enter`), re-reading the mode after each `<CR>`, since
+    // prompts stack. Another attached UI loses its prompt too.
     let mut asking_mode = client.ask_mode()?;
     let counting = client.ask_uis()?;
 
@@ -2970,13 +2070,9 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<An
             return ui_count(client, session_id, counting);
         }
         if !mode.at_hit_enter() {
-            // A more-prompt, a half-typed `g`, a script parked on a key: over
-            // RPC these are one state, and nvmux cannot tell a session wedged
-            // by a crashed callback from a command the user started and left.
-            // So it says so and hands the terminal over — the client's own
-            // keys go out as `nvim_input`, a fast call, so the first thing the
-            // user presses lands, ends the wait, and releases the queued
-            // `nvim_ui_attach` behind it.
+            // A more-prompt, a half-typed `g` or a script awaiting a key look
+            // alike over RPC. Hand over the terminal: the user's first key ends
+            // the wait and releases the queued `nvim_ui_attach`.
             tracing::info!(
                 id = session_id,
                 mode = %mode.mode,
@@ -2992,10 +2088,8 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<An
         asking_mode = client.ask_mode()?;
     }
 
-    // Still prompting after the budget: something is raising them faster than
-    // they are answered. Report it rather than park on it — the user's own
-    // keys are a better answer than an unbounded wait, and they can see what
-    // the prompts say.
+    // Still prompting after the budget: hand over to the user, who can see
+    // the prompts.
     let mode = client.mode_reply(asking_mode)?;
     if mode.blocking {
         tracing::info!(
@@ -3008,37 +2102,15 @@ fn probe_on(client: &mut rpc::Client<UnixStream>, session_id: &str) -> Result<An
     ui_count(client, session_id, counting)
 }
 
-/// How many hit-enter prompts one attach will answer before handing the
-/// terminal over instead.
-///
-/// Three scheduled callbacks that each raise an error stack three prompts, so
-/// the budget is one more than that: enough for the case that produced it, and
-/// small enough that a session generating them faster than nvmux can answer is
-/// given back to the user rather than typed at indefinitely.
+/// How many hit-enter prompts one attach answers before handing over: one
+/// more than the three that stacked erroring callbacks produced.
 const MAX_PROMPTS: usize = 4;
 
-/// The deferred half of the probe: whether this session has room for another
-/// client. The question went out with the mode; this is where its answer is
-/// waited for, and only ever on a mode reading that said the queue is running.
-///
-/// The wait here is still unbounded, and deliberately: a session in the middle
-/// of a `:!make` answers when the make is done, and that is one to wait for
-/// with a spinner rather than to refuse (see `ui::attaching`). What the caller
-/// has ruled out first is the wait that would never end on its own.
-///
-/// One question is asked however many prompts were answered in between: the
-/// reply describes the moment the queue ran, which is after the last `<CR>`,
-/// and re-asking would buy a fresher count of a thing that is racy by one
-/// either way (see the `>` below).
-///
-/// Not `unwrap_or(0)`: a server too busy to answer is exactly the one whose UI
-/// count is unknown, and guessing zero is how the seventeenth attach happens.
-///
-/// `>` rather than `>=`: the client this probe runs alongside may or may not be
-/// attached yet, so the count is off by at most one, in the direction of our own
-/// client. `MAX_UIS` is half of Neovim's limit, so a count one too high refuses
-/// the ninth other client rather than the eighth, and a count one too low still
-/// stops seven short of the abort.
+/// The deferred half of the probe: whether the session has room for another
+/// client, awaited only once the mode says the queue runs. Unbounded on
+/// purpose: a session in `:!make` answers when done (`ui::attaching` shows a
+/// spinner). Not `unwrap_or(0)`: guessing zero is how the 17th attach
+/// happens. `>`, not `>=`: our own client may already be counted.
 fn ui_count(
     client: &mut rpc::Client<UnixStream>,
     session_id: &str,
@@ -3056,8 +2128,7 @@ fn ui_count(
     Ok(Answer::Ready)
 }
 
-/// Open a pty and start the client on it — one that draws cards, if
-/// `draws_cards`.
+/// Open a pty and start the client on it.
 fn spawn_client_with(
     session_id: &str,
     sock: &Path,
@@ -3065,9 +2136,8 @@ fn spawn_client_with(
     cmd: Command,
     draws_cards: bool,
 ) -> Result<Attachment> {
-    // Right *before* the child starts: `PtySize::default()` is 24x80. Note
-    // `crossterm::size()` is (cols, rows) while `PtySize` is { rows, cols } —
-    // passing them positionally transposes the screen.
+    // Sized before the child starts (`PtySize::default()` is 24x80). Note
+    // `crossterm::size()` is (cols, rows) but `PtySize` is { rows, cols }.
     let size = term::terminal_size();
     let (master, pts) = pty_process::blocking::open()
         .map_err(|e| pty_error("could not open a pty for the client", e))?;
@@ -3075,23 +2145,17 @@ fn spawn_client_with(
         .resize(size.into())
         .map_err(|e| pty_error("could not size the client's pty", e))?;
 
-    // Before the child starts on it, so that no moment of its life finds the
-    // pty echoing what the relay writes in.
+    // Before the child starts, so the pty never echoes what the relay writes.
     take_input_as_written(&master);
 
-    // The other half of the pair the user calls their editor, so it gets the
-    // umask nvmux was started with for the same reason the session does — see
-    // `paths::restrict_umask`. A client holds no buffers and so writes next to
-    // nothing, which is a reason for the exception to go unnoticed rather than
-    // a reason to make one.
+    // The client gets nvmux's launch umask, as the session does.
     let umask = crate::paths::launch_umask().map(|mask| mask.bits());
     // Asked here, because `sysconf` is not a call the child may make.
     let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
     // SAFETY: `before_exec` makes async-signal-safe calls only.
     let cmd = unsafe { cmd.pre_exec(move || before_exec(umask, open_max)) };
-    // `spawn` takes the slave and closes it. It has to be closed here: while
-    // this process held it open the master would never see EOF, and the relay
-    // would hang forever after the child exits.
+    // `spawn` takes and closes the slave; held open here, the master would
+    // never see EOF after the child exits.
     let child = cmd
         .spawn(pts)
         .map_err(|e| pty_error("could not start the client", e))?;
@@ -3109,17 +2173,15 @@ fn spawn_client_with(
         master,
         resumed: false,
         reaped: false,
-        // Only when it will be used: a shadow costs a parse of everything the
-        // client writes. One or the other is always there, for the settings
-        // to float over (see `panel`).
+        // A shadow costs a parse of all output, so only with the fade; one of
+        // the two always exists, for the settings to float over.
         shadow,
         screen: (!fades).then(|| shadow::Shadow::new(size.rows, size.cols)),
         hold: None,
         // Set by `relay`, which knows whether there is a notice to write.
         boundary: None,
         span: false,
-        // Like the shadow, only when it will be used: a kept client is the
-        // only kind that is ever resumed from what it wrote.
+        // Only for a kept client, the only kind resumed from its output.
         ledger: kept.then(Ledger::new),
         startup_answered: false,
         expecting_a_size_report: None,
@@ -3129,8 +2191,7 @@ fn spawn_client_with(
         draws_cards,
         away: false,
         crawling: false,
-        // What its environment was given (see `own_client`), built on this
-        // thread a moment ago with nothing changed since.
+        // The generation its environment was just given (see `own_client`).
         heard: crate::config::generation(),
         desk: None,
         row: None,
@@ -3144,22 +2205,11 @@ fn spawn_client_with(
     })
 }
 
-/// What a client is given between the fork and the exec, besides the new
-/// session and the controlling terminal the pty crate makes it — what
-/// portable-pty, which started clients before it, gave them there as well:
-///
-/// - The signals a process is likeliest to have been started with ignored put
-///   back to their defaults, and none blocked. Both survive an exec — an
-///   nvmux started under `nohup` would hand every client an ignored SIGHUP —
-///   and std puts back SIGPIPE alone.
-/// - Every descriptor past stderr closed by the exec: the SIGWINCH self-pipe,
-///   and whatever whoever started nvmux let it inherit. Marked close-on-exec
-///   rather than closed, so that std's own pipe for reporting a failed exec,
-///   close-on-exec already, can still report one.
-/// - Our umask, for the reason [`spawn_client_with`] gives.
-///
-/// It runs in the child of a fork in a process with other threads, so it
-/// makes async-signal-safe calls only, and allocates nothing.
+/// Child setup between fork and exec: reset commonly ignored signals and
+/// unblock all (both survive exec; under `nohup` every client would inherit
+/// an ignored SIGHUP), mark every fd past stderr close-on-exec (not closed,
+/// so std's pipe can still report a failed exec), and set our launch umask.
+/// Async-signal-safe calls only, no allocation.
 fn before_exec(umask: Option<libc::mode_t>, open_max: libc::c_long) -> std::io::Result<()> {
     for sig in [
         libc::SIGCHLD,
@@ -3186,18 +2236,17 @@ fn before_exec(umask: Option<libc::mode_t>, open_max: libc::c_long) -> std::io::
     Ok(())
 }
 
-/// The most descriptors [`close_on_exec_from`] will look at one at a time: a
-/// limit can be set far past any descriptor a process holds, and each is a
-/// syscall.
+/// The most fds [`close_on_exec_from`] checks one by one: the limit can be
+/// far past any fd in use, and each is a syscall.
 const CLOEXEC_SCAN_MAX: libc::c_long = 65_536;
 
-/// Mark every descriptor from `low` up close-on-exec, below `open_max`: the
-/// descriptor limit, asked before the fork.
+/// Mark every fd from `low` up to `open_max` (the fd limit, read before the
+/// fork) close-on-exec.
 fn close_on_exec_from(low: libc::c_int, open_max: libc::c_long) {
-    // All of them in one call, where the kernel has it: Linux 5.11 and later.
+    // One call where available: Linux 5.11 and later.
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: a syscall on no memory of ours, which an older kernel refuses.
+        // SAFETY: a syscall touching none of our memory; old kernels refuse.
         let marked = unsafe {
             libc::syscall(
                 libc::SYS_close_range,
@@ -3216,8 +2265,7 @@ fn close_on_exec_from(low: libc::c_int, open_max: libc::c_long) {
         CLOEXEC_SCAN_MAX
     };
     for fd in low..high as libc::c_int {
-        // SAFETY: async-signal-safe, and on a number that is not an open
-        // descriptor it fails and changes nothing.
+        // SAFETY: async-signal-safe; on a closed fd it fails harmlessly.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFD);
             if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
@@ -3227,8 +2275,8 @@ fn close_on_exec_from(low: libc::c_int, open_max: libc::c_long) {
     }
 }
 
-/// A failure of the pty crate's as one of ours: an I/O error saying what was
-/// being done, of the kind the system gave.
+/// Convert a pty crate error into an I/O error saying what was being done,
+/// keeping the system's error kind.
 fn pty_error(doing: &str, e: pty_process::Error) -> NvmuxError {
     let e = match e {
         pty_process::Error::Io(e) => e,
@@ -3237,30 +2285,10 @@ fn pty_error(doing: &str, e: pty_process::Error) -> NvmuxError {
     NvmuxError::Io(std::io::Error::new(e.kind(), format!("{doing}: {e}")))
 }
 
-/// Have the pty hand the client its input exactly as the relay writes it:
-/// nothing echoed back, nothing kept for the end of a line or edited on the
-/// way, no key made a signal and no `CR` a `NL` — the raw input a client sets
-/// its terminal to as it starts, set before it starts. What the client writes
-/// is left as the pty has it until the client makes that raw too, so nothing
-/// it says reads any differently.
-///
-/// A pty opens cooked, and a fresh client is milliseconds from making it raw
-/// — an exec, a config file, a socket to connect to — where its relay may
-/// write at once: with no first paint held for a fade (see [`Hold`]), the
-/// card it opens with goes in as it starts (see
-/// [`Attachment::put_in_opening`]). A cooked pty echoed that card straight
-/// back, its `ESC`s spelt `^[`, and the relay passed the echo on as the
-/// client's own output: onto the primary screen it had just cleared for the
-/// client, which had yet to leave it for the alternate one — the screen a
-/// detach goes back to, where the shell's prompt came up under rows of hex. A
-/// key typed in that moment went the same way, a `Ctrl-C` killed the client,
-/// and an `Enter` reached it as `Ctrl-J`.
-///
-/// A client leaving puts back the terminal it was handed — this one — so the
-/// same holds once it has, for whatever is still on its way in.
-///
-/// Through the master, which sets the slave's termios on Linux and macOS
-/// both. A pty that will not take it is used as it came.
+/// Put the pty in raw input mode before the client starts, as it would
+/// itself a few ms later. Otherwise a card written meanwhile was echoed
+/// (`ESC` as `^[`) onto the primary screen, `Ctrl-C` killed the client and
+/// `Enter` arrived as `Ctrl-J`. Output flags are left alone.
 fn take_input_as_written(master: &Pty) {
     use nix::sys::termios::{self, SetArg};
 
@@ -3276,46 +2304,18 @@ fn take_input_as_written(master: &Pty) {
     }
 }
 
-/// Relay bytes between the terminal and the child until something interrupts it.
+/// Relay bytes between the terminal and the child until interrupted.
 ///
-/// One thread, one `poll` over stdin, the PTY master and the SIGWINCH
-/// self-pipe, deliberately rather than incidentally:
+/// One thread and one `poll` over stdin, the master and the SIGWINCH pipe:
+/// two readers on one file description would split the stream, and a thread
+/// blocked in `read(0)` cannot be cancelled.
 ///
-/// * `try_clone_reader` dups the *same* open file description, so two readers
-///   race and split the stream — in a proxy that means randomly deleting chunks
-///   of the user's screen. One loop, one reader.
-/// * A thread parked in a blocking `read(0)` cannot be cancelled, so returning
-///   to the picker would hang or swallow the first keystroke. A `poll` loop
-///   just stops polling.
-///
-/// # Starting the next session before this one has finished leaving
-///
-/// `begin_next` is called with the target of a `<prefix>` switch, once, the
-/// moment [`pump`] returns one — before this session dissolves and before the
-/// terminal is handed back. What follows that call is a dissolve — half of
-/// `fade.duration_ms`, which measures both directions — of nvmux drawing its
-/// own frames off a grid it already has, and the work the next attachment
-/// opens with is a fork and a round trip that touch nothing this function is
-/// using: a client writes into its own pty and nothing reaches the terminal
-/// until a relay copies it (see [`spawn_client`]), and the probe answers on a
-/// thread of its own (see [`Probe`]). Started here, both run underneath the
-/// dissolve instead of after it.
-///
-/// So the callback must *start* things and not wait for them: it is called
-/// with the terminal still raw and the outgoing session still on it, and
-/// anything it blocks on is time the user watches a frozen screen for. It must
-/// not draw. Every other outcome calls it not at all — the picker, the prompt
-/// and the help screen have nothing to start, and the three that end the relay
-/// have nowhere to go.
-///
-/// What it hands back is the card the switch lands with, if it knows where
-/// that is: this session's client draws it as the switch begins, and its fade
-/// out leaves it standing, as does the next session's fade in — so the card is
-/// on the screen as it is from the key to the session it names, left standing
-/// on the screen handed over between the two ([`Attachment::take_left_standing`]).
-/// For a step, its row moves all the while: each fade draws it from what the
-/// client draws as it goes, and the next session's client takes it up as far
-/// along as it has come since the key ([`card::Card::up_ms`]).
+/// `begin_next` is called once with a switch's target as soon as [`pump`]
+/// returns it, so the next client's fork and probe run under this session's
+/// fade out. It must only start work and must not draw: the terminal is
+/// still raw with this session on it. It returns the switch's landing card,
+/// if known, which both fades leave standing
+/// ([`Attachment::take_left_standing`]).
 pub fn relay(
     mut attachment: Attachment,
     highest_session_num: u32,
@@ -3327,52 +2327,26 @@ pub fn relay(
     // A client that has not painted yet, whose first paint can be held.
     let fresh = !attachment.resumed;
     if attachment.resumed {
-        // The client entered the alternate screen itself on its first relay
-        // and has not been told that every screen since — the picker, the
-        // prompt, the help, the `Switch` branch below — left it. It will not
-        // enter it again: the repaint below redraws the grid wherever the
-        // terminal is. Left on the primary screen it draws there, and then
-        // on a detach its `rmcup` and nvmux's own `?1049l` have nothing to
-        // leave, and its last frame is what the shell prompt lands on.
-        // Not shown to the shadow: the erase would take the screen the
-        // client had out of it, and that screen is what dissolves back in
-        // below, ahead of the repaint that then puts the real one back.
-        //
-        // A name the picker left standing is on the screen being left, and
-        // comes off it in the same span as the switch — a span the dissolve's
-        // first frame closes, drawing the name again over the session.
+        // The client entered the alternate screen on its first relay and will
+        // not re-enter it; on the primary screen, its last frame would stay
+        // under the shell prompt after a detach. Not shown to the shadow,
+        // whose screen is what fades back in. A picker's name comes off in the
+        // same span, closed by the fade's first frame.
         match attachment.hand_off.as_ref() {
             Some(h) => term::enter_alt_screen_and_clear_after(&h.erase()),
             None => term::enter_alt_screen_and_clear(),
         }
     } else {
-        // Normally already done by whoever handed the terminal over — the
-        // picker, the prompt, or the `Switch` branch below — because a clear
-        // on this side of the client spawn is a clear too late, and the old
-        // session is what fills the wait. This is the backstop for a path
-        // that did neither, and a repeat costs one write on a screen nothing
-        // has drawn to since. The client enters the alternate screen for
-        // itself, as part of its startup.
-        //
-        // Not where the picker left a name standing: the picker did the
-        // handover, and the name is the one thing on the screen since, which
-        // the first paint takes down (see `release_hold`).
+        // Normally done by whoever handed over the terminal; this is a
+        // backstop. Skipped if the picker left a name up: the first paint
+        // takes it down (see `release_hold`).
         if attachment.hand_off.is_none() {
             term::leave_alt_screen_and_clear();
         }
-        // A client started ahead was sized for the terminal nvmux started on,
-        // which may have changed since. Told now, before anything takes a
-        // byte of what it drew: the shadow then reads those bytes at the size
-        // the terminal has, and the client's redraw for that size follows
-        // them. It takes its size from the pty, as every client does until
-        // the terminal has said whether it reports sizes in band — which this
-        // one has yet to ask it.
-        //
-        // Told it is back in front before that, if it was told it was away
-        // (see `Attachment::go_away`): away, a client draws at
-        // a crawl, and that redraw would come long after the held paint it
-        // belongs in had been let through without it. The opening says so
-        // too, but only as the paint is let through.
+        // A client started ahead was sized at startup; resize it before its
+        // output is read, so the shadow and its redraw match the terminal.
+        // Tell it it is back first, or it would redraw at a crawl, after the
+        // held paint is released.
         if attachment.started_ahead() {
             if std::mem::take(&mut attachment.away) {
                 attachment.tell_client(&card::Command::Clear);
@@ -3386,23 +2360,16 @@ pub fn relay(
     }
     let mut raw = term::RawMode::enter()?;
 
-    // Whether the session's screen was dissolved in from the shadow on a
-    // resume, before the client has written a byte of this relay: what lets
-    // the notice go up over a kept session that has nothing to say (see
-    // `pump`).
+    // Whether the screen faded in from the shadow on a resume; lets the
+    // notice go up over a quiet kept session.
     let mut dissolved = false;
-    // A kept client's repaint, asked on its return and answered while the
-    // relay runs.
+    // A kept client's repaint, requested on return.
     let mut erasing: Option<Erasing> = None;
-    // The cards first, before the screen comes back: off with whatever the
-    // client showed when it was last in front, and on with where the switch
-    // landed. Its own client draws that at once — it asks nothing of the
-    // server — so it is on the screen the session dissolves in with, which
-    // leaves it standing as the rest comes in.
+    // Cards first: clear the old ones, show the landing card. The client
+    // draws it at once, so the fade in shows it.
     let landed = attachment.open_desk();
-    // Told now, for a client that has drawn its screen already or will draw
-    // it with nothing held; a fresh one's first paint is held (below), and it
-    // is told as the paint is let through.
+    // Sent now if the screen is drawn already or nothing will be held; a
+    // fresh client's held paint sends them on release.
     if attachment.resumed || attachment.shadow.is_none() {
         attachment.put_in_opening(Instant::now());
     }
@@ -3411,18 +2378,10 @@ pub fn relay(
     // picker has since drawn over.
     if attachment.resumed {
         let t_resume = Instant::now();
-        // A kept client's is read rather than thrown away: it was parked,
-        // not blocked, and what it wrote is the screen about to be painted
-        // back — see [`Attachment::drain_unrelayed`]. With the frame it draws
-        // the card on among it, which comes a moment after the card was asked
-        // for: read until the shadow has the card, so that the fade in leaves
-        // it standing (see [`Attachment::drain_until_shown`]).
-        //
-        // And so for a client that drew at a crawl while it was away, card
-        // or none: the Clear the opening put in has it draw at once what it
-        // had yet to — up to a second of its session — and say something
-        // even where that is nothing, so the screen comes back as it is now
-        // rather than as it was last drawn, and then jumps.
+        // A kept client's backlog is the screen about to come back, so it
+        // is read, not discarded, until the shadow has the requested card. A
+        // client back from a crawl is likewise given time to draw what it
+        // owed, so the screen does not jump later.
         if attachment.is_kept() {
             let kept = attachment.kept.clone();
             if landed && !kept.is_empty() && attachment.shadow.is_some() {
@@ -3438,54 +2397,25 @@ pub fn relay(
         } else {
             discard_pending(master_fd);
         }
-        // The size first, so the frames fit the terminal as it is now; then
-        // the screen the client had dissolves in, and the client's repaint
-        // lands over the last frame — asked after it, or for a kept client
-        // as it starts (below), and either way relayed after it: nothing the
-        // client writes reaches the terminal until the relay copies it.
-        //
-        // Either way the cursor is shown by nvmux, not left to the repaint:
-        // the fade out that ended the last relay hid the cursor, and a
-        // repaint is what a server *may* do — one busy in Lua or waiting for
-        // a key does nothing until that is over, and an idle editor writes
-        // nothing on its own. A fade in puts the cursor back on the session's
-        // own cell as its last frame; without one it is shown where the erase
-        // left it, as every screen left it before there was a fade.
-        //
-        // A kept client with no fade to dissolve it in has its screen painted
-        // straight back instead, from its copy: it is on the glass at once
-        // either way, whatever the server is doing.
+        // Size first, then the fade in; the repaint lands after it. nvmux
+        // shows the cursor itself: the last fade out hid it, and the server
+        // may never repaint.
         let size = term::terminal_size();
-        // Asked before the resize, because the resize is what changes it.
+        // Before the resize, which changes it.
         let resized = pty_size(&attachment.master) != Some(size);
         attachment.resize_to(size);
-        // A kept client's repaint, asked as the fade in starts rather than
-        // once it is over: the frames are nvmux's own, drawn from the copy,
-        // and take the time they take whatever the server is doing, so the
-        // server's whole redraw — the exact screen, which the copy stands in
-        // for until it comes — is done underneath them instead of after them.
-        //
-        // Not where the size changed while the client was parked. The client
-        // has its server resize first, on a signal it has yet to act on, and
-        // a repaint that got in ahead of that resize would be drawn for the
-        // old size into a terminal that has the new one. Asked after the
-        // screen is back, as before, which gives the resize a fade's head
-        // start.
-        //
-        // Nor where a card on the move stands through the fade in. The fade
-        // reads what the client writes, to draw the card where it has moved
-        // to, and what it reads goes no further than the shadow: a repaint
-        // landing in it would never reach the terminal. Asked once the screen
-        // is back, as there.
+        // A kept client's repaint is requested as the fade in starts, so the
+        // server redraws under it. Not if the size changed while parked (the
+        // repaint could beat the resize and draw at the old size), nor if a
+        // moving card stands (output during the fade reaches only the
+        // shadow); then it is requested after.
         let early = attachment.is_kept() && !resized && !attachment.standing().moves();
         if early {
             erasing = kept_clients_repaint(&mut attachment);
         }
-        // Settings or a picker to float over the session as it comes back
-        // bring it in with them, out of the background (see `panel`), rather
-        // than have it dissolve in only to be dimmed again round them: the
-        // screen stays the background the erase made it, and the shadow as it
-        // is, for the panel to draw the session from.
+        // Settings or a picker floating over the returning session bring it
+        // in from the background themselves (see `panel`), rather than
+        // fading it in only to dim it again.
         attachment.dark = attachment.to_float.is_some()
             && attachment.hand_off.is_none()
             && attachment
@@ -3493,13 +2423,12 @@ pub fn relay(
                 .as_ref()
                 .is_some_and(shadow::Shadow::has_contents);
         dissolved = !attachment.dark && attachment.dissolve_in();
-        // Off the primary screen since the switch, and on the session's only
-        // as long as the dissolve drew it.
+        // Off the primary screen since the switch; on the session's only if
+        // the fade drew it.
         let carried = attachment.hand_off.take().is_some();
         let on_screen = attachment.dark || dissolved || attachment.paint_kept_screen();
         if !on_screen {
-            // The span the switch opened for the dissolve, with no frame to
-            // close it.
+            // Close the span the switch opened, which no fade frame closed.
             if carried {
                 term::end_span();
             }
@@ -3513,12 +2442,9 @@ pub fn relay(
             "timing: resumed screen"
         );
         if attachment.is_kept() {
-            // What the client told the terminal comes back from the ledger,
-            // and the exact screen from its server — asked above where the
-            // size held, and otherwise here.
-            // The fade's last frame leaves a reset pen and a hidden cursor
-            // wherever it was; a kept client may write before the repaint
-            // lands, and writes on the belief that neither has moved.
+            // The ledger restores the client's terminal state, the server the
+            // exact screen. Restore the pen and cursor first: the client may
+            // write before the repaint, assuming neither moved.
             if dissolved {
                 attachment.hand_back_the_pen();
             }
@@ -3532,22 +2458,20 @@ pub fn relay(
         }
     }
     attachment.resumed = true;
-    // Back in front as far as the client knows: one started ahead was told
-    // so above, and one resumed by the Clear the opening put in, above too.
+    // Back in front as far as the client knows: told above if started
+    // ahead, or by the opening's Clear if resumed.
     attachment.away = false;
     attachment.crawling = false;
     if fresh && attachment.shadow.is_some() {
         attachment.hold = Some(Hold::new(Instant::now()));
     }
 
-    // Announced by a card now, which the client draws (see `crate::card` and
-    // `open_desk` above), and not by the box, which is kept as it was and
-    // never armed: it used to be `announce::Popup::arm(attachment.announce.take(),
-    // Instant::now())` here.
+    // Announced by a card the client draws (see `crate::card`). The old
+    // box is kept but never armed; it was
+    // `announce::Popup::arm(attachment.announce.take(), Instant::now())`.
     let popup: Option<announce::Popup> = None;
-    // Only for the notice, and only from here: everything written to the
-    // terminal above is nvmux's own and complete, so a parser that starts
-    // between sequences starts right.
+    // Only for the notice; everything written above is complete, so the
+    // parser starts between sequences.
     attachment.boundary = popup.is_some().then(boundary::Boundary::new);
 
     let outcome = pump(
@@ -3559,41 +2483,32 @@ pub fn relay(
         dissolved,
         erasing,
     );
-    // Taken, not kept for the next relay, whether or not it was said: `<prefix>
-    // Space` and `<prefix> ?` come back to this same client, and a session you
-    // never left has nothing to announce. The desk is this relay's alone.
+    // Cleared whether or not shown: this client may come straight back.
     attachment.announce = None;
     attachment.desk = None;
-    // Told by this relay or by none: a paint waited for that did not come is
-    // not one the next relay of this client makes.
+    // Only this relay notifies.
     attachment.painted = None;
-    // Up over this relay's session, or not to come up at all: the settings
-    // were asked to float over the session they were turned to float from,
-    // and the picker over the one it went to a prompt from.
+    // Floats only over this relay's session.
     attachment.to_float = None;
-    // From here on nothing the client writes reaches the terminal until it is
-    // relayed again: what the ledger hears next is news to the terminal.
+    // Nothing the client writes reaches the terminal until it is relayed
+    // again, so what the ledger sees next is news to the terminal.
     if let Some(ledger) = attachment.ledger.as_mut() {
         ledger.left_the_terminal();
     }
 
-    // As early as there is anything to say: everything below this line is
-    // nvmux drawing, and what the caller starts here runs underneath it. See
-    // the note on `begin_next`.
+    // As early as possible, so the caller's work runs under the fade.
     let landing = outcome
         .as_ref()
         .ok()
         .and_then(|o| o.switch_target())
         .and_then(begin_next);
 
-    // Whatever ended the relay, nothing the client wrote may stay unshown —
-    // which is as true of the few bytes the notice was holding a sequence
-    // together with as it is of a whole first paint.
+    // However the relay ended, nothing the client wrote may stay unshown.
     if let Err(e) = attachment.stop_watching_the_terminal() {
         tracing::debug!(error = %e, "could not write out what the notice was keeping");
     }
-    // A relay cut short inside the hold — a prefix typed at once, a child that
-    // exited — lets the paint through as it is, with no fade.
+    // A relay cut short during the hold (a prefix typed at once, a child
+    // that exited) releases the paint as is, with no fade.
     if let Err(e) = attachment.release_hold(false) {
         tracing::debug!(error = %e, "could not release the held first paint");
     }
@@ -3609,37 +2524,22 @@ pub fn relay(
             | Outcome::Resettle
             | Outcome::Switch(_)),
         ) => {
-            // Dissolve the session out first: before the modes go back, so a
-            // key typed during it is not echoed, and before the hand-off
-            // below, which erases with the colour the last frame ends on. A
-            // frame that could not be written must not skip the restore, so
-            // its error is logged and dropped rather than propagated.
-            //
-            // A switch has its client draw the card it lands with first, and
-            // the dissolve leaves the card standing — its row moving, for a
-            // step, from the key on.
+            // Fade out before restoring modes (so a key typed meanwhile is not
+            // echoed) and before the hand-off, which erases with the last
+            // frame's colour. A switch first has the client draw the landing
+            // card, which the fade leaves standing.
             let stood = landing
                 .as_ref()
                 .and_then(|card| attachment.stand_landing(card));
             let kept = stood
                 .as_ref()
                 .map_or_else(shadow::Kept::default, |(kept, _)| kept.clone());
-            // A panel that took the session out with it has left the screen
-            // as a fade out would.
+            // A panel that took the session with it already faded it.
             let faded = std::mem::take(&mut attachment.dark) || attachment.fade_out(&kept);
             raw.restore();
-            // Clear here rather than leaving it to the next `relay`, which runs
-            // on the far side of the client spawn: what is on the terminal until
-            // then is the session being switched away from. Harmless when the
-            // number names nothing — the same client is resumed, and a resume
-            // forces a repaint.
-            // Not shown to the shadow, for the reason the resume's erase is
-            // not: a switch that names this same session resumes it, and the
-            // screen it had is what dissolves back in.
-            //
-            // A card the dissolve left standing stays on the cleared screen,
-            // in the same synchronized write, for the next relay to take down
-            // in the one it draws the card again with (see `crate::handoff`).
+            // Clear now, not after the next client spawns, or the old session
+            // stays up meanwhile; not shown to the shadow. A card the fade left
+            // standing stays for the next relay to take down.
             if held.leads_straight_into_another_relay() {
                 let standing = stood.filter(|_| faded).and_then(|(kept, since)| {
                     let drawn = fade::standing(attachment.shadow.as_ref()?, &kept);
@@ -3656,10 +2556,8 @@ pub fn relay(
             Ok((held, Some(attachment)))
         }
         Ok(Outcome::ChildExited) => {
-            // The child is gone and has emitted its own restore; relay the rest
-            // of it, then hand back to the picker. A kept client parked
-            // meanwhile relies on modes that restore has just turned off, and
-            // is told so when it comes back (see [`EXITS_RELAYED`]).
+            // The child emitted its restore; relay the rest. Parked kept
+            // clients rely on modes it just turned off (see [`EXITS_RELAYED`]).
             EXITS_RELAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             attachment.drain_until_eof();
             raw.restore();
@@ -3667,33 +2565,28 @@ pub fn relay(
             Ok((Outcome::ChildExited, None))
         }
         Ok(other @ (Outcome::Detached | Outcome::StdinClosed)) => {
-            // Leave the session running and let the child put the terminal
-            // back itself — a competing reset while it is still writing would
-            // corrupt its own restore sequence. Once it is gone, a final reset
-            // is harmless and covers a client that died before it got that far.
+            // Let the child restore the terminal; a competing reset would
+            // corrupt its restore. A final reset covers a client that died
+            // first.
             attachment.hang_up();
             attachment.drain_until_eof();
             raw.restore();
             attachment.reap();
             term::reset_screen();
-            // After the reset, not before: leaving the alternate screen puts the
-            // cursor back on the line the client printed its hangup message
-            // from, which is the line to erase.
+            // After the reset: leaving the alternate screen puts the cursor
+            // back on the line with the client's hangup message.
             term::erase_hung_up_clients_line();
             Ok((other, None))
         }
         Err(e) => {
-            // The error is about to be printed to a shell: put the cursor and
-            // the colours back first, in case the client died mid-frame with
-            // the cursor hidden or an SGR attribute set. `attachment` is
-            // dropped on the way out, which retires the client.
+            // The error goes to a shell: restore cursor and colours first, in
+            // case the client died mid-frame.
             attachment.hang_up();
             attachment.drain_until_eof();
             raw.restore();
             attachment.reap();
             term::reset_screen();
-            // The same hangup, so the same stray line — and here the error is
-            // about to be printed onto it.
+            // The same hangup leaves the same stray line.
             term::erase_hung_up_clients_line();
             Err(e)
         }
@@ -3713,45 +2606,30 @@ fn pump(
     let mut keys = crate::config::get().keys;
     let mut prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
     let mut prefix_timeout = Duration::from_millis(keys.timeout_ms);
-    // When a pending prefix, half-typed number or cut-off escape sequence must
-    // be settled. An instant rather than a per-poll timeout on purpose: a child
-    // that keeps producing output keeps `poll` returning early, and a timeout
-    // that restarted on every wake-up would never fire while a spinner is
-    // running. It is set when the machine arms and cleared when it settles.
+    // When a pending prefix, half-typed number or cut-off sequence must be
+    // settled. An instant, not a per-poll timeout: a chatty child keeps
+    // `poll` returning early, so a restarting timeout would never fire.
     let mut deadline: Option<Instant> = None;
-    // The terminal's size: read here, and again whenever it may have changed —
-    // a `SIGWINCH`, drained below, or one the settings or the help took while
-    // they floated — rather than on every pass, as it once was for the bar.
-    // Asking it is two opens of `/dev/tty`, two `ioctl`s and two closes, three
-    // times the system calls of the rest of a pass.
+    // Re-read only on a `SIGWINCH` or after a floating panel: each read
+    // costs 3x the syscalls of the rest of a pass.
     let mut size = term::terminal_size();
-    // The notice's repaint while it is in flight; see [`Erasing`]. Shared with
-    // the hint bar, which wants the same repaint for the same reason and only
-    // when this slot is free: a `:mode` in flight repaints the whole screen and
-    // covers the bar's row on its way past. And with a kept client's return,
-    // which comes in with one already asked for.
+    // The hint bar shares `erasing` (the notice's repaint, see
+    // [`Erasing`]) when free, since a `:mode` repaints its row too.
     // The row that says what the next key does while a `<prefix>` waits.
     let mut bar = hint::Bar::new(Instant::now(), size, keys.bind);
-    // `<prefix> d` with settings changed and unsaved asks first, on the bar's
-    // row, and takes the keyboard until it is answered.
+    // `<prefix> d` with unsaved settings asks first, on the bar's row,
+    // and takes the keyboard until answered.
     let mut leaving: Option<Leaving> = None;
     let mut buf = [0u8; 8192];
-    // Diagnostics only, and what makes a switch that felt slow attributable:
-    // everything before this is nvmux's own work and is timed where it happens,
-    // while this is the session's — its redraw, and the terminal's drawing of
-    // it. Measured from the start of the relay, which is the moment the
-    // terminal became the new session's to paint.
+    // Diagnostics only: times the session's redraw from the moment the
+    // terminal became its.
     let relay_started = Instant::now();
     let mut first_byte: Option<Duration> = None;
     let mut painted_bytes = 0usize;
     let mut last_byte = Instant::now();
     let mut painted = false;
 
-    // A client started ahead of this, its first visit, has been writing all
-    // along (see [`Attachment::start_ahead`]). What it wrote goes first, and
-    // the way everything it writes from here goes — held with the first
-    // paint, shown to the shadow and the ledger, relayed — as if it had just
-    // been read, which as far as the terminal is concerned it has.
+    // A started-ahead client's output so far goes first, as if just read.
     if let Some(unshown) = attachment.unshown.take().filter(|b| !b.is_empty()) {
         let now = Instant::now();
         attachment.relay_output(&unshown, now)?;
@@ -3761,17 +2639,13 @@ fn pump(
     }
 
     loop {
-        // The settings, turned to float while they had the terminal to
-        // themselves, or the picker, back from a prompt: up over the session
-        // as soon as its screen is back, as `<prefix> ,` and `<prefix> Space`
-        // bring them, and before a key is read, so that what was typed as
-        // they went goes to them.
+        // Float pending settings or picker once the screen is back, before
+        // reading keys, so keys typed meanwhile go to them.
         if let Some(outcome) = attachment.to_float.filter(|_| attachment.screen_is_back()) {
             if let Some(outcome) = float_over(attachment, master_fd, winch, outcome)? {
                 return Ok(outcome);
             }
-            // What they may have changed, read again as after `<prefix> ,`
-            // (below).
+            // Re-read what they may have changed, as after `<prefix> ,` below.
             keys = crate::config::get().keys;
             prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
             prefix_timeout = Duration::from_millis(keys.timeout_ms);
@@ -3780,11 +2654,8 @@ fn pump(
             bar = hint::Bar::new(Instant::now(), size, keys.bind);
         }
 
-        // The attach notice has a clock of its own — a life to end, and a
-        // dissolve to pace — and so do a held first paint and a tail kept back
-        // to keep a sequence whole; all of it is folded in here so it is
-        // honoured by the same `poll`. Absolute on every side, for the reason
-        // above.
+        // Every clock (prefix, notice, hold, held tail, cards) folds into one
+        // absolute `poll` deadline.
         let now = Instant::now();
         let next = [
             deadline,
@@ -3803,9 +2674,8 @@ fn pump(
         // wait is bounded; an armed prefix shortens it to its own deadline.
         let timeout_ms = match next {
             Some(d) => {
-                // Rounded up, not down: rounded down, the last fraction of a
-                // millisecond before every deadline would be spent in
-                // `poll` calls that return at once.
+                // Rounded up: rounded down, the last fraction of a ms
+                // before each deadline would spin in `poll`.
                 let left = d.saturating_duration_since(Instant::now());
                 let ms = left.as_micros().div_ceil(1000);
                 ms.min(IDLE_POLL_MS as u128) as libc::c_int
@@ -3813,8 +2683,8 @@ fn pump(
             None => IDLE_POLL_MS,
         };
 
-        // The board, for the cards the notifier posts: see `crate::card`. A
-        // board without its pipe is polled as -1, which `poll` passes over.
+        // The board for cards the notifier posts (see `crate::card`).
+        // Without its pipe it is polled as -1, which `poll` skips.
         let board = card::board();
         let mut fds = [
             pollfd(stdin_fd),
@@ -3831,16 +2701,14 @@ fn pump(
             return Err(NvmuxError::Io(err));
         }
 
-        // Output first, so the screen is current before a keystroke is acted on.
+        // Output first, so the screen is current before keys are acted on.
         let child_spoke = n > 0 && ready(&fds[1]);
         if child_spoke {
             match read_fd(master_fd, &mut buf) {
                 // EOF on macOS, EIO on Linux: both mean the slave closed.
                 Ok(0) | Err(_) => return Ok(Outcome::ChildExited),
                 Ok(len) => {
-                    // Byte for byte, and held only while the first paint is;
-                    // see the module docs. The shadow, if there is one, is
-                    // shown a copy.
+                    // Byte for byte; the shadow gets a copy.
                     let now = Instant::now();
                     attachment.relay_output(&buf[..len], now)?;
                     if first_byte.is_none() {
@@ -3852,17 +2720,15 @@ fn pump(
             }
         }
 
-        // The held first paint, once it is over: dissolved in from the
-        // shadow, then let through. Before the notice below, which paints
-        // over the session and so must find it on screen.
+        // Release the finished first paint before the notice below,
+        // which must find the session on screen.
         let released = attachment.hold_is_due(Instant::now());
         if released {
             attachment.release_hold(true)?;
         }
 
-        // A tail the notice is holding a sequence together with is never held
-        // long: a client that stopped in the middle of one may be waiting for
-        // the terminal's answer to it. See [`crate::boundary`].
+        // A held tail is never held long: a client stopped mid-sequence may
+        // be awaiting the terminal's answer.
         if attachment
             .kept_due()
             .is_some_and(|due| Instant::now() >= due)
@@ -3870,9 +2736,8 @@ fn pump(
             attachment.release_kept()?;
         }
 
-        // Once per relay, on the first lull after the session has said
-        // anything. After the read above, so a burst that ends on this pass is
-        // counted before the lull is measured.
+        // Once per relay, on the first lull after any output. After the
+        // read above, so a burst ending this pass is counted first.
         if !painted && first_byte.is_some() && last_byte.elapsed() >= PAINT_SETTLED {
             painted = true;
             tracing::debug!(
@@ -3894,37 +2759,17 @@ fn pump(
             attachment.resize_to(size);
         }
 
-        // After the frame it sits on and before any keystroke is acted on. The
-        // size is the terminal's as it is now, read again on a resize, so
-        // every frame of the notice — it dissolves in and out, so there are
-        // many — is drawn for the screen as it is, and a resize between the
-        // drawing and the erasing is seen by both.
+        // After the frame it sits on and before keys; `size` is current, so
+        // each notice frame fits.
         if let Some(p) = popup.as_mut() {
-            // A held first paint counts as the child still talking, even
-            // though the terminal has not heard a word of it. The box must not
-            // go up over a screen the editor has not been let paint yet: there
-            // would be nothing under it to melt into, and the dissolve that
-            // ends the hold repaints every cell — it would wipe the box off a
-            // screen the popup still believes it is on. `between_sequences` is
-            // what refuses it, and the box has `GIVE_UP` against the hold's
-            // much shorter `HOLD_CAP`.
+            // A held paint counts as the child talking: the fade that ends
+            // the hold repaints every cell and would wipe the box.
             let pass = announce::Pass {
                 wrote: child_spoke || attachment.hold.is_some(),
-                // Not before the client has written a byte, and not only
-                // because there would be nothing under the box. Its first act
-                // is to enter the alternate screen, and until it has, the
-                // terminal is still showing the primary one nvmux cleared on
-                // the way in — which is the screen the user's shell comes back
-                // to, and no place to leave three rows of border. The hold
-                // says the same thing the other way round when there is one.
-                //
-                // Unless the session's screen was dissolved in from the
-                // shadow, which a kept client's return does: there the box has
-                // a screen to sit on before the client says anything — a
-                // session that is idle, or busy, may say nothing for a while
-                // yet — and the shadow to take it off again whatever the
-                // server does. A screen painted straight back has no shadow
-                // behind it, and waits for the client like any other.
+                // Not before the client's first byte (until then the
+                // terminal shows the shell's primary screen), unless the
+                // screen faded in from the shadow on a kept client's
+                // return.
                 between: (first_byte.is_some() || dissolved) && attachment.between_sequences(),
             };
             let act = p.step(Instant::now(), pass, size, attachment.shadow.as_ref());
@@ -3932,30 +2777,19 @@ fn pump(
                 announce::Act::Idle => {}
                 announce::Act::Paint(bytes) => {
                     attachment.write_over_session(&bytes)?;
-                    // On a three-row terminal — and only there — the box's
-                    // bottom row is the bar's row, so the bar can no longer
-                    // trust that what it drew is still on the screen. Told one
-                    // way only: telling the notice that the bar is up would
-                    // freeze its dissolve for as long as a prefix is armed, on
-                    // every terminal, to settle a collision that exists on one
-                    // size. The bar's own block runs below this one, so on that
-                    // size it takes the shared row back within this pass.
+                    // On a three-row terminal the box's bottom row is the
+                    // bar's. Telling only the bar avoids freezing the notice
+                    // while a prefix is armed.
                     bar.overdrawn();
                 }
                 announce::Act::Erase => {
-                    // The same repaint a resume asks for, and for the same
-                    // reason: the cells the box covered are the server's, and
-                    // only the server can say what was under them. Not the same
-                    // licence, though — see [`Repaint`] — and not the same
-                    // wait: this one is asked from a thread, because the relay
-                    // has a session to keep running while the answer comes
-                    // (see [`Erasing`]). The size goes first, as it does for a
-                    // resume, and on this thread, where a `resize` belongs.
+                    // Only the server knows what the box covered. Asked from a
+                    // thread so the relay keeps running (see [`Erasing`]);
+                    // resized here first.
                     attachment.resize_to(size);
                     match Erasing::start(&attachment.sock) {
                         Ok(started) => erasing = Some(started),
-                        // No thread to ask from: the fallback is what a server
-                        // that could not be asked would have got anyway.
+                        // No thread: use the fallback.
                         Err(e) => {
                             tracing::debug!(error = %e, "no thread for the notice repaint");
                             apply(attachment, Repaint::Notice, Served::NONE);
@@ -3965,11 +2799,8 @@ fn pump(
                 }
                 announce::Act::Done => popup = None,
             }
-            // Where the terminal stood when the notice's life ended. The one
-            // question a report of "the box never appeared" turns on, and
-            // there is no answering it from outside the process: the box is
-            // written into somebody else's byte stream and what is on the
-            // screen afterwards says nothing about why.
+            // Log the parser state when the notice ends: the key fact
+            // for a "the box never appeared" report.
             if popup.is_none() {
                 tracing::debug!(
                     between = attachment.between_sequences(),
@@ -3978,28 +2809,22 @@ fn pump(
             }
         }
 
-        // The notice's repaint, if it has answered. Only the fallback waits on
-        // this — the repaint itself arrives as the session's own output — so a
-        // pass that finds nothing costs a `try_recv`.
+        // The notice's repaint, if answered; only the fallback waits on it.
         if let Some(served) = erasing.as_ref().and_then(Erasing::answer) {
             erasing = None;
             apply(attachment, Repaint::Notice, served);
         }
 
-        // Settle a pending prefix or number before reading anything new, so a
-        // key that arrives just after the deadline is not swallowed as a
-        // command. A cut-off escape sequence is the other way round: input
-        // already waiting is the rest of it, or the key that decides it, and
-        // must be read first — the screen write above can outlast the short
-        // wait, and settling then would break a sequence whose remainder had
-        // already arrived.
+        // Settle a pending prefix before reading new input, so a key just
+        // after the deadline is not taken as a command. A cut-off escape
+        // sequence is the opposite: waiting input may complete it, so it is
+        // read first.
         let stdin_ready = n > 0 && ready(&fds[0]);
         let overdue = deadline.is_some_and(|d| Instant::now() >= d);
         if overdue && !(stdin_ready && prefix.wait() == Some(Wait::Sequence)) {
             deadline = None;
-            // `timeout` resolves a lone prefix into a literal one, but also a
-            // half-typed session number into a switch — so the actions it
-            // produces must be acted on, not just the bytes.
+            // `timeout` may also turn a half-typed number into a switch, so
+            // act on its steps.
             for step in prefix.timeout() {
                 if let Some(outcome) = take_step(attachment, step)? {
                     return Ok(outcome);
@@ -4038,20 +2863,15 @@ fn pump(
                     }
                 }
                 Ok(len) => {
-                    // Whether the settings or the help floated over the
-                    // session and went, which may have changed the keys this
-                    // relay runs on.
+                    // Whether a floating panel came and went (keys may change).
                     let mut floated = false;
-                    // Deliberately NOT logged: every keystroke the user types,
-                    // into a /tmp file that outlives the session.
+                    // Deliberately NOT logged: every keystroke, into a /tmp
+                    // file that outlives the session.
                     for step in prefix.feed(&buf[..len]) {
                         if let Some(outcome) = take_step(attachment, step)? {
-                            // `<prefix> ,`, `<prefix> ?` or `<prefix> Space`:
-                            // the settings, the help or the picker, over the
-                            // session, and back to it once they are taken down —
-                            // unless they cannot float or are not to
-                            // (`[style] float`), or where they lead needs the
-                            // session loop.
+                            // `<prefix> ,`, `?` or `Space`: float the panel and
+                            // return here, unless it cannot float or leads to
+                            // the session loop.
                             let outcome = match float_over(attachment, master_fd, winch, outcome)? {
                                 Some(outcome) => outcome,
                                 None => {
@@ -4059,8 +2879,7 @@ fn pump(
                                     continue;
                                 }
                             };
-                            // With settings unsaved, a detach asks first; what
-                            // else was typed in the same read goes with the key.
+                            // With unsaved settings, a detach asks first.
                             if outcome == Outcome::Detached {
                                 let unsaved =
                                     crate::settings::changed(&config::get(), &config::saved())
@@ -4082,8 +2901,7 @@ fn pump(
                         keys = crate::config::get().keys;
                         prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
                         prefix_timeout = Duration::from_millis(keys.timeout_ms);
-                        // A resize while they floated was theirs to take, and
-                        // its signal with it.
+                        // A resize while they floated was theirs.
                         size = term::terminal_size();
                         bar = hint::Bar::new(Instant::now(), size, keys.bind);
                     }
@@ -4100,33 +2918,11 @@ fn pump(
             }
         }
 
-        // The hint bar, after the keys and not before them: the prefix that
-        // raises it arrives in the read above, and the timeout that lowers it is
-        // settled above too, so anywhere earlier in the loop the bar would be a
-        // whole wake-up late — and the only wake-up scheduled is the prefix's own
-        // deadline, so it would appear exactly as the prefix expired. After the
-        // winch, so the row is the terminal's as it is now, and after the notice,
-        // for the reason written down there.
-        //
-        // The pass is the notice's: the child having spoken, and a held first
-        // paint — a screen the terminal has not been shown a word of yet — both
-        // mean the row may have been drawn over. Where the bar may write is the
-        // terminal's parser's to say while it is being followed, which it is
-        // from the moment the bar goes up (below) to the moment it is down: then
-        // the bar goes back up on the very pass the session drew over it, inside
-        // the frame it drew (see the closes below). Before that there is nothing
-        // to ask, and the bar waits for a lull, as it always has to go up.
-        //
-        // And one thing the notice's pass does not count: the paint let
-        // through above, on this pass. It is the client's bytes reaching the
-        // terminal, after however long a dissolve, and let through at the
-        // hold's cap they may end in the middle of a sequence — so the lull
-        // the bar goes up at is counted from here, and not from the last read
-        // before the dissolve.
-        //
-        // A command that ends the relay has already returned from the block
-        // above and never reaches this, which is what stops `<prefix> Space`
-        // flashing a bar on its way to the picker.
+        // The hint bar goes after the keys (earlier, it would appear a wake-up
+        // late), the winch and the notice. Output or a held or just-released
+        // paint means its row may be overdrawn; while the parser is tracked,
+        // the bar goes back up in the very frame that drew over it. A command
+        // ending the relay returned above, so `<prefix> Space` never shows it.
         let pass = hint::Pass {
             wrote: child_spoke || released || attachment.hold.is_some(),
             between: attachment
@@ -4145,23 +2941,17 @@ fn pump(
         ) {
             hint::Act::Idle => {}
             hint::Act::Write(bytes) => {
-                // Going up — at a lull, unless the notice has the parser
-                // followed already — and from here on what the session writes
-                // over the row is answered on the pass it is written on,
-                // rather than at the next lull: a statusline redrawn every
-                // tenth of a second, with a language server's progress in it,
-                // never shows through. See [`Attachment::watch_the_terminal`].
+                // Going up: from now on, session writes over the row are
+                // answered on the same pass, so even a fast-redrawn statusline
+                // never shows through.
                 if bar.is_up() {
                     attachment.watch_the_terminal();
                 }
                 attachment.write_over_session(&bytes)?;
             }
             hint::Act::Blanked(bytes) => {
-                // The bar has blanked its row because nothing here knows what
-                // was under it — no shadow, so no copy of those cells anywhere
-                // but the server. The same repaint the notice's erase asks for,
-                // asked the same way; skipped when one is already in flight,
-                // since a `:mode` repaints the whole screen and this row with it.
+                // Blanked: with no shadow, only the server knows what was under
+                // the row. Request a repaint unless one is in flight.
                 attachment.write_over_session(&bytes)?;
                 if erasing.is_none() {
                     attachment.resize_to(size);
@@ -4176,36 +2966,21 @@ fn pump(
             }
         }
 
-        // With nothing of nvmux's on the session's screen — the notice over,
-        // the bar down — what the parser was followed for is nobody's
-        // business, and whatever was being kept back to keep a sequence whole
-        // goes out with it.
+        // With no overlay up (notice over, bar down), stop tracking the parser,
+        // flushing anything held back for it.
         if popup.is_none() && !bar.is_up() {
             attachment.stop_watching_the_terminal()?;
         }
 
-        // Whatever the notice and the bar did or did not do, whatever was held
-        // back for them goes out here, on the pass that held it: the session's
-        // own frame close if it brackets its frames, and otherwise the
-        // synchronized update nvmux opened in front of the write. A terminal
-        // left inside either shows nothing until its own timeout expires. See
-        // [`Attachment::write_session_frame`].
-        //
-        // Here, after the bar, and not straight after the notice, where they
-        // stood while the notice was the one thing written over a session: the
-        // bar is written after the keys, and a frame closed before it is a
-        // frame the terminal may present without it. Nothing between the two
-        // writes to the terminal — the keys go to the client, as does what the
-        // cards tell it — and a key that ends the relay leaves both to the
-        // relay's own way out, which lets them go before anything else is
-        // drawn.
+        // Release what was held back for the overlays: the session's own frame
+        // close, else nvmux's span (a terminal inside either shows nothing).
+        // After the bar, which is written after the keys: a frame closed before
+        // it may be presented without it.
         attachment.release_the_sessions_close()?;
         attachment.close_span()?;
 
-        // The cards: what the notifier posted, taken — or, for a client that
-        // draws none, thrown away — whether the prefix is held, which has the
-        // card the key acts on say so, and what waits put in, once the keys
-        // just passed on leave a moment for it.
+        // Cards: take the notifier's posts, tell the desk whether the prefix is
+        // held, and send what waits.
         if n > 0 && ready(&fds[3]) {
             let posts = board.take();
             if let Some(desk) = attachment.desk.as_mut() {
@@ -4217,27 +2992,25 @@ fn pump(
         }
         attachment.send_cards(Instant::now());
 
-        // Only on an idle tick: a child that exits is noticed through its pty
-        // above, so this exists for the one that *stopped*, and a `waitid` per
-        // keystroke would buy nothing.
+        // Only on an idle tick: an exit shows through the pty above, so this
+        // is for a *stopped* child; a `waitid` per keystroke buys nothing.
         if n == 0 && check_child(attachment) == ChildState::Gone {
             return Ok(Outcome::ChildExited);
         }
     }
 }
 
-/// `<prefix> d` with settings changed and unsaved: the question on the
-/// bottom row, up until it is answered (see [`reply`]).
+/// `<prefix> d` with unsaved settings: the question on the bottom row, up
+/// until answered (see [`reply`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Leaving {
-    /// The key that detaches, which answers "detach anyway".
+    /// The detach key, which answers "detach anyway".
     detach: u8,
-    /// That the file has changed what is being saved, and `w` overwrites it.
+    /// The file changed what is being saved, so `w` overwrites it.
     overwrite: bool,
 }
 
 impl Leaving {
-    /// The question, for `unsaved` settings.
     fn question(&self, unsaved: usize) -> String {
         format!(
             "{unsaved} unsaved setting{} — w save and detach  {} detach anyway  esc stay",
@@ -4246,9 +3019,8 @@ impl Leaving {
         )
     }
 
-    /// The question again after a save that did not happen, saying why: the
-    /// file changed what is being saved too, which a second `w` overwrites,
-    /// or something no second `w` can help.
+    /// The question again after a failed save, saying why: the file also
+    /// changed these settings (a second `w` overwrites), or some other error.
     fn not_saved(&mut self, e: &crate::error::SaveError) -> String {
         let detach = keys::key_glyph(self.detach);
         self.overwrite = e.changed_in_file().is_some();
@@ -4268,16 +3040,10 @@ enum Reply {
     Stay,
 }
 
-/// The first thing in a read of stdin that answers [`Leaving`]'s question:
-/// `w`, the key that detaches, `Esc`, or a click, which stays as it declines
-/// the picker's questions. Anything else answers nothing and goes nowhere —
-/// not to the editor, whose screen the question is up over.
-///
-/// A key arrives as the text it types, or in the kitty protocol's report of
-/// it, which Neovim has the terminal send for `Esc`; key releases and
-/// repeats, and every other report, are passed over — the release of the
-/// very `d` that asked is one. A click arrives as the mouse report the
-/// editor asked the terminal for, in SGR's spelling or X10's.
+/// The first answer to [`Leaving`]'s question in a read of stdin: `w`, the
+/// detach key, `Esc`, or a click (stays). Anything else is swallowed. Keys
+/// may be kitty-protocol reports, whose releases (such as of the `d` that
+/// asked) and repeats are skipped; clicks are SGR or X10 mouse reports.
 fn reply(bytes: &[u8], detach: u8) -> Option<Reply> {
     let key = |code: u32| match code {
         27 => Some(Reply::Stay),
@@ -4299,14 +3065,12 @@ fn reply(bytes: &[u8], detach: u8) -> Option<Reply> {
             return Some(Reply::Stay);
         }
         let Some(len) = csi_len(rest) else {
-            // Not a sequence of the kinds here, or not all of one: it answers
-            // nothing, and neither does anything after it in this read.
+            // Not a whole known sequence: nothing here answers.
             return None;
         };
         let seq = &rest[..len];
         if seq == b"\x1b[M" {
-            // X10: a button and two coordinates, each a byte plus 32, after
-            // the sequence proper.
+            // X10: button and coordinates follow, each a byte plus 32.
             let button = rest.get(len).map(|b| b.wrapping_sub(32));
             if button.is_some_and(|b| b & 0b11 != 3 && b & (32 | 64) == 0) {
                 return Some(Reply::Stay);
@@ -4326,8 +3090,8 @@ fn reply(bytes: &[u8], detach: u8) -> Option<Reply> {
     None
 }
 
-/// How long the `CSI` sequence at the start of `bytes` is, to its final byte,
-/// or `None` when it is not one or not all of one is here.
+/// The length of the `CSI` sequence at the start of `bytes`, through its
+/// final byte; `None` if there is not a whole one.
 fn csi_len(bytes: &[u8]) -> Option<usize> {
     let body = bytes.strip_prefix(b"\x1b[")?;
     let end = body.iter().position(|b| (0x40..=0x7e).contains(b))?;
@@ -4363,12 +3127,8 @@ fn kitty_press(seq: &[u8]) -> Option<u32> {
     Some(code)
 }
 
-/// Carry out one instruction from the prefix machine: forward bytes to the
-/// child, or turn a command into the [`Outcome`] that ends the relay.
-///
-/// Exhaustive on purpose — no `_` arm — so a new [`Action`] cannot be dropped
-/// silently. The timeout and the feed path both come through here, which is
-/// what stops them drifting apart.
+/// Carry out one prefix-machine step: forward bytes, or map a command to its
+/// [`Outcome`]. No `_` arm, so a new [`Action`] cannot be silently dropped.
 fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
     Ok(match step {
         Step::Forward(bytes) => {
@@ -4383,15 +3143,13 @@ fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
         Step::Act(Action::Settings) => Some(Outcome::ShowSettings),
         Step::Act(Action::Switch(num)) => Some(Outcome::Switch(Target::Number(num))),
         Step::Act(Action::Cycle(dir)) => Some(Outcome::Switch(Target::Step(dir))),
-        // The relay's, which knows the cards up: see `take_step`.
+        // Handled by the relay, which knows the cards (see `take_step`).
         Step::Act(Action::Go) => None,
     })
 }
 
-/// One instruction from the prefix machine, the cards' part of it included:
-/// what is passed on to the client is watched for the moments between keys a
-/// card can go in at, and `<prefix> Enter` goes where the newest card is
-/// about (see [`crate::card`]).
+/// [`act`], plus the cards: forwarded bytes tell the desk when a card can go
+/// in, and `<prefix> Enter` acts on the newest card.
 fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outcome>> {
     attachment.saw_input(&mut step);
     if step == Step::Act(Action::Go) {
@@ -4403,14 +3161,8 @@ fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outco
     act(&mut attachment.master, step)
 }
 
-/// What a command leads to, `outcome`, over the session where it is one of
-/// the screens that float there — the settings, the help, the picker or the
-/// create prompt — and
-/// they are to (`[style] float`): `None` once it has been taken down and the
-/// relay goes on, and otherwise how the relay ends, which is `outcome` itself
-/// where nothing floats. Either way, settings or a picker that were to come up
-/// floating of their own accord have had their turn (see
-/// [`Attachment::float_the_settings`]).
+/// Float `outcome`'s panel over the session if it floats and `[style] float`
+/// allows. `None` once it is taken down; else how the relay ends.
 fn float_over(
     attachment: &mut Attachment,
     master_fd: RawFd,
@@ -4421,8 +3173,7 @@ fn float_over(
     match panel::What::of(outcome, config::get().style.float) {
         Some(what) => {
             let floated = panel::float(attachment, master_fd, winch, what);
-            // Down, however it was taken down: what its frames were diffed
-            // against goes with it, and is not kept with the client.
+            // However it went, drop what its frames were diffed against.
             if let Some(copy) = attachment.copy() {
                 copy.forget_under();
             }
@@ -4432,21 +3183,13 @@ fn float_over(
     }
 }
 
-/// How long an escape sequence cut short by the end of a read waits for the
-/// rest of itself, before being passed on as it stands.
-///
-/// The bytes of one key are split only by a buffer boundary, so this is
-/// machine time, not human time, and it should be short: in a terminal that
-/// still sends the Escape key as a bare `ESC`, every `Esc` is held for exactly
-/// this long before Neovim sees it. tmux's `escape-time`, which is the same
-/// wait in the same place, defaults to 10 ms.
+/// How long a sequence cut off by a read boundary waits for its rest.
+/// Short: a bare `ESC` key is delayed this long (tmux's `escape-time`
+/// defaults to 10 ms too).
 const SEQUENCE_TIMEOUT: Duration = Duration::from_millis(10);
 
-/// How often to look at an otherwise-idle child.
-///
-/// A child that has *stopped* generates no readable fd and no signal we
-/// subscribe to, so without a bounded wait the relay would sit forever against a
-/// frozen screen.
+/// How often to check an idle child: a *stopped* one makes no fd readable
+/// and sends no signal we watch.
 const IDLE_POLL_MS: libc::c_int = 1000;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4455,23 +3198,9 @@ enum ChildState {
     Gone,
 }
 
-/// Notice a child that has exited, and revive one that has stopped.
-///
-/// # The stop case, and why it is continued rather than escalated
-///
-/// `Ctrl-z` is forwarded to Neovim as an ordinary byte — nvmux does not
-/// special-case it. If the client responds by stopping *itself*, the user is
-/// left looking at a frozen screen: nvmux still owns the terminal, so there is
-/// no shell underneath to have been returned to, and the suspended client is
-/// not a state anyone can do anything with.
-///
-/// So a stopped child is continued with `SIGCONT` rather than torn down. It
-/// cannot loop: the stop notification is consumed when read, so a client that
-/// keeps stopping itself is continued once per stop.
-///
-/// `Child::try_wait` cannot be used here — it does not pass `WUNTRACED`, so a
-/// stopped child reads as "still running". The peek below uses `WNOWAIT` so an
-/// *exit* status is left in place for the `Child`'s own wait in `reap`.
+/// Notice a child that has exited, and continue one that has stopped:
+/// `Ctrl-z` is forwarded as a byte, and a client that stops itself would
+/// freeze the screen. Each stop is consumed when read, so this cannot loop.
 fn check_child(attachment: &mut Attachment) -> ChildState {
     use nix::sys::signal::{kill, Signal};
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -4480,10 +3209,8 @@ fn check_child(attachment: &mut Attachment) -> ChildState {
 
     match peek_child(pid) {
         Peek::Stopped => {
-            // Consume just the stop notification, which does not reap the
-            // process, then wake it up. Without consuming it, the peek would
-            // report the same stop on every poll and SIGCONT would be sent
-            // repeatedly.
+            // Consume only the stop notification (no reap), or every poll
+            // would see it again.
             let sig = match waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
                 Ok(WaitStatus::Stopped(_, sig)) => Some(sig),
                 _ => None,
@@ -4504,24 +3231,16 @@ enum Peek {
     Gone,
 }
 
-/// The client's pid, as the waits and signals here take it.
 fn child_pid(child: &Child) -> nix::unistd::Pid {
     nix::unistd::Pid::from_raw(child.id() as i32)
 }
 
-/// Look at a child's state without changing it.
-///
-/// `waitid`, not `waitpid`. WNOWAIT is only valid for waitid(2): Linux's
-/// wait4 rejects the flag outright with EINVAL, so the waitpid spelling of
-/// this peek silently never reports anything and a stopped client would sit
-/// frozen forever. (Measured — it returned EINVAL on every poll.)
-///
-/// Called through `libc` rather than `nix`: nix binds `waitid` only on Linux
-/// and FreeBSD, but the call itself is POSIX and macOS has it too.
+/// Look at a child's state without changing it. `waitid`, since Linux's
+/// wait4 rejects `WNOWAIT` with EINVAL, and through `libc` because nix lacks
+/// it on macOS.
 fn peek_child(pid: nix::unistd::Pid) -> Peek {
-    // WNOHANG with nothing to report succeeds and leaves `si_signo` (and
-    // `si_pid`) zero, which is only distinguishable if the struct starts out
-    // zeroed.
+    // WNOHANG with nothing to report succeeds and leaves `si_signo` zero,
+    // which is only detectable if the struct starts zeroed.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let flags = libc::WNOHANG | libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT;
     let rc = unsafe { libc::waitid(libc::P_PID, pid.as_raw() as libc::id_t, &mut info, flags) };
@@ -4542,14 +3261,8 @@ fn peek_child(pid: nix::unistd::Pid) -> Peek {
     }
 }
 
-/// A relayed write as it goes to the terminal: the session's own bytes behind
-/// the sequence that opens a synchronized update, and behind nothing at all
-/// when `open` says one already is.
-///
-/// Terminals hold `?2026` as a mode rather than as a count, so a second open
-/// inside a span changes nothing — and a sequence that changes nothing is
-/// still a sequence, landing wherever the session's last write happened to
-/// stop. See [`Attachment::close_span`] for what stops one there.
+/// A relayed write: the session's bytes, after a synchronized-update open
+/// unless one is already `open` (a second would be a stray sequence).
 fn framed(bytes: &[u8], open: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(fade::SYNC_BEGIN.len() + bytes.len());
     if !open {
@@ -4559,9 +3272,7 @@ fn framed(bytes: &[u8], open: bool) -> Vec<u8> {
     out
 }
 
-/// Read whatever is available. Only called after `poll` says the fd is ready.
-/// Shared with [`crate::palette`], which reads the terminal's replies the same
-/// way.
+/// Read whatever is available, once `poll` says the fd is ready.
 pub(crate) fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 {
@@ -4571,10 +3282,7 @@ pub(crate) fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
-/// A `poll` entry asking whether `fd` is readable. Shared with
-/// [`crate::proc::Shell`], which polls a child's pipes the way this module
-/// polls a pty; a negative `fd` is skipped by `poll`, which is how a pipe
-/// that has reached EOF is left out.
+/// A `poll` entry for `fd` being readable; `poll` skips a negative `fd`.
 pub(crate) fn pollfd(fd: RawFd) -> libc::pollfd {
     libc::pollfd {
         fd,
@@ -4583,10 +3291,7 @@ pub(crate) fn pollfd(fd: RawFd) -> libc::pollfd {
     }
 }
 
-/// Whether a write of at least one byte would go through without blocking.
-///
-/// A zero timeout: this is a question, not a wait. The one caller has nothing
-/// it may block for — see [`Attachment::answer_device_attributes`].
+/// Whether a write of at least one byte would not block (zero-timeout check).
 fn writable(fd: RawFd) -> bool {
     let mut p = [libc::pollfd {
         fd,
@@ -4597,20 +3302,14 @@ fn writable(fd: RawFd) -> bool {
     n > 0 && p[0].revents & libc::POLLOUT != 0
 }
 
-/// Readable, or gone. `POLLHUP` matters as much as `POLLIN`: on Linux the
-/// master reports hangup rather than readability once the child exits, and
-/// ignoring it would leave the loop spinning against a dead pty.
+/// Readable, or gone: on Linux the master reports `POLLHUP`, not `POLLIN`,
+/// once the child exits.
 pub(crate) fn ready(p: &libc::pollfd) -> bool {
     p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 
-/// Throw away buffered child output without writing it anywhere, reporting
-/// whether the child asked for its terminal's device attributes on the way.
-///
-/// That answer is acted on by [`Attachment::reap`] alone, which is the one
-/// caller whose client has no terminal left to ask. The resume path ignores it:
-/// a request there belongs to a client that is *staying*, and the real terminal
-/// answers that one itself as soon as the pump is running again.
+/// Discard buffered child output, returning whether it held a DA1 request
+/// (only [`Attachment::reap`] answers it).
 fn discard_pending(fd: RawFd) -> bool {
     let mut buf = [0u8; 8192];
     let mut asked = false;
@@ -4630,21 +3329,14 @@ fn discard_pending(fd: RawFd) -> bool {
     }
 }
 
-/// Whether this chunk of client output contains a DA1 request.
-///
-/// A request split across two reads is missed, and that is survivable rather
-/// than handled: the reply is an optimisation, and missing one costs the second
-/// it used to cost every time. Neovim writes its whole shutdown sequence in one
-/// `flush_buf`, so in practice the request arrives whole.
+/// Whether this output contains a DA1 request. A split one is missed, which
+/// only costs a second; Neovim's shutdown sequence comes in one write.
 fn asks_for_device_attributes(chunk: &[u8]) -> bool {
     memmem::find(chunk, DA1_REQUEST).is_some()
 }
 
-/// Where in these bytes, on their way from the terminal to a client, an
-/// in-band size report is — `CSI 48 ; rows ; cols ; height ; width t` — and
-/// the rows and columns it reports. The first one only, which is all a
-/// terminal answering a mode being set sends; and only whole, which is how
-/// the key parser passes on a sequence (see [`crate::keys`]).
+/// The range, rows and cols of the first in-band size report
+/// (`CSI 48 ; rows ; cols ; height ; width t`) in terminal input.
 fn find_size_report(bytes: &[u8]) -> Option<(std::ops::Range<usize>, u16, u16)> {
     const START: &[u8] = b"\x1b[48;";
     let at = memmem::find(bytes, START)?;
@@ -4662,9 +3354,8 @@ fn find_size_report(bytes: &[u8]) -> Option<(std::ops::Range<usize>, u16, u16)> 
     Some((at..at + START.len() + len + 1, rows, cols))
 }
 
-/// Whether these bytes, on their way from the terminal to a client, carry a
-/// terminal's answer to DA1: `CSI ? Ps ; … c`. What says a client's opening
-/// questions have all been answered (see `Attachment::startup_answered`).
+/// Whether terminal input carries a DA1 answer, `CSI ? Ps ; … c`, the last
+/// reply to a client's startup queries.
 fn answers_device_attributes(bytes: &[u8]) -> bool {
     const START: &[u8] = b"\x1b[?";
     memmem::find_iter(bytes, START).any(|at| {
@@ -4677,63 +3368,24 @@ fn answers_device_attributes(bytes: &[u8]) -> bool {
     })
 }
 
-/// The chunk with every DA1 request taken out, and nothing else touched. See
-/// [`Attachment::drain_until_eof`] for why a request nvmux answers itself must
-/// not reach the real terminal as well.
-///
-/// Exact bytes only: `ESC [ c` is the request, and neither the reply shape
-/// (`ESC [ ? … c`) nor DA2 (`ESC [ > c`) contains it.
+/// The chunk with every DA1 request removed: exactly `ESC [ c`, which
+/// neither the reply nor DA2 contains.
 fn without_device_attributes_request(chunk: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     without(chunk, DA1_REQUEST)
 }
 
-/// Paint the screen again after one of nvmux's own screens cleared it.
-///
-/// A client paints only what the server sends, so this is a request to the
-/// server, and there are two ways to make one. Over RPC, `:mode` clears the
-/// grid and redraws it in full ([`repaint_through_server`]); that is the one
-/// that works, and the only one that works on a terminal with in-band resize
-/// reports (DEC mode 2048 — kitty, ghostty, foot), where the client ignores
-/// `SIGWINCH`. Failing that, a [`nudge`] of the pty size, which needs no answer
-/// from the server and so is what a server too busy to give one gets: its
-/// resize is queued and repaints once the loop is free.
-///
-/// Whichever way, the pty is first told the terminal's current size, since
-/// the terminal may have changed shape while the picker was up and the pty is
-/// where the client learns its size from. A no-op when nothing changed, and
-/// a resize the client acts on when it did — one more repaint in that case,
-/// which is rare enough not to matter.
-///
-/// A resume also puts the terminal's mouse reporting back to what the client
-/// had. The screen that ran in between set its own and turned it off again,
-/// and the client — which enabled the mouse once, at startup — will not do so
-/// again. What it had is its server's to say (see [`repaint_through_server`]);
-/// a server too busy to say gets Neovim's default, `mouse=nvi` without
-/// `'mousemoveevent'`, which is [`term::MouseReporting::Buttons`]. Wrong for a
-/// `mouse=` session behind a busy server, which comes back with button
-/// tracking on until its Neovim next flips the mouse itself — and right for
-/// everything else, where the alternative is a client that no longer answers
-/// the mouse at all.
-///
-/// The asking and the waiting are one step here, which is a resume's to be:
-/// the terminal is blank, no relay has started, and the screen coming back is
-/// the thing the user is waiting for. The other caller wants the same repaint
-/// without the wait, and takes the two apart — see [`Erasing`].
+/// Repaint after one of nvmux's own screens cleared the terminal: `:mode`
+/// via RPC (see [`repaint_through_server`]), or failing that a [`nudge`].
+/// The pty is resized first. On a resume the client's mouse mode is
+/// restored as the server reports it, or Neovim's default from a busy one.
 fn repaint(attachment: &mut Attachment, why: Repaint) {
     attachment.resize_to(term::terminal_size());
     let served = repaint_through_server(&attachment.sock, why);
     apply(attachment, why, served);
 }
 
-/// What the relay does once a repaint has answered — or has failed to: the
-/// fallback for a server that could not be asked, and, for a resume, the mouse
-/// mode it reported.
-///
-/// Its own step because the two callers reach it from different places. A
-/// resume asks and waits, one statement above; the attach notice asks from a
-/// thread ([`Erasing`]) and gets here whenever the answer turns up. Both need
-/// the same two things done, and both can only do them here — a `resize` is
-/// the relay thread's to make.
+/// Act on a repaint's answer: the fallback nudge if it failed, and on resume
+/// the reported mouse mode. Runs on the relay thread, which owns `resize`.
 fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
     if why == Repaint::Resume {
         term::set_mouse_reporting(served.mouse.unwrap_or(term::MouseReporting::Buttons));
@@ -4746,10 +3398,9 @@ fn apply(attachment: &mut Attachment, why: Repaint, served: Served) {
 }
 
 /// Show terminal buffer `buf` in the session on `sock`, for `<prefix> Enter`
-/// on a card about it: the window it is in, in whichever tab page that is, or
-/// a tab page of its own where no window has it. From a thread, and best
-/// effort — the session's to do, at the speed its link allows — and never of
-/// an editor waiting for a key, which would do it once the key came.
+/// on its card: switch to a window showing it, in its tab page, or open it in
+/// a new tab page. Best effort, from a thread, and skipped for an editor
+/// waiting for a key.
 fn show_buffer(sock: PathBuf, buf: i64) {
     const SHOW: &str = r#"local buf = ...
 if not vim.api.nvim_buf_is_valid(buf) then
@@ -4792,14 +3443,9 @@ return true
     }
 }
 
-/// Ask the server of a kept client coming back to the front for its exact
-/// screen — from a thread, as the notice's repaint is, so that nothing waits
-/// for it: the screen comes back from the copy meanwhile, and the relay has a
-/// session to run. With nothing typed into a prompt ([`Repaint::Notice`]): the
-/// prompt is on the screen, for the user.
-///
-/// `None` if there was no thread to ask from, in which case the fallback has
-/// run — what a server that could not be asked would have got.
+/// Ask a returning kept client's server for its exact screen from a thread,
+/// as [`Repaint::Notice`] (no prompt answered); the copy covers meanwhile.
+/// `None` if no thread, after the fallback.
 fn kept_clients_repaint(attachment: &mut Attachment) -> Option<Erasing> {
     match Erasing::start_for(&attachment.sock, "kept client's return") {
         Ok(started) => Some(started),
@@ -4811,33 +3457,10 @@ fn kept_clients_repaint(attachment: &mut Attachment) -> Option<Erasing> {
     }
 }
 
-/// The repaint that takes the attach notice off the screen, in flight on a
-/// thread of its own.
-///
-/// The cells the box covered are the server's, and asking it for them costs
-/// two round trips — `nvim_get_mode`, and then the `:mode` that does the
-/// painting. Measured against sessions behind a delay proxy: 123 ms over a
-/// 60 ms link, 303 ms over a 150 ms one. Waited for on the relay's own thread,
-/// that is exactly how long the editor forwards no keystroke and copies no
-/// byte — a stall a whole second after the switch that put the box up, which
-/// is to say in the middle of whatever the user started typing when they
-/// arrived.
-///
-/// Nothing about the relay needs the answer, so it does not wait for one. The
-/// repaint arrives as ordinary output from the session, like every other byte
-/// the server sends; the only thing the answer decides is the fallback, and
-/// [`apply`] performs that on the relay's next pass.
-///
-/// The cheapest of the crate's threads: it owns one connection, reads nothing
-/// else, and every call it makes is bounded ([`RESUME_TIMEOUT`]), so it ends on
-/// its own whether or not anyone is still listening. A relay that ends first
-/// drops the receiver, and the send fails into nothing.
-///
-/// Not a resume's repaint, which stays where it is: there the terminal is
-/// blank, the relay has not started, and the screen coming back *is* what the
-/// user is waiting for. Except a kept client's (`[client] per_session`), whose
-/// screen is painted back from its copy meanwhile: its repaint is asked here
-/// too, as a rule as the fade in starts (see [`relay`]).
+/// The repaint that removes the attach notice, on its own thread: two round
+/// trips (measured 123 ms over a 60 ms link, 303 ms over 150 ms) would stall
+/// the relay. The repaint arrives as session output; the answer only decides
+/// the fallback. Also used for a kept client's return.
 struct Erasing {
     rx: mpsc::Receiver<Served>,
 }
@@ -4848,10 +3471,8 @@ impl Erasing {
         Self::start_for(sock, "attach notice erase")
     }
 
-    /// [`Erasing::start`], for something other than the notice: a kept
-    /// client coming back to the front, whose screen is painted back from its
-    /// copy and wants the server's exact one on top (see [`relay`]). `what`
-    /// names it in the timing record.
+    /// [`Erasing::start`] for something other than the notice, e.g. a returning
+    /// kept client (see [`relay`]); `what` names it in the timing record.
     fn start_for(sock: &Path, what: &'static str) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let sock = sock.to_path_buf();
@@ -4860,29 +3481,22 @@ impl Erasing {
             .name("nvmux-notice-repaint".into())
             .spawn(move || {
                 let served = repaint_through_server(&sock, Repaint::Notice);
-                // Timed here, as the answer comes, and not where the relay
-                // collects it: a kept client's is asked as the fade in starts,
-                // and the relay does not look until the fade is over. It is a
-                // second full repaint of the session — the one nvmux asks for
-                // rather than the one the attach produced — and what the
-                // number measures is how long that took somewhere else, which
-                // is the point of it.
+                // Timed here: a kept client's answer is collected only after
+                // the fade.
                 tracing::debug!(
                     ms = asked.elapsed().as_secs_f64() * 1000.0,
                     repainted = served.repainted,
                     "timing: {} (:mode repaint)",
                     what
                 );
-                // A receiver that has gone is a relay that ended first, and
-                // there is nobody left to tell.
+                // A dropped receiver means the relay ended first.
                 let _ = tx.send(served);
             })?;
         Ok(Self { rx })
     }
 
-    /// The verdict, if it has arrived. A worker that ended without one is
-    /// [`Served::NONE`], which is what any other failure to be answered is:
-    /// the fallback runs, exactly as it would have.
+    /// The verdict, if it has arrived. A worker that ended without one gives
+    /// [`Served::NONE`], so the fallback runs.
     fn answer(&self) -> Option<Served> {
         match self.rx.try_recv() {
             Ok(served) => Some(served),
@@ -4892,34 +3506,16 @@ impl Erasing {
     }
 }
 
-/// How often the relay looks for [`Erasing`]'s answer while one is in flight.
-///
-/// Only the fallback waits on it, so this is not a deadline, it is a bound on
-/// how late a nudge can be: without it an idle relay would not look again for
-/// [`IDLE_POLL_MS`], and the session that needs the nudge — one too busy to
-/// answer — is exactly the one producing nothing to wake the loop.
+/// How often the relay checks for [`Erasing`]'s answer, bounding how late a
+/// fallback nudge can be: a server too busy to answer produces no output to
+/// wake the loop.
 const ERASE_POLL: Duration = Duration::from_millis(50);
 
-/// Why the screen is being painted again, which decides what the repaint may
-/// do on the way.
-///
-/// A resume may end a hit-enter prompt to get itself served: the screen it is
-/// coming back to is blank, the prompt was painted over by whatever nvmux
-/// drew, and the user has no way to answer one they cannot see. It also asks
-/// what the client's mouse setting is, so the terminal can be put back to it.
-///
-/// Taking an attach notice off the screen may do neither. The prompt would be
-/// one the user is looking at right now — a startup error, most likely — and a
-/// notice that says which session you are in is never worth answering
-/// somebody's editor for. A [`nudge`] stands in, and where that does not reach
-/// (a terminal with in-band resize reports) the box simply waits for the prompt
-/// to end. And the mouse is the client's own already: nothing ran in between.
-///
-/// Its second caller is the hint bar ([`crate::hint`]) coming down where there
-/// is no shadow to put its row back from, and every word above applies to it
-/// unchanged — more so, if anything: the bar is asked for by a keystroke rather
-/// than once per attach, so the one thing it must never do is answer a prompt
-/// the user is in the middle of reading.
+/// Why the screen is being repainted, which decides what the repaint may do.
+/// A resume may end a hit-enter prompt (drawn over, so the user cannot
+/// answer it) and asks for the mouse setting. Removing the notice, or the
+/// hint bar without a shadow, may do neither: the user may be reading that
+/// prompt (likely a startup error). A [`nudge`] stands in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Repaint {
     Resume,
@@ -4943,17 +3539,10 @@ impl Served {
     };
 }
 
-/// The terminal mouse reporting a client has on, from its server's answer to
-/// `[&mouse, &mousemoveevent]` — the two options Neovim's TUI enables the
-/// modes from: nothing for an empty `'mouse'`, button tracking otherwise, and
-/// motion on top of it with `'mousemoveevent'` set. `None` for an answer that
-/// is not that pair.
-///
-/// The mode the editor is in is not consulted, though Neovim does: `mouse=nvi`
-/// turns the mouse off on the command line and at a hit-enter prompt. A
-/// resume from either puts button tracking on a little early; Neovim turns it
-/// off and on again itself as the mode next changes, which is the moment it
-/// would have anyway.
+/// The client's mouse reporting from its server's answer to
+/// `[&mouse, &mousemoveevent]`, as Neovim's TUI derives it; `None` if the
+/// answer is not that pair. The editor's mode is ignored, so resuming on the
+/// command line enables buttons slightly early, until the next mode change.
 fn mouse_reporting(answer: &rmpv::Value) -> Option<term::MouseReporting> {
     let pair = answer.as_array()?;
     let mouse = pair.first()?.as_str()?;
@@ -4968,16 +3557,10 @@ fn mouse_reporting(answer: &rmpv::Value) -> Option<term::MouseReporting> {
     })
 }
 
-/// Shrink the pty by a row and put it back, so the client asks the server for
-/// a resize, which the server answers — when its main loop is free to — with
-/// a cleared, fully redrawn grid.
-///
-/// What a server that cannot be asked over RPC gets: one busy in a `:!make`
-/// or in Lua, where the repaint then arrives with the prompt the command ends
-/// in; or one waiting for a key with its event queue off, where it repaints
-/// at the more-prompt and not otherwise (a pending operator stays blank until
-/// its next key, which completes it). A client on a terminal with in-band
-/// resize reports ignores this altogether.
+/// Shrink the pty by a row and restore it, so the client asks for a resize,
+/// which the server answers with a full redraw once its loop is free. For a
+/// server that cannot be asked over RPC; ignored by a client using in-band
+/// resize reports.
 fn nudge(master: &Pty, size: PtySize) {
     let nudged = PtySize {
         rows: size.rows.saturating_sub(1).max(1),
@@ -5001,40 +3584,18 @@ fn pty_size(master: &Pty) -> Option<PtySize> {
     })
 }
 
-/// How long a resume waits on the server before relaying regardless.
-///
-/// `nvim_get_mode` answers within a millisecond whenever it answers at all —
-/// idle, or waiting for a key — so no answer means the loop is busy in a
-/// `:!make` or in Lua, and nothing would repaint yet whatever nvmux did. The
-/// `:mode` that follows is a deferred call whose reply can take a few hundred
-/// milliseconds under a plugin-heavy config (measured: 384 ms with AstroNvim),
-/// so this is longer than `rpc::CONNECT_TIMEOUT` and much shorter than
-/// `rpc::PROBE_TIMEOUT`.
+/// How long a resume waits on the server. `nvim_get_mode` answers within a
+/// ms if at all; `:mode` can take a few hundred ms with a heavy config
+/// (measured: 384 ms with AstroNvim).
 const RESUME_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Ask the server, over RPC, to paint the whole screen again — and, for a
-/// resume, what the client's mouse setting is. Says whether it repainted.
-///
-/// A server parked at a hit-enter prompt does not run its event queue, so a
-/// resize would sit there and the terminal would stay blank until a key ended
-/// the prompt — the key the user would have to press blind, and which then
-/// also runs as a command unless it is one of the few the prompt consumes. So
-/// that prompt is ended first — where `prompt` allows it, which a resume does
-/// and taking an attach notice off the screen does not — with the `<CR>` it
-/// consumes (a fast call, delivered at once). Any other state that is waiting
-/// for a key is left alone: `<CR>` would scroll the more-prompt or complete a
-/// pending operator.
-/// Then `:mode`, which clears the grid and redraws it — `:redraw!` does not
-/// clear, and a redraw of an unchanged grid sends the client nothing.
-///
-/// Two things `:mode` does that are accepted rather than wanted. It resets
-/// the editor's pending-message state, so a script that printed something and
-/// is waiting in `getchar()` for a key will not get the hit-enter prompt it
-/// would have had once the key arrived (the text itself was already gone from
-/// the screen). And ending the prompt discards what it showed, from every
-/// attached UI; `:messages` keeps it. The reply is waited for so the relay
-/// does not start over a repaint in flight; a reply that is late rather than
-/// missing still repaints, a moment after the nudge that stands in for it.
+/// Ask the server over RPC to repaint the whole screen and, on a resume, for
+/// the client's mouse setting. A server at a hit-enter prompt runs no
+/// events, so on a resume the prompt is first ended with `<CR>`; other
+/// key-waiting states are left alone (`<CR>` would scroll a more-prompt or
+/// complete an operator). `:mode` clears and redraws, unlike `:redraw!`; it
+/// also resets pending-message state, and ending the prompt discards its
+/// text from every UI (`:messages` keeps it).
 fn repaint_through_server(sock: &Path, why: Repaint) -> Served {
     let mut client = match rpc::Client::connect(sock, RESUME_TIMEOUT) {
         Ok(c) => c,
@@ -5064,9 +3625,8 @@ fn repaint_through_server(sock: &Path, why: Repaint) -> Served {
             return Served::NONE;
         }
     }
-    // Before the repaint, which is the call that can take a few hundred
-    // milliseconds: the answer is wanted whether or not that one comes back
-    // in time.
+    // Before the repaint, which can take a few hundred ms: the mouse answer
+    // is wanted even if that times out.
     let mouse = match why {
         Repaint::Resume => match client.eval("[&mouse, &mousemoveevent]") {
             Ok(answer) => mouse_reporting(&answer),
@@ -5095,10 +3655,8 @@ mod tests {
     use super::*;
     use crate::keys::Direction;
 
-    /// Poll until the child reaches `want`: signals are delivered
-    /// asynchronously, so the state is not visible on the first look. Returns
-    /// what it last saw, so a caller asserts on the state rather than on a
-    /// timeout — a wait that ends in the wrong state is the failure.
+    /// Poll until the child reaches `want` (signals are asynchronous). Returns
+    /// what it last saw, so callers assert on the state, not on a timeout.
     fn settle(pid: Pid, want: Peek) -> Peek {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -5110,21 +3668,8 @@ mod tests {
         }
     }
 
-    /// The notice is nvmux's own drawing, not the session's, and the shadow
-    /// must not take it for one.
-    ///
-    /// The whole cross-fade rests on this: the grid holds what the client drew
-    /// where the box is, which is the only copy of it anywhere once the
-    /// terminal has been written over. Shown the notice, the shadow would hold
-    /// the box and have nothing underneath it to give back — and
-    /// `has_contents` cannot tell nvmux's border from Neovim's text, so the
-    /// box would also answer for the client's first paint and release a hold
-    /// over a screen the client had not drawn.
-    ///
-    /// The hint bar goes through the same `write_over_session`, and for the
-    /// bar the stake is sharper: its erase is a composite out of this grid —
-    /// it is what puts the editor's last row back — so a grid that had
-    /// swallowed the bar would erase the bar with the bar.
+    /// The shadow must keep what the client drew under an overlay, the only
+    /// copy left; the bar's erase is composited from it too.
     #[test]
     fn nothing_written_over_the_session_reaches_the_shadows_grid() {
         let mut a = attached_to("exit 0");
@@ -5156,14 +3701,8 @@ mod tests {
         assert!(!frame.contains('╭'), "the grid took the box: {frame:?}");
     }
 
-    /// The rule [`Attachment::boundary`] states, end to end: however the reads
-    /// happened to fall, what nvmux leaves on the terminal is between the
-    /// session's own sequences. That is what lets the notice go straight back
-    /// up after every write instead of waiting for a lull that a busy session
-    /// never gives it.
-    ///
-    /// Cut at seven bytes, which lands inside a sequence far more often than
-    /// the relay's own 8 KiB does and is therefore the harder case.
+    /// However reads fall, nvmux leaves the terminal between the session's
+    /// sequences; 7-byte chunks split sequences often.
     #[test]
     fn a_relayed_frame_leaves_the_terminal_between_the_sessions_sequences() {
         let mut a = attached_to("exit 0");
@@ -5178,8 +3717,7 @@ mod tests {
             );
         }
 
-        // And the few bytes held back to make that true are not the notice's
-        // to keep once the notice is over.
+        // The bytes held back for that are released once the notice is over.
         a.stop_watching_the_terminal().expect("release");
         assert!(a.kept_due().is_none(), "bytes outlived the notice");
         assert!(
@@ -5188,11 +3726,7 @@ mod tests {
         );
     }
 
-    /// A relayed write is held back from the terminal's eye inside a
-    /// synchronized update, so the notice that follows it lands in the same
-    /// presented frame — and the span never outlives the pass that opened it,
-    /// because a terminal left inside one shows nothing at all until its own
-    /// timeout runs out.
+    /// A terminal left inside a span shows nothing until its own timeout.
     #[test]
     fn a_synchronized_update_never_outlives_the_pass_that_opened_it() {
         let mut a = attached_to("exit 0");
@@ -5203,18 +3737,13 @@ mod tests {
 
         a.close_span().expect("close");
         assert!(!a.span);
-        // And closing one that is already closed is nothing at all, which is
-        // what lets every way out of the relay call it without asking.
+        // Closing a closed span is a no-op, so every exit path may call it.
         a.close_span().expect("close");
         assert!(!a.span);
     }
 
-    /// Except that it waits for the session to finish its sentence. A tail
-    /// that ran out of patience is handed over mid-character, and the two
-    /// sequences a span is made of are nvmux's bytes like any other: dropped
-    /// between a lead byte and its continuation they leave the terminal a
-    /// character it cannot read. So the span is held open for a pass instead,
-    /// which is the very wait it exists to impose.
+    /// The span's reset, written between a UTF-8 lead byte and its
+    /// continuation, would corrupt the character, so the span stays open.
     #[test]
     fn a_span_is_not_closed_through_the_middle_of_a_character() {
         let mut a = attached_to("exit 0");
@@ -5241,9 +3770,8 @@ mod tests {
         assert!(!a.span, "the span outlived what was holding it open");
     }
 
-    /// And the other half of holding one open: the pass that finds it open
-    /// adds its bytes to it rather than opening a second, which would be the
-    /// same sequence dropped into the same half-finished character.
+    /// A pass finding the span open adds to it: a second open would land in
+    /// the same unfinished character.
     #[test]
     fn a_relayed_write_opens_a_span_once_however_many_passes_it_takes() {
         assert_eq!(
@@ -5258,9 +3786,8 @@ mod tests {
         );
     }
 
-    /// And when the notice is over there is no next pass to close it on, so
-    /// whatever the session is half way through, the span goes. A terminal
-    /// left inside one shows nothing until its own timeout runs out.
+    /// With no next pass after the notice, the span closes whatever the
+    /// session is in the middle of.
     #[test]
     fn a_span_does_not_outlive_the_notice_that_opened_it() {
         let mut a = attached_to("exit 0");
@@ -5274,10 +3801,8 @@ mod tests {
         assert!(!a.span, "the terminal was left holding a frame for ever");
     }
 
-    /// A client that brackets its own frames is left to it. Terminals hold
-    /// `?2026` as a mode rather than as a count, so a span of nvmux's around
-    /// one of the client's would end at the client's reset and present the
-    /// frame early — the tear the span exists to prevent.
+    /// `?2026` is a mode, not a count, so nvmux's span around the client's own
+    /// would end at the client's reset and present the frame early.
     #[test]
     fn a_session_that_brackets_its_own_frames_is_left_to_do_it() {
         let mut a = attached_to("exit 0");
@@ -5293,15 +3818,8 @@ mod tests {
         );
     }
 
-    /// The hint bar has the terminal followed from the write that puts it up
-    /// to its erase, and what that buys is the place in the session's frame
-    /// the notice had: a statusline redrawn under the bar is a frame whose
-    /// close waits for the bar to be written in front of it.
-    ///
-    /// One parser at a time: asked again while the notice already has one
-    /// following the terminal — part way through a character, here — the bar
-    /// takes that one rather than a new one that would think the terminal
-    /// between sequences.
+    /// While the bar is up, a session frame's close waits for it. A second
+    /// watch (here mid-character) keeps the existing parser.
     #[test]
     fn the_bar_has_the_sessions_frames_wait_for_it_while_it_is_up() {
         let mut a = attached_to("exit 0");
@@ -5342,9 +3860,8 @@ mod tests {
         assert!(a.kept_due().is_none(), "bytes outlived the bar");
     }
 
-    /// A held first paint has not reached the terminal, so there is nothing
-    /// for a box to sit on and nothing under it to melt into — whatever the
-    /// boundary makes of bytes the terminal has not been shown.
+    /// A held first paint has not reached the terminal, so the box has nothing
+    /// to sit on, whatever the boundary says.
     #[test]
     fn nothing_goes_over_a_first_paint_that_is_still_held() {
         let mut a = attached_to("exit 0");
@@ -5357,14 +3874,8 @@ mod tests {
         );
     }
 
-    /// A stand-in client on a real pty, driven by `sh -c $script`.
-    ///
-    /// Real, because what the teardown tests are about is what a *signal* does
-    /// to a process: a fake `Child` would supply the `kill` under test and
-    /// answer for itself. `sock` is never read on these paths. The pty is
-    /// opened by [`spawn_client_with`], the same path the real client takes,
-    /// sized from `term::terminal_size()` (or 24x80), which no caller depends
-    /// on.
+    /// A stand-in client on a real pty running `sh -c $script`: the teardown
+    /// tests are about what a *signal* does to a process.
     fn attached_to(script: &str) -> Attachment {
         let cmd = Command::new("sh").arg("-c").arg(script);
         let mut a = spawn_client_with(
@@ -5375,9 +3886,8 @@ mod tests {
             false,
         )
         .expect("spawn sh");
-        // Nothing to announce, no shadow and not kept unless a test installs
-        // them: keep the fixture independent of the fade/palette process
-        // globals and of `[client] per_session`.
+        // No announce, shadow or ledger unless a test installs them, so the
+        // fixture ignores the fade globals and `[client] per_session`.
         a.announce = None;
         a.shadow = None;
         a.screen = None;
@@ -5385,15 +3895,9 @@ mod tests {
         a
     }
 
-    /// Wait for a stand-in client to say it is ready, by reading the `r` its
-    /// script echoes.
-    ///
-    /// Without this a test that signals the child immediately races `sh`'s own
-    /// startup: the signal lands before the script has run, under whatever
-    /// disposition the shell was exec'd with rather than the one the script sets.
-    /// Measured — a `trap '' HUP` client signalled straight after
-    /// [`attached_to`] dies of the hangup it is supposed to ignore, and the test
-    /// then passes for the wrong reason.
+    /// Wait for a stand-in to echo `r`, meaning its traps are set; a signal
+    /// sent sooner meets `sh`'s default disposition and the test passes for
+    /// the wrong reason.
     fn wait_until_ready(a: &Attachment) {
         assert!(
             wait_for(a, b'r'),
@@ -5401,11 +3905,7 @@ mod tests {
         );
     }
 
-    /// Read the stand-in client's output until `byte` shows up, or give up.
-    ///
-    /// The only channel a shell has to report what it did, which is how a test
-    /// tells "the signal was delivered" from "the process happens to still be
-    /// in the state I expected".
+    /// Read the stand-in's output until `byte` shows up, or give up.
     fn wait_for(a: &Attachment, byte: u8) -> bool {
         let fd = a.master.as_raw_fd();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -5425,19 +3925,12 @@ mod tests {
         false
     }
 
-    /// The pid of a stand-in client. Every teardown assertion is about a pid
-    /// rather than about the `Attachment`, because the point is what is left
-    /// behind after the attachment is gone.
     fn pid_of(a: &Attachment) -> Pid {
         child_pid(&a.child)
     }
 
-    /// A hangup must count as "something happened", not be ignored.
-    ///
-    /// On Linux the pty master reports `POLLHUP` rather than `POLLIN` once the
-    /// child is gone. Waiting only for `POLLIN` would leave the loop spinning
-    /// against a dead pty at full speed, because `poll` returns immediately
-    /// with a revents the loop then does nothing about.
+    /// On Linux the master reports `POLLHUP`, not `POLLIN`, once the child is
+    /// gone; ignoring it would spin the loop on a dead pty.
     #[test]
     fn readiness_counts_hangup_and_error_not_just_input() {
         let mk = |revents| libc::pollfd {
@@ -5464,9 +3957,6 @@ mod tests {
         assert_eq!(out, b"hello");
     }
 
-    /// What answers the question `<prefix> d` asks with settings unsaved:
-    /// `w`, the detach key, and `Esc` or a click, however the terminal spells
-    /// them — and nothing else, a key's release least of all.
     #[test]
     fn the_question_before_detaching_is_answered_by_its_keys_alone() {
         let d = b'd';
@@ -5509,7 +3999,6 @@ mod tests {
         assert_eq!(reply(b"d", b'x'), None);
     }
 
-    /// The question names the key that detaches, and how many settings.
     #[test]
     fn the_question_names_the_detach_key() {
         let leave = Leaving {
@@ -5539,9 +4028,7 @@ mod tests {
         assert!(!leave.overwrite);
     }
 
-    /// A client that last heard the settings before they changed is told
-    /// them as they are, ahead of anything else the relay opens with; one
-    /// that heard them last is told nothing.
+    /// Told first among the opening commands, and only once.
     #[test]
     fn a_relay_opens_by_telling_a_stale_client_the_settings() {
         let mut a = attached_to("exec sleep 30");
@@ -5588,8 +4075,8 @@ mod tests {
         assert!(out.is_empty(), "a command writes nothing to the child");
     }
 
-    /// A hold ends at the first lull after something has been drawn — not
-    /// at a lull before, which is a client between its queries and its grid.
+    /// A lull before anything is drawn is a client between its queries and its
+    /// grid, so it does not end the hold.
     #[test]
     fn a_hold_waits_for_a_drawn_screen_and_then_a_lull() {
         let t0 = Instant::now();
@@ -5605,8 +4092,7 @@ mod tests {
         assert!(!hold.due(quiet, false), "quiet, but nothing drawn");
         assert!(hold.due(quiet, true), "quiet and drawn");
         assert_eq!(hold.wake_at(true), Some(quiet));
-        // Nothing drawn: the lull is not worth waking for, only the cap is —
-        // or the relay would spin on a wake-up that is already past.
+        // Undrawn: only the cap is worth waking for.
         assert_eq!(
             hold.wake_at(false),
             Some(t0 + Duration::from_millis(10) + HOLD_CAP)
@@ -5618,19 +4104,14 @@ mod tests {
         assert!(hold.due(t0 + Duration::from_millis(30) + HOLD_SETTLE, true));
     }
 
-    /// Settings turned to float come up over the session only once its screen
-    /// is back: nothing of a first paint held, and the client on the screen it
-    /// draws on — the alternate one, or the primary with something on it — so
-    /// that none of their frames is left on the primary screen the shell comes
-    /// back to. With no copy of the screen they come up at once, and the panel
-    /// says for itself that it has nothing to float over.
+    /// No panel frame may land on the primary screen the shell returns to.
+    /// With no copy it is back at once (the panel reports the problem).
     #[test]
     fn settings_turned_to_float_wait_for_the_sessions_screen() {
         let mut a = attached_to("exit 0");
         assert!(a.screen_is_back(), "no copy: the panel's to say");
 
-        // A fresh client's copy, as the relay begins: the primary screen,
-        // cleared.
+        // A fresh client's copy as the relay begins: primary screen, cleared.
         let mut copy = shadow::Shadow::new(8, 40);
         copy.feed(term::HANDOVER);
         a.shadow = Some(copy);
@@ -5651,8 +4132,6 @@ mod tests {
         assert!(a.screen_is_back(), "something drawn on the primary screen");
     }
 
-    /// A client that never stops drawing is released at the cap, drawn or
-    /// not; one that writes an absurd amount is released by size.
     #[test]
     fn a_hold_is_released_at_the_cap_or_by_size() {
         let t0 = Instant::now();
@@ -5682,8 +4161,7 @@ mod tests {
         assert!(big.due(t0, false));
     }
 
-    /// The frames go on the screen the client is about to draw on: the split
-    /// is just past its alternate-screen entry, or at the start without one.
+    /// So the fade frames land on the screen the client is about to draw on.
     #[test]
     fn the_release_splits_just_past_the_alternate_screen_entry() {
         let bytes = b"\x1b[?1004h\x1b[?1049h\x1b[2J~";
@@ -5694,9 +4172,6 @@ mod tests {
         assert_eq!(split_at_alt_screen_entry(b""), 0);
     }
 
-    /// What is let through after a dissolve is presented as one: the ends of
-    /// the updates a client drew its frames in are taken out, and nothing
-    /// else — the update written around them ends it all at once.
     #[test]
     fn what_is_let_through_is_one_update() {
         let frames = b"\x1b[?2026h\x1b[1;1Ha\x1b[?2026l\x1b[?2026h\x1b[1;1Hb\x1b[?2026l~";
@@ -5724,8 +4199,6 @@ mod tests {
             .collect()
     }
 
-    /// A first paint the client finished is let through in one update, its
-    /// own frames' closes taken out of it, and nothing after the update's.
     #[test]
     fn a_finished_first_paint_is_let_through_in_one_update() {
         let paint = b"\x1b[?2026h\x1b[1;1Hone\x1b[?2026l\x1b[?2026h\x1b[2;1Htwo\x1b[?2026l";
@@ -5735,12 +4208,8 @@ mod tests {
         assert_eq!(shown(&out)[..2], ["one", "two"]);
     }
 
-    /// A first paint let go part way through a frame of the client's — a
-    /// colour cut in two, as a hold let go at a lull catches a client writing
-    /// a screenful — has the update closed in front of that frame, which goes
-    /// after it, opened as the client opened it, for the client's next bytes
-    /// to finish: none of the colour is printed. Closed after it, the close
-    /// would cut the colour in two, and the terminal print the rest of it.
+    /// Released mid-frame (here mid-colour), the update closes before that
+    /// frame, which follows still open for the client to finish.
     #[test]
     fn a_first_paint_let_go_part_way_through_a_frame_is_closed_in_front_of_it() {
         let done = b"\x1b[?2026h\x1b[1;1Hdrawn\x1b[?2026l";
@@ -5755,8 +4224,8 @@ mod tests {
         assert_eq!(&out[close + fade::SYNC_END.len()..], &open[..]);
     }
 
-    /// With no frame of the client's open, the update is closed in front of
-    /// the sequence, or the character, the client is part way through.
+    /// With no client frame open, it closes before the partial sequence or
+    /// character.
     #[test]
     fn a_first_paint_let_go_part_way_through_a_sequence_is_closed_in_front_of_it() {
         for (paint, rest, row) in [
@@ -5781,9 +4250,8 @@ mod tests {
         }
     }
 
-    /// The one outcome with a session to begin before the screen goes. Every
-    /// variant is asked, so a new one has to decide rather than default to
-    /// starting nothing — the failure that would cost an overlap silently.
+    /// Every variant is checked, so a new one must decide rather than silently
+    /// start nothing.
     #[test]
     fn only_a_switch_names_a_session_to_begin_early() {
         for target in [Target::Number(3), Target::Step(Direction::Next)] {
@@ -5811,11 +4279,8 @@ mod tests {
         }
     }
 
-    /// Exactly one outcome reaches the next session without a screen on the
-    /// way, and it is the one that has to clear for itself. Getting this wrong
-    /// in either direction is invisible in a test that only checks the
-    /// outcomes: too narrow leaves the old session on screen through the
-    /// spawn, too wide clears a screen that is about to draw anyway.
+    /// Too narrow leaves the old session on screen through the spawn; too wide
+    /// clears a screen about to draw anyway.
     #[test]
     fn only_a_switch_reaches_the_next_session_without_a_screen() {
         for target in [Target::Number(3), Target::Step(Direction::Next)] {
@@ -5842,14 +4307,8 @@ mod tests {
         }
     }
 
-    /// A msgpack-RPC server that answers what the attach probe asks and records
-    /// the methods it was asked, so the probe's call sequence is observable
-    /// without a real Neovim — which the machines running these tests may not
-    /// have, and which would answer whatever it liked anyway.
-    ///
-    /// It answers *every* call the probe could plausibly make, `nvim_get_api_info`
-    /// included, so a regression fails on the sequence rather than on a fake that
-    /// could not keep up.
+    /// A fake msgpack-RPC server that answers every call the probe could make
+    /// and records the methods asked.
     fn recording_server(
         sock: &Path,
         mode: &'static str,
@@ -5858,7 +4317,7 @@ mod tests {
         recording_server_with(sock, mode, blocking, 0, DEFAULT_MOUSE)
     }
 
-    /// What a server with Neovim's defaults answers `[&mouse, &mousemoveevent]`.
+    /// Neovim's default answer to `[&mouse, &mousemoveevent]`.
     const DEFAULT_MOUSE: (&str, i64) = ("nvi", 0);
 
     /// The same, reporting `uis` attached UIs.
@@ -5882,14 +4341,8 @@ mod tests {
         serve_recording(sock, mode, blocking, uis, mouse, None, false)
     }
 
-    /// A server whose prompt *ends* when it is typed at: it answers `mode`
-    /// until the first `nvim_input`, and an idle `n` from then on.
-    ///
-    /// The fixed-mode servers above model a prompt that outlasts every key,
-    /// which is the state the probe must refuse to wait on. This models the
-    /// ordinary one, and is the only way to see the probe go on to the UI
-    /// count after answering a prompt — the thing that made the `<CR>` worth
-    /// sending in the first place.
+    /// A server whose prompt ends when typed at: `mode` until the first
+    /// `nvim_input`, then idle `n`.
     fn recording_server_clearing_on_input(
         sock: &Path,
         mode: &'static str,
@@ -5897,8 +4350,8 @@ mod tests {
         serve_recording(sock, mode, true, 0, DEFAULT_MOUSE, None, true)
     }
 
-    /// An idle server that records `method` and then never answers it — a
-    /// session that is busy, as the attach probe sees one.
+    /// An idle server that records `method` and never answers it, as a busy
+    /// session looks to the probe.
     fn recording_server_stalling_on(
         sock: &Path,
         method: &'static str,
@@ -5906,10 +4359,8 @@ mod tests {
         serve_recording(sock, "n", false, 0, DEFAULT_MOUSE, Some(method), false)
     }
 
-    /// A server waiting for a key: it reports `mode` with `blocking` set and
-    /// answers every fast call, while `method` — a deferred one — is recorded
-    /// and never answered. Which is what a session in that state does: the
-    /// event queue is off, so the call is taken and not run.
+    /// A server waiting for a key: answers fast calls but records and never
+    /// answers the deferred `method`.
     fn recording_server_blocked_stalling_on(
         sock: &Path,
         mode: &'static str,
@@ -5930,9 +4381,8 @@ mod tests {
         use rmpv::Value;
 
         let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind");
-        // Bounded rather than blocking: if the probe never connects at all — a
-        // socket path this platform refuses, say — an accept that waited forever
-        // would hang the test instead of failing it on an empty recording.
+        // Non-blocking, so a probe that never connects fails the test rather
+        // than hanging it.
         listener
             .set_nonblocking(true)
             .expect("a non-blocking listener");
@@ -5953,16 +4403,16 @@ mod tests {
                     Err(_) => return asked,
                 }
             };
-            // The accepted stream inherits O_NONBLOCK on some platforms, and the
-            // reads below are blocking ones with their own bound.
+            // The accepted stream inherits O_NONBLOCK on some platforms, and
+            // the reads below are blocking ones with their own bound.
             stream.set_nonblocking(false).expect("a blocking stream");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("a bounded read");
             let mut reader = std::io::BufReader::new(&stream);
             let mut out = &stream;
-            // Ends on EOF, which is `spawn` dropping the client after the last
-            // call — so joining this handle waits for the whole probe.
+            // Ends on EOF, when `spawn` drops the client after its last call,
+            // so joining waits for the whole probe.
             while let Ok(frame) = rmpv::decode::read_value(&mut reader) {
                 let Some(request) = frame.as_array() else {
                     break;
@@ -5996,8 +4446,7 @@ mod tests {
                     "nvim_list_uis" => Value::Array(vec![Value::Nil; uis]),
                     // The byte count, which nvmux ignores.
                     "nvim_input" => Value::from(4u64),
-                    // Only the one expression the resume asks; anything else
-                    // is answered with nothing, as a fake should.
+                    // Only the expression the resume asks; else nil.
                     "nvim_eval"
                         if request
                             .get(3)
@@ -6010,8 +4459,7 @@ mod tests {
                     }
                     _ => Value::Nil,
                 };
-                // The keys go on the record too: which prompt gets a `<CR>` is
-                // half of what this pins.
+                // Record the keys too: which prompt gets a `<CR>` matters.
                 let keys = request
                     .get(3)
                     .and_then(|p| p.as_array())
@@ -6025,10 +4473,8 @@ mod tests {
                     typed_at = true;
                 }
                 if stall_on == Some(method) {
-                    // Recorded and never answered. The loop goes on reading,
-                    // so it ends on the EOF a cancelled probe's shutdown
-                    // produces — which is how joining this proves the hangup
-                    // reached the server.
+                    // Never answered; reading on until EOF proves the cancelled
+                    // probe's hangup reached the server.
                     continue;
                 }
                 let reply = Value::Array(vec![Value::from(1u64), msgid, Value::Nil, result]);
@@ -6040,12 +4486,7 @@ mod tests {
         })
     }
 
-    /// The notice's repaint is asked from a thread and collected later: the
-    /// two round trips it takes happen while the relay goes on relaying.
-    ///
-    /// What the server records is the whole of what is asked — the mode, and
-    /// then the `:mode` that paints — so a change that started typing at the
-    /// session to take a box off its screen fails here.
+    /// The server records the mode, then `:mode`, and nothing typed.
     #[test]
     fn the_notice_repaint_is_asked_from_a_thread_and_answered_later() {
         let sock = crate::test_support::scratch_sock("pty-erasing");
@@ -6066,13 +4507,8 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// **The point of the thread.** Asking must not wait, whatever the session
-    /// is doing: a server that never answers the `:mode` used to hold the relay
-    /// for a whole [`RESUME_TIMEOUT`], with the editor forwarding no keystroke
-    /// and copying no byte for as long.
-    ///
-    /// Bounded well under that budget rather than at it, so the assertion is
-    /// about not waiting rather than about how fast a thread starts.
+    /// **The point of the thread**: a server that never answers `:mode` used
+    /// to stall the relay for all of [`RESUME_TIMEOUT`].
     #[test]
     fn asking_for_the_notice_repaint_does_not_wait_for_it() {
         let sock = crate::test_support::scratch_sock("pty-erasingstall");
@@ -6091,8 +4527,8 @@ mod tests {
             "an answer cannot have arrived from a server that never sent one"
         );
 
-        // And when the budget does run out, the verdict is the fallback's:
-        // nothing was painted, so the relay nudges.
+        // When the budget runs out, the verdict is the fallback: nothing
+        // painted, so the relay nudges.
         let served = wait_for_the_answer(&erasing);
         assert_eq!(served, Served::NONE);
         drop(erasing);
@@ -6113,14 +4549,8 @@ mod tests {
         panic!("the notice repaint never answered");
     }
 
-    /// A resume may end a hit-enter prompt to get its screen back; taking an
-    /// attach notice off the screen may not.
-    ///
-    /// The prompt in that case is one the user is looking at right now — a
-    /// startup error, most likely, since the notice is up for a second either
-    /// side of an attach — and answering somebody's editor is far too much to
-    /// pay for tidying a notice away. Without the gate the two paths share one
-    /// `<CR>`, and nothing about the call sequence would look wrong.
+    /// The notice's prompt may be one the user is reading (likely a startup
+    /// error).
     #[test]
     fn only_a_resume_ends_a_hit_enter_prompt_to_repaint() {
         for (tag, why, want) in [
@@ -6153,9 +4583,7 @@ mod tests {
         }
     }
 
-    /// A resume asks the server what the client's mouse setting is and reads
-    /// the answer as the modes Neovim's TUI would have enabled from it; taking
-    /// a notice off the screen does not ask, since nothing ran in between.
+    /// Removing a notice does not ask: nothing ran in between.
     #[test]
     fn a_resume_asks_the_server_for_the_clients_mouse_setting() {
         use term::MouseReporting;
@@ -6189,13 +4617,12 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// A server that cannot be asked — busy, or waiting for a key — says
-    /// nothing about the mouse, and the resume falls back on the default.
+    /// The resume then falls back on the default.
     #[test]
     fn a_server_that_cannot_be_asked_says_nothing_about_the_mouse() {
         let sock = crate::test_support::scratch_sock("pty-mousebusy");
-        // Blocking on something that is not a hit-enter prompt: an operator
-        // waiting for its motion, say.
+        // Blocking on something other than hit-enter, e.g. an operator
+        // awaiting its motion.
         let server = recording_server_with(&sock, "no", true, 0, ("", 0));
         let served = repaint_through_server(&sock, Repaint::Resume);
         assert_eq!(served, Served::NONE);
@@ -6203,8 +4630,6 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// What Neovim's TUI enables from the two options, and nothing from an
-    /// answer that is not the pair asked for.
     #[test]
     fn the_mouse_setting_is_read_the_way_neovims_tui_reads_it() {
         use rmpv::Value;
@@ -6245,11 +4670,8 @@ mod tests {
         }
     }
 
-    /// A client that sits on its pty until it is hung up, in place of `nvim`,
-    /// which the machines running these tests may not have. `tag` goes on its
-    /// command line, so the process table says whether it is still there once
-    /// `spawn` has let go of it — a pid it wrote to a file would not do, since
-    /// a probe can fail before the shell has run a single line.
+    /// A client idling on its pty until hung up, standing in for `nvim`; `tag`
+    /// on its command line makes it findable in the process table.
     fn standin_client(tag: &str) -> Command {
         Command::new("sh")
             .arg("-c")
@@ -6271,22 +4693,14 @@ mod tests {
             .any(|l| l.contains(&standin_mark(tag)) && !l.contains("ps -ww"))
     }
 
-    /// The attach probe's call sequence, which is the whole of what a change to it
-    /// can break: the mode and the UI count together — one round trip, not two —
-    /// and then a `<CR>` for the one prompt that key ends.
-    ///
-    /// The `nvim_get_api_info` that used to lead this cost a round trip, and a
-    /// forwarded one over SSH, while proving nothing the `?` on the mode does not.
-    /// The server here would still answer it, so its absence is what is asserted.
+    /// Mode and UI count together, then `<CR>` only for a prompt it ends; no
+    /// `nvim_get_api_info`.
     #[test]
     fn the_attach_probe_asks_the_mode_and_the_ui_count_together_and_nothing_else() {
         for (tag, mode, want) in [
             ("idle", "n", &["nvim_get_mode", "nvim_list_uis"][..]),
-            // The prompt ends on the key, and the mode is read again before the
-            // UI count is: the `<CR>` is not sent and forgotten, because the
-            // reading it was sent on is the only thing that says *waiting* for
-            // `list_uis` is safe. One `nvim_list_uis` however many prompts were
-            // answered — the one already in flight is what the count comes from.
+            // The mode is re-read after the `<CR>`; the `list_uis` already in
+            // flight gives the count.
             (
                 "hitenter",
                 "r",
@@ -6316,14 +4730,7 @@ mod tests {
         }
     }
 
-    /// The notice is the only thing a blocked session can be told with, so it
-    /// has to carry the one instruction that gets the user out: press a key.
-    ///
-    /// Amended rather than replaced, because the name is still the answer to
-    /// the question the box normally answers — which session is this — and a
-    /// blocked attach should not stop saying it. A notice already spent says
-    /// nothing new: the box is up for a second once, and there is no second
-    /// one to correct.
+    /// Appended to the session's name rather than replacing it.
     #[test]
     fn a_blocked_session_says_so_on_its_notice_without_losing_its_name() {
         let mut attachment = attached_to("while :; do read x; done");
@@ -6333,20 +4740,17 @@ mod tests {
         assert!(said.starts_with("dotfiles"), "{said:?}");
         assert!(said.contains("press a key"), "{said:?}");
 
-        // Saying it twice says it once: no stutter on the one line the box has.
+        // Saying it twice says it once.
         attachment.note_waiting_for_a_key();
         assert_eq!(attachment.announce.as_deref(), Some(said.as_str()));
 
-        // A notice already spent stays spent: the box is up once, and there is
-        // no second one to correct.
+        // A notice already shown stays shown.
         attachment.announce = None;
         attachment.note_waiting_for_a_key();
         assert_eq!(attachment.announce, None);
     }
 
-    /// Back from the picker to the session just left, its name is not
-    /// announced again — but a session waiting for a key still says so, which
-    /// nothing else on the screen can.
+    /// The name is not repeated, but "waiting for a key" is.
     #[test]
     fn going_back_to_the_session_just_left_keeps_only_a_notice_with_news_in_it() {
         let mut attachment = attached_to("while :; do read x; done");
@@ -6361,33 +4765,20 @@ mod tests {
         assert_eq!(attachment.announce, said, "the key it is waiting for");
     }
 
-    /// **The regression test for the attach that never came back.** A session
-    /// waiting for a key must never be *waited on* for a deferred answer.
-    ///
-    /// `nvim_list_uis` is deferred, and the probe's connection has no budget,
-    /// so an answer from a session in one of these states is not slow but
-    /// absent: a probe that waited for it would park, `ui::attaching` would
-    /// spin, and the only way out would be the user giving up. Measured
-    /// against 0.12.5, all three of these did exactly that.
-    ///
-    /// So these servers never answer it at all, and the assertion is that the
-    /// probe says `Blocked` anyway — from which the attach goes ahead, because
-    /// the client nvmux is about to hand over is how the user presses the key
-    /// that ends the wait. Sending the question is not the hazard and is no
-    /// longer forbidden (see [`probe_on`]); waiting for it is, and a probe that
-    /// read the count before deciding would hang here rather than fail.
+    /// **Regression test for the attach that never came back.** These servers
+    /// never answer the deferred `nvim_list_uis`; the probe must still report
+    /// `Blocked` rather than hang `ui::attaching` (measured on 0.12.5: all
+    /// three states did).
     #[test]
     fn a_session_waiting_for_a_key_is_never_waited_on_for_a_deferred_answer() {
         for (tag, mode, keys) in [
             // A more-prompt. `<CR>` scrolls it a line rather than ending it.
             ("more", "rm", 0),
-            // A half-typed `g`: `n` with `blocking` set, which is the state the
-            // reported session was found in. Indistinguishable over RPC from a
-            // command the user started, so nvmux types nothing.
+            // A half-typed `g` (`n` with `blocking`), as in the original
+            // report: nothing is typed.
             ("pending", "n", 0),
-            // A hit-enter prompt that outlasts every key — something is raising
-            // them faster than they are answered. The budget is spent and then
-            // it is handed over, rather than typed at for ever.
+            // A hit-enter prompt outlasting every key: the budget is spent,
+            // then the terminal is handed over.
             ("stacked", "r", MAX_PROMPTS),
         ] {
             let sock = crate::test_support::scratch_sock(&format!("pty-{tag}"));
@@ -6420,11 +4811,8 @@ mod tests {
         }
     }
 
-    /// The client is started before the probe has said yes, so a probe that
-    /// says no must take it down again: nothing left running, nothing left to
-    /// print on the terminal. Both ways a probe can say no — nothing serving
-    /// the socket, and a server with too many UIs — and the error is the
-    /// probe's, not the client's.
+    /// The client starts before the probe passes, so either refusal must take
+    /// it down again.
     #[test]
     fn a_failed_probe_leaves_no_client_behind() {
         for (tag, too_many) in [("nobody", false), ("toomany", true)] {
@@ -6445,8 +4833,7 @@ mod tests {
             if let Some(server) = server {
                 server.join().expect("the server thread");
             }
-            // Retired and reaped before the error came back, so it is not in
-            // the process table at all — not even as a zombie.
+            // Reaped before the error returned: not even a zombie remains.
             assert!(
                 !standin_running(tag),
                 "{tag}: the client is still there after a failed probe"
@@ -6455,12 +4842,8 @@ mod tests {
         }
     }
 
-    /// The attach probe waits on the session with no budget, so the user's
-    /// cancel is the only thing that ends a wait on a busy one — and it has
-    /// to end all of it. The worker thread must stop, or it would answer the
-    /// prompt the session shows once it is free; and the server must see the
-    /// connection go, so the `<CR>` that answer would have carried can never
-    /// be sent on it.
+    /// The worker must stop, or it would answer the session's prompt once
+    /// free, and the server must see the connection close.
     #[test]
     fn dropping_a_probe_stops_its_worker_and_hangs_up_on_the_server() {
         let sock = crate::test_support::scratch_sock("pty-stall");
@@ -6507,34 +4890,26 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// The invariant the switch path's overlap rests on, and the one that was
-    /// silently false before: the hangup signals and comes straight back.
-    ///
-    /// The client catches the hangup and reports it rather than dying of it, so
-    /// all three things are separable — that a signal was sent at all, that
-    /// nothing escalated past it, and that nothing waited for it. On the state
-    /// alone the old path looked the same, because `portable_pty`'s `Child::kill`
-    /// SIGKILLed without waiting; the elapsed bound is what fails on it, measured
-    /// at 200 ms there against two `kill` syscalls here.
+    /// The hangup must signal and return at once, for the switch path's
+    /// overlap. `portable_pty`'s `Child::kill` passed the state checks; only
+    /// the time bound caught it.
     #[test]
     fn hanging_up_signals_the_client_without_waiting_for_it() {
-        // `read` blocks in the shell itself rather than in a child, so the
-        // process being signalled is the one that reports.
+        // `read` is a shell builtin, so the signalled process is the one
+        // that reports.
         let mut a = attached_to("trap 'printf H' HUP; printf r; while :; do read x; done");
         let pid = pid_of(&a);
-        // The `printf r` comes after the `trap`, so this is the point from which
-        // the hangup is genuinely caught rather than fatal.
+        // The `printf r` follows the `trap`, so from here the hangup is
+        // caught, not fatal.
         wait_until_ready(&a);
 
         let start = Instant::now();
         a.hang_up();
         let took = start.elapsed();
 
-        // A shell may hold the trap of a signal that lands as it goes into
-        // `read`, to run once the `read` returns: bash 3.2, macOS's `sh`, runs
-        // one at once only while `read` is waiting, and otherwise between
-        // commands. A line ends the `read` either way, and prints nothing of
-        // its own: the `H` is still the trap's alone.
+        // A shell may defer a trap for a signal arriving as it enters `read`
+        // until `read` returns (bash 3.2, macOS's `sh`). A newline ends the
+        // `read` and prints nothing, so the `H` is still the trap's alone.
         a.master.write_all(b"\n").expect("write");
         a.master.flush().expect("flush");
 
@@ -6554,9 +4929,7 @@ mod tests {
         );
         assert!(!a.reaped, "the hangup must leave the reaping to `reap`");
 
-        // And the reap is what gets rid of a client that will not leave. This is
-        // the only test that reaches that escalation: `portable_pty`'s own
-        // SIGKILL used to get there first, so the SIGKILL below it had never run.
+        // The reap kills a client that will not leave.
         a.reap();
         assert_eq!(
             settle(pid, Peek::Gone),
@@ -6565,25 +4938,19 @@ mod tests {
         );
     }
 
-    /// A client blocked writing into a master nobody reads still takes its
-    /// hangup, because the reap reads it out while it waits for it.
-    ///
-    /// That is the state the switch path leaves behind: the picker stops reading
-    /// the outgoing client the moment it opens, so one that was mid-repaint fills
-    /// the pty buffer and stops there, in a `write` it cannot leave and with its
-    /// handler never reached. Measured: 10 ms to exit on its own with the drain,
-    /// against the full `REAP_TIMEOUT` and a SIGKILL without it.
+    /// The picker stops reading the outgoing client, so one mid-repaint blocks
+    /// in `write` and never reaches its handler; the reap drains it while
+    /// waiting.
     #[test]
     fn a_client_blocked_writing_still_takes_its_hangup() {
-        // Catches the hangup rather than dying of it: a default disposition is
-        // fatal whether the process is blocked or not, and would prove nothing.
+        // Traps the hangup: the default disposition is fatal even when
+        // blocked, and would prove nothing.
         let mut a = attached_to(
             "trap 'exit 0' HUP; printf r; while :; do printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; done",
         );
         let pid = pid_of(&a);
         wait_until_ready(&a);
-        // Long enough to fill the master's buffer and stop in `write`; a machine
-        // fast enough to still be running only makes the assertion easier.
+        // Long enough to fill the master's buffer and block in `write`.
         std::thread::sleep(Duration::from_millis(400));
 
         let start = Instant::now();
@@ -6599,21 +4966,12 @@ mod tests {
         );
     }
 
-    /// A client that will not leave until its terminal answers the question it
-    /// asks on the way out is answered, and leaves.
-    ///
-    /// Neovim's shape, not an invented one: `tui_stop` writes its restore
-    /// sequence, sends `ESC [ c`, and blocks for `EXIT_TIMEOUT_MS` — a whole
-    /// second — waiting for the reply that says the terminal has caught up.
-    /// The stand-in does the same thing with `dd`. Without the answer this is
-    /// the reap's deadline and a SIGKILL two seconds later; with it, the client
-    /// goes at once.
+    /// Neovim's `tui_stop` waits up to 1 s for a DA1 reply; the stand-in does
+    /// the same with `dd`.
     #[test]
     fn a_client_waiting_on_its_terminal_is_answered_and_goes() {
-        // `stty raw` because a real client's terminal is in raw mode and the
-        // reply carries no newline: left canonical, the stand-in's read would
-        // block for a line that never comes and the test would pass for the
-        // wrong reason.
+        // `stty raw`: the reply has no newline, so a canonical read would
+        // block for a line and the test would pass for the wrong reason.
         let mut a = attached_to(
             r#"stty raw -echo; trap 'printf "\033[c"; dd bs=1 count=1 >/dev/null 2>&1; exit 0' HUP; printf r; while :; do sleep 0.05; done"#,
         );
@@ -6633,8 +4991,7 @@ mod tests {
         );
     }
 
-    /// A stand-in client that is kept: it has a ledger, which is what makes
-    /// an attachment one to park.
+    /// A stand-in kept client (one with a ledger).
     fn kept(script: &str) -> Attachment {
         let mut a = attached_to(script);
         a.ledger = Some(Ledger::new());
@@ -6650,10 +5007,8 @@ mod tests {
         !parked.is_alive()
     }
 
-    /// Parked is not left unread: a client with far more to say than a pty
-    /// holds says all of it while parked, and what it said last — a title,
-    /// after two hundred kilobytes that would have stopped it cold — is in
-    /// the ledger when it is taken back.
+    /// The title written after 200 KB, which would block an unread client,
+    /// reaches the ledger.
     #[test]
     fn a_parked_client_is_read_while_it_waits() {
         let a = kept(
@@ -6661,8 +5016,7 @@ mod tests {
         );
         let pid = pid_of(&a);
         let parked = a.park().expect("parked");
-        // Two hundred kilobytes read in pieces take a few milliseconds; a
-        // client nobody reads would still be stuck a second later.
+        // An unread client would still be stuck a second later.
         std::thread::sleep(Duration::from_secs(1));
         let a = parked.unpark().expect("handed back");
         assert_eq!(pid_of(&a), pid, "not the same client");
@@ -6673,8 +5027,6 @@ mod tests {
         );
     }
 
-    /// Taking a parked client back hands over the very client — alive, and
-    /// its thread gone.
     #[test]
     fn unparking_hands_back_the_same_client() {
         let a = kept("printf r; exec sleep 30");
@@ -6691,8 +5043,7 @@ mod tests {
         );
     }
 
-    /// A client that leaves while parked — its session killed, its link gone
-    /// — is not handed back, and is not left behind either.
+    /// Exited while parked: not handed back, and reaped.
     #[test]
     fn a_client_that_leaves_while_parked_is_not_handed_back() {
         let a = kept("sleep 0.2; exit 0");
@@ -6709,9 +5060,8 @@ mod tests {
         assert!(reaped(pid), "and it was not reaped");
     }
 
-    /// A parked client that asks its terminal for its attributes is on its
-    /// way out — or suspending, which from here is no better — and is retired,
-    /// quickly, rather than answered and kept.
+    /// A parked client sending DA1 is exiting or suspending; it is retired
+    /// quickly, not answered and kept.
     #[test]
     fn a_parked_client_on_its_way_out_is_retired() {
         let a = kept(
@@ -6734,7 +5084,6 @@ mod tests {
         );
     }
 
-    /// Letting go of a parked client retires it, on its thread.
     #[test]
     fn dropping_a_parked_client_retires_it() {
         let a = kept("printf r; exec sleep 30");
@@ -6744,12 +5093,8 @@ mod tests {
         assert!(reaped(pid), "the client outlived its parking");
     }
 
-    /// What a client started ahead writes is kept whole, in order, and seen
-    /// by nothing until it is relayed: not by the ledger, which would
-    /// otherwise count a title the terminal has not been told yet. And its
-    /// DA1 requests — two, as a real client's startup asks with nothing
-    /// answering, the first split across two reads — are questions to keep
-    /// for the terminal, not the sign of a client leaving.
+    /// Not even the ledger sees it, or it would record a title the terminal has
+    /// not been told. Its startup DA1 requests are not taken as an exit.
     #[test]
     fn a_client_started_ahead_keeps_what_it_writes_whole_and_unseen() {
         let a = kept(
@@ -6774,11 +5119,8 @@ mod tests {
         );
     }
 
-    /// A client put aside — parked, or started ahead — is told it has gone
-    /// to the back, if it is one that draws cards: in its input, whole, as it
-    /// goes, that it is away, to draw at a crawl ([`card::Command::Away`]),
-    /// which its return waits on it to catch up from. Neovim's own client,
-    /// which could not read it, is told nothing.
+    /// Card-drawing clients are sent [`card::Command::Away`] when parked or
+    /// started ahead; Neovim's client is sent nothing.
     #[test]
     fn a_client_put_aside_is_told_it_is_out_of_sight() {
         for draws_cards in [true, false] {
@@ -6827,9 +5169,8 @@ mod tests {
         }
     }
 
-    /// A client started ahead that leaves the alternate screen is on its way
-    /// out — its exit or its suspend — and is retired, as a parked one is,
-    /// however the reads split the sequence.
+    /// Leaving the alternate screen means exit or suspend, however the reads
+    /// split the sequence.
     #[test]
     fn a_client_started_ahead_on_its_way_out_is_retired() {
         for (tag, finish) in [
@@ -6850,8 +5191,6 @@ mod tests {
         }
     }
 
-    /// One that has said more than a first paint's worth before anybody
-    /// asked for it is let go, rather than kept growing.
     #[test]
     fn a_client_started_ahead_that_says_too_much_is_let_go() {
         let a = kept(&format!(
@@ -6865,10 +5204,8 @@ mod tests {
         assert!(reaped(pid), "and it was not reaped");
     }
 
-    /// The probe decides whether a client started ahead is kept, as it
-    /// decides whether a fresh one is shown: a session with room keeps it,
-    /// with the probe let go; one with too many UIs, or one waiting for a key,
-    /// retires it, so that its first visit attaches afresh.
+    /// A session with room keeps it and drops the probe; too many UIs or a key
+    /// wait retire it, so the first visit attaches afresh.
     #[test]
     fn a_client_started_ahead_is_kept_only_if_its_probe_says_so() {
         for (tag, mode, blocking, uis, keeps) in [
@@ -6887,8 +5224,7 @@ mod tests {
             let pid = pid_of(&a);
             let held = a.start_ahead(Some(probe)).expect("held");
             if keeps {
-                // One round trip on a local socket, long since answered, and
-                // a few of the thread's looks for the answer.
+                // Long enough for one local round trip.
                 std::thread::sleep(Duration::from_millis(500));
                 let mut back = held
                     .unpark()
@@ -6905,8 +5241,7 @@ mod tests {
         }
     }
 
-    /// A client asked for before its probe has answered comes back with the
-    /// probe, for the caller to wait out as it would a fresh client's.
+    /// The caller then waits on the probe as for a fresh client.
     #[test]
     fn a_probe_still_out_comes_back_with_its_client() {
         let sock = crate::test_support::scratch_sock("pty-ahead-busy");
@@ -6926,8 +5261,8 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// A sequence the growth of a buffer completed is in the tail looked at,
-    /// wherever the growth split it, and one wholly before it is not.
+    /// The tail catches a sequence wherever the growth split it, but not one
+    /// wholly before it.
     #[test]
     fn the_tail_looked_at_takes_in_a_sequence_split_by_the_growth() {
         let grown = b"xx\x1b[?1049l";
@@ -6943,8 +5278,7 @@ mod tests {
         assert_eq!(tail_from(3, ALT_SCREEN_LEAVE), 0);
     }
 
-    /// Whether the process is gone and waited for — not merely exited, which
-    /// a zombie nobody reaped is too — within a few seconds.
+    /// Whether the process is gone and reaped within 5 s.
     fn reaped(pid: Pid) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -6956,9 +5290,8 @@ mod tests {
         false
     }
 
-    /// A client that takes its size in band ignores the signal, so a new size
-    /// is sent to it as the report a terminal would send, whole, as its input
-    /// — and only a new size: the repaint is asked of the server regardless.
+    /// Such a client ignores `SIGWINCH`, so it is sent the report a terminal
+    /// would send, whole, as input; only for a changed size.
     #[test]
     fn a_client_that_reads_its_size_in_band_is_sent_a_new_one() {
         let mut a = kept(
@@ -6985,8 +5318,7 @@ mod tests {
         );
     }
 
-    /// And a client that takes its size from the pty is told nothing: the
-    /// resize is enough, and a report would reach it as keys.
+    /// The resize is enough, and a report would reach it as keys.
     #[test]
     fn a_client_that_reads_its_size_from_the_pty_is_sent_no_report() {
         let mut a =
@@ -6999,13 +5331,8 @@ mod tests {
         );
     }
 
-    /// A kept client brought back is told to come back and to show the card
-    /// its return lands with, in two writes, and a client that reads them
-    /// apart answers the first with a frame of its own before the one with
-    /// the card: the relay reads on past it until the card is on the shadow,
-    /// which the fade in then leaves standing. Read only up to the first
-    /// frame, the screen came in without the card and the card after it, on
-    /// every return, on a machine where the client read the two apart.
+    /// A client reading the return and the card apart draws a frame before the
+    /// card; the relay must read past it, or the card appears after the fade.
     #[test]
     fn a_card_is_read_for_past_a_frame_that_comes_before_it() {
         let mut a = kept(
@@ -7024,12 +5351,9 @@ mod tests {
         );
     }
 
-    /// **The regression test for the hex above the shell's prompt.** Nothing
-    /// written into a client's input comes back out of its pty: not before the
-    /// client has made its terminal raw, which is when a fresh relay puts its
-    /// first card in, and not once it has put it back on its way out. What
-    /// comes out is read as the client's own output, and relayed as that (see
-    /// [`take_input_as_written`]).
+    /// **Regression test for the hex above the shell's prompt.** Input to a
+    /// client is never echoed, before it makes its terminal raw or after it
+    /// restores it.
     #[test]
     fn nothing_written_into_a_clients_input_comes_back_out() {
         for (when, script) in [
@@ -7049,9 +5373,8 @@ mod tests {
         }
     }
 
-    /// And what is written in reaches the client as it was written, whatever
-    /// the client has made of its terminal yet: not held for the end of a
-    /// line, not edited by a `DEL`, and a `CR` still a `CR`.
+    /// Even before the client sets up its terminal: no line buffering, no `DEL`
+    /// editing, and `CR` stays `CR`.
     #[test]
     fn what_is_written_into_a_clients_input_reaches_it_as_written() {
         let mut a = attached_to(
@@ -7067,9 +5390,8 @@ mod tests {
         );
     }
 
-    /// A client starts with its terminal open and nothing else of ours: not a
-    /// descriptor nvmux made without close-on-exec, as it makes the SIGWINCH
-    /// self-pipe, nor one whoever started nvmux left it (see `before_exec`).
+    /// Neither an fd nvmux made without close-on-exec (like the SIGWINCH
+    /// self-pipe) nor one nvmux inherited (see `before_exec`).
     #[test]
     fn a_client_inherits_no_descriptor_but_its_terminal() {
         let (read, write) = nix::unistd::pipe().expect("a pipe without close-on-exec");
@@ -7091,8 +5413,7 @@ mod tests {
         );
     }
 
-    /// Output up to and including `byte`, as text, or whatever came before a
-    /// few seconds ran out.
+    /// Output up to and including `byte`, as text, or what came within 5 s.
     fn read_until(a: &Attachment, byte: u8) -> String {
         let fd = a.master.as_raw_fd();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -7140,9 +5461,8 @@ mod tests {
         }
     }
 
-    /// The terminal's answer to in-band size reports turned back on is taken
-    /// out of what it sends the client: only that answer, only at the size
-    /// the client has, only once, and only while it is looked for.
+    /// Only that answer, only at the client's size, only once, and only while
+    /// expected.
     #[test]
     fn the_terminals_answer_to_a_replayed_size_mode_is_kept_from_the_client() {
         let size = PtySize {
@@ -7177,8 +5497,6 @@ mod tests {
         assert!(a.expecting_a_size_report.is_none());
     }
 
-    /// A report by its shape, wherever it falls in what the terminal sent,
-    /// and nothing short of one.
     #[test]
     fn a_size_report_is_found_by_its_shape() {
         assert_eq!(
@@ -7191,9 +5509,7 @@ mod tests {
         assert_eq!(find_size_report(b"\x1b[?2048;2$y"), None);
     }
 
-    /// A kept client is parked only once the terminal has answered what it
-    /// asked on the way up — the answer to its DA1, the last of its questions,
-    /// forwarded to it through the relay.
+    /// The DA1 answer is the last reply a client's startup waits for.
     #[test]
     fn a_client_is_parkable_once_its_questions_are_answered() {
         let mut a = kept("exec sleep 30");
@@ -7210,8 +5526,6 @@ mod tests {
         );
     }
 
-    /// The answer by its shape, wherever it falls in what the terminal sent,
-    /// and nothing that merely looks like it.
     #[test]
     fn a_device_attributes_answer_is_recognised_by_its_shape() {
         assert!(answers_device_attributes(b"\x1b[?62;22c"));
@@ -7226,7 +5540,6 @@ mod tests {
         );
     }
 
-    /// The request as Neovim spells it, and nothing else.
     #[test]
     fn a_device_attributes_request_is_recognised_in_a_chunk_of_output() {
         assert!(asks_for_device_attributes(b"\x1b[c"));
@@ -7240,15 +5553,9 @@ mod tests {
         assert!(!asks_for_device_attributes(DA1_REPLY));
     }
 
-    /// A client that stopped itself takes the hangup only because it is
-    /// continued as well.
-    ///
-    /// SIGHUP is not delivered to a stopped process at all, and `reap`'s
-    /// `try_wait` does not pass `WUNTRACED`, so it reads a stopped child as
-    /// still running: without the SIGCONT this sits for the whole of
-    /// `REAP_TIMEOUT` and then kills it outright. Reachable because `<prefix>`
-    /// chords are read by nvmux's own stdin loop, not by the client, so a client
-    /// that `check_child` has not revived yet can be retired on the switch.
+    /// SIGHUP is not delivered to a stopped process, so without SIGCONT this
+    /// would wait out `REAP_TIMEOUT`. Reachable: a client `check_child` has not
+    /// yet revived can be retired on a switch.
     #[test]
     fn a_suspended_client_is_continued_so_the_hangup_lands() {
         let mut a = attached_to("exec sleep 30");
@@ -7258,8 +5565,8 @@ mod tests {
 
         a.hang_up();
 
-        // Gone, and without the reap having killed it: the pending hangup was
-        // delivered, which only happens once the process is running again.
+        // Gone without the reap killing it: the pending hangup lands only once
+        // the process runs again.
         assert_eq!(
             settle(pid, Peek::Gone),
             Peek::Gone,
@@ -7268,9 +5575,8 @@ mod tests {
         a.reap();
     }
 
-    /// `Drop` is the one retirement path — every `break` out of the session loop
-    /// leans on it — and it was untested. No explicit hangup, and the client is
-    /// still gone by the time the attachment is.
+    /// `Drop` is the retirement path every `break` out of the session loop
+    /// relies on.
     #[test]
     fn dropping_an_attachment_hangs_it_up_and_reaps_it() {
         let a = attached_to("exec sleep 30");
@@ -7282,8 +5588,8 @@ mod tests {
 
         // Reaped, so the peek gets ECHILD, which reads as gone.
         assert_eq!(peek_child(pid), Peek::Gone);
-        // Gone alone cannot tell "left on its hangup" from "killed by the reap's
-        // deadline two seconds later", and only the first is what `Drop` claims.
+        // "Gone" alone cannot tell a hangup exit from a kill at the reap's
+        // deadline; the time bound can.
         assert!(
             took < Duration::from_millis(500),
             "dropping took {took:?}, so the client was killed by the deadline \
@@ -7291,10 +5597,8 @@ mod tests {
         );
     }
 
-    /// The switch path's shape: hang up, do something slow, then drop. The
-    /// second hangup `Drop` sends has to be harmless — nothing in between waits
-    /// for the child, so the pid is still ours and cannot have been recycled —
-    /// and the client has to end up reaped exactly once.
+    /// The switch path: hang up, then drop later. The second hangup must be
+    /// harmless and the client reaped exactly once.
     #[test]
     fn hanging_up_then_dropping_reaps_the_client_exactly_once() {
         use nix::sys::wait::{waitpid, WaitPidFlag};
@@ -7313,8 +5617,7 @@ mod tests {
             "dropping took {took:?}: the second hangup cost the client its life \
              at the deadline rather than being the no-op it should be"
         );
-        // Reaped, not merely dead: ECHILD means no zombie was left behind, which
-        // is the half of "exactly once" a peek cannot see.
+        // ECHILD: no zombie left, the half of "exactly once" a peek cannot see.
         assert_eq!(
             waitpid(pid, Some(WaitPidFlag::WNOHANG)),
             Err(nix::errno::Errno::ECHILD),
@@ -7322,10 +5625,8 @@ mod tests {
         );
     }
 
-    /// The peek sees a stop, leaves it in place, and sees an exit without
-    /// reaping it. Runs against a real child because `waitid` is what differs
-    /// between platforms: nix does not bind it on macOS, so it goes through
-    /// `libc`, and the flag and `si_code` handling has to hold on both.
+    /// Against a real child because `waitid` goes through `libc` (nix lacks it
+    /// on macOS), and the flags and `si_code` handling must hold on both.
     #[test]
     fn peek_reports_stopped_and_gone_without_consuming_either() {
         use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -7370,8 +5671,7 @@ mod tests {
         assert_eq!(peek_child(pid), Peek::Gone);
     }
 
-    /// A write failure is the relay's error, not something to swallow: the
-    /// child is gone and the loop must end.
+    /// The child is gone and the loop must end.
     #[test]
     fn a_failed_forward_is_an_error() {
         struct Broken;
@@ -7386,10 +5686,8 @@ mod tests {
         assert!(act(&mut Broken, Step::Forward(b"x".to_vec())).is_err());
     }
 
-    /// What the teardown drain relays is the client's restore sequence minus
-    /// the one question nvmux answers in the terminal's place. Everything
-    /// around it, and every sequence that merely resembles it, goes through
-    /// untouched.
+    /// Everything around the request, and sequences that merely resemble it,
+    /// pass untouched.
     #[test]
     fn the_drain_takes_the_da1_request_out_and_nothing_else() {
         let restore = b"\x1b[?1049l\x1b[?25h\x1b[c\x1b[0m";

@@ -84,7 +84,10 @@ pub enum Fill {
     Full,
     /// `glyph` in the shape's colour or, if `inverted`, in the cell's
     /// background on the shape's colour.
-    Glyph { glyph: char, inverted: bool },
+    Glyph {
+        glyph: char,
+        inverted: bool,
+    },
 }
 
 pub fn fill(covered: Mask) -> Fill {
