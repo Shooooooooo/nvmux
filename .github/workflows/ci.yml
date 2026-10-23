@@ -19,7 +19,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            test-threads: 32
+          - os: macos-latest
+            test-threads: 12
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,9 +65,11 @@ jobs:
       # frames — not computing: tests/client.rs adds up to the same 1,520
       # test-seconds run 4, 8, 16 or 32 at a time, and is done in 394, 202,
       # 111 or 61, its longest test 57, keeping four cores 19% busy at 32. So
-      # they run thirty-two at a time.
+      # they run thirty-two at a time on Linux, and twelve on macOS: there,
+      # thirty-two at once — up to 34 ptys open, where twelve have 14 — had
+      # one of them fail to open a pty at all (ENXIO).
       #
-      # That many tests at once have more files open than a soft limit of
+      # Thirty-two tests at once have more files open than a soft limit of
       # 256, a stock macOS shell's, allows, and fewer than 512: under 256,
       # tests/client.rs fails with EMFILE. Raised where it is lower, as it may
       # be on macOS; a Linux runner allows 65536.
@@ -74,7 +80,7 @@ jobs:
           fi
           ulimit -n
           cargo test --lib --bins
-          RUST_TEST_THREADS=32 cargo test --test '*'
+          RUST_TEST_THREADS=${{ matrix.test-threads }} cargo test --test '*'
           cargo test --doc
 
   msrv:
