@@ -1,12 +1,8 @@
-//! What the notifier tells the session in front ([`nvmux::tell`]), against
-//! real `nvim --headless` sessions: that the watcher numbers what it keeps,
-//! knows whether its terminal was on the screen, and says which buffer that
-//! is and where; and that the notifier posts a card, as it happens, for what
-//! the other sessions say — and of the session in front, only for what a
-//! terminal of its own off the screen says.
+//! Tests for [`nvmux::tell`] against real `nvim --headless` sessions: the
+//! watcher's notes, and the cards the notifier posts to the session in front.
 //!
-//! They skip, rather than fail, when there is no usable `nvim` on `$PATH` —
-//! unless `$NVMUX_TEST_REQUIRE` names `nvim`, as it does in CI.
+//! Skipped when no usable `nvim` is on `$PATH`, unless `$NVMUX_TEST_REQUIRE`
+//! names `nvim` (as in CI).
 
 #[macro_use]
 mod common;
@@ -21,10 +17,9 @@ use nvmux::notes::{self, Heard, Kind};
 use nvmux::rpc::Client;
 use nvmux::tell::Notifier;
 
-/// A careful read, of an editor waiting for a key, says nothing and asks
-/// nothing; and what the watcher keeps is numbered as it comes, says whether
-/// its terminal was on the screen, and which buffer that is and the tab page
-/// it is in, while it is.
+/// A read of an editor waiting for a key is `Heard::Unknown` and asks it
+/// nothing. Notes are numbered in order and record whether their terminal was
+/// shown, its buffer, and its tab page while shown.
 #[test]
 fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
     require_nvim!();
@@ -39,8 +34,8 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
         "given the watcher"
     );
 
-    // First, while the current window still holds a buffer of its own: in a
-    // terminal's, the editor's mode is `nt`, not the `n` the wait looks for.
+    // Before any terminal opens: in a terminal buffer the mode is `nt`, not
+    // the `n` the wait looks for.
     common::block_on_a_key(&sock);
     assert_eq!(notes::hear(&sock, None), Heard::Unknown);
     Client::connect(&sock, Duration::from_secs(2))
@@ -80,11 +75,10 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
     assert_eq!(news[0].buf, None, "a buffer that is gone is none: {news:?}");
 }
 
-/// A listener on a session hears from its watcher once a read has named it,
-/// and not before: each time news comes, and when what was kept is seen —
-/// but not a `seen` with nothing to clear. A read says whether the listener
-/// was being told already. Stopped, it goes, and the watcher lets go of its
-/// channel the next time it has news.
+/// A listener hears from the watcher only after a read names it: on news, and
+/// on a `seen` that clears something. A read reports whether the listener was
+/// already being told. Once the listener stops, the watcher drops its channel
+/// at the next news.
 #[test]
 fn a_listener_hears_the_news_once_a_read_names_it() {
     require_nvim!();
@@ -109,8 +103,8 @@ fn a_listener_hears_the_news_once_a_read_names_it() {
         assert!(more.is_err(), "{what}: {more:?}");
     };
 
-    // A read that names nobody gives the session the watcher, which tells
-    // nobody; nor does news before a read has named the listener.
+    // A read naming nobody installs a watcher that tells nobody; news before
+    // the listener is named is not told either.
     assert!(!listening_by(notes::hear(&sock, None)));
     a_job_that_exits(&sock, "exit 1", false);
     nothing_more("told before it was named");
@@ -140,8 +134,8 @@ fn a_listener_hears_the_news_once_a_read_names_it() {
     nothing_more("told of a seen with nothing to clear");
     eprintln!("told {took:?} after the job was started");
 
-    // A watcher put in afresh by a read that names the listener tells it,
-    // though the read does not say it was being told.
+    // A watcher reinstalled by a read naming the listener tells it, though
+    // that read reports not listening.
     lua(&sock, "package.loaded['nvmux.notes'] = nil");
     assert!(!listening_by(notes::hear(&sock, Some(chan))));
     a_job_that_exits(&sock, "exit 5", false);
@@ -153,7 +147,7 @@ fn a_listener_hears_the_news_once_a_read_names_it() {
     stop.fire();
     let ended = listening.join().expect("the listener panicked");
     assert!(ended.is_err(), "stopped, it says why: {ended:?}");
-    // Told no more: the watcher found the channel gone and let it go.
+    // The watcher finds the channel gone and drops it.
     a_job_that_exits(&sock, "exit 4", false);
     assert!(
         !listening_by(notes::hear(&sock, Some(chan))),
@@ -161,13 +155,11 @@ fn a_listener_hears_the_news_once_a_read_names_it() {
     );
 }
 
-/// The session in front is posted a card for what another session's
-/// terminals say as it happens — a command that finished, a notification —
-/// by that session's name, going there; of its own terminals, only what one
-/// off the screen says, as `here`, going to it; and nothing while nvmux's own
-/// screens are up. A screen that comes up while another session keeps what
-/// it said is posted that session's mark alone — and told to let it go once
-/// the session keeps nothing.
+/// The session in front gets a card as it happens for what other sessions'
+/// terminals say, titled with that session and going there; for its own
+/// terminals, only those off screen, titled `here`; and nothing while nvmux's
+/// own screens are up. On returning to front, a session that still keeps news
+/// is posted as its mark alone, and forgotten once it keeps nothing.
 #[test]
 fn the_notifier_posts_cards_for_the_session_in_front() {
     require_nvim!();
@@ -179,9 +171,8 @@ fn the_notifier_posts_cards_for_the_session_in_front() {
     notifier.watch(&front.id, "front", front_sock.clone());
     notifier.watch(&other.id, "other", other_sock.clone());
     notifier.front(Some(&front.id));
-    // The first round only finds out how far each session has got, and puts
-    // its watcher in each: waited for, rather than slept for as long as that
-    // takes, which a busy machine makes longer.
+    // The first round only records each session's progress and installs the
+    // watchers; wait for that rather than sleeping.
     let watched = |sock: &std::path::Path| {
         lua(
             sock,
@@ -253,8 +244,8 @@ fn the_notifier_posts_cards_for_the_session_in_front() {
     let posts = posts_until(notes::POLL + Duration::from_millis(800), |_| false);
     assert!(posts.is_empty(), "posted with nobody in front: {posts:?}");
 
-    // Back in front, the other session keeps a failure over a command that
-    // finished: its mark alone, the failure's.
+    // Back in front: only the other session's mark, and a failure outranks
+    // the earlier finish.
     notifier.front(Some(&front.id));
     let posts = posts_until(within, |posts| {
         posts.iter().filter_map(shown).any(|(c, _)| c.only_mark)
@@ -274,7 +265,7 @@ fn the_notifier_posts_cards_for_the_session_in_front() {
         Some(Go::Session(nvmux::ids::Id::new(&other.id).expect("id")))
     );
 
-    // Seen: the mark is let go of.
+    // Once seen, the mark is forgotten.
     notes::seen(&other_sock);
     let forget = |p: &Post| p.what == Posted::Forget(other.id.clone());
     let posts = posts_until(within, |posts| posts.iter().any(forget));

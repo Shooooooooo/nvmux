@@ -1,51 +1,27 @@
-//! Split windows opening, closing and changing size the way animate.nvim's
-//! window module draws them, rather than Neovide's slide.
+//! Split windows opening, closing and resizing as animate.nvim's window
+//! module draws them, instead of Neovide's slide.
 //!
-//! Neovim lays split windows out as a tree: a row of windows side by side or
-//! a column of them one above the other, each child a window or another such
-//! row or column. Every window takes a frame of the screen — its grid, the
-//! status line or separator under it, the separator to its right — and the
-//! frames tile the space between the tabline and the command line. A UI is
-//! told where each window's grid is and nothing of the tree, so the tree is
-//! read back off the frames ([`build`]): a column every frame lies wholly to
-//! one side of is where a row is split, a line every frame lies wholly above
-//! or below is where a column is.
+//! A UI learns only where each grid is, so [`build`] reads Neovim's tree of
+//! rows and columns back off the frames (grid plus status line/separators).
+//! A batch's change to the windows drawn last is then one of:
 //!
-//! What a batch did to the windows drawn last is then one of these:
+//! - resized, same arrangement (`<C-w>>`, `:resize`, `<C-w>=`): edges ease in
+//!   and out over 150 ms, a frame per cell for small moves, one cell at once;
+//! - one window split off (`:split`, `:vsplit`, a sidebar): it grows from a
+//!   one-cell sliver on its side (right/below with `'splitright'` and
+//!   `'splitbelow'`) as its text fades in, over 200 ms, easing out;
+//! - windows closed (`:close`, `:only`): the window before each closed run
+//!   takes its place at once while a ghost of the run (content and leading
+//!   separator) flies to its far side, dimming, over 180 ms, easing in; if the
+//!   run came first, the window after it moves in over the ghost;
+//! - anything else (rearranged windows, another tab page, two splits at once)
+//!   is left to Neovide's slide ([`super::motion`]).
 //!
-//! - the same windows, still placed as they were relative to one another, in
-//!   new sizes — `<C-w>>`, `:resize`, `<C-w>=`: every edge moves from where it
-//!   was to where it goes, eased in and out, over 150 ms, or a frame a cell
-//!   for a move of a few cells, and at once for a single cell;
-//! - one window more, split off another — `:split`, `:vsplit`, `:new`, a
-//!   plugin's sidebar: it starts as a sliver one cell of text deep on its own
-//!   side of the space it took (right or below with `'splitright'` and
-//!   `'splitbelow'`, left or above without), and grows to its place as every
-//!   other window moves to its own, its text fading in out of its background,
-//!   over 200 ms, quick to start and slow to land;
-//! - windows fewer — `:close`, `:only`: the window before each run of closed
-//!   ones, left of it or above it, takes their place at once, and a ghost of
-//!   them — what they showed, with the separator before them along its edge —
-//!   flies off into their far side, its text dimming into its background as
-//!   it goes, over 180 ms, slow to start. Where the closed windows came
-//!   first, the window after them moves into their place instead, its text
-//!   with it, over their ghost;
-//! - anything else — windows rearranged (`<C-w>x`, `<C-w>r`, `<C-w>H` …),
-//!   another tab page, two windows opened at once — is nothing animate.nvim
-//!   draws, and is left to Neovide's slide ([`super::motion`]).
-//!
-//! These are animate.nvim's own rules, down to which window a split took its
-//! space from and where a closed window's ghost stops, ported from its
-//! `window/fly.lua` — but for the ghost, which there is blank in the closed
-//! window's background, fading off the window that takes its place, and here
-//! shows the closed window's text dimming away. Its windows are real, resized
-//! frame by frame, and Neovim draws each frame; the client's are drawn by the
-//! client, from what the editor last drew. A window on its way is drawn in the frame it has this
-//! frame, from its top left: one no bigger than it was shows what it showed,
-//! cut down to size, and one bigger shows what Neovim drew for where it is
-//! going ([`draw_window`]). Its status line is the one Neovim drew for where
-//! it is going, the fill between its halves stretched or squeezed to the
-//! frame's width the way Neovim would have drawn it there ([`stretch`]).
+//! The rules are ported from animate.nvim's `window/fly.lua`, whose ghost is
+//! blank. The client draws each window in its current frame from what Neovim
+//! last drew: no bigger than before, its old content cut to size; bigger,
+//! Neovim's content for the destination ([`draw_window`]). Status lines are
+//! the destination's, their fill stretched to fit ([`stretch`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -57,15 +33,15 @@ use crate::client::redraw::Event;
 use crate::client::style::{Colors, Underline};
 use crate::palette::Rgb;
 
-/// animate.nvim's resize runs at 30 frames a second and moves an edge by a
-/// cell a frame at least, so a resize of a few cells takes a frame a cell.
+/// animate.nvim's resize runs at 30 fps and moves an edge at least a cell a
+/// frame, so a resize of a few cells takes a frame per cell.
 const RESIZE_CELL: f32 = 1.0 / 30.0;
 
-/// The same for a split opening or closing, at its 60.
+/// The same for opening or closing, at 60 fps.
 const FLY_CELL: f32 = 1.0 / 60.0;
 
-/// The options of Neovim's that decide how windows are laid out, as the
-/// client's agent in the editor reports them (see `crate::client::App`).
+/// Neovim's layout options, as the client's agent reports them (see
+/// `crate::client::App`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Options {
     pub laststatus: i64,
@@ -93,7 +69,7 @@ pub enum Easing {
 }
 
 impl Easing {
-    /// How far along an animation `t` of the way through it is.
+    /// Eased progress at fraction `t` of the duration.
     pub fn at(self, t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);
         match self {
@@ -180,8 +156,8 @@ impl Area {
         }
     }
 
-    /// Every edge `e` of the way from here to `to`, to the nearest cell. Two
-    /// frames that share an edge at both ends share it all the way.
+    /// Each edge a fraction `e` of the way to `to`, rounded to a cell. Frames
+    /// sharing an edge at both ends share it throughout.
     fn towards(&self, to: &Area, e: f32) -> Area {
         Area {
             top: lerp(self.top, to.top, e),
@@ -196,13 +172,12 @@ fn lerp(a: i64, b: i64, e: f32) -> i64 {
     (a as f32 + (b - a) as f32 * e).round() as i64
 }
 
-/// An eased progress as a percentage.
 pub(super) fn percent(e: f32) -> u8 {
     (e * 100.0).round().clamp(0.0, 100.0) as u8
 }
 
-/// How a row or column holds its children — side by side, or one above the
-/// other: `winlayout()`'s `row` and `col`.
+/// How a split holds its children: side by side or stacked, `winlayout()`'s
+/// `row` and `col`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Row,
@@ -218,18 +193,18 @@ impl Kind {
     }
 }
 
-/// A split window, as it is laid out.
+/// A split window's place in the layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pane {
-    /// Its grid, the status line or separator under it, and the separator to
-    /// its right.
+    /// Its grid, the status line or separator below, and the separator to its
+    /// right.
     pub frame: Area,
-    /// A row of the frame under the grid: the status line, or with
+    /// The frame has a row below the grid: the status line, or with
     /// `'laststatus'` 3 a separator.
     pub status: bool,
-    /// A column of the frame right of the grid: the separator.
+    /// The frame has a separator column right of the grid.
     pub vsep: bool,
-    /// Rows of the grid above its text: a winbar.
+    /// Winbar rows above the text.
     pub bar: i64,
 }
 
@@ -250,16 +225,15 @@ impl Pane {
 struct Ends {
     width: i64,
     bottom: i64,
-    /// The windows along the bottom have a status line too: `'laststatus'` 2,
-    /// or 1 with two windows or more.
+    /// Bottom windows have a status line too: `'laststatus'` 2, or 1 with two
+    /// or more windows.
     last_status: bool,
 }
 
 impl Ends {
-    /// Whether a frame of a `kind` reaching `pos` ends with a line there: a
+    /// Whether a frame of `kind` reaching `pos` ends with a line there: a
     /// separator short of the right edge, or a status line or separator above
-    /// another window — or above the command line, where every window has a
-    /// status line.
+    /// another window, or above the command line if all windows have one.
     fn trailing(&self, kind: Kind, pos: i64) -> bool {
         match kind {
             Kind::Row => pos < self.width,
@@ -268,7 +242,7 @@ impl Ends {
     }
 }
 
-/// The split windows of the tab page on show, and where they are.
+/// The split windows of the current tab page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub panes: BTreeMap<u64, Pane>,
@@ -279,8 +253,8 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// The windows the model places in the layout — or nothing, where they do
-    /// not tile a screen: one part way through being placed, say.
+    /// The model's split windows, or `None` if they do not tile the screen
+    /// (e.g. mid-placement).
     pub fn of(model: &Model, laststatus: i64) -> Option<Layout> {
         let width = model.grids.get(&1)?.width() as i64;
         let wins: Vec<(u64, i64, i64, i64, i64)> = model
@@ -288,8 +262,8 @@ impl Layout {
             .iter()
             .filter(|(grid, p)| **grid != 1 && !p.hidden)
             .filter_map(|(grid, p)| match p.place {
-                // The window's own cells, which its grid fills unless it was
-                // asked to be narrower, to centre its text (see `wide`).
+                // The window's cells, which its grid fills unless narrowed to
+                // centre its text (see `wide`).
                 Place::Window { .. } => {
                     let (row, col, w, h) = model.window_cells(*grid)?;
                     Some((*grid, row as i64, col as i64, w as i64, h as i64))
@@ -345,8 +319,7 @@ impl Layout {
     }
 }
 
-/// Whether `frames` tile `area`: each in it, none over another, and nothing
-/// of it left over.
+/// Whether `frames` tile `area` exactly, without overlap.
 fn tiles(frames: &[Area], area: &Area) -> bool {
     frames.iter().all(|f| !f.is_empty() && area.contains(f))
         && frames.iter().map(Area::cells).sum::<i64>() == area.cells()
@@ -361,7 +334,6 @@ fn rect(wins: &[u64], frames: &BTreeMap<u64, Area>) -> Option<Area> {
         .reduce(|a, b| a.union(&b))
 }
 
-/// The layout's tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Node {
     Leaf(u64),
@@ -383,13 +355,11 @@ impl Node {
     }
 }
 
-/// The tree of the windows framed by `items`, read off their frames: split at
-/// every cut that runs right across them — down them for a row, along them
-/// for a column — into what lies between, and so on into each. Neovim never
-/// puts a row straight into a row, nor a column into a column, so cutting at
-/// every cut at once makes the same tree it keeps — but for one thing frames
-/// cannot tell: four windows in a square are a row of two columns or a column
-/// of two rows alike, and `prefer` says which to take.
+/// The tree of `items`, read off their frames: split at every cut running
+/// right across them (down for a row, along for a column), then recurse.
+/// Neovim never nests a row directly in a row, or a column in a column, so
+/// this gives its tree, except that four windows in a square could be a row
+/// of columns or a column of rows; `prefer` picks.
 fn build(items: &[(u64, Area)], prefer: Kind) -> Option<Node> {
     if let [(grid, _)] = items {
         return Some(Node::Leaf(*grid));
@@ -425,9 +395,8 @@ fn build(items: &[(u64, Area)], prefer: Kind) -> Option<Node> {
     Some(Node::Split(kind, kids))
 }
 
-/// `node` without the windows in `gone`, as Neovim leaves a layout they
-/// closed in: a row or column left with one child is that child, and a child
-/// of the same kind as its row or column merges into it.
+/// `node` without the windows in `gone`, as Neovim leaves the layout: a split
+/// left with one child becomes it, and a child of the same kind merges in.
 fn prune(node: &Node, gone: &BTreeSet<u64>) -> Option<Node> {
     match node {
         Node::Leaf(g) => (!gone.contains(g)).then(|| node.clone()),
@@ -449,8 +418,8 @@ fn prune(node: &Node, gone: &BTreeSet<u64>) -> Option<Node> {
     }
 }
 
-/// Where `node` is in `frames`, if they lay it out: each row or column's
-/// children one after the other along it, and all as deep across it.
+/// The area `node` covers in `frames`, if they lay it out: each split's
+/// children consecutive along it and equally deep across it.
 fn fits(node: &Node, frames: &BTreeMap<u64, Area>) -> Option<Area> {
     match node {
         Node::Leaf(g) => frames.get(g).copied(),
@@ -486,8 +455,8 @@ fn parent_of(node: &Node, win: u64) -> Option<(Kind, &[Node], usize)> {
     None
 }
 
-/// A tree in one piece, its nodes numbered, root first: what a close's
-/// ghosts find their rows and columns in.
+/// A tree with numbered nodes, root first, for finding a close's ghosts'
+/// rows and columns.
 #[derive(Debug)]
 struct Tree {
     nodes: Vec<Branch>,
@@ -501,14 +470,14 @@ struct Branch {
     kids: Vec<usize>,
 }
 
-/// A run of closed children of a row or column, one after the other.
+/// A run of consecutive closed children of a split.
 #[derive(Debug)]
 struct Run {
     parent: usize,
-    /// The first of them and the last, among its children.
+    /// Index of the first and last of them among the children.
     i: usize,
     j: usize,
-    /// The children either side of them.
+    /// The children either side.
     before: Option<usize>,
     after: Option<usize>,
 }
@@ -553,16 +522,15 @@ impl Tree {
         self.nodes[id].grid
     }
 
-    /// The windows under node `id` still open.
+    /// The still-open windows under node `id`.
     fn kept(&self, id: usize, gone: &BTreeSet<u64>) -> Vec<u64> {
         let mut wins = self.leaves(id);
         wins.retain(|w| !gone.contains(w));
         wins
     }
 
-    /// Every run of closed children: those inside a row or column before the
-    /// row or column's own, since the window that takes their place is
-    /// settled first.
+    /// Every run of closed children, inner splits' before their parent's,
+    /// since the window taking their place is settled first.
     fn runs(&self, id: usize, gone: &BTreeSet<u64>, out: &mut Vec<Run>) {
         let kids = &self.nodes[id].kids;
         let dead: Vec<bool> = kids
@@ -595,11 +563,10 @@ impl Tree {
         }
     }
 
-    /// Where each child but the first of every row and column starts, from
-    /// the old layout to the new: a closed one's start goes where the next
-    /// child still open starts, or past the end of its row or column — a cell
-    /// further where that end has no line of its own, so that the line leaves
-    /// the screen.
+    /// Where each split child but the first starts, old layout to new. A
+    /// closed child's start goes to the next open child's start, or past its
+    /// split's end, a cell further where that end has no line of its own, so
+    /// the line leaves the screen.
     fn bounds(
         &self,
         id: usize,
@@ -637,27 +604,25 @@ impl Tree {
     }
 }
 
-/// The split windows as they were drawn before a batch that may move them,
-/// and what each showed.
+/// The split windows and their contents as drawn before a batch that may
+/// move them.
 #[derive(Debug)]
 pub struct Shot {
     layout: Layout,
-    /// Each window's grid as it was, by grid.
+    /// Each window's grid contents, by grid.
     rows: HashMap<u64, Vec<Vec<Cell>>>,
-    /// How far into its frame each window's text was drawn, by grid, where
-    /// it was drawn narrower than the window, in its middle (see
-    /// `crate::client::wide`).
+    /// Text inset into the frame, by grid, for windows drawn narrower and
+    /// centred (see `crate::client::wide`).
     insets: HashMap<u64, usize>,
-    /// Grid 1 as it was: the separators and status lines of windows about to
-    /// close.
+    /// Grid 1, for the separators and status lines of windows about to close.
     chrome: Grid,
     /// The grid the cursor was on.
     cursor: u64,
 }
 
 impl Shot {
-    /// The windows as the model has them — or, part way through animating,
-    /// as the animation has them, so that what comes next starts from there.
+    /// The windows as the model has them, or mid-animation as the animation
+    /// has them, so the next change starts from there.
     pub fn take(model: &Model, laststatus: i64, running: Option<&Transition>) -> Option<Shot> {
         let mut layout = Layout::of(model, laststatus)?;
         if let Some(t) = running {
@@ -671,7 +636,7 @@ impl Shot {
                 })
                 .collect();
             let frames: Vec<Area> = panes.values().map(|p| p.frame).collect();
-            // A ghost's place is no window's: from where the windows are.
+            // Ghost areas belong to no window: use the windows' union.
             if let Some(area) = frames.iter().copied().reduce(|a, b| a.union(&b)) {
                 if tiles(&frames, &area) {
                     layout.panes = panes;
@@ -679,8 +644,8 @@ impl Shot {
                 }
             }
         }
-        // A window on its way that shows what it showed in the middle of its
-        // frame (see [`middle`]) goes on from there.
+        // A moving window showing its old content in mid-frame (see
+        // `middle`) continues from that.
         let showed = |g: &u64| running.and_then(|t| t.showed(model, *g));
         let rows = layout
             .panes
@@ -717,7 +682,7 @@ impl Shot {
 }
 
 /// Whether a batch may move split windows: it places one, or hides, closes
-/// or does away with one that was in the layout.
+/// or destroys one in the layout.
 pub fn moves_windows(model: &Model, batch: &[Event]) -> bool {
     let split = |grid: &u64| {
         model
@@ -738,24 +703,23 @@ pub fn moves_windows(model: &Model, batch: &[Event]) -> bool {
 /// What a batch did to the split windows.
 #[derive(Debug)]
 pub enum Change {
-    /// Nothing: they are where they were.
     Same,
-    /// Something animate.nvim animates: see the module docs.
+    /// Animated as animate.nvim does; see the module docs.
     Animate(Box<Transition>),
-    /// Something it draws at once: a change of a cell, or a layout the
-    /// animation could not make sense of.
+    /// Drawn at once: a one-cell change, or a layout the animation cannot
+    /// make sense of.
     Snap,
-    /// Something it does not draw at all: left to Neovide's slide.
+    /// Not animate.nvim's: left to Neovide's slide.
     Slide,
 }
 
-/// What the windows `old` showed became `new`. See the module docs.
+/// Classify the change from `old` to `new`; see the module docs.
 pub fn change(old: Shot, new: &Layout, model: &Model, w: &Windows, opts: Options) -> Change {
     if old.layout.panes == new.panes {
         return Change::Same;
     }
     if old.layout.ends.width != new.ends.width {
-        // The screen itself changed: everything is somewhere new.
+        // The screen itself changed size.
         return Change::Slide;
     }
     let was: BTreeSet<u64> = old.layout.panes.keys().copied().collect();
@@ -775,10 +739,8 @@ pub fn change(old: Shot, new: &Layout, model: &Model, w: &Windows, opts: Options
     transition.map_or(Change::Snap, |t| Change::Animate(Box::new(t)))
 }
 
-/// Whether every two of `wins` are still placed as they were relative to
-/// each other: one still left of the other, or above it, as it was. Windows
-/// that change size keep that; windows rearranged do not — one that was left
-/// of another is right of it now, or above it.
+/// Whether every pair of `wins` keeps a relative placement (left of, or
+/// above) it had: true for resizes, false for rearrangements.
 fn in_order(old: &Layout, new: &Layout, wins: &[u64]) -> bool {
     let sides = |a: &Area, b: &Area| {
         [
@@ -797,7 +759,7 @@ fn in_order(old: &Layout, new: &Layout, wins: &[u64]) -> bool {
     })
 }
 
-/// The most cells any window's frame changes by, from `start` to `new`.
+/// The largest change in any window frame's width or height.
 fn most_cells(start: &BTreeMap<u64, Area>, new: &Layout) -> i64 {
     new.panes
         .iter()
@@ -811,12 +773,11 @@ fn most_cells(start: &BTreeMap<u64, Area>, new: &Layout) -> i64 {
         .unwrap_or(0)
 }
 
-/// The same windows in new sizes: every edge from where it was to where it
-/// goes.
+/// The same windows in new sizes: every edge moves to its new place.
 fn resize(old: Shot, new: &Layout, secs: f32) -> Option<Transition> {
     let start = old.layout.frames();
     let cells = most_cells(&start, new);
-    // A change of one cell has no frame between the two.
+    // A one-cell change has no frame in between.
     if secs <= 0.0 || cells <= 1 {
         return None;
     }
@@ -837,7 +798,7 @@ enum Side {
     End,
 }
 
-/// One window more, `win`: it flies in from its own side of the space it took.
+/// A new window `win` flies in from its side of the space it took.
 fn open(
     old: Shot,
     new: &Layout,
@@ -851,7 +812,7 @@ fn open(
     }
     let old_fr = old.layout.frames();
     let new_fr = new.frames();
-    // The tree with it, which without it is the tree as it was.
+    // The new tree, which without `win` must be the old one.
     let items: Vec<(u64, Area)> = new_fr.iter().map(|(g, a)| (*g, *a)).collect();
     let gone = BTreeSet::from([win]);
     let tree = [Kind::Row, Kind::Col].into_iter().find_map(|prefer| {
@@ -860,10 +821,9 @@ fn open(
         Some(tree)
     })?;
     let (kind, kids, i) = parent_of(&tree, win)?;
-    // The child next to it whose space it took: the only neighbour that
-    // changed size along the row or column; with both changed ('equalalways'),
-    // the one it was split from, when it is the current window; else the one
-    // 'splitright' or 'splitbelow' puts it after.
+    // The neighbour whose space it took: the only one that changed size along
+    // the split; if both did ('equalalways'), the one it was split from when
+    // it is current; else the one 'splitright' or 'splitbelow' puts it after.
     let (node, side) = if i == 0 {
         (kids.get(1)?, Side::Start)
     } else if i + 1 == kids.len() {
@@ -946,7 +906,7 @@ fn open(
     Some(t)
 }
 
-/// Windows fewer, `gone`: each run of them flies out into its far side.
+/// Windows `gone` closed: each run flies out to its far side.
 fn close(
     old: Shot,
     new: &Layout,
@@ -959,7 +919,7 @@ fn close(
     }
     let old_fr = old.layout.frames();
     let new_fr = new.frames();
-    // The tree as it was, which without them is the tree as it is.
+    // The old tree, which without `gone` must be the new one.
     let items: Vec<(u64, Area)> = old_fr.iter().map(|(g, a)| (*g, *a)).collect();
     let tree = [Kind::Row, Kind::Col].into_iter().find_map(|prefer| {
         let tree = build(&items, prefer)?;
@@ -969,8 +929,8 @@ fn close(
     let tree = Tree::from(&tree);
     let mut runs = Vec::new();
     tree.runs(0, gone, &mut runs);
-    // The windows start where they were, the window before each run over the
-    // run's place too; the one after a run that came first moves into it.
+    // Windows start where they were, the one before each run also covering
+    // the run; if the run came first, the one after it moves in.
     let mut start: BTreeMap<u64, Area> = new
         .panes
         .keys()
@@ -1051,9 +1011,9 @@ fn close(
     Some(t)
 }
 
-/// The line a frame of `kind` ends with, drawn as `owner`'s was: its
-/// separator, or for a status line a blank bar in `StatusLineNC` — or with
-/// `'laststatus'` 3, the separator that takes a status line's place.
+/// The line a frame of `kind` ends with, as `owner`'s was drawn: its
+/// separator, or for a status line a blank `StatusLineNC` bar, or with
+/// `'laststatus'` 3 the separator in its place.
 fn line_of(kind: Kind, owner: u64, old: &Shot, model: &Model) -> Cell {
     let pane = old.layout.panes.get(&owner);
     let drawn = |row: i64, col: i64| cell_at(&old.chrome, row, col).cloned();
@@ -1085,15 +1045,13 @@ fn line_of(kind: Kind, owner: u64, old: &Shot, model: &Model) -> Cell {
     }
 }
 
-/// The cell of `grid` at `row`, `col`, if there is one there.
 fn cell_at(grid: &Grid, row: i64, col: i64) -> Option<&Cell> {
     grid.cell(usize::try_from(row).ok()?, usize::try_from(col).ok()?)
 }
 
-/// What the windows `wins` showed of `region` as it was drawn: their text,
-/// and around it their separators and status lines — the text in the middle
-/// of a window it was drawn narrower than, its status line's words over it
-/// (see `crate::client::wide`).
+/// What `wins` showed of `region`: their text, separators and status lines,
+/// with centred text and its status line's words as drawn (see
+/// `crate::client::wide`).
 fn picture(old: &Shot, wins: &[u64], region: Area, model: &Model) -> Vec<Vec<Cell>> {
     let grids: Vec<(Area, usize, &Vec<Vec<Cell>>)> = wins
         .iter()
@@ -1119,8 +1077,8 @@ fn picture(old: &Shot, wins: &[u64], region: Area, model: &Model) -> Vec<Vec<Cel
                         });
                     match own {
                         Some((Some(cell), _)) => cell.clone(),
-                        // Either side of a centred window's text is the
-                        // editor's own background, as `draw_window` has it.
+                        // Either side of centred text is the editor's own
+                        // background, as in `draw_window`.
                         Some((None, true)) => Cell::default(),
                         _ => cell_at(&old.chrome, y, x).cloned().unwrap_or_default(),
                     }
@@ -1174,18 +1132,16 @@ pub(super) fn background<'a>(cells: impl Iterator<Item = &'a Cell>) -> u32 {
 /// Split windows on their way from one layout to the next.
 #[derive(Debug)]
 pub struct Transition {
-    /// Each window, by grid: the frame it starts in, and how it is laid out
-    /// at the end.
+    /// Each window's starting frame and final layout, by grid.
     wins: BTreeMap<u64, (Area, Pane)>,
-    /// What the windows showed before, by grid: what a frame bigger than a
-    /// window's grid shows past it.
+    /// Each window's previous contents, shown where a frame outgrows its
+    /// grid.
     rows: HashMap<u64, Vec<Vec<Cell>>>,
-    /// How far into its frame each window's text was drawn before, by grid,
-    /// where it was drawn narrower than the window, in its middle (see
-    /// `crate::client::wide`).
+    /// Previous text insets, by grid, of windows drawn narrower and centred
+    /// (see `crate::client::wide`).
     insets: HashMap<u64, usize>,
-    /// A window opened, whose text fades in out of its background — that
-    /// highlight's.
+    /// An opened window, and the background highlight its text fades in
+    /// from.
     veil: Option<(u64, u32)>,
     ghosts: Option<Ghosts>,
     elapsed: f32,
@@ -1218,7 +1174,7 @@ impl Transition {
         }
     }
 
-    /// Move on `dt` seconds. Says whether it is still going.
+    /// Advance `dt` seconds; returns whether it is still running.
     pub fn step(&mut self, dt: f32) -> bool {
         self.elapsed += dt;
         self.elapsed < self.duration
@@ -1231,27 +1187,25 @@ impl Transition {
         self.easing.at(self.elapsed / self.duration)
     }
 
-    /// Whether window grid `grid` is one of those moving.
+    /// Whether window `grid` is moving.
     pub fn involves(&self, grid: u64) -> bool {
         self.wins.contains_key(&grid)
     }
 
-    /// What window `grid` draws in the middle of its frame (see [`middle`]).
+    /// What window `grid` centres in its frame (see [`middle`]).
     fn middle_of(&self, model: &Model, grid: u64) -> Option<Middle> {
         let was = self.insets.get(&grid).is_some_and(|&inset| inset > 0);
         middle(model, grid, self.rows.get(&grid), was)
     }
 
-    /// What window `grid` showed before, where it shows that in the middle
-    /// of its frame.
+    /// Window `grid`'s old content, if that is what it centres in its frame.
     fn showed(&self, model: &Model, grid: u64) -> Option<&Vec<Vec<Cell>>> {
         self.middle_of(model, grid).filter(|m| m.old)?;
         self.rows.get(&grid)
     }
 
-    /// What the windows showed before, the veil a window opened fades in
-    /// out of, and every ghost of windows closed hold their highlights: see
-    /// [`crate::client::model::Model::reclaim`].
+    /// Keep the highlights of old contents, the veil and the ghosts alive
+    /// (see [`crate::client::model::Model::reclaim`]).
     pub fn hold(&self, held: &mut Held) {
         for row in self.rows.values().flatten() {
             held.cells(row);
@@ -1280,11 +1234,10 @@ impl Transition {
             .collect()
     }
 
-    /// Draw the windows as they are this frame, over where the compositor put
-    /// them: each window's text `shift` columns from where it goes in it, on
-    /// its way there (see `super::Animator::insets`), and as far again as the
-    /// ghosts beside it say (see [`ghost_shift`]); the cursor at `cursor`
-    /// (see [`fade_cell`]).
+    /// Draw the windows as they are this frame, over the compositor's output.
+    /// Each window's text is offset `shift` columns (see
+    /// `super::Animator::insets`) plus what ghosts beside it add (see
+    /// [`ghost_shift`]); the cursor is at `cursor` (see [`fade_cell`]).
     pub fn paint(
         &self,
         frame: &mut Frame,
@@ -1299,8 +1252,8 @@ impl Transition {
             .ghosts
             .as_ref()
             .map_or_else(Vec::new, |g| g.frames(e, &now));
-        // What the windows and the ghosts cover this frame — they tile it, but
-        // for a cell rounding might lose — blank to start with.
+        // Blank what the windows and ghosts cover first: rounding may leave a
+        // cell untiled.
         let covered = now
             .values()
             .copied()
@@ -1346,14 +1299,9 @@ impl Transition {
     }
 }
 
-/// How far from where it goes window `grid`'s text is drawn for the ghosts
-/// beside it, where it is narrower than the window and in its middle (see
-/// `crate::client::wide`): in the middle of what of `text`, its cells this
-/// frame, no ghost covers. A window holding the place of windows closed
-/// beside it has the whole of it at once, their ghost flying off over its
-/// far side (see [`close`]): its text goes from the middle of where it was
-/// to the middle of where it goes as the ghost does, as a window's growing
-/// to its place does, rather than being there at once, under the ghost.
+/// Extra offset so window `grid`'s centred text (see `crate::client::wide`)
+/// centres in the part of `text` no ghost covers: a window taking over closed
+/// neighbours (see [`close`]) moves its text with their ghost, not at once.
 fn ghost_shift(model: &Model, grid: u64, text: Area, ghosts: &[(&Ghost, Spot)]) -> i64 {
     if model.inset(grid) == 0 {
         return 0;
@@ -1368,25 +1316,19 @@ fn ghost_shift(model: &Model, grid: u64, text: Area, ghosts: &[(&Ghost, Spot)]) 
     pad(open - text.left) - pad(text.width())
 }
 
-/// A window's text drawn in the middle of its frame on its way, narrower
-/// than the frame (see `crate::client::wide`).
+/// Text drawn centred in a moving window's frame (see
+/// `crate::client::wide`).
 #[derive(Debug, Clone, Copy)]
 struct Middle {
-    /// How wide the text is.
     width: usize,
-    /// It is what the window showed before rather than its grid.
+    /// It is the window's old content rather than its grid.
     old: bool,
 }
 
-/// What [`draw_window`] draws in the middle of window `grid`'s frame, if
-/// anything (see `crate::client::wide`): its grid, where the window has its
-/// text there where it goes; else what it showed, `old`, where it had that
-/// there before (`was`). Such a window was made narrower than its text —
-/// which Neovim lays out again for its width, once asked to — and is no
-/// bigger than it was: it shows what it showed, going from the middle of
-/// where it was to the frame's edge and then cut down to size, rather than
-/// its grid from the edge at once, with what it showed past the end of a
-/// grid laid out again.
+/// What [`draw_window`] centres in window `grid`'s frame (see
+/// `crate::client::wide`): its grid if centred at the destination, else its
+/// old content if centred before (`was`). Narrowed below its text width, it
+/// thus moves its old content to the frame's edge before cutting it to size.
 fn middle(model: &Model, grid: u64, old: Option<&Vec<Vec<Cell>>>, was: bool) -> Option<Middle> {
     if model.inset(grid) > 0 {
         let width = model.grids.get(&grid)?.width();
@@ -1397,15 +1339,13 @@ fn middle(model: &Model, grid: u64, old: Option<&Vec<Vec<Cell>>>, was: bool) -> 
     Some(Middle { width, old: true })
 }
 
-/// Window `grid`'s text in `text`, the grid's part of the frame it has, from
-/// its top left.
+/// Window `grid`'s text in `text` (the grid's part of its current frame),
+/// from the top left.
 ///
-/// A window no bigger than it was shows what it showed, cut down to size:
-/// what Neovim drew for where it is going is laid out for there — its lines
-/// wrapped at another width, scrolled to keep the cursor in view — and
-/// pieced together with the old it would not read. A window bigger than it
-/// was shows its grid, and past that what it showed before. Past both, it is
-/// blank in the colours its edge has.
+/// No bigger than before, it shows its old content cut to size: Neovim's new
+/// content is laid out for the destination (rewrapped, rescrolled) and would
+/// not join up with the old. Bigger, it shows its grid, then its old content
+/// beyond. Past both, it is blank in its edge's colours.
 fn draw_window(
     frame: &mut Frame,
     model: &Model,
@@ -1419,12 +1359,10 @@ fn draw_window(
     let (height, width) = (text.height().max(0) as usize, text.width().max(0) as usize);
     let within =
         old.is_some_and(|rows| height <= rows.len() && width <= rows.first().map_or(0, Vec::len));
-    // A window whose text is drawn narrower than it, in its middle (see
-    // `crate::client::wide`), has it in the middle of its frame on the way
-    // too, and nothing either side of it: its grid, or what it showed (see
-    // [`middle`]).
+    // Centred text (see `crate::client::wide`) stays centred in the moving
+    // frame with nothing either side: its grid or old content (see `middle`).
     let pad = middle.map_or(0, |m| width.saturating_sub(m.width) / 2);
-    // And `shift` from there, on its way across the window.
+    // Plus `shift` while it moves across the window.
     let pad = (pad as i64 + shift).max(0) as usize;
     let showed = middle.is_some_and(|m| m.old);
     for r in 0..height {
@@ -1434,8 +1372,8 @@ fn draw_window(
                 let k = k?;
                 g.and_then(|g| Some((g.cell(r, k)?, g.is_wide(r, k))))
             };
-            // What it showed, where it lines up: from the frame's edge, or
-            // in its middle as it was.
+            // Old content where it lines up: from the frame's edge, or
+            // centred as before.
             let was = || {
                 let k = k.filter(|_| pad == 0 || showed)?;
                 let row = old?.get(r)?;
@@ -1455,8 +1393,8 @@ fn draw_window(
                     style: model.style(cell.hl),
                     wide,
                 },
-                // Either side of a centred window's text is the editor's
-                // own background, as it is once the window is there.
+                // Either side of centred text is the editor's own
+                // background, as once the window arrives.
                 None if pad > 0 => Out::blank(model.style(0)),
                 None => Out::blank(model.style(edge(g, old, r, c))),
             };
@@ -1467,8 +1405,8 @@ fn draw_window(
     }
 }
 
-/// The highlight of the cell nearest `(r, c)` of a window that shows nothing
-/// there: what the blank that fills it is drawn in.
+/// The highlight of the cell nearest `(r, c)` in a window showing nothing
+/// there, for the blank that fills it.
 fn edge(g: Option<&Grid>, old: Option<&Vec<Vec<Cell>>>, r: usize, c: usize) -> u32 {
     if let Some(g) = g.filter(|g| g.width() > 0 && g.height() > 0) {
         let at = g.cell(r.min(g.height() - 1), c.min(g.width() - 1));
@@ -1479,11 +1417,9 @@ fn edge(g: Option<&Grid>, old: Option<&Vec<Vec<Cell>>>, r: usize, c: usize) -> u
         .map_or(0, |cell| cell.hl)
 }
 
-/// A window's separator and status line in the frame `at`, as Neovim drew
-/// them where the window ends up: the separator as long as the frame is
-/// deep, and the status line as wide as it is (see [`stretch`]) — its words
-/// over the window's text, where that is in the middle of the frame,
-/// `middle`.
+/// A window's separator and status line in frame `at`, as Neovim drew them
+/// at the destination: the separator as deep as the frame, the status line as
+/// wide (see [`stretch`]), its words over centred text per `middle`.
 fn draw_lines(
     frame: &mut Frame,
     model: &Model,
@@ -1528,8 +1464,8 @@ fn draw_lines(
             let wide = line.get(k + 1).is_some_and(|n| n.text == Text::Half);
             put(at.bottom - 1, at.left + k as i64, c, wide);
         }
-        // A window whose text is centred in it (see `crate::client::wide`)
-        // has its status line's words over its text on the way there too.
+        // A centred window (see `crate::client::wide`) keeps its status
+        // line's words over its text while moving.
         let text = middle.map_or(0, |m| m.width);
         let body = (at.width() - i64::from(pane.vsep)).max(0) as usize;
         if let (true, Ok(row), Ok(left)) = (
@@ -1551,13 +1487,11 @@ fn draw_lines(
     }
 }
 
-/// A status line Neovim drew as wide as `cells`, drawn `width` wide instead,
-/// the way Neovim would have drawn it: the longest run of one cell in it —
-/// the fill between what is on its left and what is on its right — grows or
-/// shrinks, down to a cell; and past that it loses what is at its start,
-/// with a `<` where it was cut, as Neovim truncates a status line that says
-/// nothing of where to. The last `corner` cells, where it meets the
-/// separator, stay at its end.
+/// A status line Neovim drew as wide as `cells`, redrawn `width` wide as
+/// Neovim would: the longest run of one cell (the fill between its left and
+/// right parts) grows or shrinks down to a cell; beyond that the start is cut
+/// with a `<`, as Neovim truncates a status line with no `%<`. The last
+/// `corner` cells, where it meets the separator, stay at the end.
 fn stretch(cells: &[Cell], width: usize, corner: usize) -> Vec<Cell> {
     let (body, end) = cells.split_at(cells.len() - corner.min(cells.len()));
     let want = width.saturating_sub(end.len());
@@ -1583,8 +1517,8 @@ fn stretch(cells: &[Cell], width: usize, corner: usize) -> Vec<Cell> {
     out
 }
 
-/// Where the longest run of one cell repeated starts, and how long it is: the
-/// first of the longest, and never the right half of something wide.
+/// Start and length of the first longest run of one repeated cell, never of
+/// right halves of wide characters.
 fn longest_run(cells: &[Cell]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
     let mut i = 0;
@@ -1601,8 +1535,8 @@ fn longest_run(cells: &[Cell]) -> Option<(usize, usize)> {
     best
 }
 
-/// Every cell of `area` moved towards `to`, keeping `keep` percent of its
-/// own colours; the cursor at `cursor` (see [`fade_cell`]).
+/// Fade every cell of `area` towards `to`, keeping `keep` percent of its
+/// colours; the cursor is at `cursor` (see [`fade_cell`]).
 fn fade(frame: &mut Frame, colors: &Colors, area: Area, to: Rgb, keep: u8, cursor: (i64, i64)) {
     for r in area.top..area.bottom {
         for c in area.left..area.right {
@@ -1613,16 +1547,14 @@ fn fade(frame: &mut Frame, colors: &Colors, area: Area, to: Rgb, keep: u8, curso
     }
 }
 
-/// A cell moved towards `to`, keeping `keep` percent of its colours — and
-/// with none of them kept, a blank in `to` rather than text nobody can see.
+/// Fade a cell towards `to`, keeping `keep` percent of its colours; at 0 it
+/// becomes a blank in `to`.
 ///
-/// A blank already in `to` shows the same at every step of the way, and is
-/// left as it is: its text's colour is seen nowhere but in a line under,
-/// over or through it, or in a link's underline under the mouse. Moved
-/// towards `to` with the rest, it would be written again every frame for a
-/// colour nobody sees: a window's blanks, most of it. Not so the cell under
-/// the cursor (`cursor`), as a terminal may draw a block cursor in the
-/// colour of the text under it.
+/// A blank already on `to` looks the same throughout and is left alone, so
+/// most of a window is not rewritten every frame for an invisible foreground
+/// (seen only in under/over/strike lines or a link underline). The cell
+/// under the cursor is still faded: a terminal may draw a block cursor in the
+/// text colour.
 pub(super) fn fade_cell(colors: &Colors, cell: &mut Out, to: Rgb, keep: u8, cursor: bool) {
     if !cursor && unseen(colors, cell, to) {
         return;
@@ -1634,9 +1566,8 @@ pub(super) fn fade_cell(colors: &Colors, cell: &mut Out, to: Rgb, keep: u8, curs
     }
 }
 
-/// Whether a fade towards `to` leaves nothing to see changed in `cell`: a
-/// blank whose background is `to` already, and whose text's colour shows
-/// nowhere (see [`fade_cell`]).
+/// Whether fading `cell` towards `to` changes nothing visible: a blank on
+/// `to` whose foreground shows nowhere (see [`fade_cell`]).
 fn unseen(colors: &Colors, cell: &Out, to: Rgb) -> bool {
     let s = &cell.style;
     cell.text == Text::Char(' ')
@@ -1647,42 +1578,38 @@ fn unseen(colors: &Colors, cell: &Out, to: Rgb) -> bool {
         && colors.visual_bg(s) == to
 }
 
-/// The ghosts of windows closed, and the layout as it was, which they fly
-/// out of.
+/// The ghosts of closed windows, and the old layout they fly out of.
 #[derive(Debug)]
 struct Ghosts {
     tree: Tree,
-    /// Where each child but the first of every row and column starts, from
-    /// and to, by node.
+    /// Each split child's start (all but the first), from and to, by node.
     bounds: Vec<Option<(i64, i64)>>,
-    /// The layout's area as it was.
+    /// The old layout's area.
     screen: Area,
     list: Vec<Ghost>,
     /// The new layout's lines, which a ghost stops short of.
     ends: Ends,
 }
 
-/// A run of windows closed, flying out into its far side.
+/// A run of closed windows, flying out to its far side.
 #[derive(Debug)]
 struct Ghost {
     kind: Kind,
-    /// The row or column they were in, and the first of them, as nodes.
+    /// Nodes of their split and of the first of them.
     parent: usize,
     first: usize,
     /// The child after them, if any.
     after: Option<usize>,
-    /// The windows before them still open, which hold their place: the ghost
-    /// goes up to their separator. None where the closed windows came first.
+    /// The open windows before them, which take their place; the ghost goes
+    /// up to their separator. `None` if the closed windows came first.
     holders: Option<Vec<u64>>,
-    /// What they showed of their place, as it was drawn (see [`picture`]):
-    /// drawn in the ghost from its near edge, as a window shrinking is drawn
-    /// from its top left.
+    /// What they showed (see [`picture`]), drawn from the ghost's near edge,
+    /// as a shrinking window is drawn from its top left.
     picture: Vec<Vec<Cell>>,
-    /// Their background, as a highlight: past the picture, the ghost is
-    /// blank in it.
+    /// Background highlight, filling the ghost past the picture.
     bg: u32,
-    /// The line along its edge: the separator, or the status line, of the
-    /// window before them, or their own.
+    /// The line along its edge: the separator or status line of the window
+    /// before them, or their own.
     line: Cell,
     /// Where that line meets their status lines, for windows side by side.
     corner: Option<Cell>,
@@ -1691,18 +1618,16 @@ struct Ghost {
 /// Where a ghost is this frame.
 #[derive(Debug)]
 struct Spot {
-    /// Its cells.
     f: Area,
-    /// Where along it its lines are.
+    /// Positions of its lines along it.
     lines: Vec<i64>,
-    /// Where its picture's top left is.
+    /// Its picture's top left.
     origin: (i64, i64),
 }
 
 impl Ghosts {
-    /// Every row, column and window of the old layout at progress `e`, and
-    /// where each child starts — not kept inside its row or column, so that
-    /// a line can leave it at the end.
+    /// Every node of the old layout at progress `e`, and each child's start,
+    /// unclamped to its split so a line can leave it at the end.
     fn at(&self, e: f32) -> (Vec<Area>, Vec<i64>) {
         let n = self.tree.nodes.len();
         let mut rects = vec![self.screen; n];
@@ -1717,7 +1642,7 @@ impl Ghosts {
         let Some(kind) = node.kind else {
             return;
         };
-        // A row or column closed whole lies inside its run's ghost.
+        // A split closed whole lies inside its run's ghost.
         if node.kids.get(1).is_none_or(|k| self.bounds[*k].is_none()) {
             return;
         }
@@ -1738,9 +1663,8 @@ impl Ghosts {
         }
     }
 
-    /// Ghost `g`'s cells this frame, and where along it its lines are: from
-    /// the line of the window before it, drawn, to the line after it — the
-    /// separator of the window holding its place, or its own, drawn.
+    /// Ghost `g`'s place this frame: from the line of the window before it to
+    /// the line after it (the holder's separator, or its own).
     fn frame_of(
         &self,
         g: &Ghost,
@@ -1750,8 +1674,8 @@ impl Ghosts {
     ) -> Option<Spot> {
         let kind = g.kind;
         let p = rects[g.parent];
-        // Its picture goes where the closed windows start: with the line
-        // before them, flying off; or where their row or column does.
+        // Picture origin: along, where the closed windows start (moving with
+        // the line before them); across, where their split starts.
         let origin = match kind {
             Kind::Row => (p.top, starts[g.first]),
             Kind::Col => (starts[g.first], p.left),
@@ -1776,15 +1700,14 @@ impl Ghosts {
         let mut f = p;
         f.set_lo(kind, a);
         f.set_hi(kind, b);
-        // A ghost of windows one above the other stops before the separator
-        // on its right.
+        // A ghost of stacked windows stops before the separator on its right.
         if kind == Kind::Col && self.ends.trailing(Kind::Row, f.right) {
             f.right -= 1;
         }
         (!f.is_empty()).then_some(Spot { f, lines, origin })
     }
 
-    /// Every ghost still to be seen at progress `e`, and where it is.
+    /// Every ghost still visible at progress `e`, and where it is.
     fn frames(&self, e: f32, now: &BTreeMap<u64, Area>) -> Vec<(&Ghost, Spot)> {
         let (rects, starts) = self.at(e);
         self.list
@@ -1795,10 +1718,9 @@ impl Ghosts {
 }
 
 impl Ghost {
-    /// Draw it where `at` has it at progress `e`: what the closed windows
-    /// showed, its text dimmed that far into its background, and the line
-    /// along its edge at full strength; the cursor at `cursor` (see
-    /// [`fade_cell`]).
+    /// Draw it at `at` for progress `e`: the closed windows' content dimmed
+    /// that far into its background, the edge line at full strength; the
+    /// cursor is at `cursor` (see [`fade_cell`]).
     fn paint(
         &self,
         frame: &mut Frame,
@@ -1872,8 +1794,8 @@ mod tests {
         }
     }
 
-    /// A window full height on the left, two one above the other on the
-    /// right: a row whose second child is a column.
+    /// One full-height window left, two stacked right: a row whose second
+    /// child is a column.
     #[test]
     fn the_tree_is_read_off_the_frames() {
         let items = [
@@ -1894,8 +1816,8 @@ mod tests {
         );
         let frames: BTreeMap<u64, Area> = items.into_iter().collect();
         assert_eq!(fits(&tree, &frames), Some(area(0, 10, 0, 21)));
-        // Without the window at the bottom right, the one above it is the
-        // row's second child itself.
+        // Without the bottom-right window, the one above it is the row's
+        // second child.
         let gone = BTreeSet::from([5]);
         assert_eq!(
             prune(&tree, &gone),
@@ -1903,8 +1825,6 @@ mod tests {
         );
     }
 
-    /// Four windows in a square are a row of columns or a column of rows
-    /// alike: which one is a preference, and both fit.
     #[test]
     fn a_square_is_either_tree() {
         let items = [
@@ -1924,8 +1844,6 @@ mod tests {
         }
     }
 
-    /// A status line drawn wider grows its fill, and narrower loses it first,
-    /// down to a cell, then what is at its start; the corner stays at its end.
     #[test]
     fn a_status_line_stretches_at_its_fill() {
         let cells = |s: &str| -> Vec<Cell> {
@@ -1953,8 +1871,6 @@ mod tests {
         assert_eq!(text(stretch(&line[..0], 3, 0)), "   ");
     }
 
-    /// Two windows side by side and swapped are rearranged; the same two in
-    /// new sizes are not.
     #[test]
     fn a_rearrangement_is_told_from_a_resize() {
         let layout = |a: Area, b: Area| Layout {
@@ -2004,8 +1920,7 @@ mod tests {
         }
     }
 
-    /// A window's grid `width` × `height` at `row`, `col`, every row of it
-    /// `fill`.
+    /// A window's grid of `size` at `row`, `col`, filled with `fill`.
     fn window(grid: u64, row: usize, col: usize, size: (usize, usize), fill: char) -> Vec<Event> {
         let (width, height) = size;
         let mut events = vec![Event::GridResize {
@@ -2034,19 +1949,18 @@ mod tests {
         }
     }
 
-    /// A client's animations and model, a screen `W` wide with one window,
-    /// grid 2, full of `a` over its status line.
+    /// A client's animations and model: a screen `W` wide with one window,
+    /// grid 2, full of `a`, above its status line.
     struct Scene {
         anim: Animator,
         model: Model,
         height: usize,
-        /// When the last batch came.
+        /// When the last batch arrived.
         now: Instant,
         drawn: bool,
     }
 
     impl Scene {
-        /// `H` rows high.
         fn new(options: Options) -> Scene {
             Scene::high(options, H)
         }
@@ -2115,7 +2029,7 @@ mod tests {
             compose::compose(&self.model, &self.anim, W, self.height).text()
         }
 
-        /// Everything moving landed, a while on.
+        /// The screen once everything has landed.
         fn settle(&mut self) -> String {
             self.now += Duration::from_secs(10);
             self.at(0)
@@ -2125,8 +2039,8 @@ mod tests {
             self.at(ms).lines().map(String::from).collect()
         }
 
-        /// How bright the text of cell `row`, `col` is `ms` after the last
-        /// batch: the red of its colour.
+        /// The red of cell `row`, `col`'s text colour `ms` after the last
+        /// batch, as its brightness.
         fn red(&mut self, ms: u64, row: usize, col: usize) -> u8 {
             self.anim.advance(self.now + Duration::from_millis(ms));
             let f = compose::compose(&self.model, &self.anim, W, self.height);
@@ -2140,7 +2054,7 @@ mod tests {
     }
 
     /// `:vsplit` as Neovim draws it with 'splitright': the window halved, a
-    /// separator, and grid 4 right of it.
+    /// separator, and grid 4 on the right.
     fn vsplit_right() -> Vec<Event> {
         let mut events = window(2, 0, 0, (10, 4), 'a');
         events.extend(window(4, 0, 11, (10, 4), 'b'));
@@ -2150,8 +2064,8 @@ mod tests {
         events
     }
 
-    /// A split flies in from its side: a column of text at the right edge
-    /// first, its separator coming left to its place.
+    /// It starts as one column of text at the right edge, its separator
+    /// moving left into place.
     #[test]
     fn a_split_flies_in_from_its_side() {
         let mut s = Scene::new(Options {
@@ -2167,7 +2081,7 @@ mod tests {
             "the new window's text not in yet"
         );
         assert_eq!(rows[4], "a.txt===========1,1 <");
-        // Part way, the separator is between where it started and its place.
+        // Midway, the separator is between its start and its place.
         let mid = s.at(40);
         let sep = mid.lines().next().unwrap().chars().position(|c| c == '│');
         assert!(sep.is_some_and(|c| (11..19).contains(&c)), "{mid}");
@@ -2178,8 +2092,6 @@ mod tests {
         assert_eq!(rows[4], "a.txt==1,1 b.txt==All");
     }
 
-    /// Without 'splitright' the new window is on the left, and comes in from
-    /// the left: the window it split from moves right, its text with it.
     #[test]
     fn without_splitright_a_split_comes_from_the_left() {
         let mut s = Scene::new(Options::default());
@@ -2204,9 +2116,9 @@ mod tests {
         events
     }
 
-    /// A closed window flies off into its far side behind the separator
-    /// before it, its text going with it and dimming into its background;
-    /// the window before it holds its place from the start.
+    /// The closed window flies off to its far side behind the preceding
+    /// separator, its text dimming; the window before it fills its place from
+    /// the start.
     #[test]
     fn a_closed_window_flies_out_into_its_side() {
         let mut s = Scene::new(Options {
@@ -2238,9 +2150,8 @@ mod tests {
         assert_eq!(last.lines().nth(4), Some("a.txt==========1,1 Al"));
     }
 
-    /// A window `width` wide at the top of the screen at `col`, its text
-    /// drawn `text` wide in its middle (see `crate::client::wide`): its grid
-    /// that wide, every row of it `fill`.
+    /// A window `width` wide at the top at `col`, with a `text`-wide grid of
+    /// `fill` drawn centred (see `crate::client::wide`).
     fn centred(grid: u64, col: usize, (width, text): (usize, usize), fill: char) -> Vec<Event> {
         let mut events = window(grid, 0, col, (text, 4), fill);
         if let Some(Event::WinPos { width: w, .. }) = events.last_mut() {
@@ -2249,9 +2160,8 @@ mod tests {
         events
     }
 
-    /// Two windows side by side, grid 2 and grid 4, 10 columns each and
-    /// their text 4 wide in their middles, each status line's words over
-    /// its text: settled, and the screen they make.
+    /// Grids 2 and 4 side by side, 10 columns each with 4-wide centred text
+    /// and status line words over it: the settled scene and its screen.
     fn centred_split() -> (Scene, String) {
         let mut s = Scene::new(Options {
             splitright: true,
@@ -2271,9 +2181,8 @@ mod tests {
         (s, screen)
     }
 
-    /// `:close` of one of [`centred_split`]'s windows, `gone`: the other,
-    /// `kept`, has the whole width, its text — rows of `fill` — still 4 wide
-    /// in its middle.
+    /// `:close` of [`centred_split`]'s window `gone`: `kept` takes the whole
+    /// width, its 4-wide text of `fill` still centred.
     fn close_centred(gone: u64, kept: u64, fill: char) -> Vec<Event> {
         let mut events = vec![
             Event::WinClose { grid: gone },
@@ -2285,12 +2194,10 @@ mod tests {
         events
     }
 
-    /// The column character `c` is first in on `row`.
     fn col_of(row: &str, c: char) -> Option<usize> {
         row.chars().position(|k| k == c)
     }
 
-    /// Every column character `c` is in on `row`.
     fn cols_of(row: &str, c: char) -> Vec<usize> {
         row.chars()
             .enumerate()
@@ -2299,18 +2206,14 @@ mod tests {
             .collect()
     }
 
-    /// The window right of another closed, each with its text in its
-    /// middle: the one left of it takes its place at once, and its text and
-    /// its status line's words over it go from the middle of where it was
-    /// to the middle of where it goes, in the middle of what the ghost
-    /// flying off it leaves of it — not there at once.
+    /// The left window takes the space at once, but its text and status words
+    /// move gradually, centred in what the ghost leaves uncovered.
     #[test]
     fn centred_text_left_of_a_window_closed_goes_to_its_middle() {
         let (mut s, _) = centred_split();
         s.batch(close_centred(4, 2, 'a'));
         assert!(s.moving());
-        // Where the window's text starts each frame, and its status line's
-        // words.
+        // Where the text and the status line's words start each frame.
         let mut seen = Vec::new();
         for ms in (0..=180).step_by(10) {
             let rows = s.rows(ms);
@@ -2335,12 +2238,9 @@ mod tests {
         assert_eq!(rows[4], "        x  y         ");
     }
 
-    /// A window whose text was drawn in its middle closed: its ghost shows
-    /// what it showed as it was drawn — its text in its middle, its status
-    /// line's words over it — so that the first frame of the close is the
-    /// screen as it was, whichever of the two is closed; and its text and
-    /// its words go with the ghost, as far into it as they were into the
-    /// window.
+    /// A closed centred window's ghost shows it as drawn (centred text,
+    /// status words over it), so the first frame matches the screen before,
+    /// whichever window closes; text and words move with the ghost.
     #[test]
     fn a_closed_window_with_centred_text_goes_as_it_was_drawn() {
         let (mut s, before) = centred_split();
@@ -2361,11 +2261,10 @@ mod tests {
         assert_eq!(col_of(&mid[0], 'a'), Some(3), "where it was: {mid:?}");
     }
 
-    /// The window, its text 13 wide in its middle and its status line's
-    /// words over it, split with 'splitright' into two 10 wide: on the left
-    /// grid 2, narrower than its text, which Neovim keeps 13 wide until it
-    /// is asked again (see `crate::client::wide`); on the right grid 4, full
-    /// of `b`. On its way.
+    /// The window with 13-wide centred text, split with 'splitright' into
+    /// two 10 wide: grid 2 on the left, narrower than its text, which Neovim
+    /// keeps 13 wide until asked again (see `crate::client::wide`); grid 4 on
+    /// the right, full of `b`. Mid-animation.
     fn split_narrower_than_its_text() -> Scene {
         let mut s = Scene::new(Options {
             splitright: true,
@@ -2388,10 +2287,7 @@ mod tests {
         s
     }
 
-    /// A window whose text was drawn in its middle, split narrower than its
-    /// text: the text goes from the middle of where it was to the window's
-    /// left edge with the window, its status line's words over it — not
-    /// there at once.
+    /// Gradually, status words included.
     #[test]
     fn centred_text_of_a_window_split_narrower_than_it_goes_to_its_edge() {
         let mut s = split_narrower_than_its_text();
@@ -2419,10 +2315,9 @@ mod tests {
         assert_eq!(rows[4], "x        y x        y");
     }
 
-    /// The same, the window drawn again and then the windows placed again
-    /// where they go before they land, as a refresh places them: the text
-    /// goes on from where it is to the window's edge, still what it showed
-    /// — not there at once, nor what was drawn since.
+    /// The same, with the window redrawn and re-placed mid-animation, as a
+    /// refresh does: the old text carries on to the edge, not jumping there
+    /// nor showing what was drawn since.
     #[test]
     fn centred_text_of_a_window_split_narrower_than_it_goes_on_when_placed_again() {
         let mut s = split_narrower_than_its_text();
@@ -2465,10 +2360,8 @@ mod tests {
         assert_eq!(rows[4], "x        y x        y");
     }
 
-    /// The same, Neovim laying the window's grid out again for its width
-    /// before it lands: on its way it shows what it showed, cut down to
-    /// size — not its new grid with what it showed past the grid's edge,
-    /// the two pieced together.
+    /// The same, with Neovim re-laying out the grid before it lands: it shows
+    /// its old content cut to size, not the new grid pieced with the old.
     #[test]
     fn a_window_split_narrower_than_its_text_shows_what_it_showed() {
         let mut s = split_narrower_than_its_text();
@@ -2496,9 +2389,7 @@ mod tests {
         assert_eq!(rows[0], "cccccccccc│bbbbbbbbbb");
     }
 
-    /// The first window closed: the one after it moves into its place, its
-    /// text with it, over the closed window's, which stays where it was,
-    /// dimming.
+    /// Over the closed window's ghost, which stays put, dimming.
     #[test]
     fn the_window_after_a_first_one_closed_moves_into_its_place() {
         let mut s = Scene::new(Options {
@@ -2526,8 +2417,7 @@ mod tests {
         assert_eq!(last.lines().next(), Some("bbbbbbbbbbbbbbbbbbbbb"));
     }
 
-    /// A resize moves the separator a cell at a time, eased in and out: it
-    /// starts where it was and lands where it goes, in between on the way.
+    /// Eased, a cell at a time.
     #[test]
     fn a_resize_moves_the_separator_there() {
         let mut s = Scene::new(Options {
@@ -2556,7 +2446,6 @@ mod tests {
         );
     }
 
-    /// A resize of a cell has nothing between: it is there at once.
     #[test]
     fn a_resize_of_one_cell_is_at_once() {
         let mut s = Scene::new(Options {
@@ -2571,7 +2460,6 @@ mod tests {
         assert!(!s.moving());
     }
 
-    /// Windows swapped round are left to Neovide's slide.
     #[test]
     fn windows_rearranged_slide_as_neovides_do() {
         let mut s = Scene::new(Options {
@@ -2588,8 +2476,8 @@ mod tests {
         assert_eq!(s.anim.origin(2, (0, 11)), (0, 0), "from where it was");
     }
 
-    /// A split one above the other: the new window comes up from the bottom
-    /// with 'splitbelow', its status line drawn from the first frame.
+    /// With 'splitbelow' the new window comes up from the bottom, its status
+    /// line drawn from the first frame.
     #[test]
     fn a_split_below_comes_up_from_the_bottom() {
         let mut s = Scene::high(
@@ -2626,8 +2514,7 @@ mod tests {
         assert_eq!(rows[10], "b.txt==========0,0 Al");
     }
 
-    /// While windows move, the terminal's cursor is hidden: it shows again in
-    /// its cell when they land.
+    /// The terminal cursor is hidden until the windows land.
     #[test]
     fn the_cursor_waits_for_its_window_to_land() {
         let mut s = Scene::new(Options {
@@ -2644,9 +2531,8 @@ mod tests {
         assert_eq!((cursor.row, cursor.col), (0, 11));
     }
 
-    /// A window that shows another buffer fades through its background: the
-    /// old text first, dimming, then the new, coming up — and a window that
-    /// moved meanwhile is not faded.
+    /// A buffer switch fades through the background: old text dims, then new
+    /// text rises. A window that moved meanwhile is not faded.
     #[test]
     fn a_buffer_switch_fades_through_the_background() {
         let mut s = Scene::new(Options::default());
@@ -2686,16 +2572,14 @@ mod tests {
         let (text, end) = fg(&mut s, 1000);
         assert_eq!((text, end), (Text::Char('c'), Rgb(255, 255, 255)));
         assert!(s.anim.switches.is_empty());
-        // More than a few windows at once fade none of them.
+        // Too many windows switching at once: none fade.
         let events = (0..4).map(|r| line(2, r, 0, &"d".repeat(21))).collect();
         s.switched(events, &[2, 2, 2, 2]);
         assert!(s.anim.switches.is_empty());
     }
 
-    /// Every cell a fade leaves alone looks as it would have moved towards
-    /// the colour with the rest — a blank already in it, a line nowhere
-    /// under, over or through it, no link — and every other cell is moved
-    /// as ever, the one under the cursor too: over every mix of text,
+    /// Every cell a fade skips looks as if it had been faded, and every other
+    /// cell (including the cursor's) is faded, over every mix of text,
     /// colours, reverse, lines and links, at every strength.
     #[test]
     fn a_fade_leaves_alone_only_blanks_it_would_change_nothing_seen_in() {
@@ -2713,8 +2597,8 @@ mod tests {
             },
         };
         let grey = Color::Rgb(Rgb(40, 40, 40));
-        // What a cell shows: its text and background, and where its text's
-        // colour can be seen, that and everything drawn in it.
+        // What a cell visibly shows: text, background, and the foreground
+        // with everything drawn in it, where it can be seen.
         let looks = |o: &Out| {
             let s = &o.style;
             let fg_shows = o.text != Text::Char(' ')
@@ -2733,8 +2617,8 @@ mod tests {
             });
             (o.text.clone(), o.wide, colors.visual_bg(s), fg)
         };
-        // A blank and a letter, in every mix of colours, reverse, and what
-        // is drawn in the text's colour.
+        // A blank and a letter, in every mix of colours, reverse, and
+        // decorations drawn in the text colour.
         let mut styles = Vec::new();
         for fg in [Color::Default, Color::Rgb(Rgb(10, 200, 30))] {
             for bg in [Color::Default, Color::Rgb(Rgb(0, 0, 0)), grey] {
@@ -2775,7 +2659,7 @@ mod tests {
         for cell in cells {
             for to in [Rgb(0, 0, 0), Rgb(40, 40, 40)] {
                 for keep in [0, 37, 100] {
-                    // As every cell was moved before.
+                    // The fade without the skip.
                     let mut was = cell.clone();
                     compose::fade_to(&colors, &mut was.style, to, keep);
                     if keep == 0 {
@@ -2799,8 +2683,8 @@ mod tests {
         assert!(left_alone > 0, "some blanks were left alone");
     }
 
-    /// A window whose rows are `first` and then blanks, cursor on `cursor`,
-    /// switching to rows of `then`: the scene, settled before the switch.
+    /// A window of `first` rows then blanks, cursor at `cursor`, about to
+    /// switch to rows of `then`; settled before the switch.
     fn switching(first: char, then: char, cursor: (usize, usize)) -> Scene {
         let mut s = Scene::new(Options::default());
         s.model.apply(
@@ -2832,8 +2716,6 @@ mod tests {
         s
     }
 
-    /// A buffer switch leaves the window's blanks as they are throughout,
-    /// the frame after it included, but for the one the cursor is on.
     #[test]
     fn a_buffer_switch_leaves_the_blanks_as_they_are_but_the_cursors() {
         let mut s = switching('a', 'c', (1, 5));
@@ -2861,8 +2743,6 @@ mod tests {
         }
     }
 
-    /// Drawn on a terminal, a buffer switch's frames write the text that
-    /// fades and none of the blanks round it.
     #[test]
     fn a_buffer_switch_writes_no_blanks() {
         use crate::client::screen::{Cursor, Screen};
@@ -2873,7 +2753,7 @@ mod tests {
             shape: 2,
             color: None,
         };
-        // What a terminal prints of `bytes`: everything but escapes.
+        // What a terminal prints of `bytes`: all but escape sequences.
         let printed = |bytes: &[u8]| {
             let mut text = Vec::new();
             let mut i = 0;
@@ -2892,7 +2772,7 @@ mod tests {
         };
         let mut s = switching('a', 'c', (0, 0));
         let mut screen = Screen::new();
-        // The window as it was, before the switch: what the terminal shows.
+        // The window before the switch, as the terminal shows it.
         let before = {
             let mut s = switching('a', 'a', (0, 0));
             s.anim.switches.clear();

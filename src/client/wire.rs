@@ -1,34 +1,16 @@
-//! The client's line to its session's server: msgpack-RPC over the session's
-//! unix socket, read and written without blocking, so that one `poll` can wait
-//! on it and on the terminal together (see [`super`]).
+//! Non-blocking msgpack-RPC over the session's unix socket, so one `poll` can
+//! wait on it and the terminal together (see [`super`]).
 //!
-//! Not [`crate::rpc`], which is synchronous on purpose and says why: on a bare
-//! channel nothing arrives that was not asked for. This channel has a UI
-//! attached, so the server speaks first and constantly — a `redraw`
-//! notification per frame, as large as the screen — and the client has to go
-//! on reading keys, the clock and the window size while it does.
+//! Unlike the synchronous [`crate::rpc`], this channel has a UI attached: the
+//! server sends constantly (a screen-sized `redraw` per frame) while the
+//! client must keep reading keys, the clock and the window size.
 //!
-//! # Framing
-//!
-//! msgpack carries no length prefix: the one way to know that a message has
-//! all arrived is to walk it. [`frame_len`] does that without building
-//! anything, by counting the values still owed — one to start with, minus one
-//! for every value read, plus however many an array or a map announces — so a
-//! frame is whole the moment that count reaches zero, however it is nested.
-//! Only a whole frame is ever decoded, and it is decoded from its own
-//! bytes, so a frame split across reads is simply waited for.
-//!
-//! # Writing
-//!
-//! What the client says — keys, mouse reports, pastes, resizes — is queued in
-//! an [`Outbox`] and written as the socket takes it. A server busy in a
-//! `:!make` does not read its socket, and a client that blocked writing to it
-//! would stop reading the terminal and stop drawing with it.
-//!
-//! Everything the client sends is a notification but for the two questions it
-//! needs answered (see `super::App`): Neovim's own TUI sends its input the same
-//! way, and an error in one comes back as an `nvim_error_event` notification
-//! rather than as a reply nobody is waiting for.
+//! msgpack has no length prefix, so [`frame_len`] walks a message to find its
+//! end; only whole frames are decoded. Output is queued in an [`Outbox`]: a
+//! server busy in `:!make` stops reading its socket, and a blocking write
+//! would stall input and drawing. Everything sent is a notification except
+//! the two requests `super::App` needs answered, as Neovim's TUI does; errors
+//! then arrive as `nvim_error_event` notifications.
 
 use std::io::{self, Read, Write};
 
@@ -37,12 +19,11 @@ pub const REQUEST: u64 = 0;
 pub const RESPONSE: u64 = 1;
 pub const NOTIFICATION: u64 = 2;
 
-/// What [`frame_len`] makes of bytes that cannot begin a msgpack value. The
-/// connection is not worth reading past it: nothing after a bad byte can be
-/// trusted to start where a value starts.
+/// A byte that cannot start a msgpack value. Nothing after it can be trusted
+/// to start a value, so the connection is not read past it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Malformed {
-    /// Where in the bytes the bad marker was.
+    /// Byte offset of the bad marker.
     pub at: usize,
 }
 
@@ -54,14 +35,13 @@ impl std::fmt::Display for Malformed {
 
 impl std::error::Error for Malformed {}
 
-/// How many bytes the msgpack value at the start of `buf` takes, if all of
-/// them are there: `Ok(None)` for a value still arriving.
+/// Length of the msgpack value at the start of `buf`, or `Ok(None)` if it has
+/// not all arrived.
 ///
-/// A count of values still owed rather than a recursion, so a value nested a
-/// thousand deep costs no stack — and a count that outgrows what is left of
-/// the buffer is a value still arriving, decided at once, since every value
-/// takes at least a byte. That is also what keeps a header announcing four
-/// billion elements from being walked one element at a time.
+/// Counts values still owed instead of recursing, so deep nesting costs no
+/// stack. A count above the bytes left means "still arriving" at once (every
+/// value takes at least a byte), so a header announcing four billion elements
+/// is not walked.
 pub fn frame_len(buf: &[u8]) -> Result<Option<usize>, Malformed> {
     let mut at = 0usize;
     let mut owed: u64 = 1;
@@ -72,8 +52,7 @@ pub fn frame_len(buf: &[u8]) -> Result<Option<usize>, Malformed> {
         let Some(&marker) = buf.get(at) else {
             return Ok(None);
         };
-        // The header's own length, the payload after it, and how many values
-        // follow it as its elements.
+        // Header length, payload length, and number of child values.
         let (head, body, children): (usize, Option<usize>, u64) = match marker {
             0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (1, Some(0), 0),
             0x80..=0x8f => (1, Some(0), 2 * u64::from(marker & 0x0f)),
@@ -82,7 +61,7 @@ pub fn frame_len(buf: &[u8]) -> Result<Option<usize>, Malformed> {
             0xc4 | 0xd9 => (2, len_at(buf, at + 1, 1), 0),
             0xc5 | 0xda => (3, len_at(buf, at + 1, 2), 0),
             0xc6 | 0xdb => (5, len_at(buf, at + 1, 4), 0),
-            // ext 8/16/32: the length, then a type byte, then the payload.
+            // ext 8/16/32: length, type byte, payload.
             0xc7 => (3, len_at(buf, at + 1, 1), 0),
             0xc8 => (4, len_at(buf, at + 1, 2), 0),
             0xc9 => (6, len_at(buf, at + 1, 4), 0),
@@ -92,7 +71,7 @@ pub fn frame_len(buf: &[u8]) -> Result<Option<usize>, Malformed> {
             0xcd | 0xd1 => (3, Some(0), 0),
             0xce | 0xd2 => (5, Some(0), 0),
             0xcf | 0xd3 => (9, Some(0), 0),
-            // fixext 1/2/4/8/16: a type byte and a payload of that size.
+            // fixext 1/2/4/8/16: type byte and a fixed-size payload.
             0xd4 => (3, Some(0), 0),
             0xd5 => (4, Some(0), 0),
             0xd6 => (6, Some(0), 0),
@@ -114,7 +93,7 @@ pub fn frame_len(buf: &[u8]) -> Result<Option<usize>, Malformed> {
                 Some(n) => (5, Some(0), 2 * n as u64),
                 None => return Ok(None),
             },
-            // 0xc1 is the one byte msgpack never uses.
+            // 0xc1 is never used by msgpack.
             0xc1 => return Err(Malformed { at }),
         };
         let Some(body) = body else {
@@ -130,42 +109,36 @@ pub fn frame_len(buf: &[u8]) -> Result<Option<usize>, Malformed> {
     Ok(Some(at))
 }
 
-/// A big-endian length of `width` bytes at `at`, if it has arrived.
+/// Big-endian length of `width` bytes at `at`, if present.
 fn len_at(buf: &[u8], at: usize, width: usize) -> Option<usize> {
     let bytes = buf.get(at..at + width)?;
     Some(bytes.iter().fold(0usize, |n, &b| (n << 8) | usize::from(b)))
 }
 
-/// What the socket has said, kept until it makes whole frames.
+/// Socket bytes awaiting whole frames.
 #[derive(Debug, Default)]
 pub struct Inbox {
-    /// Room to read into, zeroed once as it is added rather than on every
-    /// read: what has been read is `buf[..end]`, and a read lands on what
-    /// earlier reads left.
+    /// Zeroed once when grown, not per read; the data read is `buf[..end]`.
     buf: Vec<u8>,
-    /// Where the bytes not yet handed out as a frame start.
+    /// Start of the bytes not yet handed out as a frame.
     start: usize,
-    /// Where what has been read ends.
     end: usize,
 }
 
-/// How much room an inbox keeps once every frame in it has been taken. A
-/// frame larger than this — a whole file copied to the clipboard comes as
-/// one `redraw` — makes it grow for as long as the frame takes to arrive;
-/// what it grew by goes as soon as the frame has been taken, rather than
-/// staying with the client for the rest of its life.
+/// Capacity kept once every frame is taken. A larger frame (a whole file
+/// copied to the clipboard arrives as one `redraw`) grows the buffer only
+/// until it is taken.
 const KEEP: usize = 4 * READ_CHUNK;
 
-/// How much one read asks for. A full redraw of a large screen is a few
-/// hundred kilobytes; reading it in pieces this size keeps the number of
-/// passes over a frame still arriving small (see [`Inbox::take_frame`]).
+/// Bytes per read. A full redraw of a large screen is a few hundred KB; this
+/// size keeps the rescans of a partial frame few (see [`Inbox::take_frame`]).
 const READ_CHUNK: usize = 64 * 1024;
 
 impl Inbox {
-    /// Read whatever the socket has, without waiting. `Ok(false)` once the
-    /// far end has closed: the server has gone, or the link to it.
+    /// Read what the socket has without waiting. `Ok(false)` once the far end
+    /// has closed (server or link gone).
     pub fn fill(&mut self, from: &mut impl Read) -> io::Result<bool> {
-        // Compact first, so the buffer does not grow by every frame ever read.
+        // Compact first so the buffer does not grow with every frame read.
         if self.start > 0 {
             self.buf.copy_within(self.start..self.end, 0);
             self.end -= self.start;
@@ -198,8 +171,7 @@ impl Inbox {
         }
     }
 
-    /// The next whole frame's bytes, if one has arrived: lent, not copied,
-    /// until the inbox is next used.
+    /// The next whole frame, borrowed until the inbox is next used.
     pub fn take_frame(&mut self) -> Result<Option<&[u8]>, Malformed> {
         match frame_len(&self.buf[self.start..self.end]) {
             Ok(Some(n)) => {
@@ -208,8 +180,7 @@ impl Inbox {
                 Ok(Some(&self.buf[at..at + n]))
             }
             Ok(None) => {
-                // Every frame read has been taken: what a big one made the
-                // room grow to goes now (see [`KEEP`]).
+                // All frames taken: shed what a big frame grew (see `KEEP`).
                 if self.start == self.end {
                     (self.start, self.end) = (0, 0);
                     if self.buf.len() > KEEP {
@@ -225,28 +196,26 @@ impl Inbox {
     }
 }
 
-/// One argument of something the client sends, as msgpack will spell it.
+/// An argument to encode as msgpack.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Arg<'a> {
     Nil,
     Bool(bool),
     Int(i64),
-    /// A msgpack `str`. Bytes rather than `&str`, because a paste is whatever
-    /// the terminal sent and Neovim takes a `String` that is not UTF-8 as it
-    /// comes.
+    /// A msgpack `str`. Bytes, not `&str`: a paste is whatever the terminal
+    /// sent, and Neovim accepts a non-UTF-8 `String` as is.
     Str(&'a [u8]),
     Array(Vec<Arg<'a>>),
     Map(Vec<(&'a str, Arg<'a>)>),
 }
 
 impl<'a> Arg<'a> {
-    /// A string argument.
     pub fn str(s: &'a str) -> Self {
         Arg::Str(s.as_bytes())
     }
 }
 
-/// What the client has to say, waiting for the socket to take it.
+/// Output queued until the socket takes it.
 #[derive(Debug, Default)]
 pub struct Outbox {
     buf: Vec<u8>,
@@ -254,7 +223,6 @@ pub struct Outbox {
 }
 
 impl Outbox {
-    /// Queue a notification: a call nothing waits for the answer to.
     pub fn notify(&mut self, method: &str, args: &[Arg<'_>]) {
         put_array_len(&mut self.buf, 3);
         put_uint(&mut self.buf, NOTIFICATION);
@@ -262,7 +230,7 @@ impl Outbox {
         put_array(&mut self.buf, args);
     }
 
-    /// Queue a request, and say which reply will answer it.
+    /// Queue a request; returns the id its reply will carry.
     pub fn request(&mut self, method: &str, args: &[Arg<'_>]) -> u32 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
@@ -274,8 +242,8 @@ impl Outbox {
         id
     }
 
-    /// Queue the answer to a request the server sent: the client serves
-    /// nothing, and says so rather than leave the caller waiting for ever.
+    /// Queue an error reply to a server request: the client serves nothing,
+    /// and replying keeps the caller from waiting forever.
     pub fn refuse(&mut self, msgid: u64, why: &str) {
         put_array_len(&mut self.buf, 4);
         put_uint(&mut self.buf, RESPONSE);
@@ -284,12 +252,11 @@ impl Outbox {
         self.buf.push(0xc0);
     }
 
-    /// Whether anything is still waiting to be written.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 
-    /// Write as much as the socket takes without waiting, and keep the rest.
+    /// Write as much as the socket takes without blocking; keep the rest.
     pub fn send(&mut self, to: &mut impl Write) -> io::Result<()> {
         let mut sent = 0;
         while sent < self.buf.len() {
@@ -308,7 +275,6 @@ impl Outbox {
         Ok(())
     }
 
-    /// What is queued, for the tests.
     #[cfg(test)]
     pub fn bytes(&self) -> &[u8] {
         &self.buf
@@ -434,8 +400,8 @@ mod tests {
         buf
     }
 
-    /// Every shape msgpack has, at both ends of its length classes, measured
-    /// against the encoder that is the reference for what a frame is.
+    /// Every msgpack type at both ends of its length classes, against rmpv's
+    /// encoder.
     #[test]
     fn a_whole_value_is_measured_exactly() {
         let long = "x".repeat(70_000);
@@ -468,16 +434,14 @@ mod tests {
         for v in values {
             let bytes = encoded(&v);
             assert_eq!(frame_len(&bytes), Ok(Some(bytes.len())), "{v:?}");
-            // And with the next frame's first byte behind it, which is not
-            // taken.
+            // The next frame's first byte after it is not consumed.
             let mut more = bytes.clone();
             more.push(0x90);
             assert_eq!(frame_len(&more), Ok(Some(bytes.len())), "{v:?}");
         }
     }
 
-    /// Cut anywhere short of its end, a frame is still arriving — never a
-    /// shorter frame, and never an error.
+    /// Never a shorter frame, and never an error.
     #[test]
     fn a_frame_cut_short_anywhere_is_still_arriving() {
         let v = Value::Array(vec![
@@ -500,8 +464,6 @@ mod tests {
         }
     }
 
-    /// A header announcing more elements than there are bytes left is
-    /// answered at once, however many it announces.
     #[test]
     fn an_enormous_announced_length_is_not_walked() {
         let bytes = [0xdd, 0xff, 0xff, 0xff, 0xff, 0x01];
@@ -515,8 +477,6 @@ mod tests {
         assert_eq!(frame_len(&[0x92, 0x01, 0xc1]), Err(Malformed { at: 2 }));
     }
 
-    /// Frames come out whole and in order however the bytes were split by
-    /// the reads that brought them.
     #[test]
     fn the_inbox_hands_out_whole_frames_in_order() {
         let a = encoded(&Value::Array(vec![Value::from(2), Value::from("a")]));
@@ -533,8 +493,7 @@ mod tests {
         assert_eq!(inbox.take_frame(), Ok(None));
     }
 
-    /// Reads land in the room the first one made: frames coming one after
-    /// another never grow it, or move it.
+    /// Back-to-back frames never grow or move the buffer.
     #[test]
     fn the_inbox_reads_into_the_room_it_has() {
         let frame = encoded(&Value::Array(vec![Value::from(2), Value::from("x")]));
@@ -550,9 +509,8 @@ mod tests {
         assert_eq!(inbox.buf.as_ptr(), room);
     }
 
-    /// A frame too big for the room an inbox keeps — a big copy to the
-    /// clipboard — makes it grow, and once that frame has been taken the room
-    /// goes back; the start of the frame after it, read with it, is kept.
+    /// A frame larger than `KEEP` grows the buffer until taken; the start of
+    /// the next frame, read with it, is kept.
     #[test]
     fn a_big_frame_gives_back_its_room_once_taken() {
         let big = encoded(&Value::Array(vec![
@@ -580,15 +538,13 @@ mod tests {
         assert_eq!(inbox.take_frame(), Ok(Some(&small[..])));
     }
 
-    /// The far end closing is what the caller ends on.
     #[test]
     fn a_closed_socket_says_so() {
         let mut inbox = Inbox::default();
         assert!(!inbox.fill(&mut &b""[..]).expect("read"));
     }
 
-    /// What the outbox writes is what rmpv reads back, in every shape the
-    /// client sends.
+    /// Checked against rmpv's decoder, in every shape the client sends.
     #[test]
     fn the_outbox_speaks_msgpack_rpc() {
         let mut out = Outbox::default();
@@ -644,13 +600,12 @@ mod tests {
         let paste = rmpv::decode::read_value(&mut rd).expect("paste");
         let args = paste.as_array().expect("array")[2].clone();
         let args = args.as_array().expect("args");
-        // Bytes that are not UTF-8 go as a `str` all the same.
+        // Non-UTF-8 bytes still go as a `str`.
         assert_eq!(args[0].as_slice(), Some(&b"\xff\xfe"[..]));
         assert_eq!(args[1], Value::from(-70_000));
         assert!(rd.is_empty());
     }
 
-    /// Requests are told apart by their ids.
     #[test]
     fn every_request_has_its_own_id() {
         let mut out = Outbox::default();
@@ -659,7 +614,6 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// A socket that takes part of a write keeps the rest for next time.
     #[test]
     fn what_the_socket_does_not_take_is_kept() {
         struct Narrow(Vec<u8>);

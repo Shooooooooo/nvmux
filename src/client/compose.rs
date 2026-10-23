@@ -1,38 +1,28 @@
-//! One frame of the screen, put together from the grids.
+//! Composes one frame of the screen from the grids.
 //!
-//! Grid 1 first — the tabline, the status lines, the separators, and with
-//! `ext_multigrid` off everything else too — then each window in the layout at
-//! its place, then the floats and the message area over them in the order
-//! Neovim composes them (`zindex`, then `compindex`), mixed with what is under
-//! them where their highlight blends.
+//! Order: grid 1 (tabline, status lines, separators, and everything when
+//! `ext_multigrid` is off), then each window at its place, then floats and the
+//! message area in Neovim's order (`zindex`, then `compindex`), blended with
+//! what is under them where their highlight says.
 //!
-//! Where a grid is drawn is where an animation says it is this frame
-//! ([`View::origin`]), and a window in the middle of scrolling shows the lines
-//! the scroll has reached rather than its own ([`View::scroll`]): the
-//! compositor knows that things move, and nothing of how. What an animation
-//! draws of its own over the windows — split windows between two layouts, a
-//! buffer fading into another — goes on before the floats do
-//! ([`View::over_windows`]).
+//! Animations decide where a grid is drawn ([`View::origin`]) and what a
+//! scrolling window shows ([`View::scroll`]); their own drawing over the
+//! windows goes on before the floats ([`View::over_windows`]).
 //!
-//! # Wide characters
-//!
-//! A character two cells wide is drawn from its left cell, and the right one
-//! draws nothing. Anything drawn over one half of such a pair — a float's
-//! edge, the cursor's trail, a spark — leaves the other half meaning nothing,
-//! so [`Frame::mend`] turns that half into a blank in its own colours, which is
-//! what Neovim's compositor does too. It runs after every overlay.
+//! A wide character is drawn from its left cell; the right cell draws nothing.
+//! When an overlay covers one half, [`Frame::mend`] blanks the other half in
+//! its own colours, as Neovim's compositor does. It runs after every overlay.
 
 use super::grid::{Cell, Grid, Text};
 use super::model::{Model, Place};
 use super::style::{self, Color, Style};
 use crate::palette::Rgb;
 
-/// One cell of a frame: what the terminal is to show there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Out {
     pub text: Text,
     pub style: Style,
-    /// The text is two cells wide: the next cell is its right half.
+    /// Two cells wide: the next cell is its right half.
     pub wide: bool,
 }
 
@@ -63,10 +53,8 @@ impl Frame {
         }
     }
 
-    /// Made [`Frame::new`] again, `width` by `height` and every cell blank in
-    /// `blank`, in the buffer this one has: a frame a screen big is a few
-    /// hundred kilobytes, asked of the allocator — and faulted in — afresh
-    /// sixty times a second otherwise.
+    /// Like [`Frame::new`], reusing the buffer: a screen-sized frame is a few
+    /// hundred KB, otherwise allocated and faulted in 60 times a second.
     pub fn reset(&mut self, width: usize, height: usize, blank: Style) {
         let blank = Out::blank(blank);
         let n = width * height;
@@ -87,21 +75,21 @@ impl Frame {
         (row < self.height && col < self.width).then(|| &mut self.cells[row * self.width + col])
     }
 
-    /// A cell at a position that may be off the screen.
+    /// A cell at a signed position that may be off the screen.
     pub fn at(&mut self, row: i64, col: i64) -> Option<&mut Out> {
         let row = usize::try_from(row).ok()?;
         let col = usize::try_from(col).ok()?;
         self.get_mut(row, col)
     }
 
-    /// Make every wide character whole again or blank: see the module docs.
+    /// Blank any half of a wide character whose other half was overwritten.
     pub fn mend(&mut self) {
         for r in 0..self.height {
             self.mend_row(r);
         }
     }
 
-    /// [`Frame::mend`], of the rows `rows` says alone.
+    /// [`Frame::mend`] on the rows flagged in `rows` only.
     pub fn mend_rows(&mut self, rows: &[bool]) {
         for r in (0..self.height).filter(|&r| rows[r]) {
             self.mend_row(r);
@@ -123,7 +111,6 @@ impl Frame {
         }
     }
 
-    /// The frame as text, a row to a line, for the tests.
     #[cfg(test)]
     pub fn text(&self) -> String {
         (0..self.height)
@@ -139,66 +126,58 @@ impl Frame {
     }
 }
 
-/// What the animations say about where things are this frame.
+/// Where the animations put things this frame.
 pub trait View {
     /// Where grid `grid` is drawn, given where the editor put it.
     fn origin(&self, grid: u64, placed: (i64, i64)) -> (i64, i64);
 
-    /// The scroll in progress on grid `grid`, if one is.
     fn scroll(&self, grid: u64) -> Option<&dyn Scrolling>;
 
-    /// How far grid `grid`'s text is drawn from where it goes in its window,
-    /// in columns, on its way there: moved in or out, its grid made narrower
-    /// or wider with the window where it was (see `super::wide`).
+    /// Column offset of grid `grid`'s text from its place in the window while
+    /// it moves in or out, or its grid narrows or widens (see `super::wide`).
     fn shift(&self, _grid: u64) -> i64 {
         0
     }
 
-    /// Draw over the windows, once they are all drawn and before the floats
-    /// are: split windows on their way from one layout to another, a window
-    /// fading from one buffer to the next.
+    /// Draw after the windows and before the floats: windows moving between
+    /// layouts, a window fading between buffers.
     fn over_windows(&self, _frame: &mut Frame, _model: &Model) {}
 
-    /// Cells drawn over row `r` of grid `grid`, whatever it would otherwise
-    /// show — its own or a scroll's: runs of them, each from a grid column.
-    /// What Neovim will draw of a row once it hears of a key the client
-    /// has drawn the cursor moved for, or the line typed into (see
-    /// `super::anim::chain`).
+    /// Runs of cells drawn over row `r` of grid `grid`, replacing its own or a
+    /// scroll's: what Neovim will draw once it gets a key whose cursor move or
+    /// typing the client already drew (see `super::anim::chain`).
     fn patches(&self, _grid: u64, _r: usize) -> &[Patch] {
         &[]
     }
 }
 
-/// A run of cells drawn over a grid's row from column `col`: see
-/// [`View::patches`].
+/// Cells drawn over a grid row from column `col`; see [`View::patches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Patch {
     pub col: usize,
     pub cells: Vec<Cell>,
 }
 
-/// A scroll part way through, as the compositor asks after it.
+/// A scroll in progress.
 pub trait Scrolling {
     /// The rows and columns that scroll: `top..bot` × `left..right`.
     fn rect(&self) -> (usize, usize, usize, usize);
 
-    /// What row `r` of the rectangle shows now, counted from its top: a line
-    /// of the rectangle's width, or `None` for a row the scroll has nothing
-    /// for, which is drawn blank. `grid` is the grid the rectangle is in, as
-    /// it is now: a row of the rectangle's own may be lent from it, rather
-    /// than kept.
+    /// Row `r` of the rectangle (from its top) as shown now, of the
+    /// rectangle's width, or `None` to draw it blank. `grid` is the grid as it
+    /// is now; a row may be borrowed from it.
     fn row<'a>(&'a self, r: usize, grid: &'a Grid) -> Option<&'a [Cell]>;
 
-    /// Which of the rectangle's own rows of the grid row `r` shows now, both
-    /// counted from its top: `None` for one it shows a line of its own for,
-    /// kept or drawn ahead of Neovim. What runs on past a row's end goes
-    /// with the grid's rows (see `super::wide`), and such a line has none.
+    /// Which grid row of the rectangle row `r` shows now, both counted from
+    /// its top; `None` for a line the scroll holds itself (kept, or drawn
+    /// ahead of Neovim). Tails past a row's end follow grid rows (see
+    /// `super::wide`), so such a line has none.
     fn own_row(&self, _r: usize) -> Option<usize> {
         None
     }
 }
 
-/// Nothing moving: everything where the editor put it.
+/// Nothing animating.
 pub struct Still;
 
 impl View for Still {
@@ -211,17 +190,15 @@ impl View for Still {
     }
 }
 
-/// Put the frame together. See the module docs.
 pub fn compose(model: &Model, view: &dyn View, width: usize, height: usize) -> Frame {
     let mut frame = Frame::new(0, 0, Style::default());
     compose_into(&mut frame, model, view, width, height, true);
     frame
 }
 
-/// [`compose`], in the buffer `frame` already has, and mended only where
-/// `mend` says: a caller that paints over it before it goes out, mending it
-/// after, mends it once (see [`Frame::mend`]) — before, too, only where what
-/// it paints reads the cells under it.
+/// [`compose`] into `frame`'s buffer. A caller that paints over the frame and
+/// mends afterwards passes `mend: false`, unless what it paints reads the
+/// cells under it (see [`Frame::mend`]).
 pub fn compose_into(
     frame: &mut Frame,
     model: &Model,
@@ -234,13 +211,11 @@ pub fn compose_into(
     put_together(frame, model, view, mend, None);
 }
 
-/// [`compose`] again for the rows `rows` says alone, the rest of `frame`
-/// left as it is: the frame last put together, of the same size, which
-/// those rows alone can differ from. Mended, those rows.
+/// Recompose and mend only the rows flagged in `rows`. `frame` must be the
+/// previous frame, same size, differing only in those rows.
 ///
-/// Nothing may move, or be drawn over the windows, as either frame is put
-/// together (see `super::anim::Animator::still`): what an animation draws
-/// lies across rows.
+/// Nothing may move or be drawn over the windows in either frame (see
+/// `super::anim::Animator::still`): animation drawing spans rows.
 pub fn compose_rows(frame: &mut Frame, model: &Model, view: &dyn View, rows: &[bool]) {
     let blank = Out::blank(model.style(0));
     let width = frame.width;
@@ -252,8 +227,8 @@ pub fn compose_rows(frame: &mut Frame, model: &Model, view: &dyn View, rows: &[b
     put_together(frame, model, view, true, Some(rows));
 }
 
-/// What [`compose_into`] and [`compose_rows`] share: everything after the
-/// frame is made blank, onto the rows `rows` says where it says any.
+/// Shared by [`compose_into`] and [`compose_rows`]: everything after
+/// blanking, limited to `rows` if given.
 fn put_together(
     frame: &mut Frame,
     model: &Model,
@@ -262,10 +237,8 @@ fn put_together(
     rows: Option<&[bool]>,
 ) {
     let height = frame.height;
-    // The windows' places, where grid 1 has whatever Neovim drew there
-    // before the window was — nothing meant to be seen, and what a window
-    // sliding away from its place would uncover. Blank, as the frame starts:
-    // grid 1 is not drawn there.
+    // Grid 1 is not drawn in window places: it holds stale content there
+    // that a window sliding away would uncover.
     let places: Vec<_> = model
         .layout
         .iter()
@@ -284,10 +257,9 @@ fn put_together(
         rows,
     );
 
-    // A window's status line stands over its text, where that is drawn
-    // narrower than the window (see `super::wide`). It is grid 1's, under
-    // the window, and never in a window's place; but should one be laid over
-    // one, the place is blanked again, as the whole of it always was.
+    // Status lines (grid 1) are realigned over text drawn narrower than its
+    // window (see `super::wide`). They should never land in a window's place,
+    // but if one does, the places are blanked again.
     if status_lines_over_text(frame, model, view, rows) {
         let blank = Out::blank(model.style(0));
         for &(row, col, width, height) in &places {
@@ -301,18 +273,16 @@ fn put_together(
         }
     }
 
-    // Windows next: they never overlap one another, so their order is
-    // nobody's business. Each fills its place, of which a grid narrower than
-    // it fills the middle.
+    // Windows never overlap, so order does not matter. A grid narrower than
+    // its place fills the middle.
     for (&grid, p) in &model.layout {
         if p.hidden || grid == 1 {
             continue;
         }
         if let Place::Window { .. } = p.place {
             let at = view.origin(grid, model.drawn_origin(grid));
-            // Its text on its way across the window, should it be, kept to
-            // the window's place as it goes; and what runs past the grid's
-            // edge drawn on that place, as far as it goes.
+            // Moving text is clipped to the window's place; tails past the
+            // grid's edge are drawn within that place.
             let shift = view.shift(grid);
             let place = model.window_cells(grid).map(|(_, _, width, _)| {
                 let left = at.1 - model.inset(grid) as i64;
@@ -350,7 +320,7 @@ fn put_together(
     for (_, grid, p) in layers {
         let at = view.origin(grid, model.drawn_origin(grid));
         match &p.place {
-            // One anchored to a window goes with the window's text.
+            // A float anchored to a window moves with the window's text.
             Place::Float { .. } => {
                 let at = (at.0, at.1 + view.shift(grid));
                 draw(
@@ -366,8 +336,7 @@ fn put_together(
                 );
             }
             Place::Message { scrolled, sep, .. } => {
-                // The message area covers the screen from its row down, and
-                // no further whatever its grid's height.
+                // Clipped to the screen bottom, whatever the grid's height.
                 let below = (height as i64 - at.0).max(0) as usize;
                 if *scrolled && at.0 > 0 && wanted(rows, (at.0 - 1) as usize) {
                     separator(frame, model, at.0 - 1, sep);
@@ -389,16 +358,14 @@ fn put_together(
     }
 }
 
-/// Whether frame row `row` is one to put together: every one, where `rows`
-/// does not say.
+/// Whether frame row `row` is to be composed; all are when `rows` is `None`.
 fn wanted(rows: Option<&[bool]>, row: usize) -> bool {
     rows.is_none_or(|rows| rows.get(row).copied().unwrap_or(false))
 }
 
-/// How much of a grid [`draw`] puts on the frame: rows from its top, and the
-/// columns of the frame it may cover — all of either where not said; and of
-/// a window, the columns of its place, which what runs past its grid's edge
-/// may cover (see `super::wide`).
+/// What part of a grid [`draw`] puts on the frame: rows from its top and the
+/// frame columns it may cover (all when `None`); for a window, its place's
+/// columns, which tails past its grid's edge may cover (see `super::wide`).
 #[derive(Debug, Clone, Copy, Default)]
 struct Within {
     rows: Option<usize>,
@@ -406,15 +373,13 @@ struct Within {
     place: Option<(i64, i64)>,
 }
 
-/// Draw grid `grid` with its top left at `at`, as much of it as `within`
-/// says and none of it on the cells of `skip` — rectangles of the frame, its
-/// top row, first column, and how many of each — mixing it into what is
-/// under it where `blends` and its highlights say to; on the frame rows
-/// `rows` says alone, where it says any.
+/// Draw grid `grid` with its top left at `at`, limited by `within`, skipping
+/// the frame rectangles in `skip` (top row, first column, columns, rows),
+/// blending where `blends` and its highlights say, and only on the rows
+/// flagged in `rows` if given.
 ///
-/// Row by row: the columns of a row that land on the frame are worked out
-/// once for it, and the colours of a highlight once a run of it — a frame is
-/// tens of thousands of cells, and redrawn whole for a cursor that moved.
+/// Columns are computed once per row and highlight colours once per run: a
+/// frame is tens of thousands of cells, redrawn whole when the cursor moves.
 #[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut Frame,
@@ -434,7 +399,7 @@ fn draw(
     let scroll = view.scroll(grid);
     let blank = Cell::default();
     let height = within.rows.map_or(g.height(), |n| n.min(g.height()));
-    // The grid's columns on the frame, and within what it is kept to.
+    // The grid's columns that land on the frame, within `within.cols`.
     let width = frame.width as i64;
     let (mut lo, mut hi) = ((-at.1).max(0), (g.width() as i64).min(width - at.1));
     if let Some((from, to)) = within.cols {
@@ -448,7 +413,7 @@ fn draw(
     let tails = within
         .place
         .and_then(|place| Some((place, model.tails.get(&grid)?)));
-    // The last highlight resolved, and its style and blend.
+    // Last highlight resolved, with its style and blend.
     let mut last: Option<(u32, Style, u8)> = None;
     let (mut runs, mut cut) = (Vec::with_capacity(4), Vec::with_capacity(4));
     for r in 0..height {
@@ -458,16 +423,14 @@ fn draw(
         }
         let y = y as usize;
         let own = g.row(r);
-        // Inside a scroll's rectangle the row is the scroll's; outside it, the
-        // grid's own.
+        // Inside a scroll's rectangle the row is the scroll's.
         let scrolled = scroll.and_then(|s| {
             let (top, bot, left, right) = s.rect();
             (top..bot)
                 .contains(&r)
                 .then(|| (left, right, s.row(r - top, g)))
         });
-        // The grid's columns that land on this row, less those of the
-        // rectangles skipped across it.
+        // This row's columns, minus the skipped rectangles.
         runs.clear();
         runs.push((lo, hi));
         for &(top, left, cols, rows) in skip {
@@ -531,9 +494,8 @@ fn draw(
                     under.wide = wide;
                     continue;
                 }
-                // A blank lets what is under it through — unless what is
-                // under it is the right half of something wide, which has
-                // nothing of its own to show.
+                // A blank lets what is under it through, unless that is the
+                // right half of a wide character, which shows nothing itself.
                 if cell.text.is_blank() && under.text != Text::Half {
                     under.style = style::blend_through(&colors, &under.style, &style, blend);
                 } else {
@@ -543,10 +505,9 @@ fn draw(
                 }
             }
         }
-        // The rest of what Neovim draws after the line's end, which it cut
-        // at the grid's edge (see `super::wide`): the tail of the grid's
-        // row this one shows — its own, or the one a scroll has brought
-        // here; none for a line a scroll keeps of its own.
+        // What Neovim draws past the line's end, cut at the grid's edge (see
+        // `super::wide`): the tail of the grid row shown here, its own or one
+        // a scroll brought; none for a line the scroll holds itself.
         let Some(((from, to), tails)) = tails else {
             continue;
         };
@@ -564,7 +525,7 @@ fn draw(
         else {
             continue;
         };
-        // Past the grid's edge, on the window's place and on the frame.
+        // Only columns past the grid's edge, within the place and the frame.
         let (from, to) = (from.max(at.1 + g.width() as i64).max(0), to.min(width));
         for (i, cell) in cells.iter().enumerate() {
             let x = at.1 + (start + i) as i64;
@@ -587,12 +548,11 @@ fn draw(
     }
 }
 
-/// Each window's status line, where its grid is drawn narrower than the
-/// window, closed up to stand over its text (see [`super::wide::realign`]):
-/// the windows that have one of their own, as `'laststatus'` says — every
-/// window at 2; at 1 every window where there are two or more; and at 0 the
-/// ones with another window under them. None where it is 3, one line across
-/// the whole screen, or where it is not known. Says whether it laid any.
+/// Realign each window's status line over its text where its grid is drawn
+/// narrower than the window (see [`super::wide::realign`]). Which windows have
+/// one follows `'laststatus'`: all at 2; at 1, all when there are two or more;
+/// at 0, those with a window below. None at 3 (one global line) or when
+/// unknown. Returns whether any was realigned.
 fn status_lines_over_text(
     frame: &mut Frame,
     model: &Model,
@@ -615,7 +575,7 @@ fn status_lines_over_text(
         .max()
         .unwrap_or(0);
     for &(grid, (row, col, width, height)) in &windows {
-        // Where its text is drawn, on its way there or not.
+        // Text offset, including any animated shift.
         let inset = model.inset(grid) as i64 + view.shift(grid);
         let Some(g) = model.grids.get(&grid).filter(|_| inset > 0) else {
             continue;
@@ -637,8 +597,8 @@ fn status_lines_over_text(
     laid
 }
 
-/// The row above messages that have pushed up over the windows: `sep` across
-/// the whole width, in `MsgSeparator`.
+/// The row above messages scrolled up over the windows: `sep` across the
+/// whole width, in `MsgSeparator`.
 fn separator(frame: &mut Frame, model: &Model, row: i64, sep: &str) {
     let style = model
         .groups
@@ -661,8 +621,8 @@ fn separator(frame: &mut Frame, model: &Model, row: i64, sep: &str) {
     }
 }
 
-/// A style moved towards `to`, keeping `keep` percent of its colours: at 0,
-/// text and all are `to`.
+/// Move a style towards `to`, keeping `keep` percent of its colours; at 0,
+/// everything is `to`.
 pub fn fade_to(colors: &style::Colors, s: &mut Style, to: Rgb, keep: u8) {
     let fg = colors.visual_fg(s);
     let bg = colors.visual_bg(s);
@@ -740,11 +700,9 @@ mod tests {
         }
     }
 
-    /// The rows a change touched, put together again over the frame put
-    /// together before it, make the frame a whole compose makes: grid 1, a
-    /// window under a float that blends into it and a character two cells
-    /// wide the float's edge cuts in two, and a float blending into cells
-    /// no grid covers, each row changed in its turn.
+    /// Recomposing just the changed row over the previous frame matches a full
+    /// compose, for each row in turn. Covers grid 1, a window under a blending
+    /// float that cuts a wide character, and a float over cells no grid covers.
     #[test]
     fn the_rows_a_change_touched_put_together_again_are_the_whole_frame() {
         let blend = Event::HlAttr {
@@ -799,7 +757,6 @@ mod tests {
         }
     }
 
-    /// Grid 1, a window at its place, and a float over both.
     #[test]
     fn grids_are_stacked_where_the_editor_put_them() {
         let m = model(vec![
@@ -824,7 +781,6 @@ mod tests {
         assert_eq!(f.text(), "aaaaaa\nbbFFbb\nstatus");
     }
 
-    /// Higher zindex on top, whatever order they were placed in.
     #[test]
     fn floats_stack_by_zindex() {
         let m = model(vec![
@@ -839,8 +795,8 @@ mod tests {
         assert_eq!(compose(&m, &Still, 4, 1).text(), "hiwe");
     }
 
-    /// A hidden window is not drawn; a message area that scrolled up draws
-    /// its separator above it and covers the screen from there down.
+    /// A scrolled message area draws its separator above it and covers the
+    /// screen below.
     #[test]
     fn hidden_windows_and_scrolled_messages() {
         let m = model(vec![
@@ -872,8 +828,6 @@ mod tests {
         assert_eq!(compose(&m, &Still, 3, 4).text(), "   \n---\nm1 \nm2 ");
     }
 
-    /// A blank cell of a blended float lets the text under it show; a
-    /// character of its own replaces it.
     #[test]
     fn a_blended_float_shows_through_its_blanks() {
         let m = model(vec![
@@ -894,12 +848,11 @@ mod tests {
         ]);
         let f = compose(&m, &Still, 3, 1);
         assert_eq!(f.text(), "aXc");
-        // Half way between the terminal's black and the float's blue.
+        // Halfway between the terminal's black and the float's blue.
         assert_eq!(f.cells[0].style.bg, Color::Rgb(Rgb(0, 0, 127)));
     }
 
-    /// A float drawn over the right half of a wide character leaves its left
-    /// half as a blank.
+    /// A float over a wide character's right half blanks its left half.
     #[test]
     fn a_wide_character_cut_by_a_float_is_mended() {
         let m = model(vec![
@@ -935,8 +888,6 @@ mod tests {
         assert!(!f.cells[0].wide);
     }
 
-    /// A frame put together in the buffer of another, of any size and
-    /// whatever it held, is the frame put together afresh.
     #[test]
     fn a_frame_put_together_in_another_s_buffer_is_the_same() {
         let m = model(vec![
@@ -966,8 +917,7 @@ mod tests {
         }
     }
 
-    /// A wide character of grid 1 that a window's place cuts in two, either
-    /// way, leaves the half outside it as a blank.
+    /// Either way round, the half outside the place is blanked.
     #[test]
     fn a_wide_character_cut_by_a_windows_place_is_mended() {
         let wide = |col| {
@@ -1001,7 +951,7 @@ mod tests {
                 },
             ]
         };
-        // Its right half in the place, then its left.
+        // Right half in the place, then left half.
         let f = compose(&model(wide(2)), &Still, 4, 1);
         assert_eq!(f.text(), "x ww");
         assert!(!f.cells[1].wide);
@@ -1009,11 +959,8 @@ mod tests {
         assert_eq!(f.text(), "ww y");
     }
 
-    /// A window's status line laid over its text, narrower than the window
-    /// and in its middle, leaves the rest of the window's place blank: none
-    /// of what grid 1 has there shows either side of the text. The same
-    /// where the status line's row alone is put together again, over the
-    /// frame before it: the window's rows are left as they were.
+    /// Grid 1 does not show either side of a centred status line, also when
+    /// only the status row is recomposed.
     #[test]
     fn a_status_line_over_centred_text_leaves_the_place_blank() {
         let mut m = model(vec![
@@ -1043,8 +990,7 @@ mod tests {
         assert_eq!(shown.text(), " WWWW \n WWWW \n efgh ");
     }
 
-    /// What grid 1 has under a window is never seen, not even when the
-    /// window is drawn somewhere else for a frame.
+    /// Not even when the window is drawn elsewhere for a frame.
     #[test]
     fn what_grid_1_has_under_a_window_stays_hidden() {
         struct Away;
@@ -1074,9 +1020,7 @@ mod tests {
         assert_eq!(compose(&m, &Away, 4, 1).text(), "  ww");
     }
 
-    /// A window's text on its way across its window is drawn as far from
-    /// where it goes as the view says, and kept to the window: what it has
-    /// past the window's edge is not drawn over the separator beside it.
+    /// Shifted text is clipped to its window, not drawn over the separator.
     #[test]
     fn text_on_its_way_across_its_window_stays_in_it() {
         struct Across;
@@ -1117,7 +1061,6 @@ mod tests {
         );
     }
 
-    /// Where an animation says a grid is this frame is where it is drawn.
     #[test]
     fn a_grid_is_drawn_where_the_view_says() {
         struct Shifted;

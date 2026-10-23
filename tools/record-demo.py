@@ -3,91 +3,57 @@
 
     python3 tools/record-demo.py            # writes assets/demo.gif
 
-nvmux is driven on a pty here, and every byte it writes is recorded with the
-time it was written, which becomes an asciicast. agg draws the cast a frame at
-a time, each frame is set in a window with the keys just pressed shown beneath
-it, and the frames are encoded as the GIF.
+Drives nvmux on a pty and records every byte it writes, with its time, as an
+asciicast. agg draws it a frame at a time, each frame is set in a window with
+the keys just pressed beneath it, and Pillow encodes the GIF (see `encode`).
 
-**The take is `nvmux devbox`.** nvmux is for sessions on a remote host, so the
-demo connects to one, over ssh, the way a user would. devbox is this machine:
-the script starts an sshd of its own on a free port of 127.0.0.1, with a host
-key, a user key and an `authorized_keys` it generates, and nvmux reaches it
-through an `ssh` on PATH that only adds `-F` with a config naming it devbox.
-That is the alias tests/ssh_lifecycle.rs asks for as `selftest`, made and
-removed by the script: the real ssh client, a real ControlMaster, real unix
-socket forwards and a real login shell -- everything but the latency. Being
-this machine is also what lets the staging below reach a session's socket
-directly, and it means the picker lists every session in /tmp/nvmux-<uid>,
-which is why the script refuses to run while any is there (`preflight`).
+The take is `nvmux devbox` over real ssh (ControlMaster, socket forwards,
+login shell). devbox is this machine: the script runs its own sshd on a free
+127.0.0.1 port with generated keys, and an `ssh` on PATH adds `-F` with a
+config naming it devbox (the `selftest` alias of tests/ssh_lifecycle.rs).
+Staging can therefore reach session sockets directly, but the picker lists
+every session in /tmp/nvmux-<uid>, so the script refuses to run while any
+exists (`preflight`).
 
-**The pty answers.** nvmux dissolves between screens by interpolating toward
-the terminal's own background, so at startup it asks for it (OSC 10 and 11, see
-`src/palette.rs`). Nothing answers in a headless container, and an unanswered
-query is not a degraded fade but no fade at all -- `fade::enabled` is false and
-every transition is a hard cut. So this script answers the colour query itself,
-with THEME, and hands agg that same theme so the dissolve ends on exactly the
-background it renders. It answers the rest of the startup handshake too (cursor
-position, device attributes, the kitty keyboard query), without which nvmux does
-not start.
+The pty answers nvmux's startup queries: colours (OSC 10/11, see
+`src/palette.rs`) with THEME, since unanswered they disable fades entirely;
+and cursor position, device attributes and kitty keyboard, without which
+nvmux does not start. agg renders the same THEME so dissolves end on the
+background it draws. The byte stream is recorded, not screenshots: a fade is
+about seven repaints in 100 ms, which sampling would turn into steps. Checks
+render the stream with pyte through `Screen` (pyte has no alternate screen).
 
-**The recording is the byte stream, not screenshots.** A fade is about seven
-repaints inside one direction -- half of `duration_ms`, so 100ms by default.
-Sampling the screen even 20 times a second catches two of them and turns a
-dissolve into a step. Recording what nvmux actually wrote loses nothing.
+Sessions run EDITOR as init.lua: a bare remote-UI Neovim without
+'termguicolors' draws inactive statuslines bold and underlined. devbox's ssh
+config sends XDG directories under the run's temp dir, so none of your
+editor state is read or written.
 
-Driving on a pty means there is no `capture-pane` to read back, so the checks
-render the stream with pyte -- through `Screen` below, since pyte has no
-alternate screen of its own.
+Session notes (`src/notes.rs`) are staged off camera through each session's
+socket (`rpc`): api-server gets a progress message left running, dotfiles a
+finished install script in a hidden terminal. The build typed on camera runs
+the demo's `cargo` (CARGO), which finishes when the take says so.
 
-**The sessions run an editor that has been set up.** A bare Neovim attached
-over a remote UI runs without 'termguicolors', and its default colours in that
-mode draw an inactive statusline bold and underlined. The sessions get EDITOR
-as their init.lua instead: line numbers, a cursorline, a statusline, colours
-to go with THEME. It reaches the far side the way any setting would: devbox's
-ssh config sets XDG_CONFIG_HOME (and the data, state and cache directories)
-under the run's temporary directory, and its sshd accepts them, so nothing of
-yours is read or written by the editors either.
-
-**What the sessions have to say is staged.** The picker's signs and the note
-in the margin report what each session's watcher recorded (`src/notes.rs`),
-and a session made a minute ago has recorded nothing. So, off camera,
-api-server is given an agent at work -- a progress message left running, as a
-plugin driving one leaves it -- and dotfiles a run of its install script, in a
-terminal buffer no window shows, that has finished. Both go in through the
-session's own socket (see `rpc`), and neither is typed at an editor. The build
-the take starts in api-server is typed on camera, but the `cargo` it runs is
-the demo's (CARGO): there is no crate there to build, and a real build would
-take as long as it liked, where the note saying it has finished is wanted at
-one moment of the take. So it says what it compiles, and finishes when the
-take says it may.
-
-**The GIF is drawn bigger than it is shown.** A README shows it about 880
-pixels wide, which on a high-density screen is 1760 device pixels: at the size
-agg draws 15px text, the browser would be scaling it up twice over, and the
-text came out soft. See SCALE, `schedule` for how the frames are timed, and
-`encode` for why the GIF is written by Pillow.
+The GIF is drawn larger than shown (see SCALE): the README shows it ~880 px
+wide, 1760 device px on a high-density screen, where agg's 15px text came out
+soft. `schedule` times the frames.
 
 Needs, all on PATH:
   * nvim >= 0.11
-  * agg >= 1.9   https://github.com/asciinema/agg/releases -- for `--renderer`,
-                 which the notice box needs, and `--select`; see `draw_screens`
-  * OpenSSH: ssh, ssh-keygen and sshd -- sshd is looked for in the sbin
-    directories too, and is the openssh-server package on Debian and Ubuntu
+  * agg >= 1.9   https://github.com/asciinema/agg/releases (for `--renderer`,
+                 which the notice box needs, and `--select`; see `draw_screens`)
+  * OpenSSH: ssh, ssh-keygen and sshd (sshd is also looked for in sbin; it is
+    the openssh-server package on Debian and Ubuntu)
   * python3 -m pip install pyte pillow
   * a release build of nvmux (cargo build --release)
 
-The GIF is drawn in JetBrainsMono Nerd Font Mono. If it is not installed it is
-fetched once into `tools/.fonts`, which is gitignored; NVMUX_DEMO_FONT_DIR
-overrides where to look.
+The font, JetBrainsMono Nerd Font Mono, is fetched once into the gitignored
+`tools/.fonts` if not installed; NVMUX_DEMO_FONT_DIR overrides where to look.
 
-Everything the run makes -- keys, configs, the projects, the editors' state --
-lives under a temporary directory that is removed on exit, and the demo's
-sessions are killed then, with the same script `x` in the picker runs. nvmux
-has no override for its runtime directory, so the sessions live in your real
-one (/tmp/nvmux-<uid>) while the script runs. One file of yours is touched:
-/tmp/nvmux-<uid>/nvmux.log is removed beforehand and rewritten by the demo's
-own NVMUX_LOG=nvmux=debug run, because `check_fade_ran` reads it afterwards and
-must not pass on a previous run's evidence.
+Everything the run makes lives in a temp dir removed on exit, and the demo's
+sessions are then killed with the picker's `x` script. They live in your
+real /tmp/nvmux-<uid> (nvmux has no override). /tmp/nvmux-<uid>/nvmux.log is
+deleted beforehand and rewritten by the demo's NVMUX_LOG=nvmux=debug run,
+so `check_fade_ran` never reads a previous run's log.
 """
 
 import codecs
@@ -117,45 +83,35 @@ RUNTIME = "/tmp/nvmux-%d" % os.geteuid()
 
 COLS, ROWS = 100, 28
 
-# What the take types at the prompt: the remote host. See the header.
+# The remote host the take types at the prompt.
 HOST = "devbox"
 
-# The GIF's frames are on a grid of this many a second. A fade goes out a
-# frame every 16ms (`fade::FRAME`), so much coarser thins a dissolve into
-# steps; and a GIF keeps time in hundredths, so a frame of a sixtieth would be
-# rounded to two and every animation played a fifth slower than nvmux ran it.
-# Fifty is close to the one and exact in the other.
+# Frame grid. Fades draw every 16 ms (`fade::FRAME`), so much coarser turns
+# dissolves into steps; GIFs keep time in hundredths, so 1/60 s would round to
+# 2/100 and play a fifth slow. 50 is close to one and exact in the other.
 FPS = 50
 STEP = 1.0 / FPS
 
-# A pause longer than this, with nothing written, is cut to it. The take's own
-# holds are shorter, and the screen is rarely still that long anyway -- the
-# picker's spinner turns and a note counts -- so this only catches waits
-# nobody meant the viewer to sit through.
+# Silent pauses are cut to this. The take's own holds are shorter, so this
+# only trims unintended waits.
 IDLE_LIMIT = 2.0
 
-# How long the GIF stays on its last screen before it starts over.
+# Hold on the last screen before looping.
 TAIL = 1.6
 
-# The sessions the picker has when the recording opens, made off camera so the
-# demo starts on a populated list rather than an empty one -- each in a small
-# project of its own, with its files open, so what the take attaches to looks
-# like work rather than Neovim's intro screen. `:cd` first, so the statusline
-# names the file relative to the project and not under a temporary directory.
-#
-# The last file a session lists is the one on screen; the one before it is the
-# window's alternate buffer, which is what Ctrl-^ goes back to on camera.
+# Sessions made off camera, each in a small project with its files open. They
+# `:cd` first so the statusline shows project-relative paths. The last file is
+# on screen; the one before is the alternate buffer Ctrl-^ returns to.
 SESSIONS = [
     ("api-server", ["src/main.rs"]),
     ("dotfiles", ["zsh/.zshrc", "nvim/init.lua"]),
     ("notes", ["todo.md"]),
 ]
 
-# And the one made on camera, which the take then moves to the end of the list.
+# Made on camera, then moved to the end of the list.
 NEW_NAME = "blog"
 
-# The files those sessions open. Written under the run's temporary directory,
-# so nothing of them outlives the script.
+# The sessions' files, written under the run's temp dir.
 PROJECTS = {
     "api-server/src/main.rs": """\
 use std::net::SocketAddr;
@@ -342,8 +298,7 @@ zstyle ':vcs_info:git:*' formats ' %b'
 setopt prompt_subst
 PROMPT='%F{blue}%~%f%F{green}${vcs_info_msg_0_}%f %# '
 """,
-    # Run off camera, in a terminal buffer no window shows, for the `✓` the
-    # picker opens on. It says what it would link and links nothing.
+    # Run off camera in a hidden terminal, for the picker's `✓`. Links nothing.
     "dotfiles/install.sh": """\
 #!/bin/sh
 cd "$(dirname "$0")" || exit 1
@@ -366,11 +321,9 @@ echo "would link ~/.config/nvim/init.lua -> $PWD/nvim/init.lua"
 """,
 }
 
-# One theme, used twice: answered to nvmux over OSC so its fade knows what it is
-# dissolving into, and written into the asciicast header so agg renders with the
-# same colours. They have to agree, or the dissolve ends a shade off its own
-# background. agg honours the header's theme; `--theme` is not passed for that
-# reason.
+# Answered to nvmux over OSC and written into the asciicast header for agg
+# (so `--theme` is not passed). They must agree, or dissolves end a shade off
+# the background.
 THEME = {
     "fg": "#cdd0d4",
     "bg": "#12131a",
@@ -382,18 +335,13 @@ THEME = {
     ]),
 }
 
-# The sessions' init.lua (see the header). Normal sets no background, so the
-# editor sits on the terminal's own, as the picker does, and a fade between
-# the two dissolves into one colour. The rest is THEME's palette put to the
-# usual uses; Rust and zsh are highlighted by Neovim's syntax files, Lua and
-# Markdown by its tree-sitter, and both end in the groups below. `editor`
-# adds what is the run's own: the terminal colours, and the demo's cargo.
+# The sessions' init.lua. Normal sets no background, so the editor sits on
+# the terminal's, as the picker does, and fades between them go to one
+# colour. `editor` adds the terminal colours and the demo's cargo.
 #
-# The window in front gets the room ('winwidth'), since cargo's last line is
-# longer than half the screen is wide. A terminal has no line numbers, and
-# its width is taken again once they are gone: it is sized while the window
-# that became it still had them, and a wrapped "Finished" line is what that
-# left on screen.
+# 'winwidth' gives the current window room for cargo's last line, wider than
+# half the screen. A terminal's width is re-taken after its line numbers are
+# removed; otherwise the "Finished" line wraps.
 EDITOR = r"""
 local o = vim.o
 o.termguicolors = true
@@ -468,11 +416,8 @@ hl('ErrorMsg', { fg = c.red })
 hl('@variable', { fg = c.fg })
 """
 
-# How much bigger the GIF is drawn than it is shown (see the header): every
-# size below is in the pixels it is shown at, and goes through `px`. Half as
-# big again rather than twice: on a high-density screen the two are hard to
-# tell apart while the plain size is plainly soft, and twice was a third more
-# bytes, most of them in the fades, every frame of which is a screen of text.
+# Draw size over display size; sizes below are display pixels, through `px`.
+# 1.5 looks like 2 on a high-density screen, and 2 cost a third more bytes.
 SCALE = 1.5
 FONT_SIZE = 15                 # agg's, as shown
 
@@ -482,9 +427,8 @@ def px(size):
     return int(size * SCALE + 0.5)
 
 
-# The window the frames are set in. One-bit transparent outside its rounded
-# corners, which is all a GIF has: drawn bigger than it is shown, the edge is
-# softened by the browser scaling it down.
+# The window frames are set in. GIF transparency is one-bit, so the rounded
+# corners are softened only by the browser scaling the image down.
 WINDOW = {
     "bar": 34,                 # the title bar
     "pad": 16,                 # either side of the terminal
@@ -497,10 +441,8 @@ WINDOW = {
     "lights": [(0xff, 0x5f, 0x57), (0xfe, 0xbc, 0x2e), (0x28, 0xc8, 0x40)],
 }
 
-# The keys under the window: each a cap, then what it did. Not drawn into the
-# terminal, as they were before the frames were set in a window: there they
-# were a bar of reversed text, which is what nvmux's own selection looks like,
-# and read as a part of it.
+# The key strip under the window: each a cap, then what it did. Drawn outside
+# the terminal: reversed text inside it looked like nvmux's own selection.
 KEYS = {
     "px": 13,
     "height": 24,
@@ -511,16 +453,11 @@ KEYS = {
     "label": (0x87, 0x8d, 0x9e),
 }
 
-# How long a key stays shown, unless the next one replaces it sooner.
 KEY_HOLD = 1.0
 
-# The font the GIF is drawn in. The `Mono` cut of the Nerd Font, not the plain
-# one: its icons are squeezed into a single cell, and a double-width glyph in a
-# character grid would push a whole row out of line.
-#
-# agg falls back through a family list silently, so a missing font does not fail
-# -- it quietly renders a different-looking GIF. `ensure_font` is what stops
-# that being discovered later.
+# The Nerd Font's `Mono` cut fits icons in one cell; a double-width glyph would
+# push a row out of line. agg silently falls back through the family list, so
+# `ensure_font` makes sure the font is present.
 FONT_NAME = "JetBrainsMono Nerd Font Mono"
 FONT_FAMILY = FONT_NAME + ",JetBrains Mono,DejaVu Sans Mono"
 FONT_CACHE = os.path.join(ROOT, "tools", ".fonts")
@@ -531,16 +468,14 @@ FONT_URL = ("https://github.com/ryanoasis/nerd-fonts/releases/latest/download"
 
 PROMPT = "\\[\\e[2K\\]\\[\\r\\]\\[\\e[38;5;71m\\]$\\[\\e[0m\\] "
 
-# What the keys are as bytes, now that there is no `send-keys` to name them for
-# us. Ctrl-Space is NUL, which is the whole reason it works as a prefix.
+# Keys as bytes. Ctrl-Space is NUL.
 ENTER = b"\r"
 ESCAPE = b"\x1b"
 DOWN = b"\x1b[B"
 UP = b"\x1b[A"
 PREFIX = b"\x00"
-# Ctrl-L, which is readline's clear-screen: it reprints PS1, and whatever is
-# typed after it, and echoes nothing of its own. `shell` uses it to put the
-# prompt into the recording.
+# Ctrl-L: readline reprints PS1 and the typed line, echoing nothing else.
+# `shell` uses it to get the prompt into the recording.
 REDRAW = b"\x0c"
 # Neovim's half-page scrolls, and its alternate buffer.
 CTRL_D = b"\x04"
@@ -558,12 +493,10 @@ def font_installed():
 
 
 def ensure_font():
-    """The directory to hand agg with `--font-dir`, or None if it is installed.
+    """The directory to hand agg with `--font-dir`, or None if installed.
 
-    The four cuts are cached under `tools/.fonts` rather than committed: they
-    are 10MB, which is not what a repository this size should carry for a file
-    regenerated a few times a year. Set NVMUX_DEMO_FONT_DIR to point somewhere
-    else and nothing is downloaded.
+    The four cuts (10MB) are cached under `tools/.fonts`, not committed. With
+    NVMUX_DEMO_FONT_DIR set, nothing is downloaded.
     """
     override = os.environ.get("NVMUX_DEMO_FONT_DIR")
     if override:
@@ -583,7 +516,7 @@ def ensure_font():
     if subprocess.run(["curl", "-fsSL", "-o", tar, FONT_URL]).returncode != 0:
         sys.exit("could not download %s; fetch it by hand into %s"
                  % (FONT_URL, FONT_CACHE))
-    # Only the four cuts agg asks for, out of the ninety-odd in the archive.
+    # Only the four cuts agg uses, of the ~90 in the archive.
     subprocess.run(["tar", "-C", FONT_CACHE, "-xJf", tar] + FONT_FILES,
                    check=True)
     os.remove(tar)
@@ -591,8 +524,8 @@ def ensure_font():
 
 
 def font_file(font_dir, cut):
-    """The file of one cut of the font, for the keys under the window, which
-    Pillow draws rather than agg."""
+    """The file of one cut of the font, for the key strip, which Pillow draws
+    rather than agg."""
     name = "JetBrainsMonoNerdFontMono-%s.ttf" % cut
     if font_dir and os.path.exists(os.path.join(font_dir, name)):
         return os.path.join(font_dir, name)
@@ -616,29 +549,20 @@ def hex_to_rgb(colour):
 
 
 class Screen:
-    """A terminal screen, only as far as the checks in here need one.
+    """A terminal screen, as far as the checks here need one.
 
-    Two pyte screens with the alternate-screen sequences switching between
-    them: pyte has no `?1049` of its own, so without this the picker would go
-    on showing the editor's buffer after a detach, and every check that reads
-    the screen afterwards would be reading the wrong one.
-
-    `?1049` also saves the cursor on the way in and restores it on the way out,
-    and that half is not a detail here. It is what puts the cursor back on the
-    line a hung-up client printed its last words on, which is the line nvmux
-    then erases. Model the switch without the cursor and the erase lands one
-    line low, and `check_clean` reports a message that a real terminal never
-    shows.
+    Two pyte screens switched by `?1049`, which pyte lacks, so checks after a
+    detach read the right one. The switch also saves and restores the cursor,
+    putting it back on the line a hung-up client printed its last words on,
+    which nvmux then erases; without that the erase lands a line low and
+    `check_clean` reports a message a real terminal never shows.
     """
 
     ALT = re.compile(rb"\x1b\[\?1049([hl])")
 
-    # The strings that never draw anything -- DCS, SOS, PM and APC. pyte has no
-    # parser for them and prints their bodies as text, which is not harmless
-    # even off screen: it moves pyte's cursor, and the cursor is what the
-    # answering half reports when nvmux asks where it is. So they are cut out
-    # before pyte sees them, and one still open at the end of a read is held
-    # for the next.
+    # DCS, SOS, PM and APC strings draw nothing, but pyte prints their bodies,
+    # moving the cursor the answering half reports to nvmux. So they are cut
+    # out first, and one still open at the end of a read is held for the next.
     STRING = re.compile(rb"\x1b[P_^X].*?(?:\x1b\\|\x07)", re.S)
     OPEN = re.compile(rb"\x1b(?:[P_^X].*)?\Z", re.S)
 
@@ -666,10 +590,8 @@ class Screen:
             self._feed(data[pos:m.end()])
             if m.group(1) == b"h":
                 self.saved = (self.primary.cursor.y, self.primary.cursor.x)
-                # Entering clears, as it does on a real terminal. Without this
-                # the alternate screen still holds the last session's picture,
-                # so a check waiting for the picker matches the *previous*
-                # picker before this one has painted a cell.
+                # Entering clears, as on a real terminal; otherwise a check
+                # waiting for the picker matches the previous one.
                 self.alt.reset()
                 self.active = self.alt
             else:
@@ -716,22 +638,14 @@ class Terminal:
 
     # --- the answering half ------------------------------------------------
     def _replies(self, data):
-        """Answer the queries in this chunk, **in the order they were asked**.
+        """Answer the queries in this chunk in the order they were asked.
 
-        The order is the whole thing. nvmux ends its colour query with a DSR
-        (`ESC [ 5 n`) precisely because every terminal answers it, so the reply
-        to that is its signal that the colour replies before it have all
-        arrived -- see the note in `src/palette.rs`. Answer the DSR first and
-        nvmux stops reading right there, and the OSC replies still in flight are
-        left in its input to be read as keystrokes by whatever comes next. The
-        picker takes the `/` inside `rgb:cdcd/d0d0/d4d4` as its filter key and
-        types the rest of the reply into it, which is what wiped the hint row
-        and hung this script for a whole afternoon.
-
-        So the queries are found by position and answered in that order, the way
-        a terminal would. Matched spans are cut out so nothing is answered
-        twice, and a short tail is kept so a query split across two reads is
-        still seen whole.
+        nvmux ends its colour query with a DSR (`ESC [ 5 n`), whose reply tells
+        it the colour replies have all arrived (see `src/palette.rs`). Answered
+        first, it leaves the OSC replies to be read as keystrokes: the picker
+        took the `/` in `rgb:cdcd/d0d0/d4d4` as its filter key and the script
+        hung. Matched spans are cut out so nothing is answered twice, and a
+        short tail is kept so a query split across reads is still seen.
         """
         self.qbuf += data
         row, col = self.screen.cursor()
@@ -744,7 +658,7 @@ class Terminal:
             (rb"\x1b\[\?u", lambda m: b"\x1b[?0u"),
             (rb"\x1bP\+q([0-9A-Fa-f;]*)\x1b\\",
              lambda m: b"\x1bP0+r" + m.group(1) + b"\x1b\\"),
-            # The colour query. Without these the fade never runs at all.
+            # The colour query; unanswered, there is no fade at all.
             (rb"\x1b\]10;\?(?:\x1b\\|\x07)",
              lambda m: ("\x1b]10;%s\x1b\\" % hex_to_osc(THEME["fg"])).encode()),
             (rb"\x1b\]11;\?(?:\x1b\\|\x07)",
@@ -753,8 +667,8 @@ class Terminal:
              lambda m: ("\x1b]4;%s;%s\x1b\\"
                         % (m.group(1).decode(),
                            hex_to_osc(pal[int(m.group(1)) % len(pal)]))).encode()),
-            # Last in this list only as a tie-break; position is what orders the
-            # replies, and this one terminates the colour query.
+            # Last only as a tie-break: position orders the replies, and this
+            # one ends the colour query.
             (rb"\x1b\[5n", lambda m: b"\x1b[0n"),
         )
 
@@ -790,16 +704,13 @@ class Terminal:
             if not chunk:
                 return
             now = time.time()
-            # Answer before parsing, and outside the lock. The colour query has
-            # a deadline -- QUERY_CAP in `src/palette.rs`, 1.5s -- and feeding a
-            # full-screen repaint to pyte can eat most of it, so replying second
-            # loses the race on a busy frame. nvmux then starts with no palette,
-            # which is not a rougher fade but no fade at all, and the recording
-            # comes out looking fine while showing the wrong thing.
+            # Answer before parsing, outside the lock: the colour query has a
+            # 1.5s deadline (QUERY_CAP in `src/palette.rs`) and feeding pyte a
+            # full repaint can use most of it. Missing it means no palette, so
+            # no fade, and the recording silently shows the wrong thing.
             #
-            # The cursor `_replies` reports is this chunk's starting one rather
-            # than where the chunk leaves it, which is the position the query was
-            # sent from, and the reader is the only thread that writes it.
+            # `_replies` reports the cursor at the chunk's start, where the
+            # query was sent from; only this thread writes it.
             for reply in self._replies(chunk):
                 try:
                     os.write(self.fd, reply)
@@ -818,13 +729,9 @@ class Terminal:
             self.presses = []
 
     def write(self, data, wait=0.0, show=None):
-        """`show` is `(keys, label)` for the keys under the window -- a tuple
-        of the caps to draw and what pressing them did -- or None to say
-        nothing.
-
-        Only the keys worth copying carry one -- `c`, Enter, the arrows, the
-        prefix chord. `type` never passes it, which is what keeps the literal
-        typing of a name or a command out of the window's foot.
+        """`show` is `(keys, label)` for the key strip (the caps to draw and
+        what they did), or None. Only keys worth copying carry one; `type`
+        never does, keeping typed names and commands out of the strip.
         """
         if show is not None and self.t0 is not None:
             with self.lock:
@@ -865,11 +772,8 @@ class Terminal:
         sys.exit("timed out waiting for %s\n%s" % (what, self.text()))
 
     def expect_gone(self, needle, what, timeout=15):
-        """Wait for something to leave the screen.
-
-        The counterpart to `expect`, and needed because some waits can only be
-        stated negatively. After a detach there is no new text to wait for: the
-        shell's screen comes back exactly as it was, prompt included.
+        """Wait for `needle` to leave the screen: after a detach there is no
+        new text to wait for, as the shell's screen returns exactly as it was.
         """
         end = time.time() + timeout
         while time.time() < end:
@@ -895,13 +799,9 @@ class Terminal:
                    for line in self.text().split("\n"))
 
     def select(self, name, key=None, limit=6):
-        """Step to a session, and make sure that is where we landed.
-
-        Stepping rather than jumping: it shows the picker being navigated, and
-        it does not care where the selection started or what number the session
-        was given -- the list wraps, so either way gets there. Down unless `key`
-        says up. Checked before returning, because attaching to the wrong one
-        would look perfectly plausible on camera.
+        """Step to a session with the arrows (down unless `key` is UP) and
+        check we landed there: attaching to the wrong one would look plausible
+        on camera. The list wraps, so any start position works.
         """
         key = key or DOWN
         cap = "\u2191" if key == UP else "\u2193"
@@ -927,23 +827,13 @@ class Terminal:
 
 
 def shell(env, record=False, typed=""):
-    """A bash on the pty, so the recording shows nvmux being run at a prompt
-    rather than starting from nowhere.
+    """A bash on the pty, so the recording shows nvmux run at a prompt.
 
-    The prompt is set off camera and then asked for a second time, because the
-    GIF is rendered from the byte stream and the stream begins where
-    `start_recording` says it does. bash writes PS1 once, when it is ready for
-    the line after `clear`, which is before that point: the screen carried the
-    prompt the whole time while the stream did not, so the first command was
-    drawn against a bare column 1 with no `$` in front of it.
-
-    Ctrl-L is readline redrawing -- it clears and reprints PS1 and the line
-    typed so far, echoes nothing of its own, and leaves the real screen exactly
-    as `clear` did, so the stream and the screen agree from the first frame.
-    `check_prompt` is what keeps them agreeing. `typed` is that line: the take
-    opens on the command already at the prompt, which makes the GIF's first
-    frame -- all a viewer who has turned off autoplay sees -- say what is about
-    to run, where an empty prompt would say nothing.
+    bash prints PS1 before `start_recording`, so the stream would lack it and
+    the first command would be drawn with no `$`. Ctrl-L after recording
+    starts reprints PS1 and the typed line, matching the real screen
+    (`check_prompt` checks this). `typed` is that line, so the first frame,
+    all a viewer without autoplay sees, shows the command about to run.
     """
     term = Terminal(["bash", "--norc", "--noprofile"], env, record=record)
     time.sleep(1.0)
@@ -974,8 +864,8 @@ def free_port():
 
 
 def host_token(host):
-    """`ids::host_token`: what nvmux names a host's ControlPath and forwards
-    by -- FNV-1a of the host as typed, forty bits of it in base32."""
+    """`ids::host_token`, which names a host's ControlPath and forwards:
+    FNV-1a of the host as typed, 40 bits in base32."""
     h = 0xcbf29ce484222325
     for b in host.encode():
         h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
@@ -1007,13 +897,12 @@ def processes_naming(marker):
 
 
 class Devbox:
-    """The host the take connects to: an sshd of the script's own on this
-    machine, and an `ssh` that knows it as HOST (see the header).
+    """The take's host: the script's own sshd on this machine, and an `ssh`
+    that knows it as HOST.
 
-    Everything is under `root`, whose path is in the command line of every
-    process this starts -- the sshd's `-f`, and through the shim the `-F` of
-    every ssh nvmux runs, ControlMasters included -- which is how `stop` finds
-    them all without touching anyone else's.
+    Everything is under `root`, whose path is on the command line of every
+    process this starts (sshd's `-f`; via the shim, every ssh's `-F`, masters
+    included), which is how `stop` finds them without touching others.
     """
 
     def __init__(self, root, xdg):
@@ -1041,8 +930,8 @@ class Devbox:
         with open(os.path.join(self.root, "known_hosts"), "w") as f:
             f.write("[127.0.0.1]:%d %s %s\n" % (port, host_pub[0], host_pub[1]))
 
-        # The editors' directories, sent with every connection and accepted at
-        # the other end -- see the header.
+        # The editors' XDG directories, sent with every connection and
+        # accepted by sshd.
         xdg = {"XDG_%s_HOME" % k.upper(): os.path.join(self.xdg, k)
                for k in ("config", "data", "state", "cache")}
         with open(os.path.join(self.root, "sshd_config"), "w") as f:
@@ -1056,9 +945,8 @@ class Devbox:
                 "PasswordAuthentication no",
                 "KbdInteractiveAuthentication no",
                 "PermitRootLogin prohibit-password",
-                # PAM needs root, and the script may not have it. StrictModes
-                # judges a key file by the directories above it, and the run's
-                # are under /tmp, which anyone may write to.
+                # PAM needs root, which the script may lack. StrictModes would
+                # reject key files under the world-writable /tmp.
                 "UsePAM no",
                 "StrictModes no",
                 "AcceptEnv %s" % " ".join(sorted(xdg)),
@@ -1089,8 +977,8 @@ class Devbox:
                     % (shlex.quote(ssh), shlex.quote(os.path.join(self.root, "config"))))
         os.chmod(shim, 0o755)
 
-        # Run as root, sshd wants its privilege separation directory, which a
-        # system with sshd installed but never started may not have yet.
+        # As root, sshd needs its privilege separation directory, which may
+        # not exist yet where sshd was installed but never started.
         if os.geteuid() == 0 and sys.platform.startswith("linux"):
             os.makedirs("/run/sshd", mode=0o755, exist_ok=True)
         log = open(os.path.join(self.root, "sshd.log"), "w")
@@ -1121,10 +1009,9 @@ class Devbox:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        # What the masters leave in the runtime directory: their ControlPath
-        # and the forwards they held, all named by HOST's token. nvmux would
-        # clear them itself the next time it connected to a devbox -- which,
-        # the run's being gone, would be someone else's.
+        # The masters' ControlPath and forwards in the runtime directory, named
+        # by HOST's token. Otherwise nvmux would clear them on its next
+        # connection to a devbox, which would be someone else's.
         token = host_token(HOST)
         time.sleep(0.5)
         for entry in os.listdir(RUNTIME) if os.path.isdir(RUNTIME) else []:
@@ -1155,19 +1042,16 @@ def live_sessions():
 
 
 def preflight():
-    """Refuse to record over sessions that are not the demo's.
-
-    devbox is this machine, so the picker on camera lists every session in the
-    runtime directory -- and anything of yours there would be in the README.
+    """Refuse to record over sessions that are not the demo's: devbox is this
+    machine, so the picker on camera would list them all.
     """
     others = [m.get("name", "?") for m in live_sessions()]
     if others:
         sys.exit("%s has sessions running (%s), and the picker the demo records "
                  "would list them. Kill them first, or record as another user."
                  % (RUNTIME, ", ".join(others)))
-    # nvmux names a host's master connection by the host as typed, and uses
-    # one it finds up rather than start its own -- so with a master to a real
-    # host of yours called devbox about, the take would ride it there.
+    # nvmux reuses a live master named by the host as typed, so with a master
+    # up to a real host called devbox, the take would go there.
     master = os.path.join(RUNTIME, "cm-" + host_token(HOST))
     if os.path.exists(master) and answers(master):
         sys.exit("an ssh master to a host called %s is up (%s), and the demo's "
@@ -1177,10 +1061,9 @@ def preflight():
 
 
 def kill_sessions(since):
-    """Kill the demo's sessions, the way `x` in the picker does: the same
-    script, run on this machine, which is devbox. Checked, and tried again,
-    since a session left behind is one the next run would refuse to start
-    beside -- and said, if one will not go."""
+    """Kill the demo's sessions with the picker's `x` script (devbox is this
+    machine). Retried, since a leftover would block the next run, and
+    reported if one survives."""
     names = {n for n, _ in SESSIONS} | {NEW_NAME}
 
     def ours():
@@ -1221,26 +1104,25 @@ def make_sessions(env, projects):
     term.close()
 
 
-# Run by an `nvim` that is only a client of the session (see `rpc`). The socket
-# and the code come in through the environment, so nothing is quoted twice.
+# Run by an `nvim` acting only as a client of the session (see `rpc`). Socket
+# and code come through the environment, so nothing is quoted twice.
 RPC = ("local ch = vim.fn.sockconnect('pipe', os.getenv('DEMO_SOCK'), { rpc = true }) "
        "local ok, err = pcall(vim.rpcrequest, ch, 'nvim_exec_lua', os.getenv('DEMO_LUA'), {}) "
        "vim.fn.chanclose(ch) "
        "if not ok then io.stderr:write(tostring(err) .. '\\n') vim.cmd('cquit 1') end "
        "vim.cmd('qall!')")
 
-# Off camera: an agent at work in api-server, reported as a plugin driving one
-# reports it -- a progress message, left running -- and the message line
-# cleared after it, so the editor does not show it once it is attached to.
+# Off camera: an agent at work in api-server, as a plugin reports one (a
+# progress message left running); then the message line is cleared so it is
+# not shown on attach.
 AGENT_AT_WORK = r"""
 vim.api.nvim_echo({ { 'editing src/routes.rs' } }, false,
   { kind = 'progress', source = 'agent', title = 'claude', status = 'running' })
 vim.cmd.echo('""')
 """
 
-# Off camera: dotfiles' install script, run to its end in a terminal buffer no
-# window shows -- and waited for until it has closed, so the watcher has seen
-# it finish.
+# Off camera: dotfiles' install script, run in a hidden terminal and waited
+# for until it closes, so the watcher sees it finish.
 INSTALL = r"""
 local buf = vim.api.nvim_create_buf(true, false)
 local closed = false
@@ -1259,12 +1141,11 @@ vim.wait(5000, function()
 end)
 """
 
-# The `cargo` on the sessions' PATH, for the build the take starts (see the
-# header); `main` writes it out with BUILT first, the file the take makes when
-# it wants the build done. It compiles at a builder's pace and then waits, so
-# the build is still going when the take leaves it and over when it is told
-# of. What it says is said as cargo says it -- the verb bold green, right of
-# twelve columns -- and the time it gives is the time it took.
+# The `cargo` on the sessions' PATH for the take's build. `main` prepends
+# BUILT, the file the take creates when the build should finish. It compiles,
+# then waits for BUILT, so it is still running when the take leaves it. Output
+# mimics cargo (bold green verb right-aligned in 12 columns) and gives the
+# real elapsed time.
 CARGO = r"""
 import os
 import sys
@@ -1300,9 +1181,8 @@ say("Finished", "`release` profile [optimized] target(s) in %.2fs"
 
 
 def editor(tools):
-    """The sessions' init.lua: EDITOR, then the run's own -- THEME's colours
-    for a terminal's programs, and the directory of the demo's cargo ahead
-    of the rest of PATH."""
+    """The sessions' init.lua: EDITOR, then THEME's terminal colours and the
+    demo cargo's directory ahead of PATH."""
     colours = "".join("vim.g.terminal_color_%d = %s\n" % (i, json.dumps(c))
                       for i, c in enumerate(THEME["palette"].split(":")))
     return (EDITOR.lstrip() + colours
@@ -1328,9 +1208,8 @@ def rpc(env, name, code):
 
 
 def stage_news(env):
-    """What the sessions have to say when the take opens on them, off camera
-    (see the header): the agent at work in api-server, and dotfiles'
-    install, finished."""
+    """Stage, off camera, the agent at work in api-server and dotfiles'
+    finished install."""
     rpc(env, "api-server", AGENT_AT_WORK)
     rpc(env, "dotfiles", INSTALL)
 
@@ -1342,14 +1221,12 @@ def perform(env, built):
     term = shell(env, record=True, typed="nvmux %s" % HOST)
     time.sleep(1.1)
 
-    # 1. connect: the picker, with devbox's sessions and what they have to say
-    # beside their names -- the agent at work in api-server, its spinner
-    # turning and its note under the list, and dotfiles' install finished
+    # 1. connect: the picker, with api-server's agent (spinner, note under the
+    # list) and dotfiles' finished install
     term.write(ENTER, show=(("\u23ce",), "connect"))
     term.expect("attach", "the picker")
     term.expect("editing src/routes.rs", "the agent's note under the list")
-    # Each session's sign comes in as the picker reads it, so this one can
-    # land a read after the note above: waited for, not looked for once.
+    # Signs arrive as the picker reads each session, possibly after the note.
     term.expect_that(lambda text: any("dotfiles" in line and "\u2713" in line
                                       for line in text.split("\n")),
                      "a \u2713 beside dotfiles", timeout=5)
@@ -1364,10 +1241,9 @@ def perform(env, built):
     term.expect("NVIM v", "the new session to paint")
     time.sleep(1.0)
 
-    # 3. back to the picker, still attached, and the new one down to the end.
-    # A session is made just below the one selected -- the gap `c` opens is
-    # where it goes -- so it starts second, and the moves are counted from
-    # wherever it is: the list wraps, and a move too many would take it round.
+    # 3. back to the picker, still attached, and the new one moved to the end.
+    # It was made below the selection, so moves are counted from where it is:
+    # the list wraps, and one move too many would take it round.
     term.write(PREFIX + b" ", show=(("Ctrl-Space", "Space"), "picker"))
     term.expect("attach", "the picker over the session")
     time.sleep(0.7)
@@ -1387,8 +1263,8 @@ def perform(env, built):
         sys.exit("the reorder did not land: %r\n%s" % (term.listed(), term.text()))
     time.sleep(1.0)
 
-    # 4. into another -- the list wraps, so api-server is one step down from
-    # the end -- and the editor as it was left, drawn by nvmux's own client
+    # 4. into another (one step down from the end, as the list wraps), the
+    # editor as it was left, drawn by nvmux's own client
     term.select("api-server")
     time.sleep(0.2)
     term.write(ENTER, show=(("\u23ce",), "attach"))
@@ -1414,8 +1290,8 @@ def perform(env, built):
     term.expect("HISTFILE", "the other buffer")
     time.sleep(0.8)
 
-    # 8. the build finishes: a note in the margin says so; the prefix key held
-    # says the key under it, and Enter goes there, to the build as it ended
+    # 8. the build finishes and a margin note says so; the prefix shows the
+    # note's key, and Enter goes to the finished build
     open(built, "w").close()
     term.expect("exited with code 0", "the note in the margin")
     time.sleep(2.0)
@@ -1428,11 +1304,9 @@ def perform(env, built):
 
     # 9. detach: the sessions keep running on devbox, nvmux exits
     term.write(PREFIX + b"d", show=(("Ctrl-Space", "d"), "detach"))
-    # The editor has to be gone, and waiting for the prompt does not say that:
-    # leaving the alternate screen restores the shell's screen, which already
-    # carries the `$` from before nvmux was started. That check passes the
-    # instant the alternate screen is left -- before the detach has finished --
-    # and the `nvmux` typed next then lands in the editor instead of the shell.
+    # Wait for the editor to go, not just the prompt: leaving the alternate
+    # screen restores the old `$` before the detach finishes, and the next
+    # `nvmux` would land in the editor.
     term.expect_gone("Finished", "the editor")
     term.expect("$", "the shell prompt back")
     time.sleep(0.8)
@@ -1459,15 +1333,11 @@ def perform(env, built):
 
 
 def check_fade_ran():
-    """Refuse to ship a recording with no dissolves in it.
+    """Refuse to ship a recording with no dissolves.
 
-    This is the failure the answering pty exists to prevent, and it is silent:
-    nvmux asks the terminal for its colours, gives up after QUERY_CAP, and an
-    unanswered query leaves `fade::enabled` false and every transition a hard
-    cut. The recording still comes out looking perfectly good -- it is just of
-    the wrong thing, which is how the first version of this script shipped.
-
-    nvmux says which happened, so read it rather than trust the timing.
+    An unanswered colour query (given up after QUERY_CAP) leaves
+    `fade::enabled` false, and the recording still looks fine. nvmux logs
+    which happened, so read that rather than trust the timing.
     """
     log = os.path.join(RUNTIME, "nvmux.log")
     try:
@@ -1486,17 +1356,11 @@ def check_fade_ran():
 
 
 def check_prompt(events):
-    """Refuse to ship a recording whose first command is typed against nothing.
+    """Refuse to ship a recording whose first command has no prompt.
 
-    The pty this script drives is not what the GIF is made of: the GIF is the
-    byte stream, and the stream holds nothing written before `start_recording`.
-    bash writes PS1 once per line it reads, so the prompt the screen showed all
-    along was a write from before the recording -- and the first `nvmux` was
-    rendered at a bare column 1, with every check in here reading the pty and
-    seeing a prompt that the GIF did not have.
-
-    So this replays the stream and looks at the line the command lands on,
-    which is the only view of it that sees what the GIF will.
+    The GIF is the byte stream from `start_recording`; a PS1 written earlier
+    shows on the pty but not in the GIF. So replay the stream and check the
+    line the command lands on.
     """
     screen = Screen()
     for t, chunk in events:
@@ -1515,15 +1379,9 @@ def check_clean(events):
     """Refuse to ship a recording showing the departing client's last words.
 
     nvmux erases that line itself (`term::erase_hung_up_clients_line`), so the
-    bytes are in the stream and the screen ends up clean. Hence replaying and
-    reading the *rendered* screen rather than searching the bytes, which would
-    find the line nvmux already wiped.
-
-    Sampled at the GIF's frame rate, because that is what decides what a frame
-    can show. Checking after every write instead reports the gap between the
-    client printing the line and nvmux erasing it -- two writes about a third
-    of a millisecond apart, some sixty times shorter than one frame, and a
-    state nothing ever draws.
+    bytes are in the stream: check the rendered screen, not the bytes. Sampled
+    at the GIF's frame rate, since print and erase are ~0.3 ms apart, a state
+    no frame shows.
     """
     screen = Screen()
     i, t = 0, 0.0
@@ -1545,15 +1403,11 @@ SYNC_END = b"\x1b[?2026l"
 def synchronized(events, cap=0.15):
     """The writes, re-cut so that a synchronized update is one write.
 
-    nvmux's own client draws every frame between `?2026h` and `?2026l`, and a
-    terminal that knows the mode shows none of a frame until all of it has
-    come. agg does not know it: it draws whatever has arrived at the moment it
-    is asked for, and a frame that took two pty reads -- a whole window's worth
-    of text, say, as a split flies in -- is drawn half done, with the rows
-    below the cut still showing the frame before. So what follows a `?2026h`
-    is held back until its `?2026l`, and goes out at that one's time, as a
-    terminal would show it. An update left open longer than `cap` goes out
-    anyway, as terminals let one time out.
+    nvmux's client draws each frame between `?2026h` and `?2026l`, but agg
+    ignores the mode and draws a frame split across pty reads half done. So
+    output after `?2026h` is held until its `?2026l` and emitted at that
+    time. An update open longer than `cap` is released, as terminals time
+    one out.
     """
     out, carry, since = [], b"", None
     for t, chunk in events:
@@ -1576,18 +1430,12 @@ def synchronized(events, cap=0.15):
 
 
 def retime(events, presses, limit=IDLE_LIMIT):
-    """The take on the GIF's clock: starting at its first write, with every
-    pause longer than `limit` cut to it, and the presses moved with the
-    screen.
+    """The take on the GIF's clock: from the first write, pauses over `limit`
+    cut to it, and presses moved with the screen.
 
-    Done here rather than left to agg's `--idle-time-limit`, so that a time in
-    the cast is a time in the GIF: the keys under the window are drawn by this
-    script, at the times it recorded, and have to land on the frames the
-    screen reacts in.
-
-    A press goes with the write after it -- the screen's answer to it -- and
-    keeps its lead on that write, so a cut pause before a press does not
-    separate the two.
+    Done here rather than with agg's `--idle-time-limit` so cast times are GIF
+    times: the key strip is drawn by this script and must land on the frames
+    the screen reacts in. A press keeps its lead on the write after it.
     """
     out, shift, last = [], events[0][0], None
     for t, chunk in events:
@@ -1609,8 +1457,8 @@ def retime(events, presses, limit=IDLE_LIMIT):
 
 
 def write_cast(events, path, end, size=(COLS, ROWS)):
-    """The cast agg draws from, running to `end` -- agg will not draw a
-    moment past its last event, so an empty one closes it there."""
+    """The cast agg draws from, running to `end`: agg draws nothing past the
+    last event, so an empty one is added there."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     with open(path, "w") as f:
         f.write(json.dumps({
@@ -1626,14 +1474,13 @@ def write_cast(events, path, end, size=(COLS, ROWS)):
 
 
 def schedule(events, presses, end):
-    """The GIF's frames, as `(seconds, screen, keys)`: how long each lasts,
-    the slot of the grid whose screen it shows, and the keys under it.
+    """The GIF's frames as `(seconds, screen, keys)`: duration, the grid slot
+    whose screen it shows, and the keys under it.
 
-    The grid is FPS a second, and a slot with anything new in it -- a write,
-    or a key shown or taken away -- starts a frame showing how things stand
-    at the slot's end. So every frame lasts a whole number of slots, which a
-    GIF's hundredths of a second hold exactly, and a screen is drawn once
-    however many frames show it.
+    The grid is FPS slots a second. A slot with anything new (a write, or a
+    key shown or hidden) starts a frame showing the state at its end, so each
+    frame lasts whole slots, which GIF hundredths hold exactly, and each
+    screen is drawn once.
     """
     shown = []
     for i, (t, keys, label) in enumerate(presses):
@@ -1667,24 +1514,17 @@ def schedule(events, presses, end):
 
 
 def draw_screens(cast, slots, font_dir, work):
-    """Each slot's screen, drawn by agg on its own: the path of each, by slot.
+    """Each slot's screen, drawn by its own agg run; returns paths by slot.
 
-    One agg run per screen, with `--select` at the end of its slot, rather
-    than agg on the whole cast: agg hands its frames to gifski at gifski's
-    default quality, which smooths motion -- a pixel that changes too little
-    from one frame to the next is left as it was -- and a dissolve is nothing
-    but small changes, so each lagged and settled short of where it was going.
-    A screen drawn alone has no frame before it to be held to.
+    One run per screen with `--select` at the slot's end, not agg on the whole
+    cast: agg hands frames to gifski at default quality, which drops small
+    per-pixel changes, so dissolves lagged and stopped short.
 
-    `--renderer resvg` is for the notice box, and it is not a preference.
-    agg's default renderer, `swash`, draws the box-drawing block itself rather
-    than from the font -- on the cell grid, a pixel thick, which is what makes
-    a run of `─` a straight line at any size. It does not do that for the
-    rounded corners the box is built from (`src/announce.rs`: `╭ ╮ ╰ ╯`,
-    U+256D..U+2570), which come from the font instead and land a pixel higher
-    and thicker than the bar they are meant to meet. `resvg` draws every one
-    of them from the font, where they were designed to line up, and the box
-    closes.
+    `--renderer resvg` is required for the notice box: the default `swash`
+    draws box-drawing lines on the cell grid but takes the rounded corners
+    (`╭ ╮ ╰ ╯`, U+256D..U+2570, see `src/announce.rs`) from the font, a pixel
+    higher and thicker, so the box does not close. resvg draws all of them
+    from the font.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1708,12 +1548,8 @@ def draw_screens(cast, slots, font_dir, work):
 
 
 class Window:
-    """The window a screen is shown in, with the keys under it.
-
-    Drawn by Pillow rather than into the cast, so that the keys are not cells
-    of a terminal that might be taken for nvmux's -- see KEYS -- and the frame
-    around them can be what a terminal window looks like rather than more of
-    the terminal.
+    """The window a screen is shown in, with the key strip. Drawn by Pillow,
+    not into the cast, so the keys are not taken for nvmux's cells (see KEYS).
     """
 
     def __init__(self, inner, fonts):
@@ -1731,12 +1567,10 @@ class Window:
         self.strips = {}
 
     def _chrome(self):
-        """The window without its contents, and a mask of what is outside it.
+        """The window without contents, and a mask of what is outside it.
 
-        Drawn at four times the size and brought down, so that the corners,
-        the border and the lights are smooth inside; the outside is then cut
-        on the half-covered pixel, since a GIF's transparency is all or
-        nothing.
+        Drawn at 4x and scaled down for smooth corners, border and lights; the
+        outside is cut at half coverage, as GIF transparency is all or nothing.
         """
         from PIL import Image, ImageDraw
         k = 4
@@ -1759,9 +1593,8 @@ class Window:
         for i, colour in enumerate(WINDOW["lights"]):
             cx, cy, rr = u(18 + 20 * i), bar / 2, u(6)
             d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=colour + (255,))
-        # Brought down as colour and coverage apart, the colour laid over the
-        # border's first: an edge pixel that survives the cut is then the
-        # border, not the border darkened by the clear black beyond it.
+        # Scale colour and coverage apart, colour laid over the border colour,
+        # so a kept edge pixel is the border, not darkened by the clear black.
         coverage = big.getchannel("A")
         flat = Image.new("RGB", big.size, WINDOW["border"])
         flat.paste(big.convert("RGB"), (0, 0), coverage)
@@ -1776,8 +1609,7 @@ class Window:
         if (keys, label) in self.strips:
             return self.strips[(keys, label)]
         k = 3
-        # Short of the window's bottom edge, whose border it would cover; the
-        # caps are still centred on the whole of the foot.
+        # Stops short of the bottom border; caps stay centred on the whole foot.
         w, h = self.inner[0], px(WINDOW["foot"]) - px(2)
 
         def u(size):
@@ -1803,28 +1635,24 @@ class Window:
         return self.strips[(keys, label)]
 
     def frame(self, screen, keys):
-        """One frame of the GIF: a paletted image whose last entry is clear.
+        """One GIF frame: a paletted image whose last entry is transparent.
 
-        Its colours are exactly those drawn, so that a pixel nothing changed is
-        the same colour as in the frame before and the GIF need not carry it
-        again. Quantized down from more colours than a GIF holds, the window's
-        own antialiased pixels came out a shade different from frame to frame,
-        and every frame was stored whole, lights to keys, for a spinner that
-        had turned.
+        Its colours are exactly those drawn, so unchanged pixels match the
+        previous frame and need not be stored again. Quantizing from more
+        colours shifted the window's antialiased pixels each frame, so every
+        frame was stored whole.
         """
         from PIL import Image
         strip, extra = self.strip(*keys) if keys is not None else (None, set())
         img = self.compose(screen, strip)
         if img.getcolors(255) is None:
-            # Over 255 between them: the screen gives way, to as many as the
-            # window leaves -- the same way for the same screen, so a still
-            # screen stays still.
+            # Over 255: reduce the screen to what the window leaves, the same
+            # way each time, so a still screen stays still.
             img = self.compose(fixed(screen, 255 - len(self.colours | extra)), strip)
-        # With no more colours than it may have, median cut puts each in a box
-        # of its own: every pixel keeps its colour exactly. (Mapping onto a
-        # palette built by hand does not: Pillow matches through a cache of
-        # coarsened colours, and a pixel can land on a neighbour a few levels
-        # off -- a different one in each frame.)
+        # Within the limit, median cut gives each colour its own box, so every
+        # pixel keeps its colour exactly. A hand-built palette does not: Pillow
+        # matches via coarsened colours, landing a few levels off, differently
+        # each frame.
         out = img.quantize(255, method=Image.Quantize.MEDIANCUT,
                            dither=Image.Dither.NONE)
         palette = out.getpalette()[:255 * 3]
@@ -1842,10 +1670,9 @@ class Window:
 
 
 def fixed(img, colours, keep=None):
-    """`img` in at most `colours` colours, as RGB -- and the same ones every
-    time it is asked, which is what keeps a frame's unchanged pixels
-    unchanged. `keep` is a colour that must come out as it went in: the
-    window's background, which has to meet the terminal's without a seam."""
+    """`img` as RGB in at most `colours` colours, the same ones each time, so
+    unchanged pixels stay unchanged. `keep` must come out exactly: the window
+    background, which has to meet the terminal's without a seam."""
     from PIL import Image, ImageChops
     out = img.quantize(colours, method=Image.Quantize.MEDIANCUT,
                        dither=Image.Dither.NONE).convert("RGB")
@@ -1860,14 +1687,10 @@ def fixed(img, colours, keep=None):
 def encode(frames, screens, window, out):
     """Write the GIF with Pillow, frame for frame as drawn.
 
-    Not gifski, which this script used to hand the frames to: even at its
-    highest quality it leaves a pixel as it was when the next frame changes
-    it only a little, and a dissolve is nothing but such changes -- each one
-    left a faint residue of the screen it dissolved from, a few levels off
-    the background, that stayed there until something drew over it. Pillow
-    writes each frame with a palette of its own and makes clear only the
-    pixels that did not change at all, so every frame of the GIF is exactly
-    the one drawn, for about a tenth more bytes.
+    Not gifski: even at top quality it skips small per-pixel changes, so
+    dissolves left a faint residue of the previous screen. Pillow gives each
+    frame its own palette and makes only unchanged pixels transparent, for
+    about 10% more bytes.
     """
     from PIL import Image
 
@@ -1948,8 +1771,8 @@ def main():
     env["PATH"] = os.pathsep.join([devbox.bin, os.path.join(ROOT, "target", "release"),
                                    env["PATH"]])
     env["NVMUX_CONFIG"] = cfg
-    # nvmux remembers each host's launch command under XDG_STATE_HOME; the
-    # demo's is no business of yours.
+    # nvmux stores each host's launch command under XDG_STATE_HOME; keep the
+    # demo's out of yours.
     env["XDG_STATE_HOME"] = os.path.join(xdg, "state")
     env["TERM"] = "xterm-256color"
     env["COLORTERM"] = "truecolor"
