@@ -905,14 +905,15 @@ const PANEL_ROOM: u16 = 24;
 const PANEL_NARROWEST: u16 = 48;
 const PANEL_WIDEST: u16 = 72;
 
-/// How tall the floating prompt is, the hint row and the panel's last row
-/// besides its body. A create's form, three fields and a message, is centred
-/// in the body as full screen, with its menu hanging under it: the body is as
-/// tall as the form and twice the menu, less the row centring puts above
-/// rather than below. A rename's is its line and its message, with three
-/// rows round them.
-const CREATE_ROWS: u16 = (3 + 1) + 2 * MENU_ROWS - 1 + 2;
-const RENAME_ROWS: u16 = (1 + 1) + 3 + 2;
+/// How tall the floating prompt is: its body, and the panel's last row, where
+/// the prompt has its hint row full screen — blank here, the hint row being
+/// along the bottom of the screen (see [`float::inside`]). A create's form,
+/// three fields and a message, is centred in the body as full screen, with
+/// its menu hanging under it: the body is as tall as the form and twice the
+/// menu, less the row centring puts above rather than below. A rename's is
+/// its line and its message, with three rows round them.
+const CREATE_ROWS: u16 = (3 + 1) + 2 * MENU_ROWS - 1 + 1;
+const RENAME_ROWS: u16 = (1 + 1) + 3 + 1;
 
 /// The prompt floating over a session (see the module docs and
 /// `crate::pty::panel`), on the relay's keys.
@@ -1105,11 +1106,12 @@ impl Panel {
 }
 
 impl Floating for Panel {
-    /// In the middle: wide enough for its opening lines and what is typed
-    /// past them, and tall enough for the form, a create's menu under it, and
-    /// the hint row; nowhere where that leaves too little of the session
-    /// round it, which has the prompt full screen.
+    /// In the middle of the room above the hint row: wide enough for its
+    /// opening lines and what is typed past them, and tall enough for the
+    /// form and a create's menu under it; nowhere where that leaves too
+    /// little of the session round it, which has the prompt full screen.
     fn area(&self, screen: Rect) -> Option<Rect> {
+        let (room, _) = float::split(screen);
         let opening = self
             .prompt
             .fields
@@ -1119,17 +1121,17 @@ impl Floating for Panel {
             .unwrap_or(0) as u16;
         let width = (opening + PANEL_ROOM)
             .clamp(PANEL_NARROWEST, PANEL_WIDEST)
-            .min(screen.width.saturating_sub(2 * SESSION_COLS));
+            .min(room.width.saturating_sub(2 * SESSION_COLS));
         let height = match self.job {
             Job::Create { .. } => CREATE_ROWS,
             Job::Rename(_) => RENAME_ROWS,
         };
-        if width < PANEL_NARROWEST || screen.height < height + 2 * SESSION_ROWS {
+        if width < PANEL_NARROWEST || room.height < height + 2 * SESSION_ROWS {
             return None;
         }
         Some(Rect::new(
-            screen.x + (screen.width - width) / 2,
-            screen.y + (screen.height - height) / 2,
+            room.x + (room.width - width) / 2,
+            room.y + (room.height - height) / 2,
             width,
             height,
         ))
@@ -1151,8 +1153,8 @@ impl Floating for Panel {
         }
     }
 
-    /// Nothing on it to point at, as full screen. A press outside takes it
-    /// down, which is the relay's to see.
+    /// Nothing on it to point at, as full screen. A press on the session
+    /// takes it down, which is the relay's to see.
     fn on_mouse(&mut self, _mouse: MouseEvent, _now: Instant) -> Did {
         Did::Stay
     }
@@ -1186,7 +1188,7 @@ impl Floating for Panel {
 
     /// The prompt drawn into `area`: as it draws itself on a terminal of the
     /// panel's inside, in the theme's colour, and laid into a buffer of
-    /// `area`.
+    /// `area` — all but its hint row.
     fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         let inside = float::inside(area);
@@ -1200,12 +1202,16 @@ impl Floating for Panel {
             draw(f, prompt);
             crate::theme::paint(f.buffer_mut());
         });
-        let drawn = terminal.backend().buffer();
-        for y in 0..inside.height {
-            for x in 0..inside.width {
-                buf[(inside.x + x, inside.y + y)] = drawn[(x, y)].clone();
-            }
-        }
+        float::lay(&mut buf, inside, terminal.backend().buffer());
+        buf
+    }
+
+    /// The prompt's hint row drawn into `row`, as full screen, in the
+    /// theme's colour.
+    fn draw_hints(&self, row: Rect) -> Buffer {
+        let mut buf = Buffer::empty(row);
+        draw::hint_row_on(&mut buf, row, self.prompt.hints(), true);
+        crate::theme::paint(&mut buf);
         buf
     }
 
@@ -3591,9 +3597,10 @@ mod tests {
         assert_eq!(last.prompt.fields[NAME].default, "session 4");
     }
 
-    /// It floats where there is room for it and a session round it, smaller
-    /// for a rename than for a create, and nowhere on a terminal too small,
-    /// where the prompt takes the screen instead.
+    /// It floats where there is room for it and a session round it — above
+    /// the hint row, a row of the session between them — smaller for a
+    /// rename than for a create, and nowhere on a terminal too small, where
+    /// the prompt takes the screen instead.
     #[test]
     fn the_floating_prompt_fits_where_it_can() {
         let rows = hosted(&["one", "two"]);
@@ -3608,7 +3615,7 @@ mod tests {
                 "{a:?}"
             );
             assert!(
-                a.y >= SESSION_ROWS && a.bottom() + SESSION_ROWS <= 24,
+                a.y >= SESSION_ROWS && a.bottom() + SESSION_ROWS <= 23,
                 "{a:?}"
             );
         }
@@ -3617,12 +3624,14 @@ mod tests {
         assert_eq!(create.area(Rect::new(0, 0, 80, 18)), None);
     }
 
-    /// Drawn where it floats, the create prompt has its three fields and its
-    /// hint row, as full screen.
+    /// Drawn where it floats, the create prompt has its three fields, as full
+    /// screen, and its last row clear; and its hint row is the full screen's,
+    /// cell for cell, on the screen's last row.
     #[test]
     fn the_floating_create_prompt_draws_its_form_and_its_hints() {
         let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
-        let area = panel.area(Rect::new(0, 0, 80, 24)).expect("room");
+        let screen = Rect::new(0, 0, 80, 24);
+        let area = panel.area(screen).expect("room");
         let buf = panel.draw(area);
         let rows: Vec<String> = (area.y..area.bottom())
             .map(|y| {
@@ -3631,14 +3640,20 @@ mod tests {
                     .collect()
             })
             .collect();
-        for want in [
-            "new session name",
-            "nvim command",
-            "working directory",
-            "⏎ create",
-        ] {
+        for want in ["new session name", "nvim command", "working directory"] {
             assert!(rows.iter().any(|r| r.contains(want)), "{want}: {rows:#?}");
         }
+        assert!(!rows.iter().any(|r| r.contains("⏎ create")), "{rows:#?}");
+        assert!(rows[rows.len() - 1].trim().is_empty(), "{rows:#?}");
+
+        let (_, row) = float::split(screen);
+        let hints = panel.draw_hints(row);
+        let whole = test_support::buffer(80, 24, |f| draw(f, &panel.prompt));
+        for x in 0..80 {
+            assert_eq!(hints[(x, 23)], whole[(x, 23)], "column {x}");
+        }
+        let said: String = (0..80).map(|x| hints[(x, 23)].symbol()).collect();
+        assert!(said.contains("⏎ create"), "{said:?}");
     }
 
     /// Keys go to the prompt as full screen, and `Esc` takes it down going

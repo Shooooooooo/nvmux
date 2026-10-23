@@ -752,7 +752,8 @@ pub struct StyleSettings {
     /// Whether the picker (`<prefix> Space`), the settings (`<prefix> ,`)
     /// and the help (`<prefix> ?`) float over the session they are brought
     /// up from, in a panel in the middle of it, the session going on behind
-    /// them dimmed (see `crate::pty::panel`).
+    /// them dimmed (see `crate::pty::panel`) — all of each but its hint row,
+    /// which is along the bottom of the screen either way.
     ///
     /// On, the default. Off, each takes the whole terminal, the session
     /// dissolving out under it and back in after, as the picker always did.
