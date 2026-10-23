@@ -235,6 +235,21 @@ const TAILS_WAIT: Duration = Duration::from_millis(25);
 /// long before one that came to nothing is tried again.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What the client asks after the round trip with, while the user is at
+/// work (see [`predict::PING_EVERY`]): a call Neovim answers as it reads
+/// it, at work on keys typed ahead or not, as it does `nvim_get_api_info`
+/// at the attach — parsing an expression, which changes nothing. Not
+/// `nvim_get_mode`: Neovim holds that till it has taken every key typed
+/// ahead (neovim#6247), so it timed those as well as the link — 1.35 s for
+/// a link of 0.5 s, with pages typed ahead of a Neovim at work on them —
+/// and a scroll made ahead of Neovim waited the longer for it, where how
+/// long keys wait for Neovim is counted otherwise: by the agent's word
+/// that Neovim is still at work on the scrolls typed (`behind`), and where
+/// it says what Neovim made of each key, by how long one takes to be
+/// answered (see [`predict::Predictor::deadline`]). Nor `nvim_input` with
+/// no keys, which looks through what is typed ahead for `<C-c>` again.
+const PING: &str = "nvim_parse_expression";
+
 /// How many times a window is refreshed for, at most, before it is drawn as
 /// it is: Neovim does not draw for a UI attaching while it waits for Enter.
 const REFRESH_TRIES: u8 = 2;
@@ -1703,7 +1718,7 @@ enum Ask {
     Agent,
     /// [`wide::MEASURE_LUA`].
     Measure,
-    /// `nvim_get_mode`, for the round trip it takes: see [`predict`].
+    /// [`PING`], for the round trip it takes: see [`predict`].
     Ping,
     /// A request asked after keys, whose answer says Neovim has taken them
     /// and drawn what they did: see [`predict::Typed`]. With the count of
@@ -6004,7 +6019,9 @@ impl App {
         if let Some(p) = self.predict.as_mut() {
             if p.wants_ping(now, self.typed) {
                 p.pinged(now);
-                let id = self.outbox.request("nvim_get_mode", &[]);
+                let id = self
+                    .outbox
+                    .request(PING, &[Arg::str("0"), Arg::str(""), Arg::Bool(false)]);
                 self.asked.insert(id, Ask::Ping);
                 self.asked_at.insert(id, now);
             }
@@ -8803,17 +8820,14 @@ mod tests {
         let mut a = predicting(Duration::from_millis(200));
         let t1 = Instant::now() + Duration::from_secs(10);
         a.tick(t1);
-        assert!(
-            calls(&mut a).iter().all(|(_, m, _)| m != "nvim_get_mode"),
-            "idle"
-        );
+        assert!(calls(&mut a).iter().all(|(_, m, _)| m != PING), "idle");
         a.keys(b"j", t1);
         a.tick(t1);
-        let ping = request(&calls(&mut a), "nvim_get_mode", "");
+        let ping = request(&calls(&mut a), PING, "");
         answer(&mut a, ping, Value::Nil, t1 + Duration::from_millis(1));
         a.tick(t1 + PING_EVERY);
         assert!(
-            calls(&mut a).iter().all(|(_, m, _)| m != "nvim_get_mode"),
+            calls(&mut a).iter().all(|(_, m, _)| m != PING),
             "nothing typed since"
         );
         // The link gets faster: a millisecond, every time it is asked.
@@ -8822,7 +8836,7 @@ mod tests {
             t += PING_EVERY;
             a.keys(b"j", t);
             a.tick(t);
-            let ping = request(&calls(&mut a), "nvim_get_mode", "");
+            let ping = request(&calls(&mut a), PING, "");
             answer(&mut a, ping, Value::Nil, t + Duration::from_millis(1));
         }
         let p = a.predict.as_ref().expect("predicting");
@@ -8861,7 +8875,7 @@ mod tests {
             t += PING_EVERY;
             a.keys(b"j", t);
             a.tick(t);
-            let ping = request(&calls(a), "nvim_get_mode", "");
+            let ping = request(&calls(a), PING, "");
             answer(a, ping, Value::Nil, t + rtt);
             calls(a)
                 .into_iter()
@@ -8934,7 +8948,7 @@ mod tests {
             t += PING_EVERY;
             a.keys(b"j", t);
             a.tick(t);
-            let ping = request(&calls(&mut a), "nvim_get_mode", "");
+            let ping = request(&calls(&mut a), PING, "");
             answer(&mut a, ping, Value::Nil, t);
             calls(&mut a);
         }

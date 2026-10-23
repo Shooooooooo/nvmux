@@ -1227,7 +1227,7 @@ impl Trace {
     /// trip with since (see `App::start`, `App::tick`) — each from when the
     /// link read the request to when it began writing the answer.
     fn last_behind(&self) -> Option<(Instant, Vec<Duration>)> {
-        const TIMED: [&str; 2] = ["nvim_get_api_info", "nvim_get_mode"];
+        const TIMED: [&str; 2] = ["nvim_get_api_info", "nvim_parse_expression"];
         let asked: std::collections::HashMap<(usize, u64), Instant> = self
             .messages_on(false)
             .into_iter()
@@ -2280,6 +2280,14 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
         .trace
         .last_behind()
         .expect("Neovim behind on the pages");
+    // The round trip asked after with the first page is the link's: Neovim
+    // answers what it is asked with as it reads it, still at work on the
+    // pages — not once it has taken them all, which would time those too.
+    assert!(
+        timed.len() >= 2,
+        "the round trip asked after with the first page not answered before Neovim last said \
+         it was behind: {timed:?}"
+    );
     let wait = patience(&timed);
     assert!(
         at > caught_up + SLOW && at < since + wait * 5 / 4 + SLOW,
