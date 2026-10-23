@@ -10,91 +10,66 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::SessionError;
 
-/// What a liveness probe concluded about a session. Three states rather than a
-/// bool, because "did not answer" and "is not there" must not be confused —
-/// see [`crate::rpc`].
+/// Result of a liveness probe. Not a bool: "did not answer" must not be
+/// confused with "is not there".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Liveness {
-    /// Answered a deferred RPC call. Definitely serving.
+    /// Answered a deferred RPC call.
     Alive,
-    /// Reachable, but not serving deferred calls right now: running something
-    /// blocking, or waiting for a key at a prompt — [`crate::rpc::probe`] asks
-    /// the mode first, and the second is settled in a millisecond rather than
-    /// a timeout. Never reaped.
+    /// Reachable but not serving deferred calls: running something blocking,
+    /// or waiting at a prompt (which [`crate::rpc::probe`] detects at once via
+    /// the mode). Never reaped.
     Busy,
-    /// Nothing is listening. The socket file, if present, is stale.
+    /// Nothing is listening; any socket file is stale.
     #[default]
     Dead,
 }
 
-/// Runtime state, discovered by probing rather than read from disk. Kept out of
-/// the JSON entirely.
+/// Runtime state from probing; never serialised.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionState {
     pub liveness: Liveness,
-    /// The number the picker shows and `<prefix> <n>` selects: this session's
-    /// **position** in the listing, assigned by `transport::finish_listing`
-    /// after it has ordered them by the stored [`Session::num`].
+    /// The number the picker shows and `<prefix> <n>` selects: the 1-based
+    /// position in the listing, set by `transport::finish_listing` after
+    /// sorting by the stored [`Session::num`]. Dense and unique even when
+    /// stored ranks are missing or duplicated, and renumbers after a kill.
     ///
-    /// Separate from the stored one on purpose. It is dense, starts at 1 and is
-    /// duplicate-free across one listing, whatever the stored ranks were —
-    /// legacy metadata and orphans have none at all, and two clients creating
-    /// at once can store the same one. Being a position is also what makes it
-    /// recalculate: kill the second of three and the third is second on the
-    /// next listing, with nothing written anywhere.
-    ///
-    /// It must never reach disk. `SshTransport::rename_session` writes an
-    /// in-memory session straight back through `write_meta.sh`, so a position
-    /// kept in `Session::num` would be silently persisted as a rank by a
-    /// rename.
+    /// Kept apart from `Session::num` because `SshTransport::rename_session`
+    /// writes the in-memory session back to disk.
     pub num: u32,
 }
 
 /// A session, as listed by a [`crate::transport::Transport`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    /// Random 8-character base32 token. Stable for the session's life.
+    /// Random 8-character base32 token, stable for the session's life.
     pub id: String,
-    /// Display name. Mutable; carries no identity.
+    /// Display name only; carries no identity.
     pub name: String,
-    /// Unix epoch seconds, rather than RFC3339, so this file needs no date
-    /// library at all.
+    /// Unix epoch seconds.
     pub created: u64,
-    /// The nvim server's pid — a hint, not an identity. `$!` from the spawn
-    /// script is not reliably nvim's own pid, since `setsid` forks when the
-    /// caller is already a process group leader, so this is overwritten with the
-    /// server's own answer once it is reachable. Liveness never rests on it:
-    /// pids are reused.
+    /// The nvim server's pid: a hint, not an identity (pids are reused). `$!`
+    /// from the spawn script may not be nvim's pid, since `setsid` forks when
+    /// the caller leads a process group, so it is replaced by the server's own
+    /// answer once reachable.
     pub pid: u32,
-    /// The session's **rank**: what orders the listing, and nothing else. Not
-    /// what the picker shows — that is the position the rank sorts this
-    /// session into, resolved into [`SessionState::num`] by
-    /// `transport::finish_listing`, which is why killing a session above this
-    /// one changes the number it displays but not this.
-    ///
-    /// Assigned once at creation, one past the highest on the host, and
-    /// rewritten only by a reorder in the picker. Ranks are therefore *not*
-    /// dense — a kill leaves a hole in them, and nothing closes it, because a
-    /// hole in an ordering key is invisible. `0` means unranked: metadata
-    /// written before numbering existed, and orphans, both of which sort last.
+    /// Rank: orders the listing only. The displayed number is
+    /// [`SessionState::num`]. Set once at creation (one past the host's
+    /// highest) and changed only by a picker reorder, so kills leave holes.
+    /// `0` means unranked (legacy metadata, orphans) and sorts last.
     #[serde(default)]
     pub num: u32,
-    /// The command line this session's Neovim was launched with, as
-    /// [`crate::launch`] validated it and with `{sock}` still in it. A record,
-    /// not an instruction: nothing re-runs it, and the picker does not show it.
-    /// Its `<id>.log` says what the editor printed and this says what produced
-    /// it. Empty for metadata written before the field existed, and for orphans.
+    /// The launch command as [`crate::launch`] validated it, `{sock}` still in
+    /// it. A record only: never re-run or shown. Empty for legacy metadata and
+    /// orphans.
     #[serde(default)]
     pub command: String,
-    /// The directory the session's Neovim was started in, absolute and on the
-    /// host that runs it. A record in the same sense as `command`: nothing
-    /// re-enters it, and the picker does not show it. Empty for metadata written
-    /// before the field existed, and for orphans.
+    /// Absolute start directory on the session host. A record only, like
+    /// `command`; empty for legacy metadata and orphans.
     #[serde(default)]
     pub directory: String,
 
-    /// Probe results. Never serialised: the on-disk shape stays exactly the
-    /// seven keys above.
+    /// Not serialised: the on-disk shape is exactly the seven keys above.
     #[serde(skip)]
     pub state: SessionState,
 }
@@ -113,14 +88,12 @@ impl Session {
         }
     }
 
-    /// Record what launched it. Separate from `new` because an orphan and a
-    /// session reconstructed from a listing have no command to record.
+    /// Not in `new`: orphans and sessions rebuilt from a listing have none.
     pub fn launched_with(mut self, command: &str) -> Self {
         self.command = command.to_string();
         self
     }
 
-    /// Record where it was launched, for the same reason and on the same terms.
     pub fn started_in(mut self, directory: &str) -> Self {
         self.directory = directory.to_string();
         self
@@ -141,9 +114,8 @@ impl Session {
         })
     }
 
-    /// Write `<id>.json` atomically — temp file plus `rename(2)`, see
-    /// [`crate::paths::write_atomic`] — so a concurrent listing sees the old
-    /// name or the new one and never a half-written file.
+    /// Write `<id>.json` via [`crate::paths::write_atomic`], so a concurrent
+    /// listing never sees a half-written file.
     pub fn write_atomic(&self, path: &Path) -> Result<(), SessionError> {
         let mut json = self.to_json()?;
         json.push('\n');
@@ -154,11 +126,8 @@ impl Session {
     }
 }
 
-/// Validate a user-supplied session name.
-///
-/// Names are display metadata and never appear in a path, but they do reach a
-/// shell command line and the terminal, so they are checked at the boundary
-/// rather than trusted.
+/// Validate a user-supplied session name. Names never appear in a path, but
+/// they reach a shell command line and the terminal.
 pub fn validate_name(name: &str) -> Result<(), SessionError> {
     let invalid = |reason| {
         Err(SessionError::InvalidName {
@@ -175,27 +144,20 @@ pub fn validate_name(name: &str) -> Result<(), SessionError> {
     if name.trim() != name {
         return invalid("must not start or end with whitespace");
     }
-    // Control characters would corrupt the picker's rendering and could smuggle
-    // escape sequences into the terminal via a session listing; the invisible
-    // formatting characters can reorder or hide what the listing shows.
+    // Control characters could inject escape sequences into the terminal;
+    // invisible formatting characters can reorder or hide listed text.
     if name.chars().any(is_unrenderable) {
         return invalid("must not contain control or invisible formatting characters");
     }
     Ok(())
 }
 
-/// Validate a user-supplied working directory, and expand a leading `~`.
+/// Validate a user-supplied working directory and expand a leading `~` with
+/// [`expand_tilde`] (shared with the prompt's completion, so both agree).
 ///
-/// Returns the path as it should be sent to the session host: absolute, so that
-/// `scripts/spawn.sh` has nothing left to resolve and no shell is needed to
-/// resolve it. `home` is the *session host's* home directory — the local `$HOME`
-/// for a local session, and what `scripts/hello.sh` reported for a remote one.
-/// A path on one machine means nothing on another, so expanding against ours
-/// would be quietly wrong over ssh.
-///
-/// The `~` is [`expand_tilde`]'s, which the create prompt's completion also
-/// calls — so what the menu lists inside `~/` and what enter finally creates
-/// cannot mean two different directories.
+/// Returns an absolute path, so `scripts/spawn.sh` needs no shell to resolve
+/// it. `home` is the session host's home: the local `$HOME`, or what
+/// `scripts/hello.sh` reported for a remote host.
 pub fn validate_directory(directory: &str, home: &str) -> Result<String, SessionError> {
     let invalid = |reason| {
         Err(SessionError::InvalidDirectory {
@@ -208,13 +170,11 @@ pub fn validate_directory(directory: &str, home: &str) -> Result<String, Session
     if directory.is_empty() {
         return invalid("must not be empty");
     }
-    // Generous: this is a path, and PATH_MAX is 4096 on Linux. The cap is here
-    // so that a pasted runaway is refused at the prompt rather than by execve.
+    // PATH_MAX on Linux; refuses a pasted runaway here rather than at execve.
     if directory.len() > 4096 {
         return invalid("must be 4096 bytes or fewer");
     }
-    // The same rule a name and a command live by: this is drawn on the prompt
-    // and could otherwise smuggle escape sequences into the terminal.
+    // Same rule as names: this is drawn on the prompt.
     if directory.chars().any(is_unrenderable) {
         return invalid("must not contain control or invisible formatting characters");
     }
@@ -233,29 +193,16 @@ pub fn validate_directory(directory: &str, home: &str) -> Result<String, Session
     Ok(expanded)
 }
 
-/// Expand a leading `~` against the session host's home directory.
+/// Expand a leading `~` against the session host's `home` (not ours: over
+/// ssh the paths differ). The only expansion nvmux does: `~` and `~/…` only,
+/// no `~user`, globs or `$VAR`.
 ///
-/// This is the one expansion nvmux performs anywhere, and it is deliberately
-/// narrow: `~` and `~/…` only, never `~user`, no globs, no `$VAR`. It is
-/// possible here for the reason [`crate::launch`] says it is not possible for a
-/// command line — nvmux *knows* this answer, so nothing has to be handed to a
-/// shell to find it out.
-///
-/// `home` is the *session host's* home — the local `$HOME` for a local session,
-/// and what `scripts/hello.sh` reported for a remote one. A path on one machine
-/// means nothing on another, so expanding against ours would be quietly wrong
-/// over ssh.
-///
-/// The `Err` is a reason rather than a type, because its two callers want
-/// opposite things from it: [`validate_directory`] reports it and refuses, and
-/// [`crate::ui::complete`] discards it and lists the text literally — at a
-/// prompt, `~r` is not a mistake, it is `~root` half typed, and a keystroke on
-/// the way to somewhere must not turn the field red.
+/// The `Err` is a plain reason: [`validate_directory`] reports it, while
+/// [`crate::ui::complete`] ignores it (a typed `~r` may be `~root` half done).
 pub fn expand_tilde(path: &str, home: &str) -> Result<String, &'static str> {
     match path.strip_prefix('~') {
-        // `~user` is somebody else's home directory, which only the host can
-        // resolve. Refused rather than passed through as a literal directory
-        // named `~someone`, which is what would otherwise be created-or-missing.
+        // Only the host can resolve `~user`; passing it through would name a
+        // literal `~user` directory.
         Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {
             Err("~user is not expanded — spell the path out")
         }
@@ -267,9 +214,8 @@ pub fn expand_tilde(path: &str, home: &str) -> Result<String, &'static str> {
     }
 }
 
-/// A character that a session listing cannot show honestly: a control
-/// character, or one of the zero-width and bidirectional-formatting characters
-/// that change how the *surrounding* text reads without occupying a cell.
+/// A control character, or a zero-width or bidi formatting character that
+/// changes how surrounding text reads without occupying a cell.
 pub(crate) fn is_unrenderable(c: char) -> bool {
     c.is_control()
         || matches!(
@@ -318,9 +264,6 @@ mod tests {
         assert_eq!(v["directory"], "/home/you/src");
     }
 
-    /// Metadata written before either field existed still loads: both are
-    /// `#[serde(default)]`, so an older session keeps working rather than
-    /// becoming an unreadable file the picker refuses to list.
     #[test]
     fn metadata_from_before_these_fields_existed_still_loads() {
         let older = br#"{"id":"abcdefgh","name":"legacy","created":1,"pid":7}"#;
@@ -331,9 +274,6 @@ mod tests {
         assert_eq!(s.num, 0);
     }
 
-    /// A relative directory is the one rule a directory has that a name and a
-    /// command do not, and it exists because of what would happen if it did
-    /// not: the session would start somewhere nobody chose.
     #[test]
     fn a_relative_working_directory_is_refused_and_says_why() {
         let err = validate_directory("src", "/home/you").expect_err("relative");
@@ -357,9 +297,6 @@ mod tests {
         );
     }
 
-    /// `~` is expanded against the *session host's* home, which over ssh is not
-    /// ours. Expanding against ours would send a path that means nothing there,
-    /// and it would look right in the prompt while doing it.
     #[test]
     fn a_tilde_is_expanded_against_the_hosts_home_not_ours() {
         assert_eq!(validate_directory("~", "/home/them").unwrap(), "/home/them");
@@ -389,9 +326,6 @@ mod tests {
         );
     }
 
-    /// Only `~` and `~/…`. `~someone` is a question only the host can answer,
-    /// and passing it through would name a directory that is almost certainly
-    /// not there — reported as "not a directory", which explains nothing.
     #[test]
     fn a_tilde_naming_another_user_is_refused_rather_than_passed_through() {
         let err = validate_directory("~root/src", "/home/them").expect_err("~user");
@@ -401,9 +335,6 @@ mod tests {
         );
     }
 
-    /// A host that could not say where home is must not have one invented for
-    /// it. The prompt offers no default in that case, and a typed `~` is a
-    /// question nvmux cannot answer either.
     #[test]
     fn a_tilde_is_refused_when_the_host_reported_no_home() {
         let err = validate_directory("~/src", "").expect_err("no home");
@@ -417,8 +348,7 @@ mod tests {
         );
     }
 
-    /// The resolved number is display state, and a rename over ssh writes an
-    /// in-memory session straight back to disk — so it must not serialise.
+    /// A rename over ssh writes the in-memory session back to disk.
     #[test]
     fn the_resolved_number_never_reaches_disk() {
         let mut s = Session::new("abcdefgh".into(), "x".into(), 1, 2);
@@ -453,7 +383,6 @@ mod tests {
         assert_eq!(back.pid, s.pid);
         assert_eq!(back.num, s.num);
         assert_eq!(back.command, s.command);
-        // A freshly parsed session has been probed by nobody.
         assert_eq!(back.state, SessionState::default());
     }
 
@@ -501,8 +430,6 @@ mod tests {
         assert!(validate_name("abc\u{2066}def").is_err());
     }
 
-    /// What reaches disk reads back as the session that was written; that no
-    /// temp file is left beside it is `paths::write_atomic`'s own test.
     #[test]
     fn a_written_session_reads_back() {
         let dir = crate::test_support::scratch_dir("session-atomic");

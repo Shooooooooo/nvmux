@@ -1,59 +1,16 @@
-//! The colour nvmux draws its own screens in.
+//! The single colour (the *ink*) that `[style] color` draws nvmux's own
+//! screens in; they otherwise use the terminal's default foreground.
 //!
-//! nvmux's screens set no colour of their own (see [`crate::ui`]): their text
-//! is the terminal's foreground, shaded with dim, bold and reverse, on the
-//! terminal's background. `[style] color` names one colour to draw them in
-//! instead (see [`crate::config::StyleSettings`]), and this module is where
-//! that colour — the *ink* — goes on.
+//! [`paint`] is a pass over a finished frame, run before the picker's effects
+//! and the fade, so the screens' drawing (and its tests) stay colourless. It
+//! inks full-strength cells with no colour of their own; dim cells keep the
+//! terminal's foreground, and no background is ever set. The fade and effects
+//! start from the colour a cell was drawn in ([`crate::fade::drawn_in`]), so a
+//! themed screen dissolves without a jump. The switch notice and attach name
+//! write the ink into their pen ([`crate::announce::pen`]).
 //!
-//! # What is drawn in it, and what is not
-//!
-//! The theme is one colour, and it takes the screens' modifiers as it finds
-//! them. [`paint`] gives the ink to every cell of a finished frame that is
-//! drawn at full strength and has no colour of its own: so a name is the ink,
-//! the selection's bar is the ink as a background with the name standing out
-//! of it in the terminal's background colour, and an underline or a line
-//! through a name is the ink because the text is. What a screen draws *dim* —
-//! the numbers beside the names, the notes, the hint row, the prompt's labels
-//! — it leaves alone: the terminal's own foreground, dimmed, exactly as with no
-//! theme. Nothing sets a background: the terminal's own stays under
-//! everything, transparent or not.
-//!
-//! A pass over a finished frame for the reason the fade is one
-//! ([`crate::fade::apply`]): the screens' own drawing stays colourless, and its
-//! tests go on saying so. It is the first thing done to a frame once the screen
-//! has drawn it, before the picker's effects and the fade paint over it.
-//!
-//! # What fades from it
-//!
-//! The fade and the picker's effects paint colours of their own, and each one
-//! takes a cell from the colour it is drawn in ([`crate::fade::drawn_in`]):
-//! the ink this pass gave it, or for a dim cell the terminal's foreground. So
-//! a themed screen dissolves out of the colours it is drawn in, the dim ones
-//! with the rest, rather than jumping on the first frame. What an effect draws
-//! of its own — the bar a row the cursor left lets go of — is the ink. The one
-//! colour that is not the ink is the warning: while a kill asks `[y/N]`, the
-//! selection's bar warms from the ink towards the terminal's own red, as it
-//! warms from the terminal's foreground with no theme (see
-//! [`crate::ui::effects`]).
-//!
-//! What nvmux draws over a session is bytes rather than a frame. The notice a
-//! switch puts up ([`crate::announce`]) and the name an attach hands across
-//! ([`crate::handoff`]) write the ink into their pen
-//! ([`crate::announce::pen`]), and dissolve from it
-//! ([`crate::fade::Dissolve`]). The hint bar the prefix puts up
-//! ([`crate::hint`]) is the picker's hint row, and like it stays dim.
-//!
-//! # What it never touches
-//!
-//! Neovim's screen. Whichever client draws a session draws it in the editor's
-//! colours, and a session's own fade dissolves those ([`crate::shadow`]), not
-//! the ink. Nor the first-run screen ([`crate::ui::setup`]), which is up before
-//! there is a config to read the colour from.
-//!
-//! And `NO_COLOR` turns the theme off, as it does everything else that paints
-//! a colour: [`ink`] is then `None`, and every screen is exactly what it is
-//! with no theme at all.
+//! Neovim's screen and the first-run screen ([`crate::ui::setup`], shown before
+//! any config exists) are never inked. `NO_COLOR` turns the theme off.
 
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
@@ -61,8 +18,7 @@ use ratatui::style::{Color, Modifier};
 use crate::config::ThemeColor;
 use crate::palette::Rgb;
 
-/// The colour nvmux's own screens are drawn in, or `None` for the terminal's
-/// own: no `[style] color`, or `NO_COLOR`.
+/// `None` means the terminal's own colour: no `[style] color`, or `NO_COLOR`.
 pub fn ink() -> Option<Rgb> {
     configured(
         crate::config::get().style.color,
@@ -70,9 +26,7 @@ pub fn ink() -> Option<Rgb> {
     )
 }
 
-/// The gate itself, without the process globals [`ink`] reads. `NO_COLOR`
-/// wins over the config, as it does for the fade: honouring it means setting
-/// no colour whatever the file asks for.
+/// [`ink`] without the process globals. `NO_COLOR` wins over the config.
 fn configured(color: ThemeColor, no_color: bool) -> Option<Rgb> {
     match color {
         ThemeColor::Mono(ink) if !no_color => Some(ink),
@@ -80,23 +34,17 @@ fn configured(color: ThemeColor, no_color: bool) -> Option<Rgb> {
     }
 }
 
-/// Draw everything on `buf` that is at full strength and has no colour of its
-/// own in the ink, if there is one: the first thing done to a frame of any of
-/// nvmux's screens once it is drawn.
+/// Ink every full-strength cell of `buf` that has no colour of its own, if
+/// there is an ink.
 pub fn paint(buf: &mut Buffer) {
     if let Some(ink) = ink() {
         paint_in(buf, ink);
     }
 }
 
-/// [`paint`], with the ink handed in rather than read.
-///
-/// Every cell whose foreground is the terminal's own and that is not dim,
-/// blank or not: a blank shows none of it, and one that is reversed,
-/// underlined or struck through shows it as its bar or its line. A dim cell
-/// keeps the terminal's foreground, which the terminal dims, as it did before
-/// there was a theme. A foreground something has already set is that colour
-/// on purpose, and is left alone; so is every background, and every modifier.
+/// [`paint`] with a given ink. Blank cells are inked too, so reversed or
+/// underlined ones show it as their bar or line. Set foregrounds, backgrounds
+/// and modifiers are left alone.
 pub(crate) fn paint_in(buf: &mut Buffer, ink: Rgb) {
     let colour = Color::Rgb(ink.0, ink.1, ink.2);
     for cell in &mut buf.content {
@@ -120,8 +68,6 @@ mod tests {
         Color::Rgb(c.0, c.1, c.2)
     }
 
-    /// The config's colour, unless `NO_COLOR` says none at all; and none for
-    /// the terminal's own whatever `NO_COLOR` says.
     #[test]
     fn the_ink_is_the_configured_colour_unless_no_color_says_none() {
         assert_eq!(configured(ThemeColor::Mono(INK), false), Some(INK));
@@ -130,16 +76,12 @@ mod tests {
         assert_eq!(configured(ThemeColor::Terminal, true), None);
     }
 
-    /// No config is ever installed under test, so the screens are the
-    /// terminal's own, and every other test's expectations stand.
+    /// No config is installed under test, so other tests see no ink.
     #[test]
     fn under_test_there_is_no_ink() {
         assert_eq!(ink(), None);
     }
 
-    /// The pass colours what is at full strength and had no colour, and
-    /// nothing else: what is dim stays the terminal's, a colour already set
-    /// stays, no background is set, no modifier is touched.
     #[test]
     fn only_full_strength_text_with_no_colour_takes_the_ink() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 2));
@@ -167,9 +109,8 @@ mod tests {
         assert_eq!(buf[(2, 0)].fg, colour(INK), "a bar of ink");
     }
 
-    /// A themed screen dissolves out of the colours it is drawn in: what is at
-    /// full strength from the ink, what is dim from the terminal's foreground
-    /// — so neither changes colour on the fade's first frame.
+    /// Full-strength cells fade from the ink and dim ones from the terminal's
+    /// foreground, so neither jumps on the fade's first frame.
     #[test]
     fn a_themed_screen_dissolves_out_of_the_colours_it_is_drawn_in() {
         let p = terminal();

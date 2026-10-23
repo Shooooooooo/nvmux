@@ -1,76 +1,35 @@
-//! The cards nvmux shows in the margin of the screen (see [`crate::card`]):
-//! kept here as they come, and drawn over the frame the client composes.
+//! Draws the margin cards (see [`crate::card`]) over the composed frame:
+//! last, so nothing of the editor's covers them, and from kept state on every
+//! frame, so an editor redraw (`:mode`, a resize) does not erase them.
 //!
-//! Over it, and last — after the windows, the floats and the cursor's effects
-//! — so that nothing of the editor's is ever drawn over a card. And drawn from
-//! what the client keeps rather than written once: the editor clearing its
-//! screen (`:mode`, a resize) and drawing it again is a frame like any other,
-//! and the card is on it.
-//!
-//! # A note in the margin
-//!
-//! No box. Lines set flush right, two columns in from the edge, from a row
-//! down, off the tab line. News:
+//! News is a borderless note, flush right two columns from the edge, from
+//! row 1 (below the tab line), newest on top, as many as fit above the status
+//! and command lines:
 //!
 //! ```text
 //!                       ∗ api-server  2s
 //!     Claude Code · Claude needs your permission
 //! ```
 //!
-//! its sign in the colour the editor has for its kind — `WarningMsg`'s for a
-//! notification, `ErrorMsg`'s for a failure, `OkMsg`'s for a command that
-//! finished ([`Signs`]) — or in `[style] color`, which takes their place; the
-//! session's name bold, in the editor's text colour or the theme's; its age
-//! counting on, faint; and what happened in italics, softer than the text.
-//! The newest on top, a row between one and the next, as many as there is
-//! room for above the status line and the command line, which a note never
-//! covers.
+//! It fades in sign, title, then body, and out in reverse, except that the
+//! sign dims and moves to the edge as the session's mark (one per row under
+//! the notes) until the session is opened. A newer card about the same
+//! session replaces it. Timings are in units of nvmux's fade
+//! ([`crate::fade`]). While the prefix is held, the card the key acts on
+//! ([`crate::card::Desk::go`]) is shown whole with its key under it.
 //!
-//! Where a switch landed is a row of names: the session landed in, bold,
-//! between the one `<prefix> p` goes to and the one `<prefix> n` goes to,
-//! faint — and under it, that the session is waiting for a key, where it is.
-//! It takes no part in the session's own fade: drawn before the session's
-//! screen dissolves in, it stands while the screen comes in under it (see
-//! [`arrival_footprint`]) — and on a switch by key, from the key on, the
-//! session left drawing it as it goes, and the screen handed over between the
-//! two keeping it (see [`crate::handoff`]). A switch by `<prefix> n` or
-//! `<prefix> p` moves the row a name the way it went, from the moment it is
-//! up — the key — and on through both fades, the screen it lands on taking
-//! it up as far along as it has come ([`crate::card::Card::up_ms`]): the
-//! session left goes faint as the one landed in comes up, a name goes off one
-//! end and the next comes on at the other.
+//! An arrival (after a switch) is a row of names: the session landed in,
+//! bold, between the `<prefix> p` and `<prefix> n` targets, and under it
+//! whether the session waits for a key. It stays still while the screen
+//! dissolves in under it ([`arrival_footprint`], [`crate::handoff`]). After
+//! `<prefix> n`/`p` the row slides one name that way from the key press on,
+//! continuing across screens ([`crate::card::Card::up_ms`]).
 //!
-//! # The sign first, and it stays
-//!
-//! News comes a piece at a time: the sign, a little brighter than itself and
-//! settling; then who; then what. Its life over, it goes the other way round,
-//! all but the sign, which dims and moves to the edge, and stays — the mark
-//! the session keeps, one to a row under the notes, until its session is
-//! opened, which is a switch, and so another screen. A newer card about the
-//! same session takes its place. All of it is timed in nvmux's own fade (see
-//! [`crate::fade`]), and with the fade off comes and goes at once.
-//!
-//! # The key
-//!
-//! While the prefix is held, the card the key acts on says so under it,
-//! `Ctrl-Space ⏎ go there`: the newest that goes somewhere (see
-//! [`crate::card::Desk::go`]), its words again with it if they have gone.
-//!
-//! # What is under them
-//!
-//! The editor's text goes on under the cards, taken toward the background
-//! the nearer it is to one of their lines — a row counting as two columns, a
-//! cell being about twice as tall as it is wide — and under a line itself
-//! emptied: so the note reads on a busy screen, and the screen around it
-//! still reads as itself. A note takes all of that at once, for every line it
-//! has, and has it before any of its words come, as its sign does; and gives
-//! it back once they have all gone: so the words come up on a patch already
-//! quiet, rather than the quiet spreading as they come. An arrival's covers
-//! all the way the names on its row go on a step, and stays still as the
-//! row moves. A sign on its own takes less of it, and not as far. The status line
-//! and the command line are left as they are. What is drawn comes up out of
-//! what is under it: that fades to the background over the first half of a
-//! piece's coming, and the piece comes up out of it over the second.
+//! Editor text near a card is dimmed by distance from its lines (a row counts
+//! as two columns, cells being twice as tall as wide) and emptied under them.
+//! A note dims its whole area before its words come and restores it after
+//! they go; an arrival dims its whole slide path. The status and command
+//! lines are never dimmed.
 
 use std::time::{Duration, Instant};
 
@@ -84,91 +43,78 @@ use crate::card::{Card, Command, Kind};
 use crate::falloff::{self, ease, ASPECT, EMPTIED, PEAK, REACH};
 use crate::palette::Rgb;
 
-/// The widest a card's line is: the width the design was drawn at, which takes
-/// a command and its exit status on one line.
+/// Maximum line width; fits a command and its exit status on one line.
 const WIDTH: usize = 46;
 
-/// The smallest screen a card goes up on.
+/// Smallest screen cards are drawn on.
 const MIN_COLS: usize = 24;
 const MIN_ROWS: usize = 6;
 
-/// The row the first card is on: one down, off the tab line.
+/// First card row, below the tab line.
 const TOP: usize = 1;
 
-/// Columns between a card's lines and the right edge of the screen.
+/// Columns between cards and the screen's right edge.
 const MARGIN: usize = 2;
 
-/// Rows at the bottom no card covers, and the dimming leaves alone: the
-/// status line and the command line.
+/// Bottom rows never covered or dimmed: the status and command lines.
 const BOTTOM: usize = 2;
 
-/// How often a card on the move is drawn again: the client's own frame rate.
+/// Redraw interval while animating: the client's frame rate.
 const FRAME: Duration = Duration::from_millis(16);
 
-/// How much of the text colour each grey keeps, the rest the background: the
-/// greys the design was drawn in, between Neovim's default foreground and
-/// background. Dim for the key; faint for an age, and for the sessions either
-/// side of the one a switch landed in; soft for what happened, and for a
-/// session waiting for a key.
+/// Greys, as the percentage of text colour mixed into the background. Dim:
+/// the key. Faint: the age and an arrival's neighbouring names. Soft: the
+/// body and the waiting line.
 const DIM: u8 = 58;
 const FAINT: u8 = 38;
 const SOFT: u8 = 79;
 
-/// How much of its own colour a sign comes in with, the rest white.
+/// Percentage of its own colour a sign starts with, the rest white.
 const LIT: u8 = 55;
 
 const WHITE: Rgb = Rgb(0xff, 0xff, 0xff);
 
-/// How much of itself a sign keeps as a mark.
+/// Strength a sign keeps as a mark.
 const MARKED: f32 = 0.5;
 
 /// Columns between the names on an arrival's row.
 const GAP: usize = 3;
 
-/// The dimming under the cards is [`crate::falloff`]'s, shared with the
-/// settings when they float over a session: how far it reaches from a line,
-/// and how far it takes what is right beside one toward the background. Less,
-/// and not as far, around a sign.
+/// Dimming around a lone sign: less, and nearer, than [`crate::falloff`]'s
+/// for lines.
 const SIGN_REACH: f32 = REACH * 0.45;
 const SIGN_PEAK: f32 = 0.7;
 
-/// When each piece of a card comes and goes, in fades — nvmux's fade one way,
-/// the card's [`Card::fade_ms`] — each a start and a length.
+/// Piece timings as `(start, length)` in units of [`Card::fade_ms`].
 ///
-/// News: the sign, then who, then what, the sign's colour settling as they
-/// come, and all of it up by [`SAID`].
+/// News coming in; all of it is up by [`SAID`].
 const SIGN_IN: (f32, f32) = (0.0, 1.6);
 const SETTLE: (f32, f32) = (1.6, 3.6);
 const HEAD_IN: (f32, f32) = (2.6, 2.2);
 const BODY_IN: (f32, f32) = (4.3, 2.6);
 const SAID: f32 = 6.9;
 
-/// And from the end of its life: what, then who, go, and the sign goes to
-/// the edge and dims, a mark.
+/// News going, from the end of its life.
 const BODY_OUT: (f32, f32) = (0.0, 2.2);
 const HEAD_OUT: (f32, f32) = (1.2, 2.2);
 const TO_MARK: (f32, f32) = (2.6, 3.0);
 
-/// What is under a note is taken back as its sign comes, before any of its
-/// words, and given back from the end of its life once they have gone — at
-/// which the rows they took are let go of, [`UNSAID`].
+/// Dimming under a note: in with the sign, out after the words, which free
+/// their rows at [`UNSAID`].
 const MASK_IN: (f32, f32) = (0.0, 1.6);
 const MASK_OUT: (f32, f32) = (3.4, 1.6);
 const UNSAID: f32 = MASK_OUT.0 + MASK_OUT.1;
 
-/// A card let go of fades out, all of it, over this.
+/// Fade-out of a dropped card.
 const LET_GO: f32 = 3.0;
 
-/// An arrival's row moves the way the switch went from the moment it is up —
-/// for a switch by key, the key: it is up on the screen being left before
-/// that dissolves (see [`Card::up_ms`]) — and the arrival goes over
-/// [`ARRIVAL_OUT`] once its life is over.
+/// An arrival's row slides from when it is up (for a switch by key, the key
+/// press; see [`Card::up_ms`]) and fades over [`ARRIVAL_OUT`] after its life.
 const SLIDE: (f32, f32) = (0.0, 2.8);
 const ARRIVAL_OUT: f32 = 3.0;
 
-/// The colours the editor has for each kind of news, which a sign is drawn
-/// in: `WarningMsg`'s for a notification, `ErrorMsg`'s for a failure, and
-/// `OkMsg`'s for a command that finished.
+/// Sign colours: `WarningMsg` (notified), `ErrorMsg` (failed), `OkMsg`
+/// (finished).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signs {
     pub notified: Rgb,
@@ -177,9 +123,8 @@ pub struct Signs {
 }
 
 impl Signs {
-    /// As `model` has them: each group's text colour as it shows; for one the
-    /// editor has not got — `OkMsg` is newer than Neovim 0.11 — the
-    /// terminal's own bright yellow, red or green.
+    /// Missing groups (`OkMsg` is newer than Neovim 0.11) fall back to the
+    /// terminal's bright yellow, red or green.
     pub fn of(model: &Model) -> Self {
         let colors = model.colors();
         let group = |name: &str, ansi: usize| {
@@ -210,40 +155,36 @@ pub struct Cards {
 struct Live {
     card: Card,
     shown_at: Instant,
-    /// When it was first drawn, which is what it is timed from (see
-    /// [`Live::origin`]): a card that came while the editor was still drawing
-    /// its first screen has not been seen yet.
+    /// Timing starts here (see [`Live::origin`]), not on arrival: the editor
+    /// may still be drawing its first screen.
     drawn_at: Option<Instant>,
-    /// Let go of — acted on, or about what has nothing more to say — and
-    /// fading out from then.
+    /// Dropped (acted on, or obsolete); fades out from then.
     dropped_at: Option<Instant>,
-    /// A newer card about the same has come: this one goes with its words,
-    /// and leaves no mark.
+    /// Replaced by a newer card about the same session; leaves no mark.
     superseded: bool,
 }
 
-/// How far each piece of a card is in at a moment, from 0 to 1.
+/// How far in each piece of a card is, 0 to 1.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct Pieces {
     sign: f32,
-    /// How much brighter than its colour the sign is: all of it as it comes,
-    /// none once it has settled.
+    /// The sign's extra brightness: 1 as it comes, 0 once settled.
     lit: f32,
     head: f32,
     body: f32,
-    /// How far the sign has gone to being a mark: dimmer, and at the edge.
+    /// The sign's progress to a mark: dimmer, at the edge.
     marked: f32,
-    /// How much of what is under all of its lines is taken back.
+    /// Strength of the dimming under its lines.
     mask: f32,
     /// Whether its words still take their rows.
     words: bool,
-    /// For an arrival: how far its row has moved, and how much of it there is.
+    /// Arrival only: how far its row has slid, and its overall strength.
     slide: f32,
     whole: f32,
 }
 
 impl Pieces {
-    /// All of it, as the prefix held shows the card the key acts on.
+    /// Fully shown, as the keyed card is while the prefix is held.
     const WHOLE: Self = Self {
         sign: 1.0,
         lit: 0.0,
@@ -257,20 +198,19 @@ impl Pieces {
     };
 }
 
-/// Milliseconds, as the pieces are timed in them: rounded once, from a
-/// duration exact to the microsecond, so that the moment a piece is due at
-/// (see [`Live::next_change`]) is never a moment before it.
+/// Converted once from an exact duration, so a frame at the instant
+/// [`Live::next_change`] picked is never judged before the move it was for.
 fn ms(d: Duration) -> f32 {
     (d.as_secs_f64() * 1000.0) as f32
 }
 
-/// `span`, in fades of `fade` milliseconds, from `from`.
+/// A `(start, len)` span in fade units, to milliseconds after `from`.
 fn scaled((start, len): (f32, f32), fade: f32, from: f32) -> (f32, f32) {
     (from + start * fade, len * fade)
 }
 
-/// How far through `(start, len)` `t` is, eased in and out; all at once at
-/// `start`, where it takes no time.
+/// Eased progress of `t` through `(start, len)`; a step at `start` if `len`
+/// is 0.
 fn ramp(t: f32, (start, len): (f32, f32)) -> f32 {
     if len <= 0.0 {
         f32::from(u8::from(t >= start))
@@ -294,15 +234,14 @@ impl Live {
         }
     }
 
-    /// nvmux's fade one way, in milliseconds.
+    /// One fade, in milliseconds.
     fn fade(&self) -> f32 {
         self.card.fade_ms as f32
     }
 
-    /// What it is timed from, once it has been drawn: its first frame — or
-    /// for one that was up on another screen first, as long before it came
-    /// as it had been up there ([`Card::up_ms`]), so that it goes on as it
-    /// was going rather than starting over.
+    /// Timing origin once drawn: the first frame, or for a card already up on
+    /// another screen, its arrival backdated by [`Card::up_ms`] so it
+    /// continues rather than restarts.
     fn origin(&self) -> Option<Instant> {
         let drawn = self.drawn_at?;
         if self.card.up_ms == 0 {
@@ -312,31 +251,29 @@ impl Live {
         Some(self.shown_at.checked_sub(up).unwrap_or(self.shown_at))
     }
 
-    /// How long it has been up at `now`, in milliseconds.
+    /// Milliseconds since [`Live::origin`]; 0 until drawn.
     fn t(&self, now: Instant) -> f32 {
         self.origin()
             .map_or(0.0, |at| ms(now.saturating_duration_since(at)))
     }
 
-    /// When the life of news is over, and its words go.
+    /// When news's life ends and its words start to go, in ms.
     fn leave(&self) -> f32 {
         SAID * self.fade() + self.card.life_ms as f32
     }
 
-    /// Whether it goes with its words and leaves no mark: one a newer card has
-    /// taken the place of, or news that leaves none.
+    /// Whether it leaves no mark: superseded, or news without one.
     fn passes(&self) -> bool {
         self.superseded || self.card.mark.is_none()
     }
 
-    /// Whether it is a mark by now: news whose words have gone, or were never
-    /// said.
+    /// Whether it is only a mark by now: news whose words have gone or never
+    /// came.
     fn is_mark(&self, now: Instant) -> bool {
         self.card.kind != Kind::Arrival
             && (self.card.only_mark || self.t(now) >= self.leave() + UNSAID * self.fade())
     }
 
-    /// How old the news is, by now.
     fn age(&self, now: Instant) -> Option<u64> {
         let since = now.saturating_duration_since(self.shown_at).as_secs();
         self.card.age.map(|age| age + since)
@@ -346,7 +283,6 @@ impl Live {
         self.card.row.as_ref().is_some_and(|r| r.step.is_some())
     }
 
-    /// How far each piece of it is in at `now`.
     fn pieces(&self, now: Instant) -> Pieces {
         let u = self.fade();
         let t = self.t(now);
@@ -405,7 +341,6 @@ impl Live {
         p
     }
 
-    /// Whether it has gone by `now`.
     fn gone(&self, now: Instant) -> bool {
         let u = self.fade();
         if let Some(at) = self.dropped_at {
@@ -423,10 +358,9 @@ impl Live {
         }
     }
 
-    /// When it next looks different from how a frame drawn at `drawn` showed
-    /// it — `whole` saying whether that showed it whole, as the prefix held
-    /// shows the card the key acts on: a step of a piece on the move, the
-    /// moment one starts to, the next tick of an age that shows.
+    /// When it next looks different from a frame drawn at `drawn` (`whole` if
+    /// that frame showed it whole): the next animation step, the start of the
+    /// next move, or the age's next tick.
     fn next_change(&self, drawn: Instant, whole: bool) -> Option<Instant> {
         let origin = self.origin()?;
         let u = self.fade();
@@ -450,7 +384,7 @@ impl Live {
                 moves.push((self.leave(), going * u));
             }
         }
-        // The microsecond a move starts at, or the one after.
+        // Rounded up to the microsecond.
         let at = |when: f32| {
             origin + Duration::from_micros((f64::from(when.max(0.0)) * 1000.0).ceil() as u64)
         };
@@ -476,7 +410,7 @@ impl Live {
 }
 
 impl Cards {
-    /// Do what the relay said. Says whether anything changed on the screen.
+    /// Apply a relay command; returns whether the screen changed.
     pub fn apply(&mut self, cmd: Command, now: Instant) -> bool {
         match cmd {
             Command::Show(card) => {
@@ -505,9 +439,7 @@ impl Cards {
                 }
                 changed
             }
-            // A relay opening, with the prefix let go of whatever this client
-            // last heard: the one before may have ended on a key the prefix
-            // was held for.
+            // A new relay: reset `held`, as the last may have ended mid-prefix.
             Command::Clear => {
                 self.held = false;
                 !std::mem::take(&mut self.live).is_empty()
@@ -516,38 +448,34 @@ impl Cards {
                 let was = std::mem::replace(&mut self.held, held);
                 was != held && self.keyed().is_some()
             }
-            // The client's, not the cards': see `App::reconfigure` and
-            // `App::go_away`.
+            // Handled by `App::reconfigure` and `App::go_away`.
             Command::Settings(_) | Command::Away => false,
         }
     }
 
-    /// Let go of the cards that are gone by `now`.
     pub fn expire(&mut self, now: Instant) {
         self.live.retain(|l| !l.gone(now));
     }
 
-    /// Whether any card is up.
     pub fn is_empty(&self) -> bool {
         self.live.is_empty()
     }
 
-    /// The card the key acts on: the newest that goes somewhere, and has not
-    /// been acted on or had its place taken.
+    /// The card the key acts on: the newest with a target that is neither
+    /// dropped nor superseded.
     fn keyed(&self) -> Option<usize> {
         self.live
             .iter()
             .position(|l| l.card.footer.is_some() && l.dropped_at.is_none() && !l.superseded)
     }
 
-    /// The card shown whole, its key under it: the one the key acts on, while
-    /// the prefix is held.
+    /// The keyed card while the prefix is held, shown whole with its key.
     fn whole(&self) -> Option<usize> {
         self.held.then(|| self.keyed()).flatten()
     }
 
-    /// When the cards next look different from how a frame drawn at `drawn`
-    /// showed them, and so when a frame is wanted: due once that is past.
+    /// When the next frame is wanted: the cards' next change after a frame
+    /// drawn at `drawn`.
     pub fn next_frame(&self, drawn: Instant) -> Option<Instant> {
         let whole = self.whole();
         self.live
@@ -557,8 +485,7 @@ impl Cards {
             .min()
     }
 
-    /// Draw the cards up at `now` over `frame`: on `base`, the editor's own
-    /// colours, resolved through `colors`, with the signs in `signs`.
+    /// Draw the cards over `frame`; `base` is the editor's default style.
     pub fn paint(
         &mut self,
         frame: &mut Frame,
@@ -567,8 +494,8 @@ impl Cards {
         signs: &Signs,
         now: Instant,
     ) {
-        // Timed from this frame on, whether or not the screen has room for
-        // them: one that grows to have room does not show what is old by then.
+        // Start timing even without room, so a screen that grows later does
+        // not replay old cards from the start.
         for l in &mut self.live {
             l.drawn_at.get_or_insert(now);
         }
@@ -580,8 +507,7 @@ impl Cards {
         let bottom = frame.height - BOTTOM;
         let whole = self.whole();
         let mut sheet = Sheet::new(frame.width);
-        // The words first, newest on top, a row between one and the next; the
-        // marks after them, one to a row.
+        // Words first, newest on top, a row apart; then marks, one per row.
         let mut row = TOP;
         let mut room = true;
         let mut marks = Vec::new();
@@ -621,8 +547,7 @@ impl Cards {
     }
 }
 
-/// Where a card's lines end — the column of their last character — and the
-/// widest one may be.
+/// The column of a card line's last character, and the widest a line may be.
 #[derive(Debug, Clone, Copy)]
 struct Margin {
     end: usize,
@@ -630,7 +555,6 @@ struct Margin {
 }
 
 impl Margin {
-    /// On a screen `cols` wide.
     fn of(cols: usize) -> Self {
         Self {
             end: cols - MARGIN - 1,
@@ -639,16 +563,15 @@ impl Margin {
     }
 }
 
-/// The rows `card` takes while its words are up: the arrival's row of names
-/// or the note's first line, what it says under that, and where `keyed`, a
-/// row and the key.
+/// Rows `card` takes while its words are up: its first line, the body if
+/// any, and if `keyed` a blank row and the key.
 fn height(card: &Card, keyed: bool) -> usize {
     let key = if keyed && card.footer.is_some() { 2 } else { 0 };
     1 + usize::from(card.body.is_some()) + key
 }
 
-/// Where a note's first line goes, ending at the margin: its sign's column,
-/// then the session, cut to fit, and its age, which never gives way.
+/// A note's first line, ending at the margin: the sign's column, the title
+/// (cut to fit) and the age (never cut).
 struct Head {
     sign: usize,
     title: String,
@@ -679,8 +602,8 @@ fn head(card: &Card, age: Option<u64>, at: Margin) -> Head {
     }
 }
 
-/// A note with news on `row`: its sign, who, its age and what — over all of
-/// what it covers taken back as one, however far its words have come.
+/// Draw a note on `row`; the dimming covers all its lines however far its
+/// words are in.
 fn news(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens: &Pens, now: Instant) {
     let card = &l.card;
     let h = head(card, l.age(now), at);
@@ -696,7 +619,7 @@ fn news(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens: &P
     }
 }
 
-/// The key that acts on `card`, a row under its note on `row`.
+/// The key line, a blank row under the note on `row`.
 fn key(sheet: &mut Sheet, card: &Card, row: usize, at: Margin, pens: &Pens) {
     let Some(key) = &card.footer else {
         return;
@@ -708,9 +631,8 @@ fn key(sheet: &mut Sheet, card: &Card, row: usize, at: Margin, pens: &Pens) {
     sheet.part(below, from, at.end, 1.0, PEAK, REACH);
 }
 
-/// `card`'s sign on `row`: from column `from`, gone `p.marked` of the way to
-/// the edge, `end`, and to being a mark — and from its own kind's to the one
-/// it leaves.
+/// `card`'s sign on `row`, moved `p.marked` of the way from `from` to `end`
+/// and dimmed toward a mark, whose kind it shows once marking starts.
 fn sign(
     sheet: &mut Sheet,
     card: &Card,
@@ -742,10 +664,9 @@ fn sign(
     sheet.part(row, col, col, p.sign * strength, SIGN_PEAK, SIGN_REACH);
 }
 
-/// One name on an arrival's row: where it is before the row moves and after,
-/// whether it is the session the switch left and the one it landed in, and
-/// how much of it there is before and after — one going off the end of the
-/// row, or coming on at the other.
+/// A name on an arrival's row. `cols` and `there` are (before, after) the
+/// slide: its column, and its presence (0 for a name sliding off or on).
+/// `left` and `landed` mark the sessions switched from and to.
 struct Name<'a> {
     text: &'a str,
     cols: (isize, isize),
@@ -772,22 +693,19 @@ impl<'a> Name<'a> {
     }
 }
 
-/// An arrival laid out on its row: its names, each from where it lies
-/// before a step to where it lies after, and the columns it covers — for a
-/// step, all the way its names go, the one going off and the one coming on
-/// among them, out to the edge of the screen; the one span while it moves —
-/// and the line under it, that the session is waiting for a key, and where.
+/// An arrival's layout: its names, the columns it covers (for a step, the
+/// whole slide path out to the screen's edge), and the waiting line with its
+/// columns.
 struct Landing<'a> {
     names: Vec<Name<'a>>,
     covers: (usize, usize),
     waiting: Option<(String, usize, usize)>,
 }
 
-/// `card`'s names, the one landed in cut to `title`, laid out flush right in
-/// the margin, a gap between: the one landed in alone where they are too
-/// wide for it.
+/// Lay out `card`'s names flush right, [`GAP`] apart, the landed one as
+/// `title`; only the landed one if they do not fit.
 fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
-    // Flush right, a gap between: `None` where the names are too wide.
+    // Columns for `names` flush right, or `None` if too wide.
     let lay = |names: &[&str]| -> Option<Vec<isize>> {
         let width = names.iter().map(|n| n.width()).sum::<usize>() + GAP * (names.len() - 1);
         let mut col = (at.end + 1)
@@ -846,12 +764,11 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
         _ => None,
     };
     if let Some((forward, before, prev, next, gone)) = moving {
-        // The row moves by what the name landed in moves by.
+        // The row shifts by as much as the landed name moves.
         let landed_before = if forward { before[2] } else { before[0] };
         let shift = after[1] - landed_before;
         let name = Name::new;
-        // Going off the end, coming on at the other, the one left and the one
-        // landed in, and the rest: each from where it was to where it goes.
+        // Each name's columns and presence before and after the slide.
         let (off, on) = ((1.0, 0.0), (0.0, 1.0));
         names = if forward {
             vec![
@@ -868,9 +785,8 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
                 name(gone, (before[2], before[2] + shift), false, false, off),
             ]
         };
-        // All the way the names go, off one end and on at the other, and
-        // past the margin there: a name half out of the patch would be half
-        // gone with the screen, through a fade it stands in.
+        // Cover the whole slide path, out past the margin: a name half
+        // outside the covered area would half fade with the screen.
         covers = names
             .iter()
             .map(|n| n.cols.0.min(n.cols.1))
@@ -891,28 +807,24 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
     }
 }
 
-/// Where an arrival stands on a screen, as the one card up — as a relay opens
-/// with it — on any frame it is drawn on, its row still or on the move.
+/// Where an arrival is drawn as the only card (as a relay opens with it), on
+/// any frame, still or sliding.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Footprint {
-    /// On each of its rows, the columns it covers: its row of names as wide as
-    /// it lies either side of a step, and the line under it.
+    /// `(row, from, to)` covered: the names' row across the whole step, and
+    /// the waiting line.
     pub spans: Vec<(usize, usize, usize)>,
-    /// What it writes on them that stays where it is: each character, and
-    /// the cell it starts on.
+    /// Characters that stay put, as `(row, col, char)`.
     pub glyphs: Vec<(usize, usize, char)>,
-    /// And what moves with its row, for a step: the names on it all the
-    /// while, each character on the cell it starts on before the step. After
-    /// it they are `shift` columns along, and as the row moves, anywhere from
-    /// the one to the other — all of them the same way.
+    /// For a step, the characters of names on the row throughout, at their
+    /// cells before the step. They move together, by up to `shift` columns.
     pub moving: Vec<(usize, usize, char)>,
     pub shift: isize,
 }
 
-/// Where `card`, an arrival, stands on a screen `cols` wide and `rows` high:
-/// what a session's dissolve leaves standing (see [`crate::shadow::Kept`]), so
-/// that it stays as it is while the screen under it comes and goes. Nothing
-/// where it would not be drawn: not an arrival, or a screen too small for it.
+/// Where arrival `card` stands on a `cols` x `rows` screen: what a session's
+/// dissolve leaves standing (see [`crate::shadow::Kept`]) so the card stays
+/// still. Empty if `card` is not an arrival or the screen is too small.
 pub fn arrival_footprint(card: &Card, cols: usize, rows: usize) -> Footprint {
     if card.kind != Kind::Arrival
         || cols < MIN_COLS
@@ -936,8 +848,7 @@ pub fn arrival_footprint(card: &Card, cols: usize, rows: usize) -> Footprint {
     };
     let (mut glyphs, mut moving, mut shift) = (Vec::new(), Vec::new(), 0);
     for n in &landing.names {
-        // One coming on to the row or going off it is drawn on some of its
-        // frames and not on others.
+        // Names sliding on or off are not on every frame.
         if n.there.0 < 1.0 || n.there.1 < 1.0 {
             continue;
         }
@@ -965,8 +876,6 @@ pub fn arrival_footprint(card: &Card, cols: usize, rows: usize) -> Footprint {
     }
 }
 
-/// Where a switch landed, on `row`: the row of names, moving if the switch
-/// was a step along it, and under it that the session is waiting for a key.
 fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens: &Pens) {
     let card = &l.card;
     if p.whole <= 0.0 {
@@ -1002,7 +911,7 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
     }
 }
 
-/// `s` in at most `width` columns, cut with `…` where it is wider.
+/// Cut `s` to `width` columns, ending in `…` if cut.
 fn fit(s: &str, width: usize) -> String {
     if s.width() <= width {
         return s.to_string();
@@ -1039,14 +948,12 @@ impl Pen {
     }
 }
 
-/// The pens the cards are drawn with.
 struct Pens {
-    /// The editor's text colour and its background, as they show.
+    /// The editor's text and background colours, as shown.
     fg: Rgb,
     bg: Rgb,
-    /// The background a card's cells have: the editor's own, and the
-    /// terminal's where that is the editor's — a transparent terminal stays
-    /// transparent under a card.
+    /// Card cells' background: the editor's, left as the terminal default
+    /// where it is one, so a transparent terminal stays transparent.
     back: Color,
     /// What a cell under a line is emptied to.
     blank: Style,
@@ -1084,7 +991,7 @@ impl Pens {
         }
     }
 
-    /// A session's name on `card`: bold, in its theme colour or the text's.
+    /// Bold, in the theme colour or the text's.
     fn name(&self, card: &Card) -> Pen {
         Pen {
             fg: ink(card).unwrap_or(self.fg),
@@ -1093,8 +1000,8 @@ impl Pens {
         }
     }
 
-    /// The colour of `kind`'s sign on `card`: the theme's where there is one,
-    /// the text's under `NO_COLOR`, and otherwise the editor's for the kind.
+    /// The theme colour if any, the text colour under `NO_COLOR`, else the
+    /// kind's [`Signs`] colour.
     fn sign(&self, card: &Card, kind: Kind) -> Rgb {
         if let Some(ink) = ink(card) {
             return ink;
@@ -1115,8 +1022,7 @@ fn ink(card: &Card) -> Option<Rgb> {
     card.ink.map(|(r, g, b)| Rgb(r, g, b))
 }
 
-/// What the cards put on a frame: their glyphs, and the lines the dimming
-/// under them is measured from.
+/// The cards' glyphs, and the lines the dimming is measured from.
 struct Sheet {
     width: usize,
     glyphs: Vec<Glyph>,
@@ -1133,8 +1039,7 @@ struct Glyph {
     there: f32,
 }
 
-/// A line of a card, from one column to another, and how much of it there
-/// is: what the dimming is measured from.
+/// A span of a card line that the dimming is measured from.
 struct Part {
     row: usize,
     from: usize,
@@ -1157,8 +1062,7 @@ impl Sheet {
         self.text_at(row, col as isize, s, pen, there);
     }
 
-    /// `s` from column `col` of `row`, a character to a cell or two, as much
-    /// of it as is on the screen: a name on the move may be part way off it.
+    /// Clipped to the screen: a sliding name may be partly off it.
     fn text_at(&mut self, row: usize, col: isize, s: &str, pen: Pen, there: f32) {
         if there <= 0.0 {
             return;
@@ -1196,8 +1100,8 @@ impl Sheet {
         }
     }
 
-    /// Put it all on `frame`: what is above `bottom` dimmed, by the most any
-    /// line near a cell asks of it, and the glyphs over that.
+    /// Dim each cell above `bottom` by its strongest nearby part, then draw
+    /// the glyphs.
     fn lay(&self, frame: &mut Frame, bottom: usize, pens: &Pens, colors: &Colors) {
         let width = frame.width;
         let mut amounts = vec![0.0f32; width * bottom];
@@ -1238,8 +1142,8 @@ impl Sheet {
     }
 }
 
-/// `cell` taken `amount` of the way to the background, and emptied all the
-/// way. A cell on the terminal's own background keeps it.
+/// Fade `cell` `amount` of the way to the background, emptying it from
+/// [`EMPTIED`]. A terminal-default background is kept.
 fn hush(cell: &mut Out, amount: f32, pens: &Pens, colors: &Colors) {
     if amount >= EMPTIED {
         *cell = Out::blank(pens.blank);
@@ -1265,8 +1169,8 @@ fn hush(cell: &mut Out, amount: f32, pens: &Pens, colors: &Colors) {
     };
 }
 
-/// `g` over what is under it: that going to the background over the first
-/// half of the glyph's coming, the glyph coming up out of it over the second.
+/// Draw `g`: its cell fades to the background over the first half of its
+/// fade-in, and the glyph rises out of it over the second.
 fn put(frame: &mut Frame, g: &Glyph, pens: &Pens, colors: &Colors) {
     let cells = if g.wide { 2 } else { 1 };
     if g.there < 0.5 {
@@ -1330,8 +1234,7 @@ mod tests {
         }
     }
 
-    /// News as the notifier sends it, with no fade: up at once, and gone at
-    /// once.
+    /// News with no fade, so it comes and goes at once.
     fn news(id: u64) -> Card {
         Card {
             fade_ms: 0,
@@ -1383,8 +1286,7 @@ mod tests {
             .collect()
     }
 
-    /// The frame the client draws at `now`, the cards gone by then let go of
-    /// first, as it does.
+    /// Expire, then paint, as the client does.
     fn drawn(cards: &mut Cards, w: usize, h: usize, now: Instant) -> Frame {
         let mut f = frame(w, h);
         cards.expire(now);
@@ -1397,7 +1299,7 @@ mod tests {
         rows(&drawn(cards, w, h, now))
     }
 
-    /// `s` flush right on a row of `w` x's, the margin's two after it.
+    /// `s` flush right on a row of `w` x's, before the two-column margin.
     fn right(w: usize, s: &str) -> String {
         format!("{}{s}xx", "x".repeat(w - 2 - s.width()))
     }
@@ -1406,9 +1308,6 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    /// F as drawn: flush right, two columns in and a row down, the sign, the
-    /// session and its age, and under them what happened; nothing of the
-    /// editor's left under the lines, and the rest of it where it was.
     #[test]
     fn a_note_is_set_flush_right_in_the_margin() {
         let now = Instant::now();
@@ -1424,10 +1323,8 @@ mod tests {
         }
     }
 
-    /// The sign in the colour the editor has for its kind, the session bold
-    /// in the text's, the age faint and what happened soft and in italics; a
-    /// theme colour takes the sign's and the session's place, and `NO_COLOR`
-    /// leaves the sign the text's.
+    /// A theme colour replaces the sign's and the name's; `NO_COLOR` (`plain`)
+    /// leaves the sign in the text colour.
     #[test]
     fn a_note_is_drawn_in_the_editors_colours() {
         let now = Instant::now();
@@ -1470,8 +1367,6 @@ mod tests {
         assert_eq!(cell(plain, sign, 1).fg, Color::Rgb(c.term.fg));
     }
 
-    /// The newest on top, a row between one and the next, as many as fit
-    /// above the status line and the command line.
     #[test]
     fn notes_stack_newest_first_a_row_apart() {
         let now = Instant::now();
@@ -1494,9 +1389,8 @@ mod tests {
         assert_eq!(screen[11], "x".repeat(80));
     }
 
-    /// While the prefix is held, the card the key acts on says so under it —
-    /// the newest that names it, past a newer one that goes nowhere; once it
-    /// is acted on, the next; and once the prefix is let go of, none.
+    /// The keyed card is the newest with a target, skipping newer ones
+    /// without; once acted on, the next one.
     #[test]
     fn the_key_is_said_while_the_prefix_is_held() {
         let now = Instant::now();
@@ -1535,8 +1429,6 @@ mod tests {
         );
     }
 
-    /// The sign comes first, then who, then what; and the words go, and the
-    /// sign stays, at the edge and dimmer, the session's mark.
     #[test]
     fn the_sign_comes_first_and_stays() {
         let now = Instant::now();
@@ -1596,10 +1488,8 @@ mod tests {
         assert_eq!(cards.next_frame(leave + ms(600)), None, "still");
     }
 
-    /// What is under a note is taken back all at once, for every line it
-    /// has, and all of it before any of its words come: half way at half the
-    /// sign's coming, emptied by its end. And it is given back only once the
-    /// words have all gone.
+    /// The dimming covers every line at once: halfway at half the sign's
+    /// fade-in, emptied by its end, and restored only after the words go.
     #[test]
     fn what_is_under_a_note_is_taken_back_before_its_words_come() {
         let now = Instant::now();
@@ -1632,8 +1522,7 @@ mod tests {
         }
         assert_eq!(cards.next_frame(now + ms(160)), Some(now + ms(160) + FRAME));
 
-        // Its words gone, what they were on is still taken back, and given
-        // back after.
+        // Still dimmed just after the words have gone, then restored.
         let f = drawn(&mut cards, 100, 30, leave + ms(340));
         assert_eq!(f.get(2, 68).expect("a cell").text, Text::Char(' '));
         assert_eq!(f.get(1, 90).expect("a cell").text, Text::Char(' '));
@@ -1648,7 +1537,6 @@ mod tests {
         assert_eq!(f.get(2, 68).expect("a cell").style, Style::default());
     }
 
-    /// The marks are one to a row, under the notes, newest first.
     #[test]
     fn marks_are_a_row_each_under_the_notes() {
         let now = Instant::now();
@@ -1671,9 +1559,8 @@ mod tests {
         assert_eq!(screen[5], format!("{}✓xx", "x".repeat(97)));
     }
 
-    /// News leaves the sign it is told to — a notification's, say, that is
-    /// still waiting under a command's that has finished since — and a mark
-    /// alone, held up with the prefix, says its words again.
+    /// News can leave a different sign (e.g. a pending notification's under
+    /// a finished command's); a mark shown with the prefix repeats its words.
     #[test]
     fn a_mark_is_the_sign_the_session_has() {
         let now = Instant::now();
@@ -1691,8 +1578,8 @@ mod tests {
         assert_eq!(screen[4], right(100, "Ctrl-Space ⏎ go there"));
     }
 
-    /// A newer card about a session takes the older one's place: a mark at
-    /// once, and a note with its words up once they go — leaving the one mark.
+    /// A mark is replaced at once; a note with its words up only once they
+    /// go, leaving one mark per session.
     #[test]
     fn the_newer_card_about_a_session_takes_the_olders_place() {
         let now = Instant::now();
@@ -1731,9 +1618,8 @@ mod tests {
         assert_eq!(screen[3], "x".repeat(100), "one mark a session");
     }
 
-    /// Where a switch landed: the session, between the one `<prefix> p` goes
-    /// to and the one `<prefix> n` does; with two, the other after it; alone,
-    /// its name; and under it, that it is waiting for a key.
+    /// The session between its `<prefix> p` and `<prefix> n` targets; with
+    /// two sessions, the other after it; alone, just its name.
     #[test]
     fn an_arrival_is_where_you_are_in_the_row() {
         let now = Instant::now();
@@ -1773,9 +1659,8 @@ mod tests {
         );
     }
 
-    /// A step moves the row a name the way it went, from the moment it is up:
-    /// forward, a name off the left and the next on at the right; back, the
-    /// other way.
+    /// Forward, a name slides off the left and the next on at the right;
+    /// back, the other way.
     #[test]
     fn a_step_moves_the_row_the_way_it_went() {
         let now = Instant::now();
@@ -1785,8 +1670,7 @@ mod tests {
                 gone: gone.into(),
             })
         };
-        // `row` flush right, on the patch the row's names go over: from
-        // `from` out to the edge of the screen.
+        // `row` flush right on the cleared patch from `from` to the edge.
         let patch = |from: usize, row: &str| {
             format!(
                 "{}{}{row}  ",
@@ -1838,11 +1722,9 @@ mod tests {
         assert_eq!(after[1], patch(65, "nvmux   api-server   blog"));
     }
 
-    /// A card up on another screen first goes on from where it was there: the
-    /// card a switch lands with has its row as far along as it has come since
-    /// the key, on its first frame on the screen it lands on as on every one
-    /// after — and drawn first a while after it came, further along by that
-    /// while.
+    /// A handed-over arrival's row is as far along as it got since the key,
+    /// from its first frame on the new screen, plus any delay before that
+    /// frame.
     #[test]
     fn a_card_up_elsewhere_first_goes_on_from_there() {
         let now = Instant::now();
@@ -1879,13 +1761,10 @@ mod tests {
         );
     }
 
-    /// Where an arrival stands is where it is drawn, on every frame: what
-    /// stays where it is on its cell, and the names on the row all the while
-    /// all the same way along, from none of its shift on its first frame to
-    /// all of it once the row has moved — the names going off and coming on
-    /// not among them. The span is all the way the row's names go, out to the
-    /// edge of the screen; and the line that says the session is waiting has
-    /// its own.
+    /// On every frame, static glyphs are on their cells and the moving names
+    /// are all shifted equally, from 0 to `shift`; names sliding on or off are
+    /// excluded. The span is the whole slide path to the screen's edge, and
+    /// the waiting line has its own.
     #[test]
     fn an_arrival_stands_where_it_is_drawn() {
         let now = Instant::now();
@@ -1904,8 +1783,7 @@ mod tests {
         assert_eq!(footprint.shift, -7);
         let mut cards = Cards::default();
         cards.apply(Command::Show(card), now);
-        // How far along the moving names are on a frame, if they are all on
-        // their cells the same way along.
+        // The common shift of the moving names on a frame, if there is one.
         let along = |f: &Frame| {
             (footprint.shift..=0).find(|k| {
                 footprint.moving.iter().all(|&(row, col, ch)| {
@@ -1938,8 +1816,8 @@ mod tests {
         );
     }
 
-    /// A name or a line too wide is cut to fit, with `…`, and the age is never
-    /// what gives way; a row of names too wide is the one landed in alone.
+    /// The age is never cut; a row of names too wide shows only the landed
+    /// one.
     #[test]
     fn what_is_too_wide_is_cut_to_fit() {
         let now = Instant::now();
@@ -1967,8 +1845,7 @@ mod tests {
         assert_eq!(screen[1], right(60, "here"));
     }
 
-    /// Wide characters take their two cells, and what they would cut in half
-    /// is mended.
+    /// What a wide character would cut in half is mended.
     #[test]
     fn a_wide_name_takes_two_cells_a_character() {
         let now = Instant::now();
@@ -1979,8 +1856,7 @@ mod tests {
         assert_eq!(screen[1].width(), 30);
     }
 
-    /// The age counts on from what the relay said, and a frame is asked for
-    /// when it next ticks.
+    /// It counts from the relay's age, with a frame asked for at each tick.
     #[test]
     fn the_age_counts_on() {
         let now = Instant::now();
@@ -1993,9 +1869,8 @@ mod tests {
         assert_eq!(cards.next_frame(later), Some(now + Duration::from_secs(3)));
     }
 
-    /// The editor's text under a note dims the nearer it is to one of its
-    /// lines, a row counting as two columns; a reach away it is as it was,
-    /// and so are the status line and the command line.
+    /// A row counts as two columns; a reach away, and on the status and
+    /// command lines, text is untouched.
     #[test]
     fn what_is_under_a_note_dims_the_nearer_it_is() {
         let now = Instant::now();
@@ -2049,8 +1924,6 @@ mod tests {
         );
     }
 
-    /// A terminal's own background — a transparent one — stays its own under
-    /// the dimming and under the note.
     #[test]
     fn a_transparent_background_stays_transparent() {
         let now = Instant::now();
@@ -2066,8 +1939,7 @@ mod tests {
         }
     }
 
-    /// An arrival stays its life and goes; one let go of goes at once; a clear
-    /// takes them all, and lets the prefix go.
+    /// A clear also removes every card and resets the prefix.
     #[test]
     fn a_card_goes_when_its_time_is_up_or_it_is_let_go_of() {
         let now = Instant::now();
@@ -2098,8 +1970,7 @@ mod tests {
         );
     }
 
-    /// Timed from when it is first drawn, which may be a while after it came:
-    /// the editor drawing its first screen.
+    /// A card may arrive while the editor is still drawing its first screen.
     #[test]
     fn a_card_is_timed_from_when_it_is_first_drawn() {
         let now = Instant::now();
@@ -2114,7 +1985,6 @@ mod tests {
         assert!(!cards.is_empty());
     }
 
-    /// No card on a screen too small to hold one.
     #[test]
     fn no_card_on_a_screen_too_small() {
         let now = Instant::now();
