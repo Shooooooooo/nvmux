@@ -1168,8 +1168,11 @@ impl Trace {
     /// The agent's acks the frame that draws them did not follow, as Neovim
     /// sent them: each with its count and the view's top it says, and the
     /// top in the first frame after it — none where another ack came first.
+    /// An ack whose view the last frame already showed needs no frame of its
+    /// own: Neovim flushes none where nothing changed, and the client takes
+    /// such an ack at once (see `App::shows`).
     fn acks_without_their_frames(&self) -> Vec<(u64, u64, Option<u64>)> {
-        let mut top = None;
+        let (mut top, mut drawn) = (None, None);
         let mut waiting: Option<(u64, u64)> = None;
         let mut unframed = Vec::new();
         for (_, _, v) in self.messages(true) {
@@ -1179,7 +1182,9 @@ impl Trace {
                         unframed.push((count, said, None));
                     }
                     let field = |i: usize| rest.get(i).and_then(Value::as_u64);
-                    waiting = field(0).zip(field(10));
+                    waiting = field(0)
+                        .zip(field(10))
+                        .filter(|&(_, said)| drawn != Some(said));
                 }
                 Some(("redraw", events)) => {
                     for event in events.iter().filter_map(Value::as_array) {
@@ -1190,6 +1195,7 @@ impl Trace {
                                 }
                             }
                             Some("flush") => {
+                                drawn = top;
                                 if let Some((count, said)) = waiting.take() {
                                     if top != Some(said) {
                                         unframed.push((count, said, top));
