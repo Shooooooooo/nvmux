@@ -971,10 +971,14 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
     // as long as it needs to find a lull.
     term.type_bytes(&[nvmux::keys::PREFIX]);
     let mark = term.output.len();
+    // The whole of the row, not as far as a read happens to end in the
+    // middle of the write that draws it.
+    let listed = term.pump_until(Duration::from_secs(10), |out| {
+        let row = row_on_screen(out, ROWS - 1);
+        row.contains("␣ picker") && row.contains("d detach")
+    });
     assert!(
-        term.pump_until(Duration::from_secs(10), |out| {
-            row_on_screen(out, ROWS - 1).contains("␣ picker")
-        }),
+        listed || row_on_screen(&term.output, ROWS - 1).contains("␣ picker"),
         "the prefix put no hint row on row {ROWS}; it says {:?}, and the child wrote: {}",
         row_on_screen(&term.output, ROWS - 1),
         term.since(mark)
@@ -989,10 +993,11 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
     // on, so the bar has to take itself off.
     let mark = term.output.len();
     term.type_bytes(&[nvmux::keys::PREFIX]);
+    let back = term.pump_until(Duration::from_secs(10), |out| {
+        row_on_screen(out, ROWS - 1) == under
+    });
     assert!(
-        term.pump_until(Duration::from_secs(10), |out| {
-            !row_on_screen(out, ROWS - 1).contains("picker")
-        }),
+        back || !row_on_screen(&term.output, ROWS - 1).contains("picker"),
         "the hint row is still on row {ROWS} after the prefix resolved: {:?}; the child wrote: {}",
         row_on_screen(&term.output, ROWS - 1),
         term.since(mark)
@@ -1211,6 +1216,12 @@ fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) 
     );
     let before = ticks();
     term.pump_until(Duration::from_millis(20 * TICK_MS), |_| false);
+    // Ten ticks at the least, however long a busy machine takes over them,
+    // within the ten seconds the child gives the prefix to be resolved.
+    let enough = Instant::now() + Duration::from_secs(3);
+    while ticks() < before + 10 && Instant::now() < enough {
+        term.pump_until(Duration::from_millis(TICK_MS), |_| false);
+    }
     let after = ticks();
     // What the relay wrote before the key that takes the bar down: all of it
     // was written with the bar wanted up.
@@ -1402,15 +1413,19 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
     // Away to the picker's place — parked, in the child — and back, at the
     // same size, until the output after the resume has cleared the screen.
     let after = away_and_back(&mut term, |_| {});
+    // As far as row 0 of the repaint: a read can end part way through the
+    // write that clears the screen and draws it again.
+    let landed = term.pump_until(Duration::from_secs(5), |out| {
+        find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
+            && row_on_screen(out, 0).contains(marker)
+    });
     assert!(
-        term.pump_until(Duration::from_secs(5), |out| {
-            find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
-        }),
+        find(&term.output[after..], b"\x1b[2J").is_some(),
         "no repaint came after the client came back; the child wrote: {}",
         term.since(after)
     );
     assert!(
-        row_on_screen(&term.output, 0).contains(marker),
+        landed,
         "the repainted screen is not the session's: {:?}",
         row_on_screen(&term.output, 0)
     );
@@ -1647,13 +1662,16 @@ fn a_kept_clients_repaint_is_asked_under_its_fade_in() {
     );
 
     // And it lands once the fade is over, with the session's screen.
+    let landed = term.pump_until(Duration::from_secs(5), |out| {
+        repainted(out) && row_on_screen(out, 0).contains(marker)
+    });
     assert!(
-        term.pump_until(Duration::from_secs(5), repainted),
+        repainted(&term.output),
         "no repaint came after the fade in; the child wrote: {}",
         term.since(after)
     );
     assert!(
-        row_on_screen(&term.output, 0).contains(marker),
+        landed,
         "the repainted screen is not the session's: {:?}",
         row_on_screen(&term.output, 0)
     );
@@ -1740,15 +1758,19 @@ fn a_client_started_ahead_negotiates_on_its_first_visit(tag: &str, fade: bool) {
     // parked, and painted straight back.
     term.pump_until(Duration::from_millis(300), |_| false);
     let after = away_and_back(&mut term, |_| {});
+    // As far as row 0 of the repaint: a read can end part way through the
+    // write that clears the screen and draws it again.
+    let landed = term.pump_until(Duration::from_secs(5), |out| {
+        find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
+            && row_on_screen(out, 0).contains(marker)
+    });
     assert!(
-        term.pump_until(Duration::from_secs(5), |out| {
-            find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
-        }),
+        find(&term.output[after..], b"\x1b[2J").is_some(),
         "no repaint came after the client came back; the child wrote: {}",
         term.since(after)
     );
     assert!(
-        row_on_screen(&term.output, 0).contains(marker),
+        landed,
         "the repainted screen is not the session's: {:?}",
         row_on_screen(&term.output, 0)
     );
@@ -2202,37 +2224,65 @@ fn a_crawling_client_comes_back_as_its_session_is_now() {
         term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
         "the client never asked its DA1"
     );
-    // Long enough since its last frame that the client draws the one it goes
-    // with at once, and then nothing for a second.
-    term.pump_until(Duration::from_millis(1500), |_| false);
+    // Parked, the line changed, and brought back, until the change comes in
+    // with the screen, six times at most. The relay gives the client
+    // `CARD_WAIT` to draw it (see `nvmux::pty`), no longer: a client too busy
+    // for that, as on a busy machine, has the screen come back as it was and
+    // jump once the fade is over, which says nothing of what is drawn in
+    // time. A relay that never waits has every return late, and fails.
+    let mut was = String::from("as it was");
+    let mut late = 0;
+    loop {
+        let now = format!("as it is now, {late}");
+        // Long enough since its last frame that the client draws the one it
+        // goes with at once, and then nothing for a second.
+        term.pump_until(Duration::from_millis(1500), |_| false);
 
-    let mark = term.output.len();
-    term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
-    assert!(
-        term.pump_until(Duration::from_secs(5), |out| {
-            find(&out[mark.min(out.len())..], PARKED).is_some()
-        }),
-        "the child never parked its client"
-    );
-    rpc.command("call setline(1, 'as it is now')")
-        .expect("setline");
-    assert!(
-        term.pump_until(Duration::from_secs(5), |out| {
-            find(&out[mark.min(out.len())..], RESUMED).is_some()
-        }),
-        "the parked client never came back"
-    );
-    let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
-    term.pump_until(Duration::from_millis(LONG_FADE_MS / 4), |_| false);
-    assert!(
-        find(&term.output[after..], b"\x1b[2J").is_none(),
-        "the fade in was over within a quarter of its length"
-    );
-    let row = row_on_screen(&term.output, 0);
-    assert!(
-        row.contains("as it is now"),
-        "a quarter into the fade in, the screen coming back is {row:?}"
-    );
+        let mark = term.output.len();
+        term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| {
+                find(&out[mark.min(out.len())..], PARKED).is_some()
+            }),
+            "the child never parked its client"
+        );
+        rpc.command(&format!("call setline(1, '{now}')"))
+            .expect("setline");
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| {
+                find(&out[mark.min(out.len())..], RESUMED).is_some()
+            }),
+            "the parked client never came back"
+        );
+        let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
+        term.pump_until(Duration::from_millis(LONG_FADE_MS / 4), |_| false);
+        assert!(
+            find(&term.output[after..], b"\x1b[2J").is_none(),
+            "the fade in was over within a quarter of its length"
+        );
+        let row = row_on_screen(&term.output, 0);
+        if row.contains(&now) {
+            break;
+        }
+        assert!(
+            row.contains(&was),
+            "a quarter into the fade in, the screen coming back is {row:?}"
+        );
+        late += 1;
+        assert!(
+            late < 6,
+            "the screen came back as it was, {late} times in a row"
+        );
+        // Drawn as it is now once the fade is over, before the next return.
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| {
+                row_on_screen(out, 0).contains(&now)
+            }),
+            "after the fade in, the screen is {:?}",
+            row_on_screen(&term.output, 0)
+        );
+        was = now;
+    }
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 

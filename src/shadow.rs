@@ -2547,10 +2547,7 @@ mod tests {
     fn a_retired_shadow_restores_no_cursor() {
         let mut s = Shadow::new(4, 4);
         s.feed(b"ok");
-        let hook = panic::take_hook();
-        panic::set_hook(Box::new(|_| {}));
-        s.guard(|_| panic!("a parser bug"));
-        panic::set_hook(hook);
+        crate::test_support::quietly(|| s.guard(|_| panic!("a parser bug")));
         assert!(wrapper_only(&s.frame(0.0, &palette(), Cursor::Restored)));
     }
 
@@ -2561,10 +2558,7 @@ mod tests {
         let mut s = Shadow::new(4, 4);
         s.feed(b"ok");
         // Quiet the panic message this test provokes on purpose.
-        let hook = panic::take_hook();
-        panic::set_hook(Box::new(|_| {}));
-        s.guard(|_| panic!("a parser bug"));
-        panic::set_hook(hook);
+        crate::test_support::quietly(|| s.guard(|_| panic!("a parser bug")));
         assert!(s.broken);
         assert!(!s.is_usable());
         s.feed(b"more");

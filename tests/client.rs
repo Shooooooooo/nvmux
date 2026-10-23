@@ -169,6 +169,8 @@ impl Terminal {
 
     fn pump(&mut self, within: Duration, done: impl Fn(&Self) -> bool) -> bool {
         let deadline = Instant::now() + within;
+        // What frames() left of a frame it did not see the end of.
+        self.feed();
         loop {
             if done(self) {
                 return true;
@@ -201,6 +203,10 @@ impl Terminal {
     /// as a terminal would, and hand `each` the screen as every frame leaves
     /// it — not as a read happens to, part way through one — until it says
     /// that is enough. Says whether it did.
+    ///
+    /// The screen is left as the last whole frame left it: what came of the
+    /// next, should a read have ended part way through it, waits for the next
+    /// look, so that the screen a test takes after this is never half of one.
     fn frames(&mut self, within: Duration, mut each: impl FnMut(&vt100::Screen) -> bool) -> bool {
         let deadline = Instant::now() + within;
         let enough = loop {
@@ -229,7 +235,6 @@ impl Terminal {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break false,
             }
         };
-        self.feed();
         enough
     }
 
@@ -1390,24 +1395,53 @@ fn drawn_slowly_as(
 /// Neovim could have heard of it, and when Neovim's own frame lands, every
 /// row of the window and the cursor are where the prediction had them.
 fn predicted(term: &mut Terminal, name: &str, keys: &[u8]) {
-    let before = window(term);
-    term.type_bytes(keys);
-    // Within one way of the link: Neovim has not even heard of it yet.
-    assert!(
-        term.pump(SLOW, |t| window(t) != before),
-        "{name} waited for Neovim:\n{}",
-        term.text()
-    );
-    // The rest of the frame, should it have come in two reads.
-    term.pump_until(Duration::from_millis(30), |_| false);
-    let predicted = window(term);
+    let predicted = sight(&ahead(term, name, keys));
     // Neovim's own, there and back.
-    term.pump_until(4 * SLOW, |_| false);
+    let landed = last_frame(term, 4 * SLOW);
     assert_eq!(
         predicted,
-        window(term),
+        sight(&landed),
         "{name}: predicted, then drawn by Neovim"
     );
+}
+
+/// Type `keys`, which the client draws ahead of Neovim, and say what it
+/// drew: the screen as the first frame to change the window left it, and any
+/// the client drew straight after. Within one way of the link: Neovim has not
+/// even heard of them yet.
+///
+/// Whole frames, not the screen as a read happens to leave it: a busy
+/// machine hands the test a frame in pieces, and the screen part way through
+/// one is half the old view and half the new.
+fn ahead(term: &mut Terminal, name: &str, keys: &[u8]) -> vt100::Screen {
+    let before = window(term);
+    term.type_bytes(keys);
+    let mut drawn = None;
+    term.frames(SLOW, |screen| {
+        if drawn.is_some() || sight(screen) != before {
+            drawn = Some(screen.clone());
+        }
+        drawn.is_some()
+    });
+    let Some(mut drawn) = drawn else {
+        panic!("{name} waited for Neovim:\n{}", term.text());
+    };
+    term.frames(Duration::from_millis(30), |screen| {
+        drawn = screen.clone();
+        false
+    });
+    drawn
+}
+
+/// Take what the client draws for `within`: the screen as the last whole
+/// frame of it left it, or as it was if none came.
+fn last_frame(term: &mut Terminal, within: Duration) -> vt100::Screen {
+    let mut last = term.parser.screen().clone();
+    term.frames(within, |screen| {
+        last = screen.clone();
+        false
+    });
+    last
 }
 
 /// Type `keys`, which the client leaves to Neovim, and wait for it to draw
@@ -2074,7 +2108,7 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     // Neovim behind on pages typed every 10 ms, its frame past when the
     // first would be given up on, as in the test before.
     const SCROLL: Duration = Duration::from_millis(30);
-    let (mut rpc, mut term, _) = drawn_slowly(
+    let (mut rpc, mut term, link) = drawn_slowly(
         &scratch,
         "client-unturned",
         &format!(
@@ -2105,6 +2139,7 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
         }
         term.pump(until - now, |t| top_line(&t.text()) != last);
     };
+    let sent = link.trace.inputs();
     for k in 1..=28 {
         term.type_bytes(b"\x06");
         watch(&mut term, t0 + Duration::from_millis(10) * k);
@@ -2112,8 +2147,15 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     // Neovim's view once it has taken them all, and when that was: asked once
     // they have all reached it, it answers only then, taking keys typed
     // before anything asked of it. On a busy machine that is later than its
-    // sleeps alone would make it, so it is not worked out from them.
-    watch(&mut term, Instant::now() + SLOW + Duration::from_millis(50));
+    // sleeps alone would make it, so it is not worked out from them. Reached
+    // it as the link says, which a client or a link held up makes later than
+    // a way of the link after they were typed.
+    let reached = Instant::now() + Duration::from_secs(10);
+    while link.trace.inputs() < sent + 28 && Instant::now() < reached {
+        watch(&mut term, Instant::now() + Duration::from_millis(10));
+        // Which returns at once, the view gone back.
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let asked = std::thread::spawn(move || {
         let w0 = rpc.eval("line('w0')").map(|v| v.as_u64());
         (w0.map_err(|e| e.to_string()), Instant::now())
@@ -2241,7 +2283,10 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
     assert_eq!(tops[i - 1] - tops[i], 20, "by that page alone: {when:?}");
     assert_eq!(tops.last(), Some(&541), "where Neovim ends: {when:?}");
     // The first ack to cover the fifth page, and the frame with it: the
-    // view went back as that came, and no sooner.
+    // view went back as that came, and no sooner. As it came is within a
+    // link's delay of it, room for a busy machine and still well short of
+    // the time the client would have given the page up in without it,
+    // twice the round trip and more.
     let acked = link
         .trace
         .acks()
@@ -2251,7 +2296,7 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
         .expect("an ack covering the fifth page");
     let gone = seen[i].1;
     assert!(
-        gone >= acked && gone < acked + Duration::from_millis(100),
+        gone >= acked && gone < acked + SLOW,
         "back {:?} after the ack that covered it: {when:?}",
         gone.checked_duration_since(acked)
             .map_or_else(|| format!("-{:?}", acked - gone), |d| format!("{d:?}"))
@@ -2635,10 +2680,22 @@ fn holding_j_past_the_bottom_keeps_up() {
         }
         false
     };
-    for _ in 0..40 {
-        typed_at.push(Instant::now());
+    for k in 0..40 {
+        let at = Instant::now();
+        typed_at.push(at);
         term.type_bytes(b"j");
-        term.frames(Duration::from_millis(30), &mut note);
+        // Its line drawn before the next `j` goes, 30 ms on: a client held
+        // up past that, as on a busy machine, would read the two in one go
+        // and draw them as one frame, two lines on.
+        let line = start + k + 1;
+        term.frames(SLOW, |screen| {
+            note(screen);
+            line_on(screen) == Some(line)
+        });
+        term.frames(
+            Duration::from_millis(30).saturating_sub(at.elapsed()),
+            &mut note,
+        );
     }
     term.frames(4 * SLOW, &mut note);
     let when: Vec<(Duration, Option<u32>)> = seen
@@ -2823,17 +2880,10 @@ fn scrolls_and_motions_mixed_show_at_once() {
 /// [`predicted`] has it — and its colours as well: once Neovim's own frame
 /// lands, every cell of the window as the client drew it.
 fn predicted_in_colour(term: &mut Terminal, name: &str, keys: &[u8]) {
-    let before = window(term);
-    term.type_bytes(keys);
-    assert!(
-        term.pump(SLOW, |t| window(t) != before),
-        "{name} waited for Neovim:\n{}",
-        term.text()
-    );
-    term.pump_until(Duration::from_millis(30), |_| false);
-    let predicted = (window(term), colours(term));
-    term.pump_until(4 * SLOW, |_| false);
-    let landed = (window(term), colours(term));
+    let drawn = ahead(term, name, keys);
+    let predicted = (sight(&drawn), colours_of(&drawn));
+    let landed = last_frame(term, 4 * SLOW);
+    let landed = (sight(&landed), colours_of(&landed));
     assert_eq!(predicted.0, landed.0, "{name}: the text and the cursor");
     for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
         assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -2985,18 +3035,14 @@ fn typed_text_wears_the_colours_neovim_draws_it_in() {
         ("c", b"c"),
         ("d, the line's end short of the column", b"d"),
     ] {
-        let before = window(&term);
-        term.type_bytes(key);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
+        let drawn = ahead(&mut term, name, key);
+        let landed = last_frame(&mut term, 4 * SLOW);
+        assert_eq!(sight(&drawn), sight(&landed), "{name}: the text");
+        assert_eq!(
+            colours_of(&drawn),
+            colours_of(&landed),
+            "{name}: the colours"
         );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(&term), colours(&term));
-        term.pump_until(4 * SLOW, |_| false);
-        assert_eq!(predicted.0, window(&term), "{name}: the text");
-        assert_eq!(predicted.1, colours(&term), "{name}: the colours");
     }
     waited(&mut term, "e, the line's end into the column", b"e");
 }
@@ -3219,21 +3265,60 @@ fn a_character_typed_otherwise_after_the_proof_is_put_right_at_once() {
     require_nvim!();
     let scratch = Scratch::new("client-charpre-late");
     let setline = r#"call setline(1, ["x", "line 1"]) | exe "autocmd InsertCharPre * if v:char ==# 'q' | let v:char = 'Q!' | endif""#;
-    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-charpre-late", setline, TYPING);
+    let (_rpc, mut term, link) =
+        drawn_slowly_with(&scratch, "client-charpre-late", setline, TYPING);
     typed(&mut term, b"A");
     for c in "abcdefghij".chars() {
         typed(&mut term, c.to_string().as_bytes());
     }
-    let before = window(&term);
-    term.type_bytes(b"q");
+    // How many keys the agent had counted before the q.
+    let count = |a: &Vec<Value>| a.first().and_then(Value::as_u64).expect("a count");
+    let before = link
+        .trace
+        .acks()
+        .last()
+        .map(|(_, a)| count(a))
+        .expect("an ack");
+    let drawn = ahead(&mut term, "q, proved", b"q");
+    assert!(sight(&drawn).0[0].starts_with("xabcdefghijq"));
+    // Put right with Neovim's word on the q, however late a busy machine
+    // brings that: within a link's delay of the ack that covers it, and not
+    // as late as the client gives a prediction up without a word, twice the
+    // round trip and more.
+    let mut right = None;
     assert!(
-        term.pump(SLOW, |t| window(t) != before),
-        "q, proved, drawn ahead:\n{}",
+        term.frames(Duration::from_secs(10), |screen| {
+            let put = sight(screen).0[0].starts_with("xabcdefghijQ!");
+            if put {
+                right = Some(Instant::now());
+            }
+            put
+        }),
+        "put right:\n{}",
         term.text()
     );
-    assert!(window(&term).0[0].starts_with("xabcdefghijq"));
-    term.pump_until(4 * SLOW, |_| false);
-    assert!(window(&term).0[0].starts_with("xabcdefghijQ!"), "put right");
+    let right = right.expect("put right");
+    // The link puts what it carried in its trace just after writing it on,
+    // which the client can be quicker to draw from than that.
+    let covering = || {
+        link.trace
+            .acks()
+            .into_iter()
+            .find(|(_, a)| count(a) > before)
+            .map(|(written, _)| written)
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(1), || covering().is_some()),
+        "no ack covering the q"
+    );
+    let acked = covering().expect("an ack covering the q");
+    assert!(
+        right < acked + SLOW,
+        "put right {:?} after the ack that covered the q",
+        right.saturating_duration_since(acked)
+    );
+    // The frames after it in before the next key.
+    last_frame(&mut term, SLOW);
     waited(&mut term, "q, proving itself again", b"q");
 }
 
@@ -3309,9 +3394,9 @@ fn an_insert_leave_made_late_has_esc_prove_itself() {
         .expect("autocmd");
     typed(&mut term, b"j$xk");
     // `<Esc>` before Neovim has heard of the `A`, nor said anything more of
-    // Insert mode as it enters it.
-    term.type_bytes(b"A");
-    term.pump_until(Duration::from_millis(30), |_| false);
+    // Insert mode as it enters it — but after the `A` is drawn ahead, which
+    // a client held up does later than a fixed wait would allow for.
+    ahead(&mut term, "A", b"A");
     waited(&mut term, "<Esc>, proving itself", b"\x1b");
     assert_eq!(cursor(term.parser.screen()).0, 1, "on the line trimmed");
 }
@@ -3386,21 +3471,32 @@ fn motions_typed_faster_than_the_link_answers_keep_up() {
     let start = cursor(term.parser.screen());
     let mut seen: Vec<(Instant, (u16, u16))> = vec![(Instant::now(), start)];
     let mut typed_at = Vec::new();
-    for _ in 0..20 {
-        let at = Instant::now();
-        typed_at.push(at);
-        term.type_bytes(b"l");
-        term.frames(Duration::from_millis(30), |screen| {
-            if seen.last().map(|s| s.1) != Some(cursor(screen)) {
-                seen.push((Instant::now(), cursor(screen)));
-            }
-            false
-        });
-    }
-    term.frames(4 * SLOW, |screen| {
+    let mut note = |screen: &vt100::Screen| {
         if seen.last().map(|s| s.1) != Some(cursor(screen)) {
             seen.push((Instant::now(), cursor(screen)));
         }
+    };
+    for k in 0..20 {
+        let at = Instant::now();
+        typed_at.push(at);
+        term.type_bytes(b"l");
+        // Its column drawn before the next `l` goes, as for the `j`s of
+        // holding_j_past_the_bottom_keeps_up.
+        let col = start.1 + k + 1;
+        term.frames(SLOW, |screen| {
+            note(screen);
+            cursor(screen).1 == col
+        });
+        term.frames(
+            Duration::from_millis(30).saturating_sub(at.elapsed()),
+            |screen| {
+                note(screen);
+                false
+            },
+        );
+    }
+    term.frames(4 * SLOW, |screen| {
+        note(screen);
         false
     });
     let cols: Vec<i32> = seen.iter().map(|s| i32::from(s.1 .1)).collect();
@@ -4011,36 +4107,48 @@ fn sights_compared(
     });
 
     // The same keys, one at a time, to another Neovim, without MatchParen,
-    // drawn by a client over no link to speak of: what Neovim draws after
-    // each.
+    // drawn by a client over no link to speak of, its scrolls jumping as the
+    // other's do: what Neovim draws after each.
     let other = Scratch::new(&format!("{tag}-ref"));
     let (sock, mut rpc, config) = session(&other, &format!("{tag}-ref"));
     rpc.command(&format!("setlocal noswapfile | {setline} | NoMatchParen"))
         .expect("setline");
-    std::fs::write(&config, format!("[client]\n{NOTHING}")).expect("config");
+    std::fs::write(
+        &config,
+        format!("[client]\n{NOTHING}\n[effects.scroll]\nenabled = false\n"),
+    )
+    .expect("config");
     let mut reference = Terminal::spawn(&sock, &config);
     assert!(
         reference.pump_until(Duration::from_secs(20), |s| s.contains("line 1")),
         "never drawn:\n{}",
         reference.text()
     );
-    settle(
-        &mut reference,
-        Duration::from_millis(100),
-        Duration::from_secs(5),
-    );
-    let mut drew: Vec<Seen> = vec![sight(reference.parser.screen())];
-    for (_, name) in keys {
+    // What the client has drawn once Neovim has drawn everything up to now:
+    // the screen as of the frame that brings a mark Neovim is asked to put
+    // in the status line next, below the rows compared — not the command
+    // line, which Insert mode keeps for itself. Not the screen once the
+    // client has been quiet a while, which a busy machine can leave it before
+    // it has drawn anything at all.
+    let drawn = |reference: &mut Terminal, rpc: &mut nvmux::rpc::Client<_>, mark: &str| {
+        rpc.command(&format!("let &l:statusline = '{mark}'"))
+            .expect("mark");
+        let mut seen = None;
+        reference.frames(Duration::from_secs(10), |screen| {
+            let row = screen.contents_between(ROWS - 2, 0, ROWS - 2, COLS);
+            if row.contains(mark) {
+                seen = Some(sight(screen));
+            }
+            seen.is_some()
+        });
+        seen.unwrap_or_else(|| panic!("{mark} never drawn:\n{}", reference.text()))
+    };
+    let mut drew: Vec<Seen> = vec![drawn(&mut reference, &mut rpc, "drawn")];
+    for (k, (_, name)) in keys.iter().enumerate() {
         rpc.call("nvim_input", vec![name.as_str().into()])
             .expect("input");
-        // Answered once Neovim has taken the key, and flushed what it drew.
-        rpc.eval("1").expect("taken");
-        settle(
-            &mut reference,
-            Duration::from_millis(40),
-            Duration::from_secs(5),
-        );
-        drew.push(sight(reference.parser.screen()));
+        // Taken before Neovim answers the call after it.
+        drew.push(drawn(&mut reference, &mut rpc, &format!("key {k} taken")));
     }
 
     // Each sight, one Neovim drew, no earlier than the one before.
@@ -4191,15 +4299,8 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
          set termguicolors | lua vim.treesitter.start(0, 'lua')",
     );
     let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
-        let before = window(term);
-        term.type_bytes(keys);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(term), colours(term));
+        let drawn = ahead(term, name, keys);
+        let predicted = (sight(&drawn), colours_of(&drawn));
         // Coloured, not plain: a keyword, a number and a comment apart, on
         // all but the lines edited whole into a comment or a string.
         let coloured = predicted
@@ -4216,8 +4317,8 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
             })
             .count();
         assert!(coloured >= 19, "{name}: {coloured} rows of 22 coloured");
-        term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(term), colours(term));
+        let landed = last_frame(term, 4 * SLOW);
+        let landed = (sight(&landed), colours_of(&landed));
         assert_eq!(predicted.0, landed.0, "{name}: the text moved");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -4273,18 +4374,12 @@ fn cursorline_moves_with_the_cursor() {
         ("2k", b"2k"),
         ("+", b"+"),
     ] {
-        let before = (window(&term), colours(&term));
-        term.type_bytes(keys);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before.0),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(&term), colours(&term));
-        assert_ne!(predicted.1, before.1, "{name}: the bar moved");
-        term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(&term), colours(&term));
+        let before = colours(&term);
+        let drawn = ahead(&mut term, name, keys);
+        let predicted = (sight(&drawn), colours_of(&drawn));
+        assert_ne!(predicted.1, before, "{name}: the bar moved");
+        let landed = last_frame(&mut term, 4 * SLOW);
+        let landed = (sight(&landed), colours_of(&landed));
         assert_eq!(predicted.0, landed.0, "{name}: the text and the cursor");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -4441,15 +4536,8 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
          set termguicolors list listchars=nbsp:+",
     );
     let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
-        let before = window(term);
-        term.type_bytes(keys);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(term), colours(term));
+        let drawn = ahead(term, name, keys);
+        let predicted = (sight(&drawn), colours_of(&drawn));
         // Not one colour: `^A`, `^?` and `<80>` in another, on every row.
         let two = predicted
             .1
@@ -4461,8 +4549,8 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
             })
             .count();
         assert_eq!(two, 22, "{name}: {two} rows of 22 in more than one colour");
-        term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(term), colours(term));
+        let landed = last_frame(term, 4 * SLOW);
+        let landed = (sight(&landed), colours_of(&landed));
         assert_eq!(predicted.0, landed.0, "{name}: the text moved");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -4516,17 +4604,10 @@ fn predicted_rows_show_listchars_as_neovim_draws_them() {
     .expect("listchars");
     term.pump_until(4 * SLOW, |_| false);
     let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
-        let before = window(term);
-        term.type_bytes(keys);
-        assert!(
-            term.pump(SLOW, |t| window(t) != before),
-            "{name} waited for Neovim:\n{}",
-            term.text()
-        );
-        term.pump_until(Duration::from_millis(30), |_| false);
-        let predicted = (window(term), colours(term));
-        term.pump_until(4 * SLOW, |_| false);
-        let landed = (window(term), colours(term));
+        let drawn = ahead(term, name, keys);
+        let predicted = (sight(&drawn), colours_of(&drawn));
+        let landed = last_frame(term, 4 * SLOW);
+        let landed = (sight(&landed), colours_of(&landed));
         assert_eq!(predicted.0, landed.0, "{name}: the text moved");
         for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
             assert_eq!(p, l, "{name}: row {r} changed colour when Neovim's landed");
@@ -4640,21 +4721,25 @@ fn a_client_away_draws_a_busy_session_at_a_crawl() {
         back >= 10,
         "back in front, {back} frames in a second of ticks"
     );
+    // And it shows the session as it is now: the tick Neovim is at, or a
+    // later one, a whole frame of it, well within the second a client still
+    // at a crawl takes. Neovim asked first, and the screen watched for after,
+    // so that a test held up between the two is not counted against it.
     let ticks = rpc
         .eval("g:ticks")
         .ok()
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let shown: u64 = term
-        .text()
-        .lines()
-        .next()
-        .and_then(|l| l.strip_prefix("tick "))
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0);
+    let shown = |screen: &vt100::Screen| -> u64 {
+        sight(screen).0[0]
+            .strip_prefix("tick ")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
     assert!(
-        ticks.saturating_sub(shown) < 10,
-        "back in front, the screen says tick {shown} of {ticks}"
+        term.frames(Duration::from_millis(600), |screen| shown(screen) >= ticks),
+        "back in front, the screen says tick {} of {ticks}",
+        shown(term.parser.screen())
     );
 }
 
@@ -4718,17 +4803,10 @@ fn a_comment_typed_into_a_code_block_colours_the_rows_held_below_it() {
     }
     typed(&mut term, b"\x1b");
     term.pump_until(Duration::from_secs(2), |_| false);
-    let before = window(&term);
-    term.type_bytes(b"\x06");
-    assert!(
-        term.pump(SLOW, |t| window(t) != before),
-        "<C-f> waited for Neovim:\n{}",
-        term.text()
-    );
-    term.pump_until(Duration::from_millis(30), |_| false);
-    let predicted = (window(&term), colours(&term));
-    term.pump_until(4 * SLOW, |_| false);
-    let landed = (window(&term), colours(&term));
+    let drawn = ahead(&mut term, "<C-f>", b"\x06");
+    let predicted = (sight(&drawn), colours_of(&drawn));
+    let landed = last_frame(&mut term, 4 * SLOW);
+    let landed = (sight(&landed), colours_of(&landed));
     assert_eq!(predicted.0, landed.0, "the text moved");
     let mut wrong = Vec::new();
     for (r, (p, l)) in predicted.1.iter().zip(&landed.1).enumerate() {
@@ -5050,10 +5128,12 @@ fn a_wide_window_has_its_text_centred_in_it() {
         "the text is not in the middle of each window ({w:?}):\n{}",
         term.text()
     );
-    assert_eq!(
-        widths(&mut rpc),
-        columns(160, &[60, 60]),
-        "the text 60 wide"
+    // As Neovim has them once it has the client's resize, which it may take
+    // after the test's question, on another socket.
+    assert!(
+        until_widths(&mut term, &mut rpc, &columns(160, &[60, 60])),
+        "the text not 60 wide: {:?}",
+        widths(&mut rpc)
     );
     let over = format!("{}[No Name]", " ".repeat(a));
     assert!(
@@ -5274,21 +5354,26 @@ fn a_split_over_a_slow_link_is_centred_from_its_first_frame() {
 
     rpc.command("vsplit").expect("vsplit");
     // The column the new window's text starts at on the first row, each
-    // time it moves, as it flies in and once it has landed.
-    let right = |t: &Terminal| -> Option<usize> {
-        let text = t.text();
-        let row = text.lines().next()?;
+    // time it moves, as it flies in and once it has landed: frame by frame,
+    // not part way through one, where the old copy of the left window's text
+    // can still be on the row beside its new one.
+    let right = |screen: &vt100::Screen| -> Option<usize> {
+        let row: String = (0..160)
+            .map(|c| match screen.cell(0, c) {
+                Some(cell) if cell.has_contents() => cell.contents(),
+                _ => " ",
+            })
+            .collect();
         let (at, _) = row.match_indices("MARK").nth(1)?;
         Some(row[..at].chars().count())
     };
     let mut seen: Vec<usize> = Vec::new();
-    let until = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < until {
-        term.pump_until(Duration::from_millis(5), |_| false);
-        if let Some(col) = right(&term).filter(|col| seen.last() != Some(col)) {
+    term.frames(Duration::from_secs(3), |screen| {
+        if let Some(col) = right(screen).filter(|col| seen.last() != Some(col)) {
             seen.push(col);
         }
-    }
+        false
+    });
     let goes = rpc
         .eval("[win_screenpos(2)[1] - 1, nvim_win_get_width(win_getid(2))]")
         .expect("where the new window is");

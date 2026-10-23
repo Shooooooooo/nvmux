@@ -107,8 +107,19 @@ impl Scratch {
         // A plain counter, not `ThreadId`, whose Debug form is `ThreadId(2)`.
         // Parentheses are regex metacharacters, so a directory named that way
         // cannot be matched literally by anything pattern-based later.
+        //
+        // In base 36, which keeps it to two characters for 1,296 scratches a
+        // binary: tests/client.rs makes more than a hundred, and in decimal a
+        // third digit put a socket under a 19-byte tag one byte past the limit.
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(n < 36 * 36, "more scratches than two characters count");
+        let digit = |d: u32| char::from_digit(d, 36).expect("a base-36 digit");
+        let n: String = if n < 36 {
+            digit(n).into()
+        } else {
+            [digit(n / 36), digit(n % 36)].into_iter().collect()
+        };
         let dir = std::env::temp_dir().join(format!("nvmux-it-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Self(dir)
@@ -136,22 +147,38 @@ impl Drop for Scratch {
         // in `<id>.json` was validated against its socket at spawn time. That
         // leaves a live session with no `<id>.json` out of reach, so a test
         // that makes one has to kill it itself.
+        //
+        // And only a process that is that session still, its socket on its
+        // command line: a session that has gone may have left its pid to
+        // another process by now — another test's, run alongside, or anything
+        // else of the user's — and a test may write a pid of its own making.
         if let Ok(entries) = std::fs::read_dir(&self.0) {
             for e in entries.flatten() {
                 let p = e.path();
                 if p.extension().is_none_or(|x| x != "json") {
                     continue;
                 }
-                let pid = std::fs::read_to_string(&p)
+                let Some(meta) = std::fs::read_to_string(&p)
                     .ok()
                     .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
-                    .and_then(|v| v.get("pid").and_then(serde_json::Value::as_i64))
+                else {
+                    continue;
+                };
+                let sock = meta
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|id| format!("{id}.sock"));
+                let pid = meta
+                    .get("pid")
+                    .and_then(serde_json::Value::as_i64)
                     .filter(|pid| *pid > 1);
-                if let Some(pid) = pid {
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(pid as i32),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
+                if let (Some(sock), Some(pid)) = (sock, pid) {
+                    if command_line(pid as u32).contains(&sock) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                    }
                 }
             }
         }
@@ -445,7 +472,12 @@ pub fn press_enter(sock: &Path) {
 /// Run Lua in the session, as a test's own stand-in for whatever a plugin or
 /// a terminal program would have done there.
 pub fn lua(sock: &Path, code: &str) -> Value {
-    let mut client = Client::connect(sock, Duration::from_secs(5)).expect("connect");
+    lua_within(sock, code, Duration::from_secs(5))
+}
+
+/// [`lua`], given `budget` to answer in.
+pub fn lua_within(sock: &Path, code: &str, budget: Duration) -> Value {
+    let mut client = Client::connect(sock, budget).expect("connect");
     client
         .call(
             "nvim_exec_lua",
@@ -477,7 +509,10 @@ pub fn a_job_that_exits(sock: &Path, script: &str, on_screen: bool) -> i64 {
     } else {
         "local buf = vim.api.nvim_create_buf(true, false)"
     };
-    lua(
+    // Given longer than the wait in it, so that a job slow to close, on a
+    // busy machine, is waited out by Neovim and not by the call; and one
+    // that never closes fails the call, saying so.
+    lua_within(
         sock,
         &format!(
             r#"local closed = false
@@ -492,11 +527,14 @@ vim.api.nvim_create_autocmd('TermClose', {{
 vim.api.nvim_buf_call(buf, function()
   vim.fn.jobstart({{ 'sh', '-c', [=[{script}]=] }}, {{ term = true }})
 end)
-vim.wait(5000, function()
+if not vim.wait(10000, function()
   return closed
-end)
+end) then
+  error('the job never closed')
+end
 return buf"#
         ),
+        Duration::from_secs(15),
     )
     .as_i64()
     .expect("the buffer")
@@ -508,6 +546,10 @@ pub fn a_session(scratch: &Scratch, name: &str) -> (nvmux::session::Session, Pat
         .create_session(name, &launch(), anywhere())
         .expect("create");
     let sock = t.local_socket_for(&s).expect("socket path");
+    // Past its startup before a test asks it anything on a budget of a
+    // second, as the notes' reads do: Neovim takes a call that waits for its
+    // main loop only once it has started, which a busy machine makes later.
+    lua(&sock, "return 1");
     (s, sock)
 }
 

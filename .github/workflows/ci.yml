@@ -19,12 +19,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            test-threads: 32
+          - os: macos-latest
+            test-threads: 12
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The dependencies, built optimised in a debug build (see Cargo.toml),
+      # once for every change of toolchain or Cargo.lock rather than every
+      # run. Saved from main alone, which every branch can restore from, so
+      # that branches do not crowd main's out of the repository's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Neovim (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -48,7 +59,29 @@ jobs:
       - run: cargo fmt --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # The unit tests compute, and run one at a time per core, the default:
+      # 4 on a Linux runner, 3 on a macOS one. The integration tests spend
+      # their time waiting — on Neovim, on links made slow on purpose, on
+      # frames — not computing: tests/client.rs adds up to the same 1,520
+      # test-seconds run 4, 8, 16 or 32 at a time, and is done in 394, 202,
+      # 111 or 61, its longest test 57, keeping four cores 19% busy at 32. So
+      # they run thirty-two at a time on Linux, and twelve on macOS: there,
+      # thirty-two at once — up to 34 ptys open, where twelve have 14 — had
+      # one of them fail to open a pty at all (ENXIO).
+      #
+      # Thirty-two tests at once have more files open than a soft limit of
+      # 256, a stock macOS shell's, allows, and fewer than 512: under 256,
+      # tests/client.rs fails with EMFILE. Raised where it is lower, as it may
+      # be on macOS; a Linux runner allows 65536.
+      - name: cargo test
+        run: |
+          if [ "$(ulimit -n)" != unlimited ] && [ "$(ulimit -n)" -lt 4096 ]; then
+            ulimit -n 4096
+          fi
+          ulimit -n
+          cargo test --lib --bins
+          RUST_TEST_THREADS=${{ matrix.test-threads }} cargo test --test '*'
+          cargo test --doc
 
   msrv:
     name: rust-version check
@@ -56,4 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --all-targets

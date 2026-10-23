@@ -3,7 +3,7 @@
 //! overlay tests share. The screen tests have their own in
 //! [`crate::ui::test_support`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::palette::{Palette, Rgb};
@@ -36,6 +36,36 @@ pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
 /// [`scratch_path`] for a socket: `<tag>.sock`, not bound to anything.
 pub(crate) fn scratch_sock(tag: &str) -> PathBuf {
     scratch_path(&format!("{tag}.sock"))
+}
+
+/// Run `f`, which provokes a panic on purpose and catches it, with the panic
+/// hook quiet. The hook is the whole test binary's: two tests swapping it at
+/// once can each put back the other's quiet one, and leave every panic after
+/// them — a failing test's own message among them — unsaid. So they take
+/// turns.
+pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    // The hook back however `f` ends: a panic that gets out of it is the
+    // test failing, and has to be said.
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(hook);
+    out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Leave a socket at `path` that nothing will ever accept a connection on, as
+/// a server that has gone leaves its own behind.
+///
+/// Not a listener bound and dropped: the tests alongside spawn processes, and
+/// a child forked while the listener is open holds it open too — until it
+/// execs, or for as long as it runs on macOS, where std cannot make a socket
+/// close-on-exec in the call that makes it — and a connect is taken into its
+/// backlog. A datagram socket never listens, and a stream connect to one is
+/// refused whoever holds it.
+pub(crate) fn dead_socket(path: &Path) {
+    drop(std::os::unix::net::UnixDatagram::bind(path).expect("bind"));
 }
 
 /// Wait up to `within` for `cond` to hold, polling gently. Returns whether it

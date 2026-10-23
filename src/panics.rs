@@ -84,14 +84,13 @@ mod tests {
         assert!(!catching());
         assert_eq!(caught(catching).ok(), Some(true));
         assert!(!catching());
-        let hook = panic::take_hook();
-        panic::set_hook(Box::new(|_| {}));
-        let outer = caught(|| {
-            assert!(caught(|| panic!("a parser bug")).is_err());
-            catching()
+        let (outer, thrown) = crate::test_support::quietly(|| {
+            let outer = caught(|| {
+                assert!(caught(|| panic!("a parser bug")).is_err());
+                catching()
+            });
+            (outer, caught(|| panic!("a parser bug")))
         });
-        let thrown = caught(|| panic!("a parser bug"));
-        panic::set_hook(hook);
         assert_eq!(outer.ok(), Some(true), "still marked after an inner catch");
         assert!(thrown.is_err());
         assert!(!catching());

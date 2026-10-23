@@ -85,6 +85,17 @@ vt100 = "0.16"
 lto = "thin"
 strip = true
 
+# The dependencies optimised in a debug build, nvmux itself not. The
+# integration tests run nvmux's client, its relay and a terminal emulator of
+# their own against a real Neovim, and hold them to deadlines a frame or two
+# long; unoptimised, a busy machine has them miss those deadlines. Pinned to
+# one core with two busy loops beside it, relay_encodings failed four runs
+# in four this way and passed four in four with this. It costs the first
+# build of the dependencies, which CI caches, and nothing after: nvmux
+# itself still builds as fast as ever.
+[profile.dev.package."*"]
+opt-level = 2
+
 # For profiling the optimised build: the release profile with its symbols and
 # line tables kept, so that callgrind, DHAT, massif and perf can name what
 # they measure. `cargo build --profile profiling`; what ships is unchanged.
