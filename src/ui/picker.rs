@@ -18,8 +18,9 @@
 //! lists behind them on a thread, as the picker does after `<prefix> Space`
 //! (see [`super::Listing`]). A kill or a move made on it lists again, and the
 //! session loop takes the rows that leaves back once the relay is over
-//! ([`take_changed`]), so a `<prefix>` switch afterwards names what is there.
-//! Until then, the next panel over the session opens on them ([`rows`]).
+//! ([`take_changed`]). Until then, the next panel over the session opens on
+//! them, and a `<prefix>` switch names a session among them ([`rows`]): so a
+//! switch afterwards names what is there.
 //!
 //! # The prompts
 //!
@@ -112,7 +113,7 @@ static IN_HAND: Mutex<Vec<Session>> = Mutex::new(Vec::new());
 static ON: Mutex<Option<String>> = Mutex::new(None);
 
 /// The rows as a panel left them, where it changed them, for the session loop
-/// to take back, and the next panel to open on.
+/// to take back, and until then the rows as they stand (see [`rows`]).
 static CHANGED: Mutex<Option<Vec<Session>>> = Mutex::new(None);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -147,8 +148,10 @@ pub(super) fn transport() -> Option<Shared> {
 }
 
 /// The rows as they stand: as a panel left them, where one changed them, and
-/// otherwise as the session loop handed them over.
-pub(super) fn rows() -> Vec<Session> {
+/// otherwise as the session loop handed them over. What the next panel opens
+/// on, and what a `<prefix>` switch names a session among before the session
+/// loop has taken them back (see `main`).
+pub fn rows() -> Vec<Session> {
     lock(&CHANGED)
         .clone()
         .unwrap_or_else(|| lock(&IN_HAND).clone())

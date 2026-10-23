@@ -475,7 +475,17 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     // A target that names nothing is left to the path below,
                     // which can re-list for it; that is a round trip, and this
                     // is not the place to spend one.
-                    let session = pick(&listing, target, current.state.num)?;
+                    //
+                    // Among the rows as they stand, not the ones this relay
+                    // was handed: a picker floating over the session may have
+                    // moved or killed one since, and what it left is taken
+                    // back only once the relay is over, below. Among the ones
+                    // handed over, a switch after a move went by the order
+                    // before it: the card it landed with named the session
+                    // that had been there, and where no client was kept for
+                    // that one, so did the switch.
+                    let rows = ui::picker::rows();
+                    let session = pick_from(&rows, target, &current)?;
                     // A switch onto the session already attached reuses the
                     // client in hand. Starting a second one for it would put a
                     // second UI on that server — which shrinks its screen to
@@ -493,7 +503,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                         &announce::label(&session.name),
                         false,
                     )
-                    .in_row(row_of(&listing, session, step));
+                    .in_row(row_of(&rows, session, step));
                     // Nor for one with a client kept for it, which has nothing
                     // to start: the switch resumes that one. Nor for one whose
                     // kept client has left, which may have left with the link:
@@ -1050,6 +1060,21 @@ fn pick(
     }
 }
 
+/// [`pick`], stepping from where `current` is among `sessions`: from its
+/// number there, rather than the one it was taken with, which a move made
+/// since in a picker floating over it may have changed.
+fn pick_from<'a>(
+    sessions: &'a [nvmux::session::Session],
+    target: pty::Target,
+    current: &nvmux::session::Session,
+) -> Option<&'a nvmux::session::Session> {
+    let from = sessions
+        .iter()
+        .find(|s| s.id == current.id)
+        .map_or(current.state.num, |s| s.state.num);
+    pick(sessions, target, from)
+}
+
 /// Where `current` is among the sessions `<prefix> n` and `<prefix> p` step
 /// through, for the card that says where a switch landed: the session each
 /// goes to from it — with two, the other is the one `n` goes to — and, for a
@@ -1529,6 +1554,27 @@ mod tests {
         assert_eq!(next.id, "id000003");
         let prev = pick(&listing, pty::Target::Step(Direction::Prev), 2).expect("1 precedes 2");
         assert_eq!(prev.id, "id000001");
+    }
+
+    /// A switch after a move made in a picker floating over the session goes
+    /// by the rows the picker left: a number names the session there now, and
+    /// `n` and `p` step from where the session in front is now, its number
+    /// moved by the move — not from where it was, which steps onto the session
+    /// itself, or past the one before it.
+    #[test]
+    fn a_switch_after_a_move_goes_by_the_rows_as_they_stand() {
+        let taken = listing_of(&[(1, "id000001"), (2, "id000002"), (3, "id000003")]);
+        // The third put first, over the session in front.
+        let moved = listing_of(&[(1, "id000003"), (2, "id000001"), (3, "id000002")]);
+        let current = &taken[0];
+        let to = |target| {
+            pick_from(&moved, target, current)
+                .map(|s| s.id.clone())
+                .expect("among the rows")
+        };
+        assert_eq!(to(pty::Target::Number(3)), "id000002");
+        assert_eq!(to(pty::Target::Step(Direction::Next)), "id000002");
+        assert_eq!(to(pty::Target::Step(Direction::Prev)), "id000003");
     }
 
     /// A number the listing does not have resolves to nothing rather than to
