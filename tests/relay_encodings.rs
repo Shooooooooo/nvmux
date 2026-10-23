@@ -2333,16 +2333,13 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
     term.pump_until(gone, |_| false);
     assert!(!carded(&term.output, label), "the first card never went");
 
-    // Parked and brought back until the card comes in with the screen, six
+    // Parked and brought back until the card comes in with the screen, three
     // times at most. The relay gives the client `CARD_WAIT` to draw it before
     // the screen dissolves in (see `nvmux::pty`), no longer: a client too busy
     // for that, as on a busy machine, has the screen come in without it and
-    // the card after, which says nothing of how the card stands. Here it takes
-    // the client under 3 ms; a CI runner held up for longer now and then —
-    // its machine's, not the client's — had three returns in a row late. A
-    // relay that never waits has every one late, and fails all the same.
+    // the card after, which says nothing of how the card stands.
     let mut late = 0;
-    while late < 6 {
+    while late < 3 {
         let mark = term.output.len();
         term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
         assert!(

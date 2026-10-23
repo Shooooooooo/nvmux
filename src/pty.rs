@@ -958,16 +958,30 @@ impl Attachment {
         }
         self.tell_client(&card::Command::Clear);
         self.tell_client(&card::Command::Show(card.clone()));
-        let deadline = Instant::now() + CARD_WAIT;
+        if self.drain_until_shown(&kept, Instant::now() + CARD_WAIT) {
+            return Some((kept, Instant::now()));
+        }
+        tracing::debug!("the client did not draw the card a switch lands with in time");
+        None
+    }
+
+    /// Read what the client writes, as [`Attachment::drain_unrelayed`] does,
+    /// until the shadow shows `kept` — the card it was just told to draw — or
+    /// `deadline`. Says whether it does.
+    ///
+    /// Until the card, and not only until the client writes something: it is
+    /// told to come back and to show the card in two writes, and a client
+    /// that reads them apart answers the first with a frame of its own, a
+    /// moment before the one with the card.
+    fn drain_until_shown(&mut self, kept: &shadow::Kept, deadline: Instant) -> bool {
         loop {
             self.await_output(deadline.saturating_duration_since(Instant::now()));
             self.drain_unrelayed();
-            if self.shadow.as_ref().is_some_and(|s| s.shows(&kept)) {
-                return Some((kept, Instant::now()));
+            if self.shadow.as_ref().is_some_and(|s| s.shows(kept)) {
+                return true;
             }
             if Instant::now() >= deadline {
-                tracing::debug!("the client did not draw the card a switch lands with in time");
-                return None;
+                return false;
             }
         }
     }
@@ -3401,7 +3415,8 @@ pub fn relay(
         // not blocked, and what it wrote is the screen about to be painted
         // back — see [`Attachment::drain_unrelayed`]. With the frame it draws
         // the card on among it, which comes a moment after the card was asked
-        // for: so the shadow has the card, and the fade in brings it in.
+        // for: read until the shadow has the card, so that the fade in leaves
+        // it standing (see [`Attachment::drain_until_shown`]).
         //
         // And so for a client that drew at a crawl while it was away, card
         // or none: the Clear the opening put in has it draw at once what it
@@ -3409,7 +3424,14 @@ pub fn relay(
         // even where that is nothing, so the screen comes back as it is now
         // rather than as it was last drawn, and then jumps.
         if attachment.is_kept() {
-            if landed || attachment.crawling {
+            let kept = attachment.kept.clone();
+            if landed && !kept.is_empty() && attachment.shadow.is_some() {
+                if !attachment.drain_until_shown(&kept, Instant::now() + CARD_WAIT) {
+                    tracing::debug!(
+                        "the client did not draw the card its return lands with in time"
+                    );
+                }
+            } else if landed || attachment.crawling {
                 attachment.await_output(CARD_WAIT);
             }
             attachment.drain_unrelayed();
@@ -6974,6 +6996,31 @@ mod tests {
         assert!(
             !wait_briefly_for(&a, b'|'),
             "a report reached a client that asked for none"
+        );
+    }
+
+    /// A kept client brought back is told to come back and to show the card
+    /// its return lands with, in two writes, and a client that reads them
+    /// apart answers the first with a frame of its own before the one with
+    /// the card: the relay reads on past it until the card is on the shadow,
+    /// which the fade in then leaves standing. Read only up to the first
+    /// frame, the screen came in without the card and the card after it, on
+    /// every return, on a machine where the client read the two apart.
+    #[test]
+    fn a_card_is_read_for_past_a_frame_that_comes_before_it() {
+        let mut a = kept(
+            r#"stty raw -echo; printf r; head -c 1 >/dev/null; printf '\033[2;1Hback'; sleep 0.05; printf '\033[1;11Hcard'; exec sleep 30"#,
+        );
+        a.shadow = Some(shadow::Shadow::new(24, 80));
+        let card = shadow::Kept::new(
+            [(0, 10, 13)],
+            [(0, 10, 'c'), (0, 11, 'a'), (0, 12, 'r'), (0, 13, 'd')],
+        );
+        wait_until_ready(&a);
+        a.tell_client(&card::Command::Clear);
+        assert!(
+            a.drain_until_shown(&card, Instant::now() + Duration::from_secs(5)),
+            "the card never reached the shadow"
         );
     }
 
