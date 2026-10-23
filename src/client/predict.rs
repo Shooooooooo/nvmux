@@ -2958,8 +2958,9 @@ impl Ack {
 /// Whether Neovim may count as more than one a key the client sends as one:
 /// `<C-c>`, which interrupts as well and is counted twice, and a key with
 /// Alt, which Neovim takes as `<Esc>` and the key unless something maps it
-/// as it is. The counts are in doubt after one, until a fence ties them
-/// again (see [`Sync`]).
+/// as it is. The counts are in doubt from one on — all of them, for
+/// `<C-c>` (see [`interrupts`]) — until a fence ties them again (see
+/// [`Sync`]).
 pub fn uncertain(key: &str) -> bool {
     let Some(inner) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')) else {
         return false;
@@ -3092,8 +3093,9 @@ pub enum Answer {
     Tied,
     /// They were tied, and still agree.
     Checked,
-    /// They are not to be trusted: never tied, out of step, or the last key
-    /// sent not counted yet.
+    /// They are not to be trusted: never tied, out of step, the last key
+    /// sent not counted yet, or past a key Neovim may count as two (see
+    /// [`Sync::passed`]).
     Doubted,
 }
 
@@ -3365,8 +3367,18 @@ pub struct Sent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     Key(Box<str>),
-    Wheel,
+    Wheel(Turn),
     Click,
+}
+
+/// A turn of the wheel, as sent: over window grid `grid`, `way` — `down`,
+/// `up`, `right` or `left` — with modifiers `mods`, to be made out again
+/// as it was made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    pub grid: u64,
+    pub way: Box<str>,
+    pub mods: Box<str>,
 }
 
 impl Input {
@@ -3374,7 +3386,7 @@ impl Input {
     pub fn key(&self) -> Option<&str> {
         match self {
             Input::Key(key) => Some(key),
-            Input::Wheel | Input::Click => None,
+            Input::Wheel(_) | Input::Click => None,
         }
     }
 }
@@ -4036,10 +4048,10 @@ impl Predictor {
         self.keep(seq, input, now);
     }
 
-    /// Input `seq`, a turn of the wheel, sent at `now`: see
+    /// Input `seq`, `turn` of the wheel, sent at `now`: see
     /// [`Predictor::sent`].
-    pub fn turned(&mut self, seq: u64, now: Instant) {
-        self.keep(seq, Input::Wheel, now);
+    pub fn turned(&mut self, seq: u64, turn: Turn, now: Instant) {
+        self.keep(seq, Input::Wheel(turn), now);
     }
 
     fn keep(&mut self, seq: u64, input: Input, now: Instant) {
@@ -4060,7 +4072,7 @@ impl Predictor {
         }
         let lost = match input {
             Input::Key(_) => self.typed.lost,
-            Input::Wheel => false,
+            Input::Wheel(_) => false,
             Input::Click => true,
         };
         self.queue.push_back(Sent {
@@ -7166,9 +7178,10 @@ mod tests {
         assert_eq!(s.heard(&ack(4, "<C-D><Space><lt><Tab>"), seq), Some(4));
     }
 
-    /// `<C-c>`, which Neovim counts twice, and a key with Alt, which it may,
-    /// put the counts in doubt as they are sent — till a fence with nothing
-    /// after it ties them again.
+    /// `<C-c>`, which Neovim counts twice, puts the counts in doubt as it is
+    /// sent — till a fence with nothing after it ties them again; and it and
+    /// a key with Alt, which Neovim may count as two, are told from the keys
+    /// it counts as one.
     #[test]
     fn ctrl_c_puts_the_count_in_doubt_until_a_quiet_fence() {
         let mut p = Predictor {
@@ -7329,7 +7342,11 @@ mod tests {
             let mut seq = 0;
             let mut s = tied(0, 0);
             send(&mut s, &mut seq, sent);
-            s.doubt("a key Neovim may count as two");
+            if sent.ends_with("<C-c>") {
+                s.doubt("an interrupt, which may throw away keys sent before it");
+            } else {
+                s.uncertain_from(seq);
+            }
             assert_eq!(s.heard(&ack(4, taken), seq), None);
             assert_eq!(s.answered(s.fenced(seq), seq, 4), Answer::Tied);
             send(&mut s, &mut seq, "l");

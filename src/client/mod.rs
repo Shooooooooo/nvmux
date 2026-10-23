@@ -3376,7 +3376,14 @@ impl App {
         if let Some(p) = self.predict.as_mut() {
             let seq = p.typed.input();
             match m.button {
-                "wheel" => p.turned(seq, now),
+                "wheel" => {
+                    let turn = predict::Turn {
+                        grid,
+                        way: m.action.into(),
+                        mods: m.mods.as_str().into(),
+                    };
+                    p.turned(seq, turn, now);
+                }
                 _ => p.sent(seq, None, now),
             }
         }
@@ -3415,14 +3422,44 @@ impl App {
     /// columns; with Shift or Ctrl, a page, or the window's width — or
     /// whatever something mapping it says, which is not predicted.
     fn predict_wheel(&mut self, grid: u64, way: &str, mods: &str, now: Instant) {
+        let insert = Mode::of(&self.model.mode_name) == Mode::Insert;
+        let command = self.wheel_command(grid, way, mods, insert);
         let Some(p) = self.predict.as_mut() else {
             return;
         };
+        // Blind from an input before it, as a key the client could not
+        // make leaves it till Neovim's word covers it: a turn drawn from
+        // where Neovim has the view and the cursor would leave out what
+        // that input did, as keys typed then are not drawn either — and
+        // like them it is made with Neovim's word on that input (see
+        // [`App::replay`]).
+        match command.filter(|_| !p.acks() || p.known()) {
+            Some((command, by)) => {
+                let seq = p.typed.seq();
+                self.predict_command(grid, command, Cause { by, seq, at: now }, now);
+            }
+            None => p.typed.missed(),
+        }
+    }
+
+    /// What a turn of the wheel over grid `grid`, `way`, with modifiers
+    /// `mods`, makes (see [`App::predict_wheel`]), and by what — in Insert
+    /// mode where `insert` says: none where the scrolls are not predicted,
+    /// or something maps it.
+    fn wheel_command(
+        &self,
+        grid: u64,
+        way: &str,
+        mods: &str,
+        insert: bool,
+    ) -> Option<(Command, By)> {
+        let p = self.predict.as_ref()?;
         // A turn of the wheel is a scroll, and left to Neovim with the rest
         // where the scrolls are not predicted.
-        let scrolls = p.predictions.scrolls;
+        if !p.predictions.scrolls {
+            return None;
+        }
         let shape = self.model.wins.get(&grid).and_then(|w| p.shape(*w));
-        let insert = Mode::of(&self.model.mode_name) == Mode::Insert;
         let (dir, sideways) = match way {
             "down" => (1, false),
             "up" => (-1, false),
@@ -3435,13 +3472,7 @@ impl App {
             predict::wheel(&w, mods)
         };
         let width = self.model.grids.get(&grid).map_or(0, |g| g.width() as i64);
-        let command = match (shape, mods) {
-            _ if !scrolls => None,
-            // Blind from an input before it, as a key the client could not
-            // make leaves it till Neovim's word covers it: a turn drawn from
-            // where Neovim has the view and the cursor would leave out what
-            // that input did, as keys typed then are not drawn either.
-            _ if p.acks() && !p.known() => None,
+        match (shape, mods) {
             (Some(s), _) if s.mapped.contains(&name) => None,
             (Some(s), "") if sideways => Some((Command::Side(Side::Wheel(dir * s.hor)), By::Wheel)),
             (Some(_), "S" | "C") if sideways => {
@@ -3458,13 +3489,6 @@ impl App {
                 By::PageWheel,
             )),
             _ => None,
-        };
-        match command {
-            Some((command, by)) => {
-                let seq = p.typed.seq();
-                self.predict_command(grid, command, Cause { by, seq, at: now }, now);
-            }
-            None => p.typed.missed(),
         }
     }
 
@@ -5789,16 +5813,28 @@ impl App {
         let grid = self.model.cursor.grid;
         let win = self.model.wins.get(&grid).copied();
         for sent in queue {
+            // A turn of the wheel, made out again over its own window, and
+            // by the wheel.
+            let turned = match &sent.input {
+                predict::Input::Wheel(t) => {
+                    let insert = self.predict.as_ref().is_some_and(|p| p.typed.inserting());
+                    Some((t.grid, self.wheel_command(t.grid, &t.way, &t.mods, insert)))
+                }
+                _ => None,
+            };
             let Some(p) = self.predict.as_mut() else {
                 return;
             };
             let seq = sent.seq;
-            let command = match &sent.input {
-                predict::Input::Key(key) => p.remake(win, key),
-                predict::Input::Wheel => None,
+            let (command, onto) = match &sent.input {
+                predict::Input::Key(key) => (p.remake(win, key), None),
+                predict::Input::Wheel(_) => match turned {
+                    Some((grid, Some((command, by)))) => (Some(command), Some((grid, by))),
+                    _ => (None, None),
+                },
                 predict::Input::Click => {
                     p.typed.clicked();
-                    None
+                    (None, None)
                 }
             };
             p.remade(seq);
@@ -5823,11 +5859,14 @@ impl App {
                                 | Command::Leave
                         ) =>
                 {
-                    let by = if p.typed.inserting() {
-                        By::InsertKeys
-                    } else {
-                        By::Keys
-                    };
+                    let (grid, by) = onto.unwrap_or_else(|| {
+                        let by = if p.typed.inserting() {
+                            By::InsertKeys
+                        } else {
+                            By::Keys
+                        };
+                        (grid, by)
+                    });
                     let cause = Cause {
                         by,
                         seq,
@@ -9236,21 +9275,26 @@ mod tests {
     /// A turn of the wheel after a key the client does not follow is not
     /// drawn either, as a scroll typed then is not: drawn from where Neovim
     /// has the view and the cursor, it would leave out what that key did —
-    /// the cursor a line short of where Neovim draws it after the turn.
-    /// Neovim's word on the turn has the client follow the keys again.
+    /// here the cursor four lines down, which the turn leaves in view, the
+    /// client's a line short of Neovim's. It is made once the agent says
+    /// where the key left the cursor, with the frame that draws it, as a
+    /// scroll typed then is (see
+    /// [`a_scroll_after_a_key_left_to_neovim_lands_with_its_ack`]); and the
+    /// turns after it at once.
     #[test]
-    fn a_turn_of_the_wheel_after_a_key_left_to_neovim_is_left_to_it() {
+    fn a_turn_of_the_wheel_after_a_key_left_to_neovim_lands_with_its_ack() {
         let t1 = Instant::now() + Duration::from_secs(1);
         let mut a = acking(Duration::from_millis(200));
-        a.keys(b"j\x1b[<65;3;2M", t1);
+        a.keys(b"4j\x1b[<65;3;2M", t1);
         assert_eq!(a.anim.ahead(2), (0, 0), "not drawn");
         assert_eq!(top_row(&a), "line 0");
-        ack(&mut a, 2, "j<ScrollWheelDown>", "n", (3, 0, 0, 3), t1);
-        let mut events = vec![at(3, 3, 3)];
-        events.extend((0..5).map(|r| line(2, r, &format!("line {}", r + 3))));
-        redraw(&mut a, events, t1);
-        assert_eq!(top_row(&a), "line 3");
+        ack(&mut a, 2, "4j", "n", (4, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(4, 0), t1);
+        assert_eq!(top_row(&a), "line 3", "made with its ack");
+        assert_eq!(drawn(&a), (1, 0), "the cursor on line 4");
         assert!(a.predict.as_ref().is_some_and(Predictor::known));
+        a.keys(b"\x1b[<65;3;2M", t1);
+        assert_eq!(top_row(&a), "line 6", "and the next at once");
     }
 
     /// A scroll typed after a key the client does not follow is made once
