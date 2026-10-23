@@ -9,8 +9,7 @@ repository = "https://github.com/Shooooooooo/nvmux"
 readme = "README.md"
 keywords = ["neovim", "nvim", "session", "tmux", "ssh"]
 categories = ["command-line-utilities", "development-tools"]
-# The README's pictures are linked from it by absolute URL, and the tools
-# are for re-making them: neither is needed to build nvmux.
+# Not needed to build: the README links its images by URL.
 exclude = ["assets/", "tools/", ".github/"]
 
 [dependencies]
@@ -20,85 +19,52 @@ clap = { version = "4", default-features = false, features = [
 ] }
 getrandom = "0.4"
 libc = "0.2"
-# The fixed strings the relay looks for in what goes through it (see
-# `src/pty.rs`): a finishing client's DA1 request and its leaving the
-# alternate screen, the frame closes taken out of a held first paint, the
-# terminal's answers; and the `ESC ]` that opens an OSC, which the shadow's
-# and the ledger's parsers are shown only so much of (see `src/ledger.rs`).
-# Already in the tree for `vte` and `nucleo-matcher`, so it adds no crate to
-# the build graph. 2.4 is the first with `memmem`.
+# Fixed-string search in the relay. Already in the tree; 2.4 adds `memmem`.
 memchr = "2.4"
-# Ranks the create prompt's directory completions. Its own two dependencies,
-# `memchr` and `unicode-segmentation`, were already in this tree, so it adds
-# exactly one crate to the build graph -- which is what made it worth taking
-# rather than hand-rolling a subsequence scorer.
+# Ranks directory completions; adds only itself to the build graph.
 nucleo-matcher = "0.3"
 nix = { version = "0.31", default-features = false, features = [
     "fs", "process", "signal", "term", "user",
 ] }
-# The pty each client runs on. Unix only, as nvmux is, and the child comes back
-# as a plain `std::process::Child` with nothing of the crate's own between
-# nvmux and the process it signals and waits for (see `src/pty.rs`). Its one
-# dependency, `rustix`, was already in this tree for crossterm.
+# The client's pty; the child is a plain `std::process::Child`.
 pty-process = "0.5"
-# Only the crossterm backend: the defaults also pull in every widget (the
-# calendar brings the `time` crate) and the layout macros, none of which the
-# picker uses.
+# Crossterm backend only: the default widgets pull in unused crates.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rmpv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# `display` is the serialising half: the state file is written, not just read.
+# `display`: the state file is written, not just read.
 toml = { version = "1", default-features = false, features = [
     "std",
     "parse",
     "display",
     "serde",
 ] }
-# What the settings screen saves with: it edits the user's config.toml in
-# place, keeping every comment, blank line and key it did not change, which
-# `toml` cannot do — it reads a document into values and writes values back.
-# Its parser, writer and datetime crates are `toml`'s own, already in the
-# tree, so it adds itself and nothing else.
+# The settings screen edits config.toml in place, keeping its comments and
+# layout, which `toml` cannot do.
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
-# Not `attributes`: nvmux has no `#[instrument]`, and its proc-macro is build
-# time for nothing.
+# No `attributes`: nvmux uses no `#[instrument]`.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-# Not `env-filter`: `$NVMUX_LOG` is read as a `filter::Targets` (see
-# `src/logging.rs`), and `EnvFilter` is what links a regex engine in.
+# No `env-filter`: `$NVMUX_LOG` is a `filter::Targets`, and `EnvFilter`
+# links a regex engine.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 unicode-width = "0.2.2"
-# The decoder `src/ledger.rs` reads a kept client's output with, for the few
-# terminal settings it would not send again. Already in the tree as `vt100`'s
-# own parser, at the same version, so it adds no crate to the build graph.
+# Used by `src/ledger.rs`; already in the tree as `vt100`'s parser.
 vte = "0.15"
-# Keeps a shadow copy of an attached session's screen, so the outgoing session
-# can be dissolved cell by cell (see `src/shadow.rs`). The bytes reaching the
-# terminal are never touched; the parser only watches them go by. It brings
-# `vte` and `arrayvec`; its other dependencies were already in the tree. The
-# relay tests (tests/relay_encodings.rs) reuse it to ask what is *on* a row of
-# the far side of a pty rather than what went past on the wire.
+# Shadow copy of the attached screen for the dissolve (see `src/shadow.rs`).
 vt100 = "0.16"
 
 [profile.release]
 lto = "thin"
 strip = true
 
-# The dependencies optimised in a debug build, nvmux itself not. The
-# integration tests run nvmux's client, its relay and a terminal emulator of
-# their own against a real Neovim, and hold them to deadlines a frame or two
-# long; unoptimised, a busy machine has them miss those deadlines. Pinned to
-# one core with two busy loops beside it, relay_encodings failed four runs
-# in four this way and passed four in four with this. It costs the first
-# build of the dependencies, which CI caches, and nothing after: nvmux
-# itself still builds as fast as ever.
+# Optimise dependencies in debug builds: unoptimised, the integration tests
+# miss their frame-length deadlines on a busy machine.
 [profile.dev.package."*"]
 opt-level = 2
 
-# For profiling the optimised build: the release profile with its symbols and
-# line tables kept, so that callgrind, DHAT, massif and perf can name what
-# they measure. `cargo build --profile profiling`; what ships is unchanged.
+# Release with line tables, for profilers: `cargo build --profile profiling`.
 [profile.profiling]
 inherits = "release"
 strip = false
