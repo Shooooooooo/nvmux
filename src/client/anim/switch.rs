@@ -1,27 +1,18 @@
-//! A window that shows another buffer fading from one to the other:
-//! animate.nvim's switch fade, `through` the window's background.
+//! animate.nvim's switch fade: when a window shows another buffer, the old
+//! text dims into the window's background and the new text comes up out of it.
 //!
-//! Neovim does not tell a UI which buffer a window shows. The client's agent
-//! in the editor does (see `crate::client::App`): a buffer entering a window
-//! that showed another one is a switch — `:bnext`, `:edit`, `<C-^>`, a picker
-//! opening a file — and the first batch after it is the one that draws it.
-//! What the window showed is kept from just before that batch; then, over
-//! 200 ms, eased in and out, the old text dims into the window's background,
-//! and the new text comes up out of it.
-//!
-//! Only a window still where it was, the same size, fades, and only when a
-//! few switch at once: `:windo bnext`, or a session loading, switches every
-//! window, and fades none (animate.nvim's `max_burst`).
+//! Neovim does not tell a UI which buffer a window shows; the client's agent in
+//! the editor reports it (see `crate::client::App`). None fade when more than
+//! [`MAX_BURST`] switch at once (`:windo bnext`, a session loading).
 
 use super::layout::{background, fade_cell, percent, Easing};
 use crate::client::compose::{Frame, Out};
 use crate::client::grid::{Cell, Text};
 use crate::client::model::{Held, Model, Place};
 
-/// More windows than this switching at once fade none of them.
+/// animate.nvim's `max_burst`.
 pub const MAX_BURST: usize = 3;
 
-/// A window about to show another buffer, as it was drawn.
 #[derive(Debug)]
 pub struct Was {
     grid: u64,
@@ -31,7 +22,7 @@ pub struct Was {
 }
 
 impl Was {
-    /// Split window `grid` as the model has it, if it is on show.
+    /// `None` unless `grid` is a visible split window.
     pub fn take(model: &Model, grid: u64) -> Option<Was> {
         model
             .layout
@@ -46,7 +37,6 @@ impl Was {
         })
     }
 
-    /// Whether the window is where it was, the same size, on show.
     fn still(&self, model: &Model) -> bool {
         let placed = model.layout.get(&self.grid).is_some_and(|p| {
             !p.hidden
@@ -61,20 +51,17 @@ impl Was {
     }
 }
 
-/// One window's fade.
 #[derive(Debug)]
 pub struct Switch {
     was: Was,
-    /// The window's background, as a highlight: what the old text fades into
-    /// and the new one out of.
+    /// The window's background highlight, which the fade passes through.
     bg: u32,
     elapsed: f32,
     duration: f32,
 }
 
 impl Switch {
-    /// Fade from what `was` showed over `duration` seconds — if the window is
-    /// still where it was.
+    /// `None` if `duration` is not positive or the window has moved.
     pub fn start(was: Was, model: &Model, duration: f32) -> Option<Switch> {
         if duration <= 0.0 || !was.still(model) {
             return None;
@@ -93,8 +80,8 @@ impl Switch {
         self.was.grid
     }
 
-    /// What the window showed, and the background it fades through, hold
-    /// their highlights: see [`crate::client::model::Model::reclaim`].
+    /// Keeps the fade's highlights from being reclaimed (see
+    /// [`crate::client::model::Model::reclaim`]).
     pub fn hold(&self, held: &mut Held) {
         for row in &self.was.rows {
             held.cells(row);
@@ -102,21 +89,17 @@ impl Switch {
         held.mark(self.bg);
     }
 
-    /// Whether its window is still where it was: one moved or resized since
-    /// is not faded any more.
     pub fn still(&self, model: &Model) -> bool {
         self.was.still(model)
     }
 
-    /// Move on `dt` seconds. Says whether it is still going.
+    /// Returns whether the fade is still running.
     pub fn step(&mut self, dt: f32) -> bool {
         self.elapsed += dt;
         self.elapsed < self.duration
     }
 
-    /// Draw the fade over the window as the compositor drew it: the old text
-    /// dimmed for the first half, the new one coming up for the second; the
-    /// cursor at `cursor` (see [`fade_cell`]).
+    /// Old text dims for the first half, new text comes up for the second.
     pub fn paint(&self, frame: &mut Frame, model: &Model, cursor: (i64, i64)) {
         let e = Easing::InOutQuad.at(self.elapsed / self.duration);
         let colors = model.colors();

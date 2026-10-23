@@ -1,20 +1,9 @@
 //! The local/remote seam.
 //!
-//! Everything above this module — the picker, the attach path — is written once
-//! against [`Transport`] and does not know whether the sessions it is listing
-//! live on this machine or on the far end of an SSH connection.
-//!
-//! Below it, most of the work is written once too. The scripts are the
-//! protocol and [`crate::proc::Shell`] runs them the same way on either host,
-//! so listing, creating and killing a session are one body each — [`list`],
-//! [`create`], [`kill`] — over a [`Host`] that supplies what differs: how the
-//! host is reached, how a session's liveness is settled, and where its
-//! metadata lives. The differences that do not fold are kept in the open, as
-//! each transport's own methods: [`Transport::local_socket_for`], which is the
-//! seam that makes a remote session attachable at all, and the metadata edits
-//! (`rename_session`, `renumber`), which the local transport does in place on
-//! files it can re-read and the remote one does by writing the picker's record
-//! back through a script.
+//! The picker and attach path use [`Transport`] without knowing where sessions
+//! run. The scripts are the protocol, so [`list`], [`create`] and [`kill`] are
+//! shared over a [`Host`] supplying what differs: how the host is reached, how
+//! liveness is settled and where metadata lives.
 
 pub mod local;
 pub mod protocol;
@@ -32,12 +21,11 @@ use crate::rpc;
 use crate::session::Session;
 use crate::shell;
 
-/// Where a set of sessions lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     Local,
-    /// Passed to `ssh` **verbatim**, so a hostname, `user@host` or any
-    /// `~/.ssh/config` alias works without nvmux understanding it.
+    /// Passed to `ssh` verbatim, so a hostname, `user@host` or any
+    /// `~/.ssh/config` alias works.
     Ssh(String),
 }
 
@@ -50,106 +38,54 @@ impl std::fmt::Display for Location {
     }
 }
 
-/// Session management, independent of where the sessions run.
-///
-/// Object-safe on purpose: the picker holds a `dyn Transport` and never
-/// branches on which one it has.
+/// Object-safe: the picker holds a `dyn Transport`.
 pub trait Transport {
     fn location(&self) -> &Location;
 
-    /// Every session on the host, with liveness already determined. One call,
-    /// not one per session — see [`crate::shell::LIST_SCRIPT`].
+    /// Every session on the host, liveness determined, in one script run.
     fn list_sessions(&self) -> Result<Vec<Session>>;
 
-    /// Spawn a session running `launch`, whose `{sock}` becomes this session's
-    /// socket — on this machine or on the far end, wherever the sessions live.
-    ///
-    /// `directory` is where it starts, absolute and on *this* host, as
-    /// [`crate::session::validate_directory`] left it. Whether it exists is the
-    /// spawn script's question and not asked here: it is the side that can
-    /// answer it without a round trip and without a gap between the answer and
-    /// the launch.
+    /// Spawn a session running `launch`, with `{sock}` replaced by its socket.
+    /// `directory` is absolute, on the transport's host; the spawn script
+    /// checks it exists, avoiding a round trip and a race.
     fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session>;
 
-    /// Terminate a session, unconditionally: nvmux never asks about unsaved
-    /// buffers. The ordinary way out is `:q` in the session itself, which ends
-    /// it because the editor *is* the session.
+    /// Terminate unconditionally; nvmux never asks about unsaved buffers.
     fn kill_session(&self, s: &Session) -> Result<()>;
 
-    /// Rename is a metadata edit and nothing more. The socket is never renamed
-    /// or moved: its path is the session's stable identity and the display name
-    /// is only data, so no SSH forward has to be rebuilt.
+    /// Metadata only: the socket path is the session's stable identity.
     fn rename_session(&self, s: &Session, new_name: &str) -> Result<()>;
 
-    /// Persist the order the user arranged in the picker: write each of these
-    /// records' [`Session::num`], and change nothing else.
+    /// Persist the picker's order: write each record's [`Session::num`] and
+    /// nothing else, in one batch.
     ///
-    /// Whole records rather than `(id, number)` pairs, so there is one source of
-    /// truth for the number a session should store. Locally only `id` and `num`
-    /// are read — the file is right here, so it is re-read and edited, which
-    /// keeps a rename another nvmux landed in between. Over ssh the record is
-    /// written back whole, the same trade [`Transport::rename_session`] already
-    /// makes and safe for the same reason: `list.sh` ships each session's entire
-    /// `<id>.json`, so the picker's copy is complete, and `SessionState` is
-    /// `#[serde(skip)]`, so no resolved number can reach disk.
+    /// Locally the file is re-read and only `num` changed, keeping a concurrent
+    /// rename. Over ssh the record is written back whole: safe because
+    /// `list.sh` ships each entire `<id>.json` and `SessionState` is
+    /// `#[serde(skip)]`.
     ///
-    /// Batched. Over ssh this is one round trip whatever the list length, where
-    /// a row dragged the length of a long list would otherwise cost one per row
-    /// it passed — see [`crate::shell`].
-    ///
-    /// Not atomic across sessions: the files are written one at a time on the
-    /// host that owns them. A failure part way is reported and the picker
-    /// re-lists straight afterwards, so what is on screen is what is on disk;
-    /// [`finish_listing`] resolves any half-written state into a valid,
-    /// duplicate-free ordering by construction.
-    ///
-    /// A session with no metadata — an orphan, or one killed since the listing —
-    /// is skipped rather than having a record conjured for it.
+    /// Not atomic; [`finish_listing`] turns half-written state into a valid
+    /// order. Sessions without metadata are skipped, not given a record.
     fn renumber(&self, sessions: &[Session]) -> Result<()>;
 
-    /// The home directory on the host that runs the sessions: what a new
-    /// session starts in unless the user says otherwise, and what a leading `~`
-    /// expands against.
-    ///
-    /// Empty only if the host could not say — over ssh, a `hello.sh` from a
-    /// newer nvmux than the far end has ever seen. The prompt then offers no
-    /// default rather than a wrong one.
+    /// The session host's home, for the default directory and `~`. Empty if
+    /// the host could not say.
     fn home(&self) -> &str;
 
-    /// A handle for listing directories on this session's host, owned and
-    /// `Send` so the create prompt's completion worker can hold one — see
-    /// [`crate::dirs`], which explains why it cannot simply borrow this.
+    /// For the create prompt's completion worker (see [`crate::dirs`]).
     fn dir_source(&self) -> crate::dirs::DirSource;
 
-    /// A socket path on **this** machine that `nvim --server` can use.
-    ///
-    /// The single seam that makes remote sessions work: locally the session
-    /// socket itself, over SSH the local end of a forward. Everything downstream
-    /// is identical in both cases.
+    /// A socket path on this machine for `nvim --server`: locally the session
+    /// socket, over SSH the local end of a forward.
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf>;
 
-    /// Make whatever [`Self::local_socket_for`] would make for each of these
-    /// sessions, all at once, ahead of it being asked for each: over ssh one
-    /// `-O forward` for them all rather than one apiece. Whatever this could
-    /// not make, `local_socket_for` makes as it always has, and reports; so
-    /// nothing here is reported, and locally, where there is nothing to make,
-    /// it does nothing.
+    /// Batch [`Self::local_socket_for`]'s work (over ssh, one `-O forward`).
+    /// Failures are left for `local_socket_for` to retry and report.
     fn reach_all(&self, _sessions: &[Session]) {}
 
-    /// Bring the link to the host back if it has gone, and say whether it had.
-    ///
-    /// Asked once a client has exited on its own, which over ssh is what a
-    /// dropped connection looks like: the forward closes under the client and
-    /// it leaves, exactly as it would have if the session had been quit. The
-    /// link is what tells the two apart — a session that ended leaves the
-    /// master standing — so the answer is not a bool but three: the link was
-    /// fine ([`Reconnect::Unneeded`]) and the session is what went; it was
-    /// down and is back ([`Reconnect::Restored`]), so the same session can be
-    /// attached again; or it was down and stays down, which is the error.
-    ///
-    /// One attempt, bounded: this is the step [`crate::reconnect`] repeats, so
-    /// it must not itself wait for the system's TCP timeout. Locally there is
-    /// no link to lose, and the default says so.
+    /// Restore the link if it dropped. Called when a client exits on its own,
+    /// which is also what a dropped ssh link looks like; an error means the
+    /// link stays down. One bounded attempt: [`crate::reconnect`] retries.
     fn reconnect(&self) -> Result<Reconnect> {
         Ok(Reconnect::Unneeded)
     }
@@ -158,22 +94,16 @@ pub trait Transport {
 /// What [`Transport::reconnect`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reconnect {
-    /// The link never went: whatever exited, exited for its own reasons.
+    /// The link never dropped: the session itself ended.
     Unneeded,
-    /// The link had gone and is back. Every forward went with it, so a
-    /// session is reached afresh — [`Transport::local_socket_for`] knows.
+    /// The link dropped and is back; its forwards must be remade.
     Restored,
 }
 
-/// A transport that can be lent to a thread: what [`open`] builds.
-///
-/// The one thread it is lent to so far lists the sessions behind a picker
-/// that opened without waiting for the host (see [`crate::ui::Listing`]).
-/// Both transports keep their shell behind a lock, so a script asked for
-/// meanwhile waits for that listing rather than running inside it.
+/// Lent to the picker's background listing thread (see
+/// [`crate::ui::Listing`]); the shell lock makes other scripts wait for it.
 pub type Shared = std::sync::Arc<dyn Transport + Send + Sync>;
 
-/// Build the transport for a location.
 pub fn open(location: Location) -> Result<Shared> {
     match location {
         Location::Local => Ok(std::sync::Arc::new(local::LocalTransport::new()?)),
@@ -184,64 +114,39 @@ pub fn open(location: Location) -> Result<Shared> {
 // --- the bodies both transports share ---------------------------------------
 
 /// What a transport supplies to [`list`], [`create`] and [`kill`].
-///
-/// Everything here is about *where* the host is. The scripts run there, in a
-/// shell of the host's, and speak the same protocol wherever they run; what
-/// each transport knows is how a socket is spelled over there and reached from
-/// here, what a listed session's liveness is worth, and where a session's
-/// metadata is kept. Each default is the answer of the transport with nothing
-/// to do there: locally no listing is ever in hand ahead of time and a socket
-/// needs no reaching, so `take_listing` and `unreach` default to nothing; over
-/// ssh nothing is left behind to sweep and the log is on another machine, so
-/// `sweep` and `log_tail` default to nothing.
 pub(crate) trait Host {
     fn location(&self) -> &Location;
 
-    /// The runtime directory on the session host, as the scripts take it.
     fn dir(&self) -> &str;
 
-    /// Run one of the shared scripts in the host's shell.
-    ///
-    /// A script that fails is an `Ok` with a status, which each body reads its
-    /// own way; `Err` is the shell, or the link it runs over.
+    /// A failing script is `Ok` with a status; `Err` means the shell or its
+    /// link failed.
     fn run(&self, script: &str, args: &[&str]) -> Result<Output>;
 
-    /// A listing already in hand, taken once. Over ssh the greeting carries
-    /// one, so the picker's first listing costs no round trip.
+    /// A listing already in hand (over ssh, from the greeting), taken once.
     fn take_listing(&self) -> Option<String> {
         None
     }
 
-    /// Settle what the listing script said about each session's liveness:
-    /// which to keep, which to drop, and what to clean up on the way.
     fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>>;
 
-    /// The socket path as the session host sees it — what `--listen` gets —
-    /// checked against the path budget *before* anything is spawned: an
-    /// overlong path makes Neovim silently truncate and bind somewhere that
-    /// could never be reached.
+    /// The `--listen` path, checked against the length limit before spawning:
+    /// Neovim silently truncates an overlong path.
     fn host_sock(&self, id: &str) -> Result<PathBuf>;
 
-    /// Make a new session's socket reachable from this machine, and say where.
-    /// Locally that is the socket itself; over ssh, a forward onto it.
     fn reach(&self, id: &str, host_sock: &Path) -> Result<PathBuf>;
 
-    /// Undo [`Host::reach`] for a session that is going or gone. A session
-    /// that comes back is reached again, so this is never wrong to call.
+    /// Undo [`Host::reach`]. Always safe to call.
     fn unreach(&self, _id: &str) {}
 
-    /// After the kill script has seen a session go: whatever it could not
-    /// remove itself, which would otherwise resurrect the session in the next
-    /// listing. Only the local transport has anything to do here.
+    /// Remove what the kill script could not, which would otherwise resurrect
+    /// the session in the next listing.
     fn sweep(&self, _id: &str) {}
 
-    /// Write a new session's metadata where the host keeps it.
     fn write_meta(&self, session: &Session) -> Result<()>;
 
-    /// Where the session's log is, in the words of the error that names it.
     fn log_path(&self, id: &str) -> PathBuf;
 
-    /// The last lines of that log, where it can be read from here.
     fn log_tail(&self, _id: &str) -> Option<String> {
         None
     }
@@ -252,10 +157,7 @@ pub(crate) fn list(h: &impl Host) -> Result<Vec<Session>> {
     let stdout = match h.take_listing() {
         Some(stdout) => stdout,
         None => {
-            // Timed apart from the settling below because the two have
-            // different fixes: the script is the host's process table and a
-            // shell, while settling is round trips to editors that may be
-            // busy. See the `timing:` records in `main` and `pty`.
+            // Timed apart from settling: the two have different fixes.
             let t_script = std::time::Instant::now();
             let out = h.run(shell::LIST_SCRIPT, &[h.dir()])?;
             tracing::debug!(
@@ -272,23 +174,19 @@ pub(crate) fn list(h: &impl Host) -> Result<Vec<Session>> {
     Ok(finish_listing(h.settle(listed)?))
 }
 
-/// Spawn a session and wait for it to answer; see [`Transport::create_session`].
+/// Spawn a session and wait for it to answer (see
+/// [`Transport::create_session`]).
 pub(crate) fn create(
     h: &(impl Host + Sync),
     name: &str,
     launch: &Launch,
     directory: &str,
 ) -> Result<Session> {
-    // The listing is also what the new session's rank is allocated from, and
-    // what its displayed number is read back out of once it exists, so
-    // numbering costs no extra work here.
     let existing = list(h)?;
     let (id, rank) = plan_create(&existing, name)?;
     let host_sock = h.host_sock(&id)?;
 
-    // The socket is substituted here rather than in the script: this side
-    // already computed the path and bounded its length, which the script has
-    // no way to do. Every word travels as its own argument.
+    // Substituted here, where the path's length was checked.
     let argv = launch.argv_for(&host_sock.to_string_lossy());
     let mut args: Vec<&str> = vec![h.dir(), &id, directory];
     args.extend(argv.iter().map(String::as_str));
@@ -297,12 +195,9 @@ pub(crate) fn create(
     let out = h.run(shell::SPAWN_SCRIPT, &args)?;
     let spawned = protocol::parse_spawn(&out.stdout)?;
 
-    // Every way out of a half-created session ends it through the kill
-    // script, which removes the files only once it has seen the process go —
-    // unlinking the socket here on the strength of "it did not answer in
-    // time" would orphan a Neovim that was merely slow to start — and reports
-    // why, naming the log on the host that has it. The log is read before the
-    // kill, which removes it.
+    // Failures end the session via the kill script, which removes files only
+    // after the process exits (unlinking on a timeout would orphan a slow
+    // Neovim). The log is read first, since the kill removes it.
     let not_ready = |detail: String| -> NvmuxError {
         let log_tail = h.log_tail(&id).unwrap_or(detail);
         discard(h, &id, spawned.pid);
@@ -323,12 +218,8 @@ pub(crate) fn create(
         .launched_with(launch.line())
         .started_in(directory);
 
-    // Over ssh this is the forward, and proves it works before the user tries
-    // to attach; a forward that cannot be made leaves no session behind either.
-    // The metadata is written meanwhile: a round trip to the host of its own,
-    // which the answer does not wait for. A session that never answers is
-    // ended by the kill script, which takes the metadata away with the rest,
-    // and that only once both are done.
+    // The metadata write (its own round trip) runs in parallel with reaching
+    // the socket; a session that never answers is killed after both finish.
     let (local, reached, written) = std::thread::scope(|scope| {
         let writing = std::thread::Builder::new()
             .name("nvmux-meta".into())
@@ -351,29 +242,20 @@ pub(crate) fn create(
     }
 
     if !reached {
-        // A forward succeeding proves nothing on its own: `ssh -O forward` to
-        // a nonexistent remote socket still exits 0 and creates a working
-        // local socket. Only an answer through it does.
+        // `ssh -O forward` to a missing remote socket still succeeds, so only
+        // an answer proves the session.
         return Err(not_ready("the session never answered".into()));
     }
     written?;
-    // The caller attaches to this without re-listing, so give it the same
-    // resolved number a listing would have. Numbers are positions now, so that
-    // is a question only the whole list can answer: hand `finish_listing` the
-    // listing this create was planned from with the new session in it, and
-    // read back the place it takes.
+    // The caller attaches without re-listing, so give it the number a
+    // listing would.
     session.state.num = numbered_in(existing, &session);
 
     tracing::info!(host = %h.location(), id = %session.id, name, pid = session.pid, "session ready");
     Ok(session)
 }
 
-/// The number `session` will show once it joins `existing`: its position in
-/// the listing the two of them make.
-///
-/// Its own rank as the fallback, for the impossible case of a listing that
-/// does not contain the session just put into it — a number that is at least
-/// never zero, which is the one value [`crate::keys`] cannot dial.
+/// Falls back to the rank, which is never zero (zero cannot be dialled).
 fn numbered_in(existing: Vec<Session>, session: &Session) -> u32 {
     let mut listing = existing;
     listing.push(session.clone());
@@ -383,8 +265,7 @@ fn numbered_in(existing: Vec<Session>, session: &Session) -> u32 {
         .map_or(session.num, |s| s.state.num)
 }
 
-/// End a session that never became one. An empty pid is fine: the script
-/// finds the process by its socket, and the pid is only a hint.
+/// End a session that never came up.
 fn discard(h: &impl Host, id: &str, pid: Option<u32>) {
     h.unreach(id);
     let pid = opt_pid_arg(pid);
@@ -399,10 +280,9 @@ fn discard(h: &impl Host, id: &str, pid: Option<u32>) {
 
 /// Terminate a session; see [`Transport::kill_session`].
 pub(crate) fn kill(h: &impl Host, s: &Session) -> Result<()> {
-    // Straight to signals — SIGTERM first, inside the script, so nvim still
-    // runs VimLeavePre, writes its ShaDa file and unlinks its own socket. The
-    // recorded pid is only a starting guess: the script uses it only if it
-    // still owns this session's socket, since pids get reused.
+    // The script sends SIGTERM first, so nvim writes ShaDa and unlinks its
+    // socket. The pid is used only if it still owns the socket (pids are
+    // reused).
     let pid = pid_arg(s.pid);
     let out = h.run(shell::KILL_SCRIPT, &[h.dir(), &s.id, &pid])?;
     if !out.ok() {
@@ -410,11 +290,8 @@ pub(crate) fn kill(h: &impl Host, s: &Session) -> Result<()> {
     }
     let outcome = protocol::parse_kill(&out.stdout)?;
 
-    // Whatever the outcome: re-attaching would reach it again anyway.
     h.unreach(&s.id);
 
-    // Files are removed only once the session is genuinely gone; see
-    // `kill_outcome`.
     kill_outcome(outcome, &s.name)?;
     h.sweep(&s.id);
     tracing::info!(host = %h.location(), id = %s.id, name = %s.name, "session killed");
@@ -424,16 +301,9 @@ pub(crate) fn kill(h: &impl Host, s: &Session) -> Result<()> {
 // --- behind list/create/kill above; the transports also call plan_rename and
 // --- claim_shell directly ---------------------------------------------------
 
-/// Take a transport's shell slot for one script run, once another thread's
-/// run in it is over: the listing behind a picker that opened on the rows in
-/// hand runs on a thread of its own (see [`crate::ui::Listing`]), and a kill
-/// asked for in the picker meanwhile goes after it.
-///
-/// A poisoned lock is taken anyway: every caller checks for a dead shell and
-/// replaces it before running anything, which is all a panic mid-run could
-/// have left behind. A slot that *this* thread holds already is a bug being
-/// reported rather than a wait that would never end: no transport method
-/// calls another while running a script.
+/// Claim a transport's shell slot for one script run, waiting for another
+/// thread's run. A poisoned lock is taken anyway: callers replace a dead shell
+/// before running. A re-entrant claim is an error, not a deadlock.
 pub(crate) fn claim_shell(slot: &Mutex<Option<Shell>>) -> Result<Claimed<'_>> {
     if CLAIMED.with(Cell::get) {
         return Err(NvmuxError::Io(std::io::Error::other(
@@ -446,13 +316,9 @@ pub(crate) fn claim_shell(slot: &Mutex<Option<Shell>>) -> Result<Claimed<'_>> {
 }
 
 thread_local! {
-    /// Whether this thread holds a shell slot, which is what tells a claim
-    /// from inside a script run — a bug — from one made while another
-    /// thread's run is under way, which waits its turn (see [`claim_shell`]).
     static CLAIMED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// A shell slot claimed for one script run: see [`claim_shell`].
 pub(crate) struct Claimed<'a>(MutexGuard<'a, Option<Shell>>);
 
 impl Drop for Claimed<'_> {
@@ -475,24 +341,15 @@ impl std::ops::DerefMut for Claimed<'_> {
     }
 }
 
-/// How long to wait for a new session's socket to appear and accept a
-/// connection. A *reachability* budget, not a readiness one: a config that
-/// clones plugins on first run can take far longer than any timeout worth
-/// having here, and a session that is still starting is a good session.
+/// Reachability, not readiness: a config cloning plugins can take far longer.
 const REACHABLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const REACHABLE_POLL: Duration = Duration::from_millis(25);
 
-/// Wait until the socket accepts a connection and a real Neovim answers:
-/// `nvim_get_mode`, a fast call whose answer is a few bytes. Deliberately
-/// *not* a deferred call — see [`crate::rpc`]. Over SSH `sock` is the local
-/// end of the forward, which also proves the forward works.
-///
-/// The `:Detach` alias ([`DETACH_ALIAS`]) is asked for on the same connection,
-/// sent behind the mode before its answer is read, so it costs no connection
-/// and no round trip of its own. It is a deferred call, so it is not waited
-/// for while the editor waits for a key, and otherwise for no longer than a
-/// call on a connection of its own, [`rpc::CONNECT_TIMEOUT`].
+/// Wait until a real Neovim answers `nvim_get_mode` (not a deferred call; see
+/// [`crate::rpc`]). The `:Detach` alias is sent behind it on the same
+/// connection; being deferred, it is not waited for while the editor waits for
+/// a key.
 fn reachable(sock: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -509,8 +366,6 @@ fn reachable(sock: &Path, timeout: Duration) -> bool {
                                 tracing::debug!(error = %e, "could not install the :Detach alias");
                             }
                         }
-                        // Run by the editor once it has its key, with nobody
-                        // left to read the answer.
                         Ok(_) => {}
                         Err(e) => {
                             tracing::debug!(error = %e, "could not ask for the :Detach alias");
@@ -525,10 +380,7 @@ fn reachable(sock: &Path, timeout: Duration) -> bool {
     false
 }
 
-/// Names carry no identity, but two identical ones in a picker is a usability
-/// trap, so a name is refused if another session already has it — compared
-/// case-insensitively. `except` is the session being renamed, which may of
-/// course keep its own name.
+/// Case-insensitive. `except` is the session being renamed.
 fn ensure_name_free(existing: &[Session], name: &str, except: Option<&str>) -> Result<()> {
     let taken = existing
         .iter()
@@ -539,32 +391,19 @@ fn ensure_name_free(existing: &[Session], name: &str, except: Option<&str>) -> R
     Ok(())
 }
 
-/// Everything a create needs decided before anything is spawned: the name is
-/// legal and free, the new session has an id and a rank.
-///
-/// A rank, not the number the picker will show — see [`finish_listing`] for
-/// the difference and [`create`] for where the number comes from.
-///
-/// Pure, and shared by both transports. The listing it works from is **not**
-/// taken here: fetching one is where local and remote differ (one reaps dead
-/// sessions, the other sweeps orphaned forwards), so each caller passes its own.
+/// Validate the name and allocate an id and a rank (see [`finish_listing`]).
 fn plan_create(existing: &[Session], name: &str) -> Result<(String, u32)> {
     crate::session::validate_name(name)?;
     ensure_name_free(existing, name, None)?;
     Ok((crate::ids::nonce()?, next_rank(existing)))
 }
 
-/// The same checks for a rename, which allocates nothing.
 pub(crate) fn plan_rename(existing: &[Session], new_name: &str, id: &str) -> Result<()> {
     crate::session::validate_name(new_name)?;
     ensure_name_free(existing, new_name, Some(id))
 }
 
-/// The `<pid>` argument `kill.sh` takes.
-///
-/// Empty unless the recorded pid is worth signalling: 0 is "unknown" and 1 is
-/// init. The script finds the process by its socket anyway, so the pid is only
-/// ever a hint, and a wrong one must not become a signal to something else.
+/// Empty for 0 (unknown) and 1 (init): the pid is only a hint.
 fn pid_arg(pid: u32) -> String {
     if pid > 1 {
         pid.to_string()
@@ -573,15 +412,12 @@ fn pid_arg(pid: u32) -> String {
     }
 }
 
-/// The same argument, from what `spawn.sh` reported.
 fn opt_pid_arg(pid: Option<u32>) -> String {
     pid.map(pid_arg).unwrap_or_default()
 }
 
-/// What a kill script outcome means for the caller. Files are removed by the
-/// script only once the session is genuinely gone; claiming success on the
-/// other outcomes would drop it from the picker while its Neovim kept running,
-/// with no socket left to ever find it by.
+/// Reporting success unless the session is gone would hide a running Neovim
+/// from the picker.
 fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result<()> {
     use protocol::KillOutcome;
     match outcome {
@@ -600,43 +436,17 @@ fn kill_outcome(outcome: protocol::KillOutcome, name: &str) -> Result<()> {
     }
 }
 
-/// A new session's way out that is not `:q`, put in by [`reachable`].
-/// `command!` requires an uppercase name (`command! q` is E183), so this
-/// cannot shadow `:q` itself. Failure is not worth failing the create over.
+/// `command!` requires an uppercase name, so this cannot shadow `:q`.
 const DETACH_ALIAS: &str = "command! -bar Detach detach";
 
-/// Shared by both transports: put the sessions in order, then number them by
-/// the position each one landed in.
+/// Sort sessions by rank and number them by position.
 ///
-/// The column is **dense and recalculated on every listing**. Kill the second
-/// of three and the third becomes the second: there is no hole to explain, the
-/// last row of a list of *n* is always *n*, and a session's number is just the
-/// count of rows above it plus one.
-///
-/// That is a trade, and this is the side of it that costs: a number is no
-/// longer a name a session keeps for life, because killing a row shifts every
-/// row below it up one. What is stable instead is the *order*, and the stored
-/// [`Session::num`] is what holds it — a **rank**, read here only to sort by
-/// and never shown. Ranks need not be dense and their gaps never reach the
-/// screen: a create takes one past the end ([`next_rank`]), a reorder writes
-/// the arrangement back ([`Transport::renumber`]), and a kill leaves the
-/// survivors' ranks exactly as they were, because nothing downstream reads a
-/// rank as a number to display.
-///
-/// Ordering is by rank rather than by name because the number is what the user
-/// reads off the screen and presses; a name sort would scramble the column and
-/// make it noise. It also stops the list reshuffling on every rename.
-///
-/// Resolution still never writes to disk. The three things that arrive without
-/// a usable rank — metadata written before numbering existed, orphans with no
-/// metadata at all, and the two-clients-created-at-once duplicate — are settled
-/// in memory by the sort below. A read path that wrote would cost an SSH round
-/// trip per listing, and would persist a derived number as if it had been
-/// assigned.
+/// Displayed numbers are dense and recomputed per listing. The stored
+/// [`Session::num`] is a rank, used only to sort; ranks may have gaps. Missing
+/// or duplicate ranks are resolved in memory, never written back (that would
+/// cost an SSH round trip per listing).
 fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
-    // Rank first, so sessions with a claim on a place in the list keep it;
-    // `created` then `id` puts the rankless ones — and any pair sharing a rank
-    // — in a stable order rather than whatever the directory happened to yield.
+    // `created` then `id` give unranked sessions and ties a stable order.
     sessions.sort_by(|a, b| {
         let key = |s: &Session| if s.num == 0 { u32::MAX } else { s.num };
         key(a)
@@ -645,8 +455,6 @@ fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    // Position, not rank. Every session gets a number, they start at 1, and no
-    // two can collide however broken the ranks that arrived.
     for (i, s) in sessions.iter_mut().enumerate() {
         s.state.num = i as u32 + 1;
     }
@@ -654,16 +462,8 @@ fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
     sessions
 }
 
-/// The rank to store for a session being created now: one past the highest
-/// rank on the host, so it sorts after everything that already exists and the
-/// new row appears at the end of the list.
-///
-/// Stored ranks, not displayed numbers — those are positions now, and the
-/// number this session will show is whatever place it lands in once it joins
-/// the listing. [`create`] reads that back out of [`finish_listing`] rather
-/// than assuming it is the last one, because a session with no rank at all
-/// (legacy metadata, an orphan) sorts after every ranked one and so keeps the
-/// bottom of the list.
+/// One past the highest stored rank (not displayed number). Unranked sessions
+/// still sort after it.
 fn next_rank(existing: &[Session]) -> u32 {
     existing
         .iter()
@@ -673,28 +473,14 @@ fn next_rank(existing: &[Session]) -> u32 {
         .saturating_add(1)
 }
 
-/// The session `<prefix> n` / `<prefix> p` moves to from the one numbered
-/// `from`, wrapping at both ends.
-///
-/// By number rather than by position in the slice. The listing a caller hands
-/// in happens to be sorted ([`finish_listing`]), but nothing here leans on
-/// that, so the rule is the same whatever order it arrives in.
-///
-/// `from` is a pivot, not a member, and that is what makes the awkward case
-/// right without a special arm: press `n` in a session someone killed from
-/// another window and you land on the nearest number that still exists, rather
-/// than nowhere or back at the start.
-///
-/// `None` only for an empty listing. With one session it names that session,
-/// which the session loop then reuses the client for — nothing changes, and
-/// nothing is announced.
+/// The session `<prefix> n` / `<prefix> p` moves to from number `from`,
+/// wrapping. `from` need not exist (a session killed elsewhere): it lands on
+/// the nearest number left. With one session, returns that session.
 pub fn neighbour(sessions: &[Session], from: u32, dir: crate::keys::Direction) -> Option<&Session> {
     use crate::keys::Direction;
-    // Zero is "unnumbered", which `finish_listing` never leaves behind. Nobody
-    // can be sitting on one or have typed one, so it is not somewhere to land.
+    // Zero is "unnumbered".
     let numbered = || sessions.iter().filter(|s| s.state.num != 0);
-    // On the id as well as the number, so a duplicate — which only a listing
-    // built by hand can contain — still gives one deterministic answer.
+    // By id too, so duplicates give one deterministic answer.
     let order = |a: &&Session, b: &&Session| (a.state.num, &a.id).cmp(&(b.state.num, &b.id));
     match dir {
         Direction::Next => numbered()
@@ -720,7 +506,7 @@ mod tests {
         assert!(ensure_name_free(&existing, "name-aaa", None).is_err());
         assert!(ensure_name_free(&existing, "NAME-AAA", None).is_err());
         assert!(ensure_name_free(&existing, "name-ccc", None).is_ok());
-        // A rename to its own name (or its own name in another case) is fine.
+        // Renaming to its own name, in any case, is fine.
         assert!(ensure_name_free(&existing, "Name-aaa", Some("aaa")).is_ok());
         assert!(ensure_name_free(&existing, "name-bbb", Some("aaa")).is_err());
     }
@@ -738,9 +524,6 @@ mod tests {
         assert!(plan_create(&taken, "").is_err(), "an empty name is invalid");
     }
 
-    /// A create takes a rank past the end, so the new row lands at the bottom
-    /// of the list rather than in the first hole — which is the whole point of
-    /// ranks being an ordering key and not the column on screen.
     #[test]
     fn a_create_takes_a_rank_past_the_end() {
         let all = finish_listing(vec![
@@ -753,17 +536,13 @@ mod tests {
         assert_eq!(rank, 4);
         assert!(crate::ids::is_valid_id(&id), "{id:?}");
 
-        // Killing the middle session leaves a hole in the *ranks*. The next
-        // create must step over it rather than fill it, or the new session
-        // would come up between the two survivors.
+        // Killing the middle session leaves a hole in the ranks. The next
+        // create must not fill it, or it would sort between the survivors.
         let gapped: Vec<_> = all.into_iter().filter(|s| s.num != 2).collect();
         let (_, rank) = plan_create(&gapped, "fresh").expect("planned");
         assert_eq!(rank, 4, "the freed rank is not reused");
     }
 
-    /// The number a create hands back, which the caller attaches to without
-    /// re-listing, is the place the new session takes in the list — not its
-    /// rank, and the two part company as soon as anything has been killed.
     #[test]
     fn a_new_session_is_numbered_by_where_it_lands() {
         let listed = finish_listing(vec![session("aaaaaaaa", 1, 1), session("cccccccc", 3, 3)]);
@@ -773,17 +552,13 @@ mod tests {
         let mut fresh = session("ffffffff", rank, 9);
         assert_eq!(numbered_in(listed, &fresh), 3, "it shows as the third row");
 
-        // An orphan has no rank and keeps the bottom of the list, so the new
-        // session is numbered above it rather than after it.
+        // An orphan has no rank and stays last.
         let with_orphan =
             finish_listing(vec![session("aaaaaaaa", 1, 1), session("zzzzzzzz", 0, 2)]);
         fresh.num = next_rank(&with_orphan);
         assert_eq!(numbered_in(with_orphan, &fresh), 2);
     }
 
-    /// `<prefix> n` and `<prefix> p` must round the list and come back, or the
-    /// two keys would dead-end at either edge and the user would have to know a
-    /// number after all.
     #[test]
     fn stepping_wraps_at_both_ends() {
         let all = finish_listing(vec![
@@ -800,10 +575,6 @@ mod tests {
         assert_eq!(step(2, Direction::Prev), Some(1));
     }
 
-    /// A listing has no gaps to cross any more, but `neighbour` must not be the
-    /// place that assumes it: it takes whatever slice it is handed, and the
-    /// numbers in one built by hand are nobody's promise. From 2 of {1, 2, 5}
-    /// the next session is 5, not 3.
     #[test]
     fn stepping_crosses_a_gap_in_the_numbering() {
         let all = numbered(&[
@@ -821,10 +592,6 @@ mod tests {
         );
     }
 
-    /// A session killed from another window while this one was attached to it:
-    /// the number the user is on is no longer in the listing. Stepping must
-    /// still land somewhere, and the nearest number is a far better answer than
-    /// the start of the list.
     #[test]
     fn stepping_from_a_number_that_is_gone_lands_on_the_nearest_one_left() {
         let all = numbered(&[
@@ -841,7 +608,7 @@ mod tests {
             neighbour(&all, 3, Direction::Prev).map(|s| s.state.num),
             Some(2)
         );
-        // Past either end it still wraps rather than giving up.
+        // Past either end it still wraps.
         assert_eq!(
             neighbour(&all, 9, Direction::Next).map(|s| s.state.num),
             Some(1)
@@ -852,8 +619,6 @@ mod tests {
         );
     }
 
-    /// An unnumbered session is one `finish_listing` never produces, and not
-    /// somewhere anyone could have typed their way to either.
     #[test]
     fn an_unnumbered_session_is_not_somewhere_to_land() {
         let mut orphan = session("zzzzzzzz", 0, 9);
@@ -867,8 +632,6 @@ mod tests {
         );
     }
 
-    /// One session is its own neighbour, which the session loop then reuses as
-    /// the client it already has: a no-op, not a reattach.
     #[test]
     fn stepping_with_one_session_stays_put_and_with_none_goes_nowhere() {
         let one = finish_listing(vec![session("aaaaaaaa", 1, 1)]);
@@ -878,8 +641,6 @@ mod tests {
         }
     }
 
-    /// `kill.sh` finds the process by its socket; a pid of 0 or 1 is never a
-    /// hint worth passing, and 1 would name init.
     #[test]
     fn only_a_signallable_pid_is_passed_to_the_kill_script() {
         assert_eq!(pid_arg(0), "");
@@ -904,16 +665,13 @@ mod tests {
         }
     }
 
-    /// `created` is what orders the unranked ones, so it is set explicitly.
     fn session(id: &str, num: u32, created: u64) -> Session {
         let mut s = Session::new(id.to_string(), format!("name-{id}"), 0, num);
         s.created = created;
         s
     }
 
-    /// A listing whose displayed numbers are the stored ones, which
-    /// `finish_listing` no longer produces. For the cases that are about what
-    /// `neighbour` does with an arbitrary slice rather than about resolution.
+    /// Displayed numbers equal to stored ones, for `neighbour` on any slice.
     fn numbered(sessions: &[Session]) -> Vec<Session> {
         sessions
             .iter()
@@ -936,8 +694,6 @@ mod tests {
             .collect()
     }
 
-    /// The change this whole model exists for: the stored ranks order the list
-    /// and then stop mattering, so the column is 1, 2, 3 and not 1, 2, 5.
     #[test]
     fn the_column_is_dense_however_gapped_the_ranks_are() {
         let out = resolved(vec![
@@ -956,9 +712,6 @@ mod tests {
         );
     }
 
-    /// Kill the second of three and the third becomes the second, with nothing
-    /// written to disk: the survivors' ranks are untouched, and only the
-    /// listing they are resolved into changed.
     #[test]
     fn killing_a_session_renumbers_the_ones_below_it() {
         let all = vec![
@@ -985,8 +738,6 @@ mod tests {
         );
     }
 
-    /// Metadata written before numbering existed, and orphans, have no stored
-    /// rank. They must still be reachable by keystroke.
     #[test]
     fn unranked_sessions_sort_last_and_are_still_numbered() {
         let out = resolved(vec![
@@ -994,8 +745,7 @@ mod tests {
             session("bbb", 2, 2),
             session("ccc", 0, 3),
         ]);
-        // "bbb" is the only one with a rank, so it heads the list; the unranked
-        // pair follow it oldest first, and all three get a number.
+        // Only "bbb" has a rank, so it leads; the unranked follow oldest first.
         assert_eq!(
             out,
             vec![
@@ -1006,8 +756,6 @@ mod tests {
         );
     }
 
-    /// Two clients creating at the same moment can store the same rank. Both
-    /// sessions must stay pressable.
     #[test]
     fn duplicate_stored_numbers_are_broken_apart() {
         let out = resolved(vec![
@@ -1047,42 +795,28 @@ mod tests {
         let listed = finish_listing(vec![session("aaa", 1, 1), session("bbb", 2, 2)]);
         assert_eq!(next_rank(&listed), 3, "one past the highest");
 
-        // What killing the middle session leaves behind: a hole in the ranks
-        // that the next create steps over rather than fills.
+        // A hole left by killing the middle session is stepped over.
         let listed = finish_listing(vec![session("aaa", 1, 1), session("ccc", 3, 3)]);
         assert_eq!(next_rank(&listed), 4);
     }
 
-    /// It reads the *stored* rank, not the number on screen — which is exactly
-    /// the pair that come apart after a kill. Ranking a new session by the
-    /// number of rows would collide with a survivor and put the two in
-    /// `created` order, which is not necessarily the end of the list.
     #[test]
     fn the_next_rank_reads_stored_ranks_and_not_the_column() {
         let listed = finish_listing(vec![session("aaa", 1, 1), session("ccc", 9, 3)]);
         assert_eq!(numbers(&listed), vec![1, 2], "two rows on screen");
         assert_eq!(next_rank(&listed), 10, "but the rank clears the highest");
 
-        // Nothing has a rank at all: ranking starts over at 1.
+        // Nothing has a rank: ranking starts over at 1.
         let listed = finish_listing(vec![session("aaa", 0, 1), session("bbb", 0, 2)]);
         assert_eq!(listed[0].num, 0, "still unranked on disk");
         assert_eq!(next_rank(&listed), 1);
     }
 
-    /// What a reorder writes is what the next listing reads back. Reordering is
-    /// only worth anything if this holds, and it is the round trip nothing else
-    /// covers: the picker arranges `state.num`, the transport stores those as
-    /// `num`, and `finish_listing` has to resolve them to the same order again.
-    ///
-    /// The fixture is deliberately the hard one — two sessions storing the
-    /// *same* number, which `duplicate_stored_numbers_are_broken_apart` says is
-    /// a real condition. A reorder that wrote only the rows whose displayed
-    /// number changed would leave one of these two storing a stale number that
-    /// collides with a freshly written one, and this is where that shows up.
+    /// With two sessions sharing a stored number, writing only the changed
+    /// rows would leave a stale number colliding with a fresh one.
     #[test]
     fn the_order_a_reorder_wrote_is_the_order_the_next_listing_reads() {
-        // As listed: "bbb" and "ccc" both claim 2, so one of them is showing a
-        // number it does not store, and "ddd" has none at all.
+        // "bbb" and "ccc" both store 2, and "ddd" has no number.
         let listed = finish_listing(vec![
             session("aaa", 1, 1),
             session("bbb", 2, 2),
@@ -1101,8 +835,8 @@ mod tests {
             ]
         );
 
-        // The picker sends the whole arrangement, with "aaa" dragged to the end:
-        // each row keeps the number of the position it now sits in.
+        // The whole arrangement, "aaa" dragged to the end; each row takes its
+        // new position's number.
         let arranged = ["bbb", "ccc", "ddd", "aaa"];
         let written: Vec<Session> = arranged
             .iter()
@@ -1114,9 +848,6 @@ mod tests {
         assert_eq!(back, arranged, "the arrangement did not survive a listing");
     }
 
-    /// A shell slot another thread holds is waited for — the listing behind
-    /// the picker's rows, with a kill asked for meanwhile — and had once that
-    /// thread lets go of it, not refused.
     #[test]
     fn a_claim_waits_for_another_threads_run() {
         let slot = Mutex::new(None);
@@ -1136,9 +867,6 @@ mod tests {
         });
     }
 
-    /// A claim on the thread that holds the slot already is refused, not
-    /// waited on — it would wait for itself — and the thread can claim again
-    /// once it has let go.
     #[test]
     fn a_claim_inside_a_claim_is_refused() {
         let slot = Mutex::new(None);

@@ -8,8 +8,8 @@ use crate::transport::Location;
 #[derive(Debug, Parser)]
 #[command(
     name = "nvmux",
-    // clap takes the usage line from argv[0], not from `name`, so a binary
-    // invoked through a symlink would otherwise print someone else's name.
+    // clap takes the usage line from argv[0], not `name`; without this a
+    // binary run through a symlink prints the symlink's name.
     bin_name = "nvmux",
     version,
     about = "A tmux-style session manager for Neovim",
@@ -32,9 +32,8 @@ pub struct Cli {
     pub host: Option<String>,
 
     /// Run as nvmux's own Neovim client for the session at this socket, on the
-    /// pty nvmux relays — what nvmux starts to draw a session unless `[client]
-    /// ui = "nvim"` asks for `nvim --remote-ui` (see [`crate::client`]).
-    /// Hidden: a flag for nvmux to give itself, not a way to run it.
+    /// pty nvmux relays. Hidden: nvmux passes it to itself unless `[client]
+    /// ui = "nvim"` selects `nvim --remote-ui`.
     #[arg(long, value_name = "SOCK", hide = true, conflicts_with = "host")]
     pub client: Option<std::path::PathBuf>,
 }
@@ -85,8 +84,6 @@ mod tests {
         );
     }
 
-    /// nvmux's own client is the same binary with a flag nobody else is
-    /// told about: hidden from `--help`, and no host with it.
     #[test]
     fn the_client_flag_is_hidden_and_takes_a_socket() {
         let cli = Cli::try_parse_from(["nvmux", "--client", "/tmp/x.sock"]).expect("parse");
@@ -104,8 +101,8 @@ mod tests {
         assert!(Cli::try_parse_from(["nvmux", "a", "b"]).is_err());
     }
 
-    /// `--help` is printed before the config is read, so it spells the
-    /// built-in default; this keeps that spelling tied to the constant.
+    /// `--help` is printed before the config is read, so it names the built-in
+    /// default prefix; this ties that text to the constant.
     #[test]
     fn help_names_the_default_prefix() {
         let help = Cli::command().render_long_help().to_string();
