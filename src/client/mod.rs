@@ -2788,7 +2788,7 @@ impl App {
                         // What the agent said ahead of a frame that never
                         // came — a key that changed nothing on the screen —
                         // before what the fence says after it.
-                        self.take_acks(now);
+                        self.take_acks(None, now);
                         let mode = Mode::of(&self.model.mode_name);
                         let mut upto = None;
                         if let Some(p) = self.predict.as_mut() {
@@ -2997,7 +2997,7 @@ impl App {
         self.flushed = true;
         self.landed_sideways(now);
         self.take_tails();
-        self.take_acks(now);
+        self.take_acks(None, now);
         self.fill_in(now);
         if let Some(p) = self.predict.as_mut() {
             p.typed.settle(Mode::of(&self.model.mode_name));
@@ -3847,10 +3847,12 @@ impl App {
 
     /// Scroll window grid `grid` ahead of Neovim from the view at `from` to
     /// the one at `to`, for key `cause`, as a step of the cursor moved
-    /// ahead of Neovim says (see [`App::step`]): the rows it brings into view
-    /// drawn from the agent's lines (see [`anim::Animator::predict`]), at
-    /// once, the cursor drawn by the step — and landed, as far as the
-    /// scroll can say, in grid column and wanting display column `col`.
+    /// ahead of Neovim says (see [`App::step`]), or Neovim's word on the
+    /// keys up to it ahead of its frame (see [`App::scroll_to_word`]): the
+    /// rows it brings into view drawn from the agent's lines (see
+    /// [`anim::Animator::predict`]), at once, the cursor drawn by the step
+    /// or the word — and landed, as far as the scroll can say, in grid
+    /// column and wanting display column `col`.
     /// One that cannot be drawn at once, a line it brings in not to be had,
     /// is let go of, and every scroll ahead in the window and every step
     /// with it, to be made again from Neovim's next word. Says whether it
@@ -5298,6 +5300,15 @@ impl App {
     /// client could not make out what one of the keys does (see
     /// [`predict::Sent::lost`]), which may have changed what a window shows
     /// and left its cursor and view as they were. The newest wins.
+    ///
+    /// Or at once where it says the scrolls made ahead of Neovim of the keys
+    /// it covers did not put the view where Neovim did, and the client can
+    /// draw where Neovim did in their place (see [`App::unturned`]): its own
+    /// frame may never come — Neovim, going on to keys it had to hand,
+    /// flushes once it has caught up with them, a frame for more keys than
+    /// the ack covers — and the scrolls ahead would be on the screen till
+    /// then, and taken against that frame, which cannot say which of them
+    /// Neovim made.
     fn heard_ack(&mut self, params: &[ValueRef<'_>], now: Instant) {
         let Some(ack) = predict::Ack::read(params) else {
             return;
@@ -5313,11 +5324,92 @@ impl App {
             .base
             .as_ref()
             .is_some_and(|b| (b.ack.buf, b.ack.tick) != (ack.buf, ack.tick));
-        let shown = !edited && p.made_out(k) && self.shows(&ack);
+        let sure = !edited && p.made_out(k);
+        let shown = sure && self.shows(&ack);
+        let word = (sure && !shown).then(|| self.unturned(k, &ack)).flatten();
         self.ack = Some((k, ack));
-        if shown {
-            self.take_acks(now);
+        if shown || word.is_some() {
+            self.take_acks(word, now);
         }
+    }
+
+    /// The window grid whose view `ack`, Neovim's word on the client's keys
+    /// up to `k`, says Neovim put elsewhere than the scrolls made ahead of
+    /// it of those keys did — a page Neovim did not turn, a key it threw
+    /// away — where the client can draw Neovim's view in their place before
+    /// Neovim's frame shows it (see [`App::scroll_to_word`]): the window
+    /// with the cursor, as Neovim drew it, in the mode it drew, not moved
+    /// sideways by Neovim nor ahead of it; no scroll ahead of those keys in
+    /// another, nor a step of the cursor's ahead of Neovim anywhere, which
+    /// the ack judges by where it says the cursor went (see
+    /// [`App::judge_steps`]); and the lines the view comes over to Neovim's
+    /// all to be had.
+    fn unturned(&self, k: u64, ack: &predict::Ack) -> Option<u64> {
+        let p = self.predict.as_ref()?;
+        let grid = self.model.cursor.grid;
+        let win = *self.model.wins.get(&grid)?;
+        let view = self.model.viewports.get(&grid)?;
+        let shape = p.shape(win)?;
+        let (top, bot, left, right) = anim::text_rect(&self.model, grid)?;
+        let (pos, h) = (&ack.pos, (bot - top) as i64);
+        if pos.win != win
+            || pos.left != shape.leftcol
+            || pos.rest != Rest::drawn(&self.model.mode_name)
+            || ack.line_count != view.line_count
+            || pos.top == view.topline
+            || view.topline + self.anim.ahead_by(grid, k) == pos.top
+            || self.anim.unmade(k) != [grid]
+            || !self.anim.chained().is_empty()
+            || self.anim.side_left(grid).is_some()
+        {
+            return None;
+        }
+        // The lines out of Neovim's view the view comes over to Neovim's.
+        let over = if pos.top > view.topline {
+            view.topline + h..pos.top + h
+        } else {
+            pos.top..view.topline
+        };
+        let over = over.start.max(0)..over.end.min(view.line_count);
+        drawable(p, win, shape, over, pos.line, shape.leftcol, right - left).then_some(grid)
+    }
+
+    /// Scroll window grid `grid` ahead of Neovim to where `ack`, its word on
+    /// the client's keys up to `k`, says it put the view and the cursor, its
+    /// frame yet to show it — in place of the scrolls ahead of those keys,
+    /// given up (see [`App::unturned`]): the view goes back to Neovim's, and
+    /// no further, rather than to Neovim's last frame, which is further
+    /// behind still. Neovim's frame, when it comes, lands on it, or on one
+    /// of the scrolls made again from it (see [`App::replay`]). Says whether
+    /// it was made.
+    fn scroll_to_word(&mut self, grid: u64, k: u64, ack: &predict::Ack, now: Instant) -> bool {
+        let Some(p) = self.predict.as_ref() else {
+            return false;
+        };
+        let (Some(&win), Some(&view)) =
+            (self.model.wins.get(&grid), self.model.viewports.get(&grid))
+        else {
+            return false;
+        };
+        let Some(shape) = p.shape(win) else {
+            return false;
+        };
+        let pos = ack.pos;
+        // Where the cursor lands, where it goes to another line: as a step's
+        // scroll has it (see [`App::step`]).
+        let col = p
+            .text(win, pos.line)
+            .filter(|_| pos.line != view.curline)
+            .and_then(|t| moves::drawn(t, shape, pos.byte).checked_sub(pos.left))
+            .map(|c| (shape.textoff + c, pos.want.col()));
+        let at = |top, cursor| predict::At { top, cursor };
+        let views = (at(view.topline, view.curline), at(pos.top, pos.line));
+        let cause = Cause {
+            by: By::Keys,
+            seq: k,
+            at: now,
+        };
+        self.scroll_ahead(grid, views, col, cause, now)
     }
 
     /// Whether what Neovim has drawn shows what `ack` says already: the
@@ -5345,23 +5437,39 @@ impl App {
     /// scroll's deadline, which on a lossy link may be a lost segment's
     /// time after the frame. And what the keys sent since make is made out
     /// again from there (see [`App::replay`]).
-    fn take_acks(&mut self, now: Instant) {
+    ///
+    /// Or, taken before its frame, as soon as it says the scrolls ahead of
+    /// window grid `word` did not put the view where Neovim did (see
+    /// [`App::unturned`]): the view goes to where it says instead (see
+    /// [`App::scroll_to_word`]), and the keys sent since are made out again
+    /// from there.
+    fn take_acks(&mut self, word: Option<u64>, now: Instant) {
         let Some((k, ack)) = self.ack.take() else {
             return;
         };
         let unmade = self.anim.unmade(k);
         for &grid in &unmade {
-            tracing::debug!(
-                grid,
-                k,
-                "client: a scroll ahead its key's frame did not make, given up"
-            );
+            if word == Some(grid) {
+                tracing::debug!(
+                    grid,
+                    k,
+                    "client: a scroll ahead its key's ack says Neovim did not make, given up"
+                );
+            } else {
+                tracing::debug!(
+                    grid,
+                    k,
+                    "client: a scroll ahead its key's frame did not make, given up"
+                );
+            }
             self.give_up(grid);
             self.dirty = true;
         }
+        let worded = word.is_some_and(|grid| self.scroll_to_word(grid, k, &ack, now));
         // Neovim's frame for the keys, or one it drew after more of them,
         // having gone on to those before it could flush: only from its own
-        // can a scroll be made of the keys after them.
+        // — or from its word, scrolled to ahead of its frame — can a scroll
+        // be made of the keys after them.
         let fresh = self.shows(&ack);
         self.judge_steps(k, &ack, fresh, now);
         // Steps that went on from a scroll given up: worked out over a view
@@ -5383,7 +5491,7 @@ impl App {
         if let Some(p) = self.predict.as_mut() {
             p.judge(k, ack, view, !unmade.is_empty());
         }
-        self.replay(fresh, now);
+        self.replay(fresh || worded, now);
     }
 
     /// Judge where the cursor was moved ahead of Neovim (see
@@ -5704,8 +5812,10 @@ impl App {
     /// So does a scroll not made, where the frame the word came with is not
     /// Neovim's for those keys but for more (`fresh`): Neovim, going on to
     /// keys it had to hand, did not flush between them, and that frame may
-    /// have made it already. A motion is worked out from the ack, not the
-    /// frame, and is made all the same.
+    /// have made it already — unless the view was scrolled ahead to the word
+    /// itself (see [`App::scroll_to_word`]), which is where they go on from.
+    /// A motion is worked out from the ack, not the frame, and is made all
+    /// the same.
     fn replay(&mut self, fresh: bool, now: Instant) {
         let Some(p) = self.predict.as_ref() else {
             return;
@@ -9241,6 +9351,37 @@ mod tests {
         assert!(!p.known(), "blind");
         ack(&mut a, 2, "j<C-E>", "n", (1, 0, 0, 1), t1);
         assert!(a.predict.as_ref().is_some_and(Predictor::known));
+    }
+
+    /// An ack whose own frame never comes — Neovim, going on to the keys
+    /// after, flushes once it has caught up with them — that says a scroll
+    /// made ahead of it of a key it covers was not made: here the second of
+    /// three `<C-E>` thrown away. The view goes to where Neovim says at once,
+    /// not to Neovim's last frame, the scroll after made again from there;
+    /// and Neovim's frame for all three, when it comes, lands on them.
+    #[test]
+    fn a_scroll_neovim_did_not_make_is_given_up_at_an_ack_with_no_frame() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"\x05\x05\x05", t1);
+        assert_eq!(a.anim.ahead(2), (3, 3));
+        assert_eq!(top_row(&a), "line 3");
+        ack(&mut a, 2, "<C-E><C-E>", "n", (1, 0, 0, 1), t1);
+        assert_eq!(base(&a).map(|b| b.seq), Some(2), "taken with no frame");
+        let p = a.predict.as_ref().expect("predicting");
+        assert_eq!(p.shadow.unmade, 1);
+        assert_eq!(a.anim.ahead(2), (2, 2), "Neovim's view, the third from it");
+        assert_eq!(top_row(&a), "line 2");
+        let mut events = vec![
+            at(2, 2, 2),
+            ("grid_cursor_goto", vec![2.into(), 0.into(), 0.into()]),
+        ];
+        events.extend((0..5).map(|r| line(2, r, &format!("line {}", r + 2))));
+        redraw(&mut a, events, t1);
+        assert_eq!(a.anim.ahead(2), (0, 0), "landed");
+        assert_eq!(top_row(&a), "line 2");
+        a.keys(b"\x05", t1);
+        assert_eq!(top_row(&a), "line 3", "and on from there");
     }
 
     /// Where the agent says nothing of a key — the link stalled, or Neovim

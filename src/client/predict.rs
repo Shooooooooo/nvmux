@@ -121,7 +121,10 @@
 //! after a key it was blind to is made with that key's ack, a round trip
 //! after the key, not after the last typed ([`Typed`]). And a scroll made
 //! ahead of Neovim of a key an ack covers, which the frame for it did not
-//! make, is given up on with that frame, not at its deadline.
+//! make, is given up on with that frame, not at its deadline — or with the
+//! ack itself, where it says Neovim put the view elsewhere: Neovim, going
+//! on to keys it had to hand, may draw no frame for it at all, and the view
+//! goes to where it says at once.
 //!
 //! And so do the motions. The client follows the keys that move the cursor
 //! in Normal mode a character, a line or a word at a time

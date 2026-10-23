@@ -300,6 +300,16 @@ impl Scroll {
         self.ahead.iter().any(|a| a.seq.is_some_and(|s| s <= k))
     }
 
+    /// How many rows the scrolls ahead made by input `k` of the client's,
+    /// and those before it, put the view ahead of Neovim's, drawn or not.
+    pub fn ahead_by(&self, k: u64) -> i64 {
+        self.ahead
+            .iter()
+            .filter(|a| a.seq.is_some_and(|s| s <= k))
+            .map(|a| a.rows)
+            .sum()
+    }
+
     /// The client's numbers for the inputs the scrolls ahead were made of,
     /// where it numbers them.
     pub fn seqs(&self) -> Vec<u64> {

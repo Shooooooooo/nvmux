@@ -928,6 +928,13 @@ impl Animator {
         grids
     }
 
+    /// How many rows window grid `grid`'s view is ahead of Neovim's by the
+    /// scrolls made of input `k` of the client's and those before it: see
+    /// [`Scroll::ahead_by`].
+    pub fn ahead_by(&self, grid: u64, k: u64) -> i64 {
+        self.scrolls.get(&grid).map_or(0, |s| s.ahead_by(k))
+    }
+
     /// Stop scrolling window grid `grid` ahead of Neovim: it shows Neovim's
     /// view again. Says the client's numbers for the inputs the scrolls it
     /// gave up were made of, where it numbers them.
