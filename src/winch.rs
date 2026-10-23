@@ -1,40 +1,25 @@
-//! Noticing that our own terminal was resized.
+//! Detect resizes of our own terminal via a self-pipe.
 //!
-//! # Why nvmux only has to notice
-//!
-//! Resizing the PTY master is sufficient end to end: the kernel then delivers
-//! `SIGWINCH` to the pty's foreground process group, the client on the pty
-//! calls `try_resize`, and the server follows. nvmux never forwards the signal
-//! to the child itself.
-//!
-//! # The self-pipe
-//!
-//! The handler does one async-signal-safe `write(2)` of a single byte. The read
-//! end joins the proxy's `poll` set, so a resize is just another readable fd
-//! alongside stdin and the pty master — no extra thread, no shared state, and
-//! nothing for the relay loop to poll for.
-//!
-//! A `sigwait`-based version is ordering-sensitive — every signal in the waited
-//! set must be blocked in every thread before any thread waits, and getting it
-//! wrong produces zero deliveries and a silent hang. The self-pipe cannot.
+//! Only detection is needed: resizing the PTY master makes the kernel send
+//! `SIGWINCH` to the client, which calls `try_resize`; nvmux never forwards the
+//! signal. The handler writes one byte; the read end joins the relay's `poll`
+//! set. Chosen over `sigwait`, which hangs silently unless the signal is
+//! blocked in every thread before any waits.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::error::Result;
 
-/// The write end, as a raw fd the signal handler can reach.
-///
-/// An atomic rather than a `OnceLock` because the handler must never block and
-/// must tolerate firing before or after the pipe exists.
+/// The write end for the handler. Atomic, not `OnceLock`: the handler must not
+/// block and may fire before the pipe exists or after it closes.
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_winch(_sig: libc::c_int) {
     let fd = WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
-        // One byte, ignoring the result. If the pipe is full a resize is
-        // already pending, which is all this byte was going to say. `write` is
-        // async-signal-safe; nothing else here allocates or locks.
+        // Result ignored: a full pipe already has a resize pending. `write` is
+        // async-signal-safe.
         unsafe {
             libc::write(fd, c"w".as_ptr().cast(), 1);
         }
@@ -51,11 +36,8 @@ impl Winch {
     pub fn install() -> Result<Self> {
         let (read, write) = nix::unistd::pipe()?;
 
-        // Both ends non-blocking. The write end because a signal handler must
-        // never block, and if the pipe has filled there is already an unread
-        // resize notification. The read end because `drain` reads until the
-        // pipe is empty, and a blocking read on an empty pipe would park the
-        // whole relay until the *next* resize — see `drain`.
+        // Non-blocking: the handler must never block, and `drain` reads until
+        // `EAGAIN`, which a blocking read end would turn into a hang.
         set_nonblocking(&write)?;
         set_nonblocking(&read)?;
 
@@ -75,16 +57,8 @@ impl Winch {
         self.read.as_raw_fd()
     }
 
-    /// Consume every pending notification.
-    ///
-    /// Several resizes can coalesce into one wake-up, which is fine: the caller
-    /// reads the terminal's *current* size afterwards, so intermediate sizes
-    /// were never interesting.
-    ///
-    /// Reads until the pipe reports empty (`EAGAIN`), which is why the read end
-    /// is non-blocking: with a blocking read, a burst of exactly one buffer's
-    /// worth of notifications would leave the loop parked in `read` with the
-    /// pipe empty, and the relay would stop forwarding until another resize.
+    /// Consume every pending notification. Resizes coalesce; the caller reads
+    /// the current size afterwards.
     pub fn drain(&self) {
         let mut buf = [0u8; 64];
         loop {
@@ -107,8 +81,8 @@ fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
 
 impl Drop for Winch {
     fn drop(&mut self) {
-        // Stop the handler touching a fd that is about to close. Restoring the
-        // default disposition is right: SIGWINCH's default is to be ignored.
+        // Stop the handler using the fd before it closes. SIGWINCH's default
+        // disposition is to ignore it.
         WRITE_FD.store(-1, Ordering::Relaxed);
         unsafe {
             libc::signal(libc::SIGWINCH, libc::SIG_DFL);
@@ -120,11 +94,8 @@ impl Drop for Winch {
 mod tests {
     use super::*;
 
-    /// These tests share process-global state — one SIGWINCH disposition and
-    /// one `WRITE_FD` — so running them concurrently lets one test's `Drop`
-    /// tear down another's subscription mid-assertion. Serialising them is the
-    /// fix; the alternative is a test that fails once every few hundred runs
-    /// and gets dismissed as noise.
+    /// The tests share the SIGWINCH disposition and `WRITE_FD`, so they run
+    /// serially; otherwise one test's `Drop` can tear down another's handler.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn serial() -> std::sync::MutexGuard<'static, ()> {
@@ -140,7 +111,6 @@ mod tests {
             libc::raise(libc::SIGWINCH);
         }
 
-        // The fd should now be readable without blocking.
         let mut fds = [libc::pollfd {
             fd: winch.fd(),
             events: libc::POLLIN,
@@ -152,7 +122,6 @@ mod tests {
 
         winch.drain();
 
-        // ...and after draining it is quiet again.
         let mut fds = [libc::pollfd {
             fd: winch.fd(),
             events: libc::POLLIN,
@@ -181,11 +150,8 @@ mod tests {
         assert_eq!(n, 0, "drain should consume every pending notification");
     }
 
-    /// A burst that fills `drain`'s buffer exactly must not park the relay.
-    ///
-    /// With a blocking read end, 64 pending bytes are read in one call, the
-    /// loop continues, and the next read blocks on an empty pipe until the
-    /// next resize. 65 covers the "one more than a buffer" case too.
+    /// With a blocking read end, exactly 64 pending bytes (one `drain` buffer)
+    /// would leave the next read blocked on an empty pipe.
     #[test]
     fn a_burst_that_fills_the_drain_buffer_does_not_block() {
         let _guard = serial();
@@ -196,7 +162,6 @@ mod tests {
                     libc::raise(libc::SIGWINCH);
                 }
             }
-            // Would hang here before the read end was made non-blocking.
             winch.drain();
             let mut fds = [libc::pollfd {
                 fd: winch.fd(),
@@ -213,7 +178,6 @@ mod tests {
         let _guard = serial();
         let winch = Winch::install().expect("install");
         drop(winch);
-        // The handler must not write to the now-closed fd.
         unsafe {
             libc::raise(libc::SIGWINCH);
         }

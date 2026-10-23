@@ -1,84 +1,59 @@
-//! The `<prefix>` prefix state machine.
+//! The `<prefix>` state machine.
 //!
-//! This sits in the stdin half of the PTY proxy and is the *only* thing that
-//! inspects the byte stream on the way to Neovim. The child-to-terminal
-//! direction is never rewritten or acted on — [`crate::pty`] states that
-//! invariant and describes the two watchers ([`crate::shadow`],
-//! [`crate::boundary`]) that read it without changing it.
+//! It sits in the stdin half of the PTY proxy and is the only thing that
+//! inspects bytes going to Neovim; output is never rewritten (see
+//! [`crate::pty`]). Pure: timing is the caller's, via [`Prefix::timeout`], so
+//! it is testable without a PTY, terminal or clock.
 //!
-//! Deliberately pure: timing is the caller's job, via [`Prefix::timeout`], so
-//! the machine is unit-testable without a PTY, a terminal or a clock.
+//! [`BINDINGS`] is the one command table (default key, name, help).
+//! `[keys.bind]` can move keys ([`crate::config`]); a [`Keymap`] is the table
+//! as moved, read by [`Prefix::feed`], the help screen ([`crate::ui::help`])
+//! and the hint bar ([`crate::hint`]), so the help cannot miss a command. The
+//! README's "While attached" table is a hand-kept copy and can go stale.
 //!
-//! [`BINDINGS`] is the one table: every command, the key it is on by default,
-//! and its name. A config file can move a command to another key under
-//! `[keys.bind]` (see [`crate::config`]), and a [`Keymap`] is the table as
-//! moved — what [`Prefix::feed`] consults, the help screen
-//! ([`crate::ui::help`]) renders and the hint bar ([`crate::hint`]) draws — so
-//! a command cannot be added without appearing in the help, nor moved without
-//! the help saying where to. The README's "While attached" table is a prose
-//! copy — each command's name, its default key, and what it does — and it is
-//! what can go stale.
-//!
-//! Note what is *not* here: `Ctrl-z` (0x1a) is not special-cased. It is
-//! forwarded like any other byte and Neovim receives it as a key.
+//! `Ctrl-z` (0x1a) is not special: it is forwarded to Neovim.
 //!
 //! # How the prefix is spelled
 //!
-//! The prefix is a `Ctrl` chord, and a terminal has three ways of spelling one:
-//! the control byte — `NUL` for the default `Ctrl-Space` — or, once Neovim's
-//! TUI has asked it for the kitty keyboard protocol or xterm's
-//! `modifyOtherKeys`, which it does at every start, an escape sequence.
-//! [`crate::keyseq`] knows the spellings; the machine treats all of them as the
-//! same key, so the prefix works in Windows Terminal, kitty, Ghostty, WezTerm or
-//! xterm exactly as it does in a terminal that speaks neither protocol.
+//! The prefix is a `Ctrl` chord, sent as a control byte (`NUL` for the default
+//! `Ctrl-Space`) or, once Neovim's TUI enables the kitty keyboard protocol or
+//! `modifyOtherKeys` (at every start), as an escape sequence. [`crate::keyseq`]
+//! knows the spellings; all are the same key here.
 //!
-//! Two consequences. A sequence can be cut in two by the end of a `read()`, so
-//! an unfinished one is held back until the rest arrives, or until the caller's
-//! short [`Wait::Sequence`] passes and it is passed on as it stands — which is
-//! how a bare `Esc`, in a terminal that still sends one, reaches Neovim. And
-//! whatever spelled the prefix is what a literal `<prefix>` replays: a terminal
-//! that sent a sequence gets its sequence back, byte for byte, never a control
-//! byte it did not send.
+//! A sequence may be split across `read()`s, so an unfinished one is held
+//! until the rest arrives or the caller's [`Wait::Sequence`] passes, then
+//! forwarded as is (this is how a bare `Esc` reaches Neovim). A literal
+//! `<prefix>` replays the exact bytes that spelled the prefix.
 //!
-//! Not everything on stdin is a keystroke. A terminal asked for key-release
-//! reports (Neovim 0.12 asks) sends one for every key, the prefix included;
-//! and the terminal answers the editor's queries on the same stream, at every
-//! start and resume. Neither is the next key: both change nothing and go
-//! through as they came — except the release of the prefix itself while its
-//! press is still held back, which stays with that press and shares its fate.
-//! Neovim only ever sees the input in its original order, less what the
-//! machine consumed.
+//! Key-release reports (Neovim 0.12 asks for them) and replies to the editor's
+//! terminal queries also arrive on stdin. They are not the next key and pass
+//! through unchanged, except the prefix's own release while its press is held,
+//! which shares the press's fate. Neovim sees input in its original order,
+//! minus what the machine consumed.
 //!
 //! # Digits
 //!
-//! `<prefix> 1` through `<prefix> 9` select a session by its number, and a number may run
-//! to several digits. That means a digit after the prefix is *always* a command
-//! and no longer reaches Neovim — `<prefix> <prefix> 1` is the way to send it. `0` is the
-//! exception: no session number starts with one, so `<prefix> 0` replays both bytes
-//! like any other non-command.
-//!
-//! Multi-digit numbers need a moment to see whether another digit follows, and
-//! [`Prefix::new`] takes the highest live session number so that moment is only
-//! ever spent when it could change the answer. With nine or fewer sessions a
-//! single digit acts at once. The hint is a latency optimisation and nothing
-//! more: whether a session actually exists is settled by the caller.
+//! `<prefix> 1`-`9` select a session by number, possibly multi-digit, so a
+//! digit after the prefix never reaches Neovim (`<prefix> <prefix> 1` sends
+//! it). No number starts with `0`, so `<prefix> 0` replays both bytes.
+//! [`Prefix::new`] takes the highest session number so the wait for another
+//! digit happens only when it could change the answer (never with nine or
+//! fewer sessions). Whether the session exists is the caller's concern.
 
 use crate::keyseq::{self, Sequence, ESC};
 
-/// The byte `Ctrl-Space` sends: `NUL`. The one chord in the prefix's class
-/// that is not a `Ctrl-<letter>`, so it is also the one whose label and key
-/// code do not follow from a letter — see [`prefix_label`] and [`prefix_code`].
+/// The byte `Ctrl-Space` sends: `NUL`. The only prefix chord that is not
+/// `Ctrl-<letter>`, so [`prefix_label`] and [`prefix_code`] special-case it.
 const CTRL_SPACE: u8 = 0x00;
 
-/// What the space bar is called: in a config file, on the help screen, and in
-/// the README — as the prefix chord's key and as the picker command's.
+/// The space bar's name in config files, the help screen and the README.
 const SPACE_NAME: &str = "Space";
 
 /// `Ctrl-Space`.
 pub const PREFIX: u8 = CTRL_SPACE;
 
-/// How the prefix is spelled for people: on the help screen, in the README and
-/// in `--help`. A test ties it to [`PREFIX`].
+/// The prefix as shown on the help screen, the README and `--help`. A test
+/// ties it to [`PREFIX`].
 pub const PREFIX_LABEL: &str = "Ctrl-Space";
 
 /// Which way `<prefix> n` and `<prefix> p` step through the session list.
@@ -91,29 +66,26 @@ pub enum Direction {
 /// Something the proxy must do instead of forwarding bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// `<prefix> Space` — suspend the relay and show the picker. The child stays
-    /// alive.
+    /// `<prefix> Space`: suspend the relay and show the picker. The child
+    /// stays alive.
     Picker,
-    /// `<prefix> d` — terminate the local UI and exit, leaving the server running.
+    /// `<prefix> d`: exit the local UI, leaving the server running.
     Detach,
-    /// `<prefix> c` — create a new session and attach to it.
+    /// `<prefix> c`: create a new session and attach to it.
     Create,
-    /// `<prefix> ?` — show the key bindings. The child stays alive.
+    /// `<prefix> ?`: show the key bindings. The child stays alive.
     Help,
-    /// `<prefix> <number>` — attach to the session with that number, leaving this
-    /// one running. The only action with no [`BINDINGS`] row: one row cannot
-    /// stand for nine keys, so digits are a rule in [`Prefix::feed`] instead.
+    /// `<prefix> <number>`: attach to that session, leaving this one running.
+    /// Has no [`BINDINGS`] row; digits are a rule in [`Prefix::feed`].
     Switch(u32),
-    /// `<prefix> n` / `<prefix> p` — attach to the session either side of this
-    /// one in the picker's order, wrapping at both ends. One action rather than
-    /// two, so the direction stays a value all the way to the session loop
-    /// instead of being spelled out again at every hand-off.
+    /// `<prefix> n` / `<prefix> p`: attach to the neighbouring session in the
+    /// picker's order, wrapping.
     Cycle(Direction),
-    /// `<prefix> Enter` — go where the newest note in the margin is about:
-    /// the session it came from, or the terminal of this one it came from
-    /// (see [`crate::card`]). Nothing, with no such note up.
+    /// `<prefix> Enter`: go where the newest margin note is about (its
+    /// session, or this session's terminal; see [`crate::card`]). Nothing if
+    /// no such note is up.
     Go,
-    /// `<prefix> ,` — change nvmux's settings while it runs (see
+    /// `<prefix> ,`: change settings while running (see
     /// [`crate::ui::settings`]). The child stays alive.
     Settings,
 }
@@ -123,40 +95,29 @@ pub enum Action {
 pub enum Step {
     /// Write these bytes to the PTY master, verbatim.
     Forward(Vec<u8>),
-    /// Do this.
     Act(Action),
 }
 
-/// One `<prefix>` command: the byte that selects it, what it does, and how the help
-/// screen describes it.
+/// One `<prefix>` command: its key, action, and help text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
-    /// The byte typed after the prefix: in [`BINDINGS`] the one the command is
-    /// on unless `[keys.bind]` moves it, and out of [`Keymap::bindings`] the
-    /// one it is on. Printable ASCII, or Enter; [`key_label`] spells it for the
-    /// help screen, since one of them is the space bar and would otherwise be
-    /// an empty cell, and another is no character at all.
+    /// The byte after the prefix: the default in [`BINDINGS`], the current key
+    /// from [`Keymap::bindings`]. Printable ASCII or Enter; [`key_label`]
+    /// names Space (else a blank cell) and Enter (not a character).
     pub key: u8,
     pub action: Action,
     /// One line, in terms of what happens to the user.
     pub help: &'static str,
-    /// The same thing in one lowercase word, for the hint bar the relay puts
-    /// up while the prefix is armed ([`crate::hint`]). A field rather than a
-    /// second table, so a command cannot be added without a label for the bar
-    /// — the guarantee `help` already gives the help screen.
-    ///
-    /// It is the command's name in `[keys.bind]` as well, so the bar names the
-    /// setting that moves what it shows. Renaming one renames the other, and a
-    /// config file that used the old name stops loading — the README's, which a
-    /// test parses, first.
+    /// One lowercase word for the hint bar ([`crate::hint`]), and the
+    /// command's name in `[keys.bind]`. Renaming it breaks config files using
+    /// the old name, starting with the README's, which a test parses.
     pub hint: &'static str,
 }
 
 /// Every command, in the order the help screen lists them.
 pub const BINDINGS: &[Binding] = &[
     Binding {
-        // The prefix chord's own key, without the Ctrl: `<prefix> Space`, the
-        // way `<prefix> <prefix>` is the prefix chord twice.
+        // The prefix chord's own key, without the Ctrl.
         key: b' ',
         action: Action::Picker,
         help: "back to the picker, session still attached",
@@ -207,12 +168,10 @@ pub const BINDINGS: &[Binding] = &[
     },
 ];
 
-/// How many commands there are: a row of [`BINDINGS`] each.
 const COMMANDS: usize = BINDINGS.len();
 
-/// Every command's name in `[keys.bind]`, in [`BINDINGS`]' order: each row's
-/// [`hint`](Binding::hint). Spelled out for a config file that names a command
-/// there is not — this is the list the refusal offers instead.
+/// Each command's `[keys.bind]` name ([`hint`](Binding::hint)) in
+/// [`BINDINGS`] order, listed when a config names an unknown command.
 pub(crate) static NAMES: [&str; COMMANDS] = {
     let mut names = [""; COMMANDS];
     let mut i = 0;
@@ -223,20 +182,13 @@ pub(crate) static NAMES: [&str; COMMANDS] = {
     names
 };
 
-/// Which key each command is on: the table's own, or where `[keys.bind]` moved
-/// it (see [`crate::config`]).
+/// The key each command is on: the default, or where `[keys.bind]` moved it
+/// ([`crate::config`]). One key per [`BINDINGS`] row; only keys can move. The
+/// machine, help screen and hint bar all read through this, so they agree.
 ///
-/// A key per row of [`BINDINGS`], in its order, rather than a table of its own:
-/// what a command does, what the help says of it and what the bar calls it stay
-/// the table's, and only the key can be moved. Everything that reads the table
-/// as the user has it reads it through here — the machine ([`Prefix`]), the
-/// help screen and the hint bar — so none of them can disagree about where a
-/// command is.
-///
-/// Two commands can be put on one key here; [`clash`](Keymap::clash) finds
-/// them, and the config refuses to load them. No command can be put on a digit
-/// or on the prefix, because [`parse_key`], the one way a key comes in from a
-/// file, refuses the one and cannot spell the other.
+/// Two commands may share a key here; [`clash`](Keymap::clash) finds them and
+/// the config refuses to load. No command can be on a digit or the prefix:
+/// [`parse_key`] refuses the one and cannot spell the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Keymap([u8; COMMANDS]);
 
@@ -248,8 +200,7 @@ impl Default for Keymap {
 }
 
 impl Keymap {
-    /// Every command in the table's order, each on the key it is on now: a row
-    /// of [`BINDINGS`] with its key moved, if it has been.
+    /// [`BINDINGS`] with each key as currently bound.
     pub fn bindings(&self) -> impl Iterator<Item = Binding> {
         BINDINGS
             .iter()
@@ -257,20 +208,19 @@ impl Keymap {
             .map(|(b, key)| Binding { key, ..*b })
     }
 
-    /// The command a second byte selects, if any. Linear over a handful of
-    /// rows; a `match` would be a second copy of the table.
+    /// The command a second byte selects, if any. A linear scan; a `match`
+    /// would duplicate the table.
     pub fn command(&self, byte: u8) -> Option<Action> {
         self.bindings().find(|b| b.key == byte).map(|b| b.action)
     }
 
-    /// The key `action` is on: `None` only for [`Action::Switch`], which is a
-    /// rule and no row.
+    /// `None` only for [`Action::Switch`], which has no row.
     pub fn key(&self, action: Action) -> Option<u8> {
         self.bindings().find(|b| b.action == action).map(|b| b.key)
     }
 
-    /// Put the command called `name` — its word on the hint bar — on `key`.
-    /// False, with nothing moved, when no command is called that.
+    /// Put the command named `name` (its hint word) on `key`. False, and
+    /// nothing moved, if there is no such command.
     pub fn bind(&mut self, name: &str, key: u8) -> bool {
         match NAMES.iter().position(|n| *n == name) {
             Some(i) => {
@@ -281,9 +231,8 @@ impl Keymap {
         }
     }
 
-    /// The first two commands that share a key, by name and in the table's
-    /// order, and the key they share. The second of them could never be
-    /// reached, and the help and the bar would offer it all the same.
+    /// The first two commands (by name, in table order) that share a key, and
+    /// the key. The second could never be reached.
     pub fn clash(&self) -> Option<(&'static str, &'static str, u8)> {
         (0..COMMANDS).find_map(|i| {
             (i + 1..COMMANDS)
@@ -293,22 +242,14 @@ impl Keymap {
     }
 }
 
-/// Parse a human prefix spelling like `"C-Space"`, `"C-t"` or `"Ctrl-a"` into
-/// its control byte. Case-insensitive on both halves; the inverse of
-/// [`prefix_label`].
+/// Parse a prefix like `"C-Space"`, `"C-t"` or `"Ctrl-a"` into its control
+/// byte. Case-insensitive; the inverse of [`prefix_label`].
 ///
-/// Only a `Ctrl-<letter>` chord or `Ctrl-Space` is accepted, because the prefix
-/// has to be a single byte the terminal delivers in raw mode, and a control
-/// chord is the one class that is both typable and does not collide with
-/// ordinary text. `Ctrl-Space` is that class's one non-letter member, and it
-/// sends `NUL` — a byte no ordinary text contains. A few of the letters are
-/// refused: they already mean something else on the wire and would never reach
-/// the machine as a prefix (or, for `C-m`, would clash with the number-entry
-/// terminator `ENTER`).
-///
-/// `C-c` and `C-z` are *allowed*, as in tmux: choosing them is the user's
-/// explicit, reversible decision, and it only means that byte stops reaching
-/// Neovim — the machine is unaffected.
+/// Only `Ctrl-<letter>` or `Ctrl-Space` (`NUL`): a single raw-mode byte that
+/// is typable and never ordinary text. `C-h`, `C-i`, `C-j` are refused (they
+/// mean something else on the wire), and `C-m` would clash with `ENTER`, which
+/// ends a number. `C-c` and `C-z` are allowed, as in tmux; that byte just stops
+/// reaching Neovim.
 pub fn parse_prefix(s: &str) -> Result<u8, String> {
     let lower = s.trim().to_ascii_lowercase();
     let key = lower
@@ -339,23 +280,15 @@ pub fn parse_prefix(s: &str) -> Result<u8, String> {
     }
 }
 
-/// Parse a command's key as `[keys.bind]` spells it: one character, as itself,
-/// or the space bar or Enter by name, `Space` and `Enter` in any case — the
-/// spellings [`key_label`] prints, so the help screen's key column reads back
-/// as the keys it names.
+/// Parse a `[keys.bind]` key: one character, or `Space` / `Enter` in any case
+/// (as [`key_label`] prints them).
 ///
-/// Only a key that reaches [`Prefix`] as a byte of its own, in every keyboard
-/// protocol a terminal speaks to it (see [`crate::keyseq`]): a printable ASCII
-/// character, which a terminal sends as the text it types, shifted or not — the
-/// way `?` has always arrived; the space bar; and Enter, which even the kitty
-/// protocol leaves a carriage return. Not a digit, which the session-number rule
-/// has already taken; and not a chord, which arrives as an escape sequence the
-/// machine passes on rather than reads. Nor can a key be the prefix: that is a
-/// control byte, and the one control byte a key can be, Enter's, is one
-/// [`parse_prefix`] refuses.
-///
-/// Case matters for a character, as it does to the terminal: `D` is a key of
-/// its own, Shift and `d`.
+/// Only keys that arrive as a single byte in every keyboard protocol
+/// ([`crate::keyseq`]): printable ASCII (sent as text, even shifted), Space,
+/// and Enter (a carriage return even under kitty). Not digits (session
+/// numbers), not chords (escape sequences the machine passes on), and never
+/// the prefix (Enter is the only control byte, and [`parse_prefix`] refuses
+/// it). Case matters: `D` is Shift-`d`, a key of its own.
 pub fn parse_key(s: &str) -> Result<u8, String> {
     if s.eq_ignore_ascii_case(SPACE_NAME) {
         return Ok(b' ');
@@ -385,10 +318,8 @@ pub fn parse_key(s: &str) -> Result<u8, String> {
     Ok(byte)
 }
 
-/// Spell a key the way people read it: itself for a printable character, and
-/// a name for the space bar, which would otherwise be an invisible cell on the
-/// help screen and an unreadable one in the README — and for Enter, which is
-/// no character at all.
+/// A key as people read it: the character itself, or a name for Space
+/// (otherwise invisible) and Enter (not a character).
 pub fn key_label(byte: u8) -> String {
     match byte {
         b' ' => SPACE_NAME.to_string(),
@@ -400,28 +331,18 @@ pub fn key_label(byte: u8) -> String {
 /// What the Enter key is called on the help screen and in the README.
 pub const ENTER_NAME: &str = "Enter";
 
-/// What it is drawn as on a one-line hint row, and on a card: `⏎`, as the
-/// picker's own row has it (see [`SPACE_GLYPH`]).
+/// Enter on a one-line hint row or a card, as on the picker's row.
 pub const ENTER_GLYPH: &str = "⏎";
 
-/// What the space bar is drawn as on a one-line hint row: `␣` (U+2423), rather
-/// than [`SPACE_NAME`]. Such a row is uniformly lowercase — `esc`, never `Esc` —
-/// and a glyph is neither, which is the argument `src/ui/draw.rs` already makes
-/// for the picker's row, where `⏎` and `↑↓` stand for Enter and the arrows on the
-/// same grounds. One column wide, like every other cell on the row: it carries
-/// no Emoji property, so nothing paints it double.
+/// Space on a one-line hint row (U+2423), instead of [`SPACE_NAME`]: those rows
+/// are all lowercase and a glyph is neither case. One column wide (no Emoji
+/// property).
 pub const SPACE_GLYPH: &str = "␣";
 
-/// Spell a key the way a one-line hint row does — the picker's own
-/// (`src/ui/draw.rs`), and the hint bar the prefix puts up ([`crate::hint`]).
-///
-/// [`key_label`] is the other spelling: a name, for the help screen's key column
-/// and the README's table, where there is room for a word and an invisible cell
-/// would be the worse answer. The two keys with names are the two with glyphs;
-/// every other key is a character, drawn as itself, case and all. `D` is a key
-/// of its own, Shift and `d`, that `[keys.bind]` can put a command on, and a row
-/// that drew it `d` would send the user to the wrong key — so the row is as
-/// lowercase as the keys it names, and no more.
+/// A key as one-line hint rows spell it (the picker's in `src/ui/draw.rs`, and
+/// [`crate::hint`]): glyphs for Space and Enter, else the character with its
+/// case, since `D` and `d` are different keys. [`key_label`] is the named form
+/// for the help screen and README.
 pub fn key_glyph(byte: u8) -> String {
     match byte {
         b' ' => SPACE_GLYPH.to_string(),
@@ -430,18 +351,14 @@ pub fn key_glyph(byte: u8) -> String {
     }
 }
 
-/// Spell a prefix byte the way people read it: `0x00` -> `"Ctrl-Space"`,
-/// `0x14` -> `"Ctrl-t"`. The inverse of [`parse_prefix`], used by the runtime
-/// help screen and messages so a remapped prefix is described as the key the
-/// user actually set.
+/// `0x00` -> `"Ctrl-Space"`, `0x14` -> `"Ctrl-t"`; the inverse of
+/// [`parse_prefix`], so a remapped prefix is shown as configured.
 pub fn prefix_label(byte: u8) -> String {
     format!("Ctrl-{}", key_label(prefix_code(byte)))
 }
 
-/// The key code a terminal reports the prefix chord under, see
-/// [`crate::keyseq`]: the letter of a `Ctrl-<letter>` control byte, its low
-/// five bits set back into ASCII, so `0x14` is `'t'`; and for `Ctrl-Space`,
-/// whose byte is `NUL`, the space bar's own code.
+/// The key code terminals report the prefix chord under ([`crate::keyseq`]):
+/// the letter for `Ctrl-<letter>` (`0x14` is `'t'`), Space's code for `NUL`.
 fn prefix_code(byte: u8) -> u8 {
     if byte == CTRL_SPACE {
         b' '
@@ -450,19 +367,18 @@ fn prefix_code(byte: u8) -> u8 {
     }
 }
 
-/// Carriage return, which is what Enter is in raw mode. Ends a number early
-/// rather than waiting out `keys.timeout_ms`.
+/// Enter in raw mode (carriage return). Ends a number without waiting out
+/// `keys.timeout_ms`.
 const ENTER: u8 = 0x0d;
 
 /// Where the machine is between keystrokes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// Ordinary bytes, passing straight through.
     #[default]
     Idle,
-    /// A `<prefix>` has been swallowed and we are waiting to see what follows.
+    /// A `<prefix>` was swallowed; waiting for the next key.
     Armed,
-    /// Digits are accumulating into a session number.
+    /// Digits accumulating into a session number.
     Number(u32),
 }
 
@@ -472,27 +388,15 @@ pub enum Wait {
     /// A lone `<prefix>` or a half-typed number: give the user
     /// `keys.timeout_ms` to finish it.
     Command,
-    /// An escape sequence the last read cut short: give the rest of it a
-    /// moment to arrive. Machine time, not human time — the bytes of one key
-    /// are only ever split by a buffer boundary — so this wait should be
-    /// short: a bare `Esc` in a terminal that still sends one is held for
-    /// exactly this long.
+    /// An escape sequence cut short by the last read: give the rest a moment.
+    /// Keep it short (machine time, as only a buffer boundary splits a key's
+    /// bytes): a bare `Esc` is held for exactly this long.
     Sequence,
 }
 
-/// What the machine is waiting for, for something that wants to say so on the
-/// screen — the hint bar the relay puts up while the prefix is armed (see
-/// [`crate::hint`]).
-///
-/// Not [`Wait`], which is the same question asked about clocks: that says what
-/// the caller must *time*, and an unfinished escape sequence is one of its
-/// answers because it is a timer the caller must arm. This says what the user
-/// has half-typed, which is a different set — and the set a bar can be drawn
-/// from.
-///
-/// [`State`] stays private. This is the part of it that is anybody else's
-/// business, and no more: a caller can tell a pending command from a pending
-/// number, and cannot reach in and change either.
+/// What the user has half-typed, for the hint bar ([`crate::hint`]). Unlike
+/// [`Wait`], which says what the caller must time (including unfinished
+/// escape sequences). A read-only view of the private [`State`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pending {
     /// A lone `<prefix>`: the next key picks a command.
@@ -501,33 +405,23 @@ pub enum Pending {
     Number(u32),
 }
 
-/// The prefix state machine.
-///
-/// The prefix byte and the keymap are state, not a global read: the machine
-/// stays pure and clock-free (see the module docs), and the configured keys
-/// enter through the constructor rather than a settings lookup buried in
-/// [`feed`](Prefix::feed).
+/// The prefix state machine. The prefix byte and keymap come in through the
+/// constructor rather than a global read, keeping it pure.
 #[derive(Debug)]
 pub struct Prefix {
     state: State,
-    /// The highest live session number, used only to decide whether a further
-    /// digit could still change the answer. Stale is harmless — see the module
-    /// docs.
+    /// The highest live session number, used only to decide whether another
+    /// digit could change the answer; stale is harmless.
     highest: u32,
-    /// The byte that arms the machine. [`PREFIX`] by default; a config file can
-    /// remap it (see [`crate::config`]).
+    /// The byte that arms the machine ([`PREFIX`] unless remapped).
     prefix: u8,
-    /// Which key after the prefix runs which command. The table's own by
-    /// default; a config file can move them (see [`Keymap`]).
     keymap: Keymap,
-    /// The bytes that armed the machine — the control byte, or the sequence a
-    /// terminal sent instead of it, and that key's release report if one has
-    /// arrived since — replayed verbatim when the prefix turns out to be meant
-    /// literally. Empty unless [`State::Armed`].
+    /// The bytes that armed the machine (control byte or sequence, plus its
+    /// release report if one arrived), replayed verbatim if the prefix was
+    /// meant literally. Empty unless [`State::Armed`].
     armed: Vec<u8>,
-    /// An escape sequence still being read. It could yet spell the prefix, so
-    /// it is held back until it is complete or clearly something else; empty
-    /// between sequences.
+    /// An escape sequence still being read, held back since it could spell
+    /// the prefix. Empty between sequences.
     seq: Vec<u8>,
 }
 
@@ -539,19 +433,15 @@ impl Default for Prefix {
 }
 
 impl Prefix {
-    /// A machine armed by the standard [`PREFIX`] (`Ctrl-Space`), with every
-    /// command on the table's own key.
+    /// A machine armed by [`PREFIX`] with the default keymap.
     pub fn new(highest: u32) -> Self {
         Self::with_prefix(highest, PREFIX)
     }
 
-    /// A machine armed by `prefix`, for a config file that remaps the key.
     pub fn with_prefix(highest: u32, prefix: u8) -> Self {
         Self::with_keys(highest, prefix, Keymap::default())
     }
 
-    /// A machine armed by `prefix`, with its commands on the keys `keymap`
-    /// puts them on: all that a config file can say about the keys.
     pub fn with_keys(highest: u32, prefix: u8, keymap: Keymap) -> Self {
         Self {
             state: State::Idle,
@@ -563,23 +453,14 @@ impl Prefix {
         }
     }
 
-    /// The tests' shorthand for `wait().is_some()`: true while a timeout would
-    /// have to be armed — a lone `<prefix>`, a half-typed number or an
-    /// unfinished escape sequence. The relay itself calls
-    /// [`wait`](Self::wait), which says which.
     #[cfg(test)]
     fn is_armed(&self) -> bool {
         self.wait().is_some()
     }
 
-    /// What the caller must time, if anything. The caller polls on that wait
-    /// while this is `Some`, and calls [`timeout`](Self::timeout) when it
-    /// passes, so a number does not resolve late and a cut-off sequence does
-    /// not hang.
-    ///
-    /// An unfinished sequence takes precedence: settling it settles whatever
-    /// else was pending too, since it was the key after the prefix or the
-    /// number.
+    /// What the caller must time, if anything; call
+    /// [`timeout`](Self::timeout) when it passes. An unfinished sequence takes
+    /// precedence: settling it, as the next key, settles the rest too.
     pub fn wait(&self) -> Option<Wait> {
         if !self.seq.is_empty() {
             Some(Wait::Sequence)
@@ -590,14 +471,9 @@ impl Prefix {
         }
     }
 
-    /// What the user has half-typed, if anything — for the hint bar, which says
-    /// so on the screen while the machine waits (see [`crate::hint`]).
-    ///
-    /// Read from `state` and not from [`wait`](Self::wait), which would be a
-    /// different answer: an escape sequence cut short *from idle* is the Escape
-    /// key arriving and nothing is pending, while one arriving after the prefix
-    /// is still the prefix waiting — so the bar goes up on the prefix and does
-    /// not blink off while the bytes of the next key come in.
+    /// What the user has half-typed, for the hint bar ([`crate::hint`]). From
+    /// `state`, not [`wait`](Self::wait): a partial sequence from idle is just
+    /// `Esc`, and one after the prefix must not make the bar blink off.
     pub fn pending(&self) -> Option<Pending> {
         match self.state {
             State::Idle => None,
@@ -606,16 +482,14 @@ impl Prefix {
         }
     }
 
-    /// Whether another digit could still extend `n` into a live session number.
-    /// `checked_mul` because a held-down digit key would otherwise overflow.
+    /// Whether another digit could extend `n` into a live session number.
+    /// `checked_mul`: a held-down digit key would overflow.
     fn can_extend(&self, n: u32) -> bool {
         n.checked_mul(10).is_some_and(|wider| wider <= self.highest)
     }
 
-    /// Feed a chunk of bytes read from the user's terminal.
-    ///
-    /// Runs of ordinary bytes are coalesced into a single [`Step::Forward`], so
-    /// a paste of 8 KB does not become 8192 writes.
+    /// Feed bytes read from the terminal. Ordinary runs coalesce into one
+    /// [`Step::Forward`], so an 8 KB paste is not 8192 writes.
     pub fn feed(&mut self, input: &[u8]) -> Vec<Step> {
         let mut steps = Vec::new();
         let mut pending: Vec<u8> = Vec::new();
@@ -626,7 +500,6 @@ impl Prefix {
         steps
     }
 
-    /// One byte, in whatever state the machine is in.
     fn byte(&mut self, b: u8, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
         if !self.seq.is_empty() {
             self.seq.push(b);
@@ -637,12 +510,9 @@ impl Prefix {
                     self.prefix_key(bytes, steps, pending);
                 }
                 Sequence::Release(code) => {
-                    // Releasing a key is not pressing one: no state changes,
-                    // and Neovim gets the report as it was sent. The one
-                    // exception is the release of the prefix while its press
-                    // is still held back: it stays with that press, so Neovim
-                    // sees the two in order for a literal and neither for a
-                    // command, never a release before its press.
+                    // No state change; forwarded as sent. Except the prefix's
+                    // release while its press is held: it stays with the press,
+                    // so Neovim never sees a release before its press.
                     let mut report = std::mem::take(&mut self.seq);
                     if self.state == State::Armed && code == u32::from(prefix_code(self.prefix)) {
                         self.armed.append(&mut report);
@@ -651,17 +521,15 @@ impl Prefix {
                     }
                 }
                 Sequence::Reply => {
-                    // The terminal answering the editor, not the user typing:
-                    // no state changes, and the answer goes through as it
-                    // came — even between a prefix and its command.
+                    // A terminal reply, not typing: forwarded unchanged, even
+                    // between a prefix and its command.
                     pending.append(&mut self.seq);
                 }
                 Sequence::Other(n) => {
                     let mut key = std::mem::take(&mut self.seq);
                     let rest = key.split_off(n);
                     self.other_key(key, steps, pending);
-                    // What followed the key is input in its own right — it
-                    // may even be the prefix byte, or the start of another
+                    // The rest is new input; it may be the prefix or another
                     // sequence.
                     for r in rest {
                         self.byte(r, steps, pending);
@@ -677,7 +545,6 @@ impl Prefix {
         }
     }
 
-    /// The prefix, spelled as `bytes`.
     fn prefix_key(&mut self, bytes: Vec<u8>, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
         match self.state {
             State::Idle => {
@@ -685,16 +552,14 @@ impl Prefix {
                 self.armed = bytes;
             }
             State::Armed => {
-                // <prefix> <prefix>: one literal prefix reaches Neovim — the
-                // one that was held back, in the terminal's own spelling.
-                // Checked before everything else, so no rule and no row can
-                // ever shadow it.
+                // <prefix> <prefix>: forward the held one, in the terminal's
+                // spelling. Checked first, so no binding can shadow it.
                 self.state = State::Idle;
                 pending.append(&mut self.armed);
             }
             State::Number(n) => {
-                // The digits already typed were a complete command, and this
-                // prefix starts the next one.
+                // The digits were a complete command; this prefix starts the
+                // next.
                 self.state = State::Idle;
                 flush(steps, pending);
                 steps.push(Step::Act(Action::Switch(n)));
@@ -704,16 +569,13 @@ impl Prefix {
         }
     }
 
-    /// A whole key that is not the prefix, arriving as an escape sequence —
-    /// or a sequence that turned out to be no key at all. Handled like any
-    /// other non-command: the machine's pending business is settled and the
-    /// bytes go through unchanged.
+    /// A complete non-prefix escape sequence (or one that is no key): settle
+    /// what is pending and forward the bytes unchanged.
     fn other_key(&mut self, bytes: Vec<u8>, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
         match self.state {
             State::Idle => {}
             State::Armed => {
-                // Not a command, so the user's original keystrokes are
-                // replayed in order and nothing is eaten.
+                // Not a command: replay the original keystrokes in order.
                 self.state = State::Idle;
                 pending.append(&mut self.armed);
             }
@@ -726,7 +588,6 @@ impl Prefix {
         pending.extend(bytes);
     }
 
-    /// An ordinary byte: neither the prefix nor part of an escape sequence.
     fn plain_byte(&mut self, b: u8, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
         match self.state {
             State::Idle => pending.push(b),
@@ -735,15 +596,13 @@ impl Prefix {
                 self.state = State::Idle;
                 let mut armed = std::mem::take(&mut self.armed);
                 if (b'1'..=b'9').contains(&b) {
-                    // A number never starts with 0, so `<prefix> 0` falls
-                    // through to the replay branch below.
+                    // No number starts with 0, so `<prefix> 0` is replayed.
                     self.start_number(u32::from(b - b'0'), steps, pending);
                 } else if let Some(action) = self.keymap.command(b) {
                     flush(steps, pending);
                     steps.push(Step::Act(action));
                 } else {
-                    // Not a command, so the user's original keystrokes are
-                    // replayed in order and nothing is eaten.
+                    // Not a command: replay the original keystrokes in order.
                     pending.append(&mut armed);
                     pending.push(b);
                 }
@@ -752,23 +611,19 @@ impl Prefix {
             State::Number(n) => {
                 if b.is_ascii_digit() {
                     self.state = State::Idle;
-                    // Saturating throughout: a held-down digit key must
-                    // neither panic nor wrap a huge number back around onto
-                    // a live one.
+                    // Saturating: a held digit must not panic or wrap around
+                    // onto a live number.
                     let wider = n.saturating_mul(10).saturating_add(u32::from(b - b'0'));
                     self.start_number(wider, steps, pending);
                 } else if b == ENTER {
-                    // An explicit "that is the whole number", so a user who
-                    // knows the id never waits out the timeout.
+                    // Enter ends the number without waiting out the timeout.
                     self.state = State::Idle;
                     flush(steps, pending);
                     steps.push(Step::Act(Action::Switch(n)));
                 } else {
-                    // The digits already typed were a complete command, and
-                    // this byte is simply the next key. Acting and then
-                    // handling `b` afresh is what keeps `<prefix> 1 x` equivalent
-                    // to `<prefix> Space x`: the command runs, the `x` reaches Neovim,
-                    // and no stray prefix byte is injected.
+                    // The digits were a complete command and `b` is the next
+                    // key, so `<prefix> 1 x` acts like `<prefix> Space x`: the
+                    // command runs and `x` reaches Neovim.
                     self.state = State::Idle;
                     flush(steps, pending);
                     steps.push(Step::Act(Action::Switch(n)));
@@ -778,8 +633,8 @@ impl Prefix {
         }
     }
 
-    /// Begin, or extend, a session number: wait for another digit only when one
-    /// could still change which session is meant.
+    /// Begin or extend a session number, waiting for another digit only if one
+    /// could change which session is meant.
     fn start_number(&mut self, n: u32, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
         if self.can_extend(n) {
             self.state = State::Number(n);
@@ -790,19 +645,15 @@ impl Prefix {
         }
     }
 
-    /// Called when the [`wait`](Self::wait) the machine asked for has passed
-    /// with no further byte.
-    ///
-    /// Resolves a lone `<prefix>` into a literal one, a half-typed number into
-    /// the session it already names, and a cut-off escape sequence into the
-    /// bytes it was — which, as the key after a prefix or a number, settles
-    /// those too. Idempotent, so a caller that fires its timer spuriously does
-    /// no harm.
+    /// Call when the requested [`wait`](Self::wait) passes with no input.
+    /// Resolves a lone `<prefix>` to a literal one, a half-typed number to its
+    /// session, and a cut-off sequence to its bytes (settling those too).
+    /// Idempotent, so spurious timer fires are harmless.
     pub fn timeout(&mut self) -> Vec<Step> {
         let mut steps = Vec::new();
         let mut pending = Vec::new();
         if !self.seq.is_empty() {
-            // The rest never came: whatever it was, it was not the prefix.
+            // The rest never came, so it was not the prefix.
             let held = std::mem::take(&mut self.seq);
             self.other_key(held, &mut steps, &mut pending);
         } else {
@@ -849,16 +700,9 @@ mod tests {
             .collect()
     }
 
-    /// The README's "While attached" table is a prose copy of [`BINDINGS`], and
-    /// a reader picking the tool up has only that copy — the `<prefix> ?` screen
-    /// needs a running session. So every command must have a row there, under
-    /// the name `[keys.bind]` moves it by and on the key it has by default.
-    ///
-    /// Those two cells, not the description: the two word things differently
-    /// on purpose (the screen has one line, the README has a column), and
-    /// pinning the prose would only force them to drift together. What
-    /// actually goes wrong is a command added here and never written down — or
-    /// renamed, or given another key by default, with its row left behind.
+    /// The README's "While attached" table must have each command's name and
+    /// default key. Descriptions are not compared: they are worded differently
+    /// on purpose.
     #[test]
     fn every_binding_has_a_row_in_the_readme() {
         let readme = include_str!("../README.md");
@@ -945,9 +789,7 @@ mod tests {
         assert!(p.timeout().is_empty());
     }
 
-    /// The prefix may be the last byte of one `read()` and the command the
-    /// first byte of the next. This is the common case at a human typing speed,
-    /// not an edge case.
+    /// The common case at human typing speed, not an edge case.
     #[test]
     fn state_survives_a_chunk_boundary() {
         let mut p = Prefix::new(0);
@@ -962,8 +804,7 @@ mod tests {
 
     #[test]
     fn ctrl_z_is_not_special() {
-        // 0x1a must reach Neovim as an ordinary key. Whether the server then
-        // emits a `suspend` UI event is the child TUI's business, not ours.
+        // Whether Neovim then suspends is the child TUI's business.
         let mut p = Prefix::new(0);
         let steps = p.feed(&[0x1a]);
         assert_eq!(forwarded(&steps), vec![0x1a]);
@@ -972,16 +813,15 @@ mod tests {
 
     #[test]
     fn ctrl_c_and_ctrl_s_are_not_special() {
-        // These only reach us as bytes because the terminal is in raw mode with
-        // ISIG off and IXON cleared; the machine itself must not intercept them.
+        // These arrive as bytes only because raw mode clears ISIG and IXON;
+        // the machine must not intercept them.
         let mut p = Prefix::new(0);
         let steps = p.feed(&[0x03, 0x13, 0x1c]);
         assert_eq!(forwarded(&steps), vec![0x03, 0x13, 0x1c]);
     }
 
-    /// Sequences are looked at — that is how an encoded prefix is found — but
-    /// everything that is not the prefix goes through byte for byte, and none
-    /// of it leaves the machine waiting once the sequence is whole.
+    /// Sequences are inspected (to find an encoded prefix), but nothing else is
+    /// changed or left waiting once whole.
     #[test]
     fn other_escape_sequences_pass_through_untouched() {
         let mut p = Prefix::new(0);
@@ -995,14 +835,11 @@ mod tests {
         assert_eq!(p.wait(), None, "nothing should be held: {steps:?}");
     }
 
-    // The prefix spelled the way a terminal in an extended keyboard mode
-    // spells it — see `keyseq` for the grammar; these pin the machine's use
-    // of it.
+    // The prefix as extended keyboard modes spell it (grammar in `keyseq`).
 
-    /// `Ctrl-Space` as the kitty keyboard protocol and xterm's
-    /// `modifyOtherKeys` send it. This is the bug that motivated `keyseq`:
-    /// Windows Terminal 1.25 speaks the first, Neovim asks for it, and
-    /// `<prefix> d` reached the editor as the prefix and a pending delete.
+    /// `Ctrl-Space` under the kitty protocol and `modifyOtherKeys`. Regression:
+    /// in Windows Terminal 1.25, `<prefix> d` reached Neovim as the prefix and
+    /// a pending delete.
     const KITTY: &[u8] = b"\x1b[32;5u";
     const XTERM: &[u8] = b"\x1b[27;5;32~";
 
@@ -1030,10 +867,9 @@ mod tests {
         }
     }
 
-    /// The picker key is the prefix chord's own key without the Ctrl, so both
-    /// arrive under the same key code (32) in a terminal that reports releases.
-    /// The chord's release belongs to its press and is held with it; the bare
-    /// byte that follows is the command, and neither reaches Neovim.
+    /// The picker key and the chord share key code 32. The chord's release is
+    /// held with its press; the bare space after it is the command, and neither
+    /// reaches Neovim.
     #[test]
     fn the_prefix_then_its_bare_key_opens_the_picker() {
         for spelling in [&[PREFIX][..], KITTY, XTERM] {
@@ -1053,8 +889,7 @@ mod tests {
         assert!(forwarded(&steps).is_empty(), "neither reaches Neovim");
     }
 
-    /// Both spellings in one read, with the command and ordinary text around
-    /// them, in the right order.
+    /// Both spellings in one read, with text around them, kept in order.
     #[test]
     fn an_encoded_prefix_inside_a_larger_chunk_splits_correctly() {
         let mut p = Prefix::new(0);
@@ -1076,9 +911,7 @@ mod tests {
         );
     }
 
-    /// A read can end anywhere inside the sequence — including right after
-    /// the `ESC`, which is also what a bare Escape key looks like. Every
-    /// split must still find the prefix.
+    /// Including right after the `ESC`, which looks like a bare Escape key.
     #[test]
     fn an_encoded_prefix_survives_a_chunk_boundary_at_every_byte() {
         for spelling in [KITTY, XTERM] {
@@ -1101,8 +934,6 @@ mod tests {
         }
     }
 
-    /// The literal is what the terminal sent, not the control byte: a terminal
-    /// that spells the chord as a sequence gets its sequence back.
     #[test]
     fn a_doubled_encoded_prefix_replays_the_terminal_s_own_spelling() {
         let mut p = Prefix::new(0);
@@ -1133,12 +964,11 @@ mod tests {
         assert!(p.timeout().is_empty(), "idempotent");
     }
 
-    /// The key after an encoded prefix is not a command: both are replayed,
-    /// each in the spelling it arrived in.
+    /// Each in the spelling it arrived in.
     #[test]
     fn an_encoded_prefix_then_another_key_replays_both() {
-        // A plain letter, and a key that is itself a sequence (Escape, as the
-        // kitty protocol spells it).
+        // A plain letter, and keys that are themselves sequences (e.g. kitty's
+        // Escape).
         for other in [&b"x"[..], b"\x1b[27u", b"\x1b[100;5u"] {
             let mut p = Prefix::new(0);
             let mut input = KITTY.to_vec();
@@ -1152,9 +982,8 @@ mod tests {
         }
     }
 
-    /// The other direction: a byte prefix followed by a sequence that is not
-    /// a command (an arrow) replays both, and `<prefix> <sequence-prefix>` is
-    /// still a literal.
+    /// A byte prefix then an arrow replays both; `<prefix> <sequence-prefix>`
+    /// is still a literal.
     #[test]
     fn a_byte_prefix_then_a_sequence_is_handled_like_any_other_key() {
         let mut p = Prefix::new(0);
@@ -1169,9 +998,8 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// A terminal asked for release events reports one for every key,
-    /// including the prefix just swallowed. None of them is a keystroke:
-    /// they go through, and the machine stays where it was.
+    /// Release reports (sent for every key, the prefix included) are forwarded
+    /// and change no state.
     #[test]
     fn key_release_reports_are_transparent_in_every_state() {
         let release_prefix = b"\x1b[32;5:3u";
@@ -1183,9 +1011,8 @@ mod tests {
         assert_eq!(forwarded(&p.feed(release_prefix)), release_prefix);
         assert!(!p.is_armed());
 
-        // Armed: the prefix's own release must not count as the next key —
-        // nor reach Neovim ahead of the press it belongs to, which is still
-        // held back; another key's release goes straight through.
+        // Armed: the prefix's own release is not the next key and must not
+        // precede its held press; another key's release goes through.
         let mut p = Prefix::new(12);
         p.feed(KITTY);
         assert!(p.feed(release_prefix).is_empty(), "held with its press");
@@ -1206,9 +1033,8 @@ mod tests {
         assert_eq!(actions(&p.feed(b"2")), vec![Action::Switch(12)]);
     }
 
-    /// The editor queries the terminal at every start and resume, and the
-    /// answer can land between a prefix and its command — as it does when a
-    /// prefix is typed the moment the client comes up. An answer is not a key.
+    /// The editor queries the terminal at every start and resume, so a reply
+    /// can land between a prefix typed at startup and its command.
     #[test]
     fn a_terminal_reply_between_the_prefix_and_its_command_is_not_a_key() {
         let da1 = b"\x1b[?62;22c";
@@ -1225,9 +1051,7 @@ mod tests {
         assert_eq!(actions(&p.feed(b"2")), vec![Action::Switch(12)]);
     }
 
-    /// The press and the release of a literal prefix reach Neovim in the
-    /// order they were typed, whether the literal comes from a doubled
-    /// prefix or from the wait passing.
+    /// Whether the literal comes from a doubled prefix or the timeout.
     #[test]
     fn a_literal_prefix_replays_its_press_and_release_in_order() {
         let release = b"\x1b[32;1:3u";
@@ -1247,9 +1071,7 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// Holding the key down repeats it, and a repeat is a press: the first
-    /// repeat makes a literal, the next arms again — as a held-down control
-    /// byte does in a terminal without the protocol.
+    /// A repeat is a press: the first makes a literal, the next arms again.
     #[test]
     fn a_held_down_encoded_prefix_alternates_like_a_held_down_byte() {
         let repeat = b"\x1b[32;5:2u";
@@ -1271,8 +1093,6 @@ mod tests {
         assert!(p.is_armed());
     }
 
-    /// An encoded prefix after a half-typed number ends the number and arms
-    /// again, exactly as the byte does.
     #[test]
     fn an_encoded_prefix_after_a_number_ends_it_and_arms_again() {
         let mut p = Prefix::new(12);
@@ -1285,12 +1105,12 @@ mod tests {
         assert_eq!(actions(&p.feed(b" ")), vec![Action::Picker]);
     }
 
-    /// The wait for the rest of a sequence is the short one, and it wins over
-    /// the command wait: settling the sequence settles the command too.
+    /// It wins over the command wait; settling the sequence settles the
+    /// command.
     #[test]
     fn a_cut_off_sequence_asks_for_the_short_wait_in_every_state() {
-        // Idle: a bare ESC, which in a terminal without the protocol is the
-        // Escape key. It is held, then goes through as it stands.
+        // Idle: a bare ESC (the Escape key without the protocol) is held, then
+        // forwarded.
         let mut p = Prefix::new(12);
         assert!(p.feed(b"\x1b").is_empty());
         assert_eq!(p.wait(), Some(Wait::Sequence));
@@ -1319,9 +1139,7 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// A held `ESC` followed by something that cannot continue it: the `ESC`
-    /// was the Escape key, and the next byte is the next key — which may be
-    /// the prefix.
+    /// The next byte may be the prefix.
     #[test]
     fn an_escape_then_an_unrelated_byte_forwards_the_escape_and_goes_on() {
         let mut p = Prefix::new(0);
@@ -1344,8 +1162,7 @@ mod tests {
         assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach]);
     }
 
-    /// Only the exact chord: `Ctrl-Shift-Space`, `Ctrl-d`, and a key with an
-    /// extra modifier all go through untouched.
+    /// `Ctrl-Shift-Space`, `Ctrl-d` and extra modifiers go through untouched.
     #[test]
     fn a_different_chord_in_the_same_spelling_is_not_the_prefix() {
         for seq in [
@@ -1364,8 +1181,7 @@ mod tests {
         }
     }
 
-    /// A remapped prefix is recognised under its own letter's code, and the
-    /// default's code is then just another key.
+    /// The default's code is then just another key.
     #[test]
     fn a_remapped_prefix_is_recognised_in_every_spelling() {
         let ctrl_a = 0x01;
@@ -1379,8 +1195,6 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// The key a terminal reports the chord under is the one the label names,
-    /// for every prefix the parser accepts.
     #[test]
     fn the_prefix_code_is_the_key_the_label_names() {
         for byte in 1u8..=26 {
@@ -1392,14 +1206,12 @@ mod tests {
             );
             assert!(prefix_code(byte).is_ascii_lowercase());
         }
-        // The one prefix that is not a letter: the label spells the key out,
-        // and the terminal reports it under the space bar's own code.
+        // The non-letter prefix, reported under Space's code.
         assert_eq!(prefix_label(CTRL_SPACE), "Ctrl-Space");
         assert_eq!(prefix_code(CTRL_SPACE), b' ');
     }
 
-    /// A pasted burst never arms the machine on its way through, and never
-    /// leaves anything held once it is whole.
+    /// It never arms the machine or leaves anything held.
     #[test]
     fn a_large_paste_full_of_sequences_is_forwarded_whole() {
         let mut p = Prefix::new(30);
@@ -1429,8 +1241,8 @@ mod tests {
     #[test]
     fn several_commands_in_one_chunk() {
         let mut p = Prefix::new(0);
-        // Literal bytes on purpose: this is what pins each letter to its
-        // action, independently of what `BINDINGS` says.
+        // Literal bytes on purpose, pinning each letter to its action
+        // independently of `BINDINGS`.
         let steps = p.feed(b"\x00 \x00d\x00c\x00n\x00p\x00?");
         assert_eq!(
             actions(&steps),
@@ -1446,8 +1258,6 @@ mod tests {
         assert!(forwarded(&steps).is_empty());
     }
 
-    /// `n` and `p` are the two keys that name a *relative* target, so the
-    /// direction has to survive the machine rather than being decided later.
     #[test]
     fn n_and_p_step_forwards_and_backwards() {
         for (key, want) in [(b'n', Direction::Next), (b'p', Direction::Prev)] {
@@ -1467,8 +1277,6 @@ mod tests {
         }
     }
 
-    /// A doubled prefix is a literal before the table is consulted, so the two
-    /// new keys are still typable in the editor.
     #[test]
     fn a_literal_prefix_then_n_still_reaches_neovim() {
         let mut p = Prefix::new(0);
@@ -1494,9 +1302,8 @@ mod tests {
         assert!(p.is_armed(), "an empty read must not disarm");
     }
 
-    /// A keymap with commands moved the ways a config file can move them: onto
-    /// a capital, onto punctuation, onto the key another command left, and off
-    /// Enter.
+    /// Commands moved onto a capital, punctuation, a key another command left,
+    /// and off Enter.
     fn moved() -> Keymap {
         let mut keymap = Keymap::default();
         for (name, key) in [
@@ -1511,13 +1318,9 @@ mod tests {
         keymap
     }
 
-    /// Every byte that is not a command must survive a prefix unchanged — on
-    /// the table's keys, and on keys a config file has moved, where a key a
-    /// command left is as ordinary as any other.
-    ///
-    /// With no sessions known, every digit resolves at once, so nothing here is
-    /// left mid-sequence — except `ESC`, which could be the start of another
-    /// spelling of the prefix and is held until the wait passes.
+    /// Every non-command byte survives a prefix unchanged, with the default and
+    /// a moved keymap. With no sessions, digits resolve at once; only `ESC` is
+    /// held, as it could start an encoded prefix.
     #[test]
     fn exhaustive_second_byte_table() {
         for keymap in [Keymap::default(), moved()] {
@@ -1559,8 +1362,7 @@ mod tests {
         }
     }
 
-    /// The table is the default keymap, row for row, and the names a config
-    /// file moves its rows by are their hints, in its order.
+    /// And the `[keys.bind]` names are the hints, in table order.
     #[test]
     fn the_default_keymap_is_the_table() {
         let keymap = Keymap::default();
@@ -1570,8 +1372,8 @@ mod tests {
         assert_eq!(keymap.clash(), None, "the table's own keys are distinct");
     }
 
-    /// Moving a command moves that one and no other: its new key runs it, the
-    /// key it left runs nothing, and a name that is no command moves nothing.
+    /// The new key runs it, the old key runs nothing, and an unknown name moves
+    /// nothing.
     #[test]
     fn binding_a_command_by_name_moves_only_that_command() {
         let mut keymap = Keymap::default();
@@ -1589,8 +1391,7 @@ mod tests {
         assert_eq!(keymap.key(Action::Switch(1)), None, "a rule, not a row");
     }
 
-    /// Two commands on one key is a clash, whether both were moved there or one
-    /// was moved onto the other's own key; trading keys is not one.
+    /// Whether both moved there or one moved onto the other's key.
     #[test]
     fn a_shared_key_is_a_clash_and_a_swap_is_not() {
         let mut keymap = Keymap::default();
@@ -1610,8 +1411,7 @@ mod tests {
         assert_eq!(keymap.command(b'd'), Some(Action::Create));
     }
 
-    /// A moved command acts on its new key, and the key it left is an ordinary
-    /// one, replayed with the prefix — however the terminal spells the prefix.
+    /// The key it left is replayed with the prefix, in any prefix spelling.
     #[test]
     fn a_moved_command_acts_on_its_new_key_in_every_spelling() {
         let mut keymap = Keymap::default();
@@ -1633,8 +1433,8 @@ mod tests {
         }
     }
 
-    /// Enter is two things: the key `go` is on by default, and the end of a
-    /// half-typed number. Moving `go` takes away only the first.
+    /// Enter is `go`'s default key and also ends a number; moving `go` removes
+    /// only the first.
     #[test]
     fn enter_off_go_is_replayed_and_still_ends_a_number() {
         let mut keymap = Keymap::default();
@@ -1656,9 +1456,8 @@ mod tests {
         );
     }
 
-    /// A command on the prefix chord's own letter is what the space bar already
-    /// is for `Ctrl-Space`: the chord and the bare key arrive under one key
-    /// code, and the chord's release still belongs to its press.
+    /// As Space is for `Ctrl-Space`: chord and bare key share a key code, and
+    /// the chord's release stays with its press.
     #[test]
     fn a_command_on_the_prefix_s_own_letter_is_that_command() {
         let ctrl_a = 0x01;
@@ -1674,8 +1473,6 @@ mod tests {
         }
     }
 
-    /// One character is itself, case and all; the two keys with no character
-    /// are their names, in any case.
     #[test]
     fn a_key_string_parses_to_its_byte() {
         for (s, byte) in [
@@ -1695,8 +1492,8 @@ mod tests {
         }
     }
 
-    /// A key a terminal does not send as one byte of its own is refused, and so
-    /// is a digit, which the session numbers have already taken — saying so.
+    /// Keys not sent as a single byte, and digits (session numbers), with a
+    /// reason.
     #[test]
     fn what_cannot_be_a_key_is_refused() {
         for s in [
@@ -1710,9 +1507,8 @@ mod tests {
         }
     }
 
-    /// What the help screen prints in its key column reads back as the key it
-    /// names, for every key a command can be on — the table's own among them,
-    /// which is what the first-run file writes down.
+    /// [`key_label`] output parses back to the same key, for every possible
+    /// key (the first-run file writes the defaults this way).
     #[test]
     fn the_key_string_round_trips() {
         let bindable = (b' '..=b'~').filter(|b| !b.is_ascii_digit()).chain([ENTER]);
@@ -1724,8 +1520,6 @@ mod tests {
         }
     }
 
-    /// A capital is a key of its own, so the bar draws it as one: the glyphs
-    /// are for the two keys with no character, and every other key is itself.
     #[test]
     fn a_key_is_drawn_as_itself_case_and_all() {
         assert_eq!(key_glyph(b'D'), "D");
@@ -1735,8 +1529,7 @@ mod tests {
         assert_eq!(key_glyph(ENTER), ENTER_GLYPH);
     }
 
-    /// `<prefix> ?` used to be replayed to Neovim as two bytes. This is the way to
-    /// still send it, and it must keep working.
+    /// The way to send `<prefix> ?` to Neovim now that `?` is a command.
     #[test]
     fn a_literal_prefix_then_question_mark_still_reaches_neovim() {
         let mut p = Prefix::new(0);
@@ -1745,13 +1538,9 @@ mod tests {
         assert!(actions(&steps).is_empty());
     }
 
-    /// Rust cannot enumerate an enum, so the list is kept here by hand. The
-    /// `match` is exhaustive on purpose: a new variant fails to compile until
-    /// it is added to the list, and then the count fails until it has a row.
-    ///
-    /// `Switch` is the one deliberate exception, asserted below rather than
-    /// waived: a single row cannot stand for nine keys, so digits are a rule in
-    /// `feed` and a literal row on the help screen.
+    /// The list is kept by hand; the exhaustive `match` makes a new variant
+    /// fail to compile until listed, then the count fails until it has a row.
+    /// `Switch` is excluded: digits are a rule in `feed`.
     #[test]
     fn the_table_binds_every_action_exactly_once() {
         let all = [
@@ -1766,8 +1555,7 @@ mod tests {
         ];
         for action in all {
             match action {
-                // `Cycle` carries data and is still listed twice above: unlike a
-                // session number, each direction has one key of its own.
+                // `Cycle` is listed twice: each direction has its own key.
                 Action::Picker
                 | Action::Detach
                 | Action::Create
@@ -1797,8 +1585,7 @@ mod tests {
         );
     }
 
-    /// No row may claim a digit either, or the help screen would promise a key
-    /// the digit rule has already taken.
+    /// The digit rule would shadow it, and the help screen would lie.
     #[test]
     fn no_command_key_is_a_digit() {
         for b in BINDINGS {
@@ -1818,8 +1605,7 @@ mod tests {
                 "byte {:#04x} cannot be shown on the help screen",
                 a.key
             );
-            // The literal rule runs before the table, so a PREFIX row would be
-            // a help-screen lie that never fires.
+            // The literal rule runs first, so a PREFIX row would never fire.
             assert_ne!(a.key, PREFIX);
             for b in &BINDINGS[i + 1..] {
                 assert_ne!(a.key, b.key, "two commands share {:?}", a.key as char);
@@ -1839,10 +1625,8 @@ mod tests {
         }
     }
 
-    /// The hint bar is one row and reads at a glance, so a label that wrapped,
-    /// ran to two words or arrived capitalised would break the row rather than
-    /// merely look wrong — the grammar is `src/ui/draw.rs`'s, which is
-    /// uniformly lowercase and one word per key.
+    /// The hint bar is one row, lowercase and one word per key, like
+    /// `src/ui/draw.rs`.
     #[test]
     fn every_binding_has_a_one_word_hint() {
         for b in BINDINGS {
@@ -1862,10 +1646,8 @@ mod tests {
         }
     }
 
-    /// A hint is also its command's name in `[keys.bind]`, where it is written
-    /// as a bare TOML key — and the first-run file is checked by reading its
-    /// commented settings as ones named in lowercase letters and underscores.
-    /// Letters alone keep a name all three of those at once.
+    /// A hint is a bare TOML key in `[keys.bind]`, and the first-run file check
+    /// expects lowercase letters and underscores; plain letters satisfy both.
     #[test]
     fn every_hint_is_a_name_a_config_file_can_write() {
         for name in NAMES {
@@ -1876,8 +1658,7 @@ mod tests {
         }
     }
 
-    /// `parse_key`'s promise that a command can never be put on the prefix:
-    /// no key it accepts is a byte `parse_prefix` does.
+    /// No key `parse_key` accepts is a byte `parse_prefix` accepts.
     #[test]
     fn no_key_a_command_can_be_on_is_a_prefix() {
         let prefixes: Vec<u8> = (b'a'..=b'z')
@@ -1894,8 +1675,6 @@ mod tests {
         }
     }
 
-    /// Two commands labelled the same thing make the bar say one of them
-    /// twice and neither of them clearly.
     #[test]
     fn no_two_bindings_share_a_hint() {
         for (i, a) in BINDINGS.iter().enumerate() {
@@ -1905,9 +1684,8 @@ mod tests {
         }
     }
 
-    /// `pending` is what the hint bar is drawn from, so it has to follow the
-    /// machine exactly: a bar that appeared without the prefix, or stayed up
-    /// after the command ran, would be drawn over an editor that owns the row.
+    /// The hint bar is drawn from `pending`; a bar shown without the prefix or
+    /// after the command would cover the editor's row.
     #[test]
     fn pending_follows_the_state_machine() {
         let mut p = Prefix::new(12);
@@ -1931,14 +1709,9 @@ mod tests {
         assert_eq!(p.pending(), None, "so does the timeout");
     }
 
-    /// The bar must not blink between the prefix and a next key the terminal
-    /// spells as a sequence: those bytes arrive over more than one `read` at a
-    /// human typing speed, and the prefix is still waiting throughout.
-    ///
-    /// And the other way round: a sequence cut short from *idle* is the Escape
-    /// key arriving, which is not a pending command however long the machine
-    /// holds it. That is the distinction `pending` reads `state` for rather
-    /// than `wait`, which answers `Some` to both.
+    /// The bar must not blink off while a next key's sequence arrives over
+    /// several reads after the prefix; and a sequence cut short from idle is
+    /// just `Esc`, not a pending command.
     #[test]
     fn pending_ignores_a_half_read_sequence() {
         let mut p = Prefix::new(0);
@@ -1956,8 +1729,7 @@ mod tests {
             "the prefix is still waiting"
         );
 
-        // The prefix's own release report, which is held back with its press:
-        // not a key, so not the end of the wait either.
+        // The prefix's release, held with its press, does not end the wait.
         let mut p = Prefix::new(0);
         p.feed(KITTY);
         p.feed(b"\x1b[32;5:3u");
@@ -1970,8 +1742,7 @@ mod tests {
 
     #[test]
     fn a_single_digit_selects_a_session_without_waiting() {
-        // Nine sessions: no second digit could name a different one, so the
-        // common case costs nothing.
+        // Nine sessions: no second digit could change the answer.
         let mut p = Prefix::new(9);
         let steps = p.feed(&[PREFIX, b'3']);
         assert_eq!(actions(&steps), vec![Action::Switch(3)]);
@@ -1991,7 +1762,6 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// The wait exists only while another digit could still change the answer.
     #[test]
     fn a_digit_waits_only_while_a_longer_number_is_possible() {
         let mut p = Prefix::new(12);
@@ -2033,8 +1803,7 @@ mod tests {
         );
     }
 
-    /// `<prefix> Enter` with no number begun goes where the newest note is
-    /// about; begun, Enter still ends the number.
+    /// Once a number is begun, Enter still ends it.
     #[test]
     fn enter_after_the_prefix_alone_goes_where_the_card_is_about() {
         let mut p = Prefix::new(12);
@@ -2046,7 +1815,6 @@ mod tests {
         assert_eq!(key_glyph(ENTER), "⏎");
     }
 
-    /// A number never starts with zero, so this is not a command at all.
     #[test]
     fn a_leading_zero_is_replayed_like_any_other_non_command() {
         let mut p = Prefix::new(30);
@@ -2063,8 +1831,6 @@ mod tests {
         assert_eq!(actions(&steps), vec![Action::Switch(10)]);
     }
 
-    /// The digits already typed were a complete command; the key after them is
-    /// simply the next key, exactly as it is after `<prefix> Space`.
     #[test]
     fn a_key_after_a_number_ends_it_and_then_reaches_neovim() {
         let mut p = Prefix::new(12);
@@ -2087,8 +1853,7 @@ mod tests {
         assert!(p.is_armed(), "the second prefix should arm");
     }
 
-    /// The prefix may end one `read()` and the digits begin the next, at any
-    /// point in the sequence.
+    /// Split at any point.
     #[test]
     fn a_number_survives_a_chunk_boundary() {
         let mut p = Prefix::new(30);
@@ -2098,8 +1863,7 @@ mod tests {
         assert_eq!(actions(&steps), vec![Action::Switch(12)]);
     }
 
-    /// This is the documented way to send a digit to Neovim now that `<prefix> 1` is
-    /// a command, so it must keep working.
+    /// The documented way to send a digit to Neovim.
     #[test]
     fn a_literal_prefix_then_a_digit_still_reaches_neovim() {
         let mut p = Prefix::new(9);
@@ -2108,8 +1872,6 @@ mod tests {
         assert!(actions(&steps).is_empty());
     }
 
-    /// Ordinary typing contains digits. They must only ever be a command
-    /// directly after the prefix.
     #[test]
     fn digits_in_ordinary_input_are_not_commands() {
         let mut p = Prefix::new(30);
@@ -2119,7 +1881,7 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// A held-down digit key must not wrap around into a live session number.
+    /// A held digit key must not wrap around into a live session number.
     #[test]
     fn an_absurdly_long_number_does_not_overflow() {
         let mut p = Prefix::new(u32::MAX);
@@ -2135,9 +1897,7 @@ mod tests {
         );
     }
 
-    /// The label is what the help screen and the README print; the byte is
-    /// what the machine matches. Tie the two together so they cannot disagree,
-    /// in both directions.
+    /// Ties [`PREFIX_LABEL`] to [`PREFIX`] in both directions.
     #[test]
     fn the_prefix_label_names_the_prefix_byte() {
         assert_eq!(prefix_label(PREFIX), PREFIX_LABEL);
@@ -2152,7 +1912,7 @@ mod tests {
         assert_eq!(parse_prefix("C-z"), Ok(0x1a));
     }
 
-    /// Both halves are case-insensitive, and surrounding space is ignored.
+    /// Surrounding space is ignored too.
     #[test]
     fn a_prefix_string_is_case_insensitive() {
         assert_eq!(parse_prefix("ctrl-T"), Ok(0x14));
@@ -2161,13 +1921,10 @@ mod tests {
         assert_eq!(parse_prefix("  c-sPaCe  "), Ok(CTRL_SPACE));
     }
 
-    /// The label and the parser are inverses for every control byte, so what the
-    /// help screen prints round-trips back to the byte the machine matches.
     #[test]
     fn the_prefix_string_round_trips() {
         for byte in 1u8..=26 {
-            // The four bytes that are also Enter/newline/Tab/Backspace are
-            // refused on the way back, by design; they never round-trip.
+            // Enter, newline, Tab and Backspace are refused by design.
             if matches!(byte, 0x08 | 0x09 | 0x0a | 0x0d) {
                 continue;
             }
@@ -2178,7 +1935,6 @@ mod tests {
         assert_eq!(parse_prefix(&prefix_label(CTRL_SPACE)), Ok(CTRL_SPACE));
     }
 
-    /// Generalises [`the_prefix_label_names_the_prefix_byte`] beyond the default.
     #[test]
     fn the_prefix_label_names_any_control_byte() {
         assert_eq!(prefix_label(0x01), "Ctrl-a");
@@ -2196,8 +1952,7 @@ mod tests {
         }
     }
 
-    /// These control bytes are already Enter/newline/Tab/Backspace on the wire,
-    /// so they could never act as a prefix; the parser refuses them by name.
+    /// Enter, newline, Tab and Backspace on the wire; refused by name.
     #[test]
     fn prefixes_that_break_the_terminal_are_rejected() {
         for s in ["C-m", "C-j", "C-i", "C-h"] {
@@ -2205,16 +1960,14 @@ mod tests {
         }
     }
 
-    /// Allowed on purpose (tmux does the same): the byte simply stops reaching
-    /// Neovim. Documented, reversible, and harmless to the machine.
+    /// Allowed, as in tmux: the byte just stops reaching Neovim.
     #[test]
     fn ctrl_c_and_ctrl_z_are_accepted_as_prefixes() {
         assert_eq!(parse_prefix("C-c"), Ok(0x03));
         assert_eq!(parse_prefix("C-z"), Ok(0x1a));
     }
 
-    /// A remapped machine arms on its own byte, and the old default is then just
-    /// an ordinary key forwarded to Neovim.
+    /// The old default is then an ordinary key.
     #[test]
     fn a_remapped_prefix_arms_on_its_own_byte() {
         let ctrl_a = 0x01;
@@ -2226,7 +1979,6 @@ mod tests {
         let steps = p.feed(b" ");
         assert_eq!(actions(&steps), vec![Action::Picker]);
 
-        // The former default is no longer special.
         let mut p = Prefix::with_prefix(0, ctrl_a);
         let steps = p.feed(&[PREFIX]);
         assert_eq!(forwarded(&steps), vec![PREFIX]);
@@ -2242,8 +1994,6 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// `new` and the derived-less `Default` both arm on the standard prefix, so
-    /// the default machine is unchanged.
     #[test]
     fn new_and_default_use_the_standard_prefix() {
         for mut p in [Prefix::new(0), Prefix::default()] {
