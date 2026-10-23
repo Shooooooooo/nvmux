@@ -1006,6 +1006,10 @@ fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Link) {
         std::thread::spawn(move || {
             for (at, bytes) in rx {
                 std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                // Stamped as the write begins: the other end may have read
+                // it and acted on it before the write returns, and a busy
+                // machine may leave this thread waiting milliseconds after.
+                let written = Instant::now();
                 if to.write_all(&bytes).is_err() {
                     return;
                 }
@@ -1013,7 +1017,7 @@ fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Link) {
                     conn,
                     back,
                     read: at - delay,
-                    written: Instant::now(),
+                    written,
                     bytes,
                 });
             }
@@ -1077,7 +1081,7 @@ struct Carried {
     conn: usize,
     /// From the session to the client, or the other way.
     back: bool,
-    /// When it was read, and when written on.
+    /// When it was read, and when the link began to write it on.
     read: Instant,
     written: Instant,
     bytes: Vec<u8>,
@@ -1159,6 +1163,47 @@ impl Trace {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The agent's acks the frame that draws them did not follow, as Neovim
+    /// sent them: each with its count and the view's top it says, and the
+    /// top in the first frame after it — none where another ack came first.
+    fn acks_without_their_frames(&self) -> Vec<(u64, u64, Option<u64>)> {
+        let mut top = None;
+        let mut waiting: Option<(u64, u64)> = None;
+        let mut unframed = Vec::new();
+        for (_, _, v) in self.messages(true) {
+            match notification(&v) {
+                Some(("nvmux_client", [kind, rest @ ..])) if kind.as_str() == Some("ack") => {
+                    if let Some((count, said)) = waiting.take() {
+                        unframed.push((count, said, None));
+                    }
+                    let field = |i: usize| rest.get(i).and_then(Value::as_u64);
+                    waiting = field(0).zip(field(10));
+                }
+                Some(("redraw", events)) => {
+                    for event in events.iter().filter_map(Value::as_array) {
+                        match event.first().and_then(Value::as_str) {
+                            Some("win_viewport") => {
+                                for args in event[1..].iter().filter_map(Value::as_array) {
+                                    top = args.get(2).and_then(Value::as_u64).or(top);
+                                }
+                            }
+                            Some("flush") => {
+                                if let Some((count, said)) = waiting.take() {
+                                    if top != Some(said) {
+                                        unframed.push((count, said, top));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        unframed
     }
 
     /// How many keys the client has sent the session, as Neovim's notation
@@ -2218,24 +2263,27 @@ fn pages_typed_faster_than_the_link_answers_keep_up_told_the_motions() {
 /// page alone, and the pages after it made again from there, on to where
 /// Neovim ends.
 ///
-/// Neovim taking each page in 30 ms, slower than they come: it takes them
-/// all before it goes to wait for a key, and says what it made of them
-/// once, with the frame that draws them.
+/// Neovim taking each page in 30 ms, slower than they come: past the first
+/// page it takes them all before it goes to wait for a key again, and the
+/// first ack to cover the fifth is its last.
 #[test]
 fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
     given_up_at_its_ack("client-unturn-ack", Duration::from_millis(30));
 }
 
 /// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`], Neovim taking
-/// each page in 20 ms: part way through them it goes to wait for a key now
-/// and then, and the agent says what it made of the keys so far — as the
-/// next key has come in already, which Neovim goes on to without waiting,
-/// and so without flushing the frame that draws them. The agent flushes
-/// that frame behind its word. Without it, the word was taken with the next
-/// frame Neovim flushed, one for keys after it, in which the page Neovim
-/// did not turn looked turned — a later page made up the rows — and the
-/// page was given up on only once Neovim had caught up, as on a macOS
-/// runner, where Neovim is slower.
+/// each page in 20 ms: at that pace the key it throws away, which costs it
+/// no scroll, is the last it has to hand, and it goes to wait for the next
+/// straight after — so the agent says what it made of the keys part way
+/// through, the first word on the fifth page, with the next key come in
+/// already. Neovim goes on to that without waiting, and so without
+/// flushing the frame that draws the keys the word is on: the agent
+/// flushes it. Without that, the word was taken with the next frame Neovim
+/// flushed, one for keys after it, in which the page Neovim did not turn
+/// looked turned — a later page made up its rows — and the page was given
+/// up on only once Neovim had caught up, as macOS runners saw at 30 ms.
+/// Where the pace or a slower machine has the first word on the fifth page
+/// be the last, each word still has to come with its frame.
 #[test]
 fn a_page_neovim_does_not_turn_is_given_up_at_an_ack_part_way_through() {
     given_up_at_its_ack("client-unturn-mid", Duration::from_millis(20));
@@ -2243,7 +2291,8 @@ fn a_page_neovim_does_not_turn_is_given_up_at_an_ack_part_way_through() {
 
 /// Pages typed every 10 ms, the fifth of which Neovim throws away, to a
 /// session whose Neovim takes `scroll` over each: see
-/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`].
+/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`]. And every ack
+/// the agent said came with the frame that draws it.
 fn given_up_at_its_ack(tag: &str, scroll: Duration) {
     require_nvim!();
     let scratch = Scratch::new(tag);
@@ -2300,6 +2349,14 @@ fn given_up_at_its_ack(tag: &str, scroll: Duration) {
         w0(&mut rpc)
     );
     watch(&mut term, Instant::now() + 6 * SLOW);
+    // Each ack followed by the frame that draws what it says, before any
+    // ack after it: where Neovim goes on to a key that has come in without
+    // waiting for it, and so without flushing, the agent flushes that frame.
+    let unframed = link.trace.acks_without_their_frames();
+    assert!(
+        unframed.is_empty(),
+        "acks not followed by their frames, as (count, top, the next frame's top): {unframed:?}"
+    );
     let when: Vec<(u32, Duration)> = seen.iter().map(|&(top, at)| (top, at - t0)).collect();
     let tops: Vec<u32> = seen.iter().map(|&(top, _)| top).collect();
     let back: Vec<usize> = (1..seen.len()).filter(|&i| tops[i] < tops[i - 1]).collect();

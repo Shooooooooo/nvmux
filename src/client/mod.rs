@@ -347,12 +347,12 @@ return out";
 /// last of them, its mode, and the window, buffer, `b:changedtick`, line
 /// count, cursor, `curswant` and view they left, and how wide Neovim lays
 /// the cursor's line out: see [`predict::Ack`]), the edits they made sent
-/// first and the frame that draws them flushed after, even where the next
-/// key has come in by then — and what would make a key typed in Insert
-/// mode in the buffer of the window that has the cursor do other than what
-/// typing it plainly does, as Insert mode is entered there, the buffer
-/// is, or an option that bears on it is set, where any of it changed
-/// (`insert`, see [`typing::Facts`]); and
+/// first and, in Normal, Visual and Insert mode, the frame that draws them
+/// flushed after, even where the next key has come in by then — and what
+/// would make a key typed in Insert mode in the buffer of the window that
+/// has the cursor do other than what typing it plainly does, as Insert mode
+/// is entered there, the buffer is, or an option that bears on it is set,
+/// where any of it changed (`insert`, see [`typing::Facts`]); and
 /// each time Neovim moves a view while it is behind on the keys typed
 /// (`behind`), which it may send no frame for till it has caught up — what
 /// the client scrolled ahead of it waits for it meanwhile (see
@@ -1168,6 +1168,7 @@ if predict then
   -- looked up afresh: one mapped since, by a plugin or by hand, has the
   -- window's shape said again.
   local wanted, said, fixed, decorated, recheck, rehooked
+  local judged = { n = true, v = true, V = true, ['\\22'] = true, i = true }
   local function remapped()
     recheck = false
     local buf = api.nvim_get_current_buf()
@@ -1289,11 +1290,15 @@ if predict then
     said = a
     send('ack', a[1], table.concat(tail), unpack(a, 2))
     -- Said just ahead of the frame Neovim flushes as it waits for the next
-    -- key. But where that key has come in already, it goes on to it without
-    -- waiting, and flushes no frame till it does wait: the next the client
-    -- has is one for keys after these, which this word would be taken with.
-    -- So it flushes the frame for these here, behind the word.
-    if vim.fn.getchar(1, { cursor = 'keep' }) ~= 0 then
+    -- key, which the client takes it with. But where that key has come in
+    -- already, Neovim goes on to it without waiting, and so without
+    -- flushing: the next frame the client has is one for keys after these.
+    -- So the frame that draws them is flushed here, behind the word, whether
+    -- a key has come in or not — looking for one would take in a <C-c>
+    -- typed ahead, which Neovim would then never see. Only in the modes the
+    -- client judges by the word (see predict::Rest): on the command line the
+    -- frame would have the cursor in the window.
+    if judged[mode] then
       pcall(api.nvim__redraw, { flush = true, cursor = true })
     end
   end)
