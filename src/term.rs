@@ -1,28 +1,16 @@
 //! Terminal mode handling for the attach path.
 //!
-//! # What raw mode is for here
+//! While a session is attached, nvmux is in raw mode with `ISIG` off, so
+//! `Ctrl-c`, `Ctrl-z` and `Ctrl-s` reach Neovim as bytes, not signals.
+//! `cfmakeraw` already clears `ISIG` and `IXON`, disables `ICANON`, `ECHO`
+//! and `OPOST`, and sets `VMIN = 1` / `VTIME = 0` (measured); only `VSUSP`
+//! needs disabling on top.
 //!
-//! While a session is attached, nvmux stays in raw mode with `ISIG` disabled.
-//! That is what makes `Ctrl-c`, `Ctrl-z` and `Ctrl-s` arrive at Neovim as
-//! ordinary bytes instead of being turned into signals for nvmux. The proxy
-//! forwards them; the editor decides what they mean.
-//!
-//! `cfmakeraw` already clears `ISIG` and `IXON`, disables `ICANON`, `ECHO` and
-//! `OPOST`, and sets `VMIN = 1` / `VTIME = 0` — measured, not assumed. The one
-//! genuinely non-redundant step is disabling `VSUSP`.
-//!
-//! # The failure this module exists to prevent
-//!
-//! A `Drop` guard and a panic hook do not cover a *signal*. Because raw mode
-//! clears `ISIG`, `^C` cannot reach nvmux at all — but a plain `kill` from
-//! another window still can, and returning from that without restoring the
-//! terminal leaves the user's shell with no echo and no line editing. That is
-//! the worst thing this program could do to somebody, and it happens after
-//! nvmux is already gone, so there is nothing left to fix it.
-//!
-//! So the saved termios also lives in a static that a signal handler can read,
-//! and the handler restores it before re-raising the signal with the default
-//! disposition — which keeps the reported exit status honest.
+//! A `Drop` guard and panic hook do not cover a signal such as a `kill` from
+//! another window, which would leave the shell with no echo or line editing.
+//! So the saved termios also lives in a static; a signal handler restores it
+//! and re-raises the signal with the default disposition, keeping the exit
+//! status honest.
 
 use std::os::fd::BorrowedFd;
 use std::sync::OnceLock;
@@ -31,13 +19,9 @@ use nix::sys::termios::{self, SetArg, SpecialCharacterIndices, Termios};
 
 use crate::error::Result;
 
-/// Write to stdout and flush, so an escape sequence lands before the next.
-/// One lock for both calls; the unlocked `Stdout` would take it twice.
-///
-/// Every sequence nvmux writes to the terminal on its own account — the
-/// mode strings below, the fade's frames, the relay's hand-offs — goes
-/// through here. The one exception is [`restore_and_reraise`], which is a
-/// signal handler and may only `write(2)`.
+/// Write to stdout and flush, under one lock. Every sequence nvmux writes on
+/// its own account goes through here, except in [`restore_and_reraise`],
+/// which as a signal handler may only `write(2)`.
 pub(crate) fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -45,8 +29,8 @@ pub(crate) fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
     out.flush()
 }
 
-/// A `libc::termios` we can read from a signal handler: plain C data, and
-/// `OnceLock::get` is an atomic load plus a read of initialised memory.
+/// Readable from a signal handler: plain C data, and `OnceLock::get` is an
+/// atomic load plus a read of initialised memory.
 struct Saved(libc::termios);
 
 // SAFETY: `libc::termios` is a plain-data struct with no pointers or interior
@@ -61,23 +45,16 @@ fn stdin_fd() -> BorrowedFd<'static> {
     unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) }
 }
 
-/// Restore the terminal, then die the way the signal intended.
-///
-/// Async-signal-safe: `tcsetattr`, `signal` and `raise` are all on POSIX's list.
-/// Re-raising under the default disposition rather than calling `_exit` means
-/// the shell still reports "terminated" or "hangup" rather than a plain exit
-/// code that hides why the process died.
+/// Restore the terminal, then re-raise under the default disposition (not
+/// `_exit`) so the shell reports the signal. `tcsetattr`, `write`, `signal`
+/// and `raise` are all async-signal-safe.
 extern "C" fn restore_and_reraise(sig: libc::c_int) {
     if let Some(saved) = SAVED.get() {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved.0);
         }
     }
-    // Undo whatever screen state was mid-flight — the picker's alternate
-    // screen, a hidden cursor — so a signal does not hand the shell back a
-    // blank screen with no cursor. A single fixed-string `write` is
-    // async-signal-safe, like the `tcsetattr` above, and is harmless when
-    // nothing was in progress.
+    // Undo screen state (alternate screen, hidden cursor); harmless if none.
     unsafe {
         libc::write(libc::STDOUT_FILENO, RESET.as_ptr().cast(), RESET.len());
     }
@@ -87,84 +64,61 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
     }
 }
 
-/// What a client cut off mid-frame leaves behind, and nothing else: an open
-/// synchronized-update span (Neovim draws inside one) and whatever SGR
-/// attributes were in force on the cell it had reached. Both are terminal-wide
-/// state rather than per-screen-buffer, so they outlive the client's screen and
-/// go on describing whatever nvmux draws next.
+/// What a client cut off mid-frame leaves behind: an open synchronized update
+/// (Neovim draws inside one) and its current SGR attributes. Both are
+/// terminal-wide, not per screen buffer, so they apply to what nvmux draws
+/// next.
 const INHERITED: &[u8] = b"\x1b[?2026l\x1b[0m";
 
-/// The screen-state reset: [`INHERITED`], plus leaving the alternate screen (a
-/// no-op when not in it), showing the cursor, and turning mouse reporting off
-/// ([`MOUSE_OFF`]). One fixed string so the signal handler can write it, and so
-/// the ordinary error paths put the screen back exactly the way a signal would.
-///
-/// The mouse is in here because every path this ends on is a shell prompt, and
-/// a shell wants no mouse reports: the picker turns reporting on when nothing
-/// is behind it, and a client killed with nvmux never gets to turn its own off.
+/// [`INHERITED`], plus leave the alternate screen (no-op if not in it), show
+/// the cursor and turn mouse reporting off ([`MOUSE_OFF`]). One fixed string
+/// so the signal handler can write it, and error paths match a signal's reset.
+/// Mouse off is included because every path here ends at a shell prompt, and
+/// a client killed with nvmux never turns its own off.
 const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1003l\x1b[?1006l\x1b[?1002l";
 
-/// Mouse reporting as Neovim's own TUI turns it on with `'mousemoveevent'`
-/// set: button-event tracking (`?1002`: presses, releases, and drags with a
-/// button held) in the SGR encoding (`?1006`: a click past column 223 still
-/// says where it landed), and then any-event tracking (`?1003`), which adds
-/// the plain motion the picker follows with its highlight. In that order, so
-/// a terminal without `?1003` is still left reporting clicks.
+/// Mouse reporting as Neovim's TUI enables it with `'mousemoveevent'`:
+/// button-event tracking (`?1002`) in SGR encoding (`?1006`, needed past
+/// column 223), then any-event tracking (`?1003`) for plain motion. In that
+/// order, so a terminal without `?1003` still reports clicks.
 ///
-/// Fixed strings of nvmux's own rather than crossterm's `EnableMouseCapture`
-/// (which also sets `?1000` and `?1015`, redundant under the two above):
-/// [`RESET`] has to carry the undo as one string a signal handler can write,
-/// and the handover strings are pinned not to mention any of these modes.
-/// crossterm's parser reads SGR reports whichever command enabled them.
+/// Not crossterm's `EnableMouseCapture`: [`RESET`] must carry the undo as one
+/// fixed string. crossterm parses SGR reports however they were enabled.
 const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h\x1b[?1003h";
 
-/// [`MOUSE_ON`] undone, in reverse order.
+/// [`MOUSE_ON`] undone, in reverse.
 const MOUSE_OFF: &[u8] = b"\x1b[?1003l\x1b[?1006l\x1b[?1002l";
 
-/// What a resumed client's terminal mouse reporting is put back to — see
-/// [`set_mouse_reporting`].
+/// What a resumed client's mouse reporting is restored to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseReporting {
-    /// The client had the mouse off (`mouse=`).
+    /// `mouse=`.
     Off,
-    /// Presses, releases and drags, in SGR: what Neovim's TUI turns on for a
-    /// non-empty `'mouse'`.
+    /// Presses, releases and drags, in SGR: Neovim's TUI with a non-empty
+    /// `'mouse'`.
     Buttons,
-    /// [`MouseReporting::Buttons`] plus plain motion: `'mousemoveevent'` set.
+    /// `Buttons` plus plain motion: `'mousemoveevent'` set.
     Motion,
 }
 
-/// [`MouseReporting::Buttons`], starting from a screen that had `?1003` on.
-/// `?1003` off *first*: on xterm, resetting any one of the tracking modes
-/// clears tracking altogether, so the two the client wants have to be set
-/// after it and not before.
+/// [`MouseReporting::Buttons`] from a screen with `?1003` on. `?1003` goes
+/// off first: on xterm, resetting any tracking mode clears all tracking.
 const MOUSE_BUTTONS: &[u8] = b"\x1b[?1003l\x1b[?1002h\x1b[?1006h";
 
-/// Turn mouse reporting on, for a screen of nvmux's own.
-///
-/// Every screen does, whatever is behind it, and turns it off again as it
-/// closes ([`disable_mouse`]). A resumed client's own setting is put back by
-/// the relay as it resumes the client, with [`set_mouse_reporting`]: a client
-/// enables the mouse once, at startup, and never again (as it enters the
-/// alternate screen once, see [`enter_alt_screen_and_clear`]), so nothing but
-/// nvmux can put the terminal back the way the client left it. What the client
-/// had comes from its ledger for a kept client (`[client] per_session`, the
-/// default), and for a held one is a question for its server, which that resume
-/// already asks to repaint.
+/// Turn mouse reporting on for an nvmux screen; [`disable_mouse`] undoes it.
+/// A client enables the mouse only at startup, so on resume the relay restores
+/// its setting with [`set_mouse_reporting`]: from its ledger for a kept
+/// client, or asked of a held client's server.
 pub fn enable_mouse() {
     let _ = write_stdout(MOUSE_ON);
 }
 
-/// Put mouse reporting back to what a client being resumed had, after a screen
-/// that set its own. See [`crate::pty`], which takes it from a kept client's
-/// ledger or asks a held client's server.
 pub fn set_mouse_reporting(reporting: MouseReporting) {
     let _ = write_stdout(mouse_reporting_bytes(reporting));
 }
 
-/// What [`set_mouse_reporting`] writes, for a caller writing it among other
-/// things of its own: the settings over a session, which report the mouse
-/// while they are up and put the session's back as they go.
+/// What [`set_mouse_reporting`] writes, for callers batching it with other
+/// output (the settings screen over a session).
 pub fn mouse_reporting_bytes(reporting: MouseReporting) -> &'static [u8] {
     match reporting {
         MouseReporting::Off => MOUSE_OFF,
@@ -173,99 +127,63 @@ pub fn mouse_reporting_bytes(reporting: MouseReporting) -> &'static [u8] {
     }
 }
 
-/// Turn mouse reporting off again, for the screen that turned it on.
 pub fn disable_mouse() {
     let _ = write_stdout(MOUSE_OFF);
 }
 
-/// Show the cursor — `DECTCEM` on — and nothing else.
+/// `DECTCEM` on, and nothing else.
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 
-/// Show the cursor, for a client about to be resumed onto a screen nothing
-/// dissolved in.
-///
-/// A fade hides the cursor and, on a fade in, puts it back on the last frame
-/// (see [`crate::shadow`]). A resume with no fade in — the fade is off, the
-/// shadow has nothing to show or cannot be trusted — inherits the hide from the
-/// fade out that ended the last relay and has nothing to undo it: the repaint
-/// asked for next is asked for, not certain. Shown here, where the erase left
-/// it, which is where every screen used to leave it before there was a fade.
+/// Show the cursor for a client resumed without a fade in. A fade hides the
+/// cursor and only a fade in shows it again (see [`crate::shadow`]); without
+/// one the hide from the last fade out would stick, since the requested
+/// repaint is not guaranteed.
 pub fn show_cursor() {
     let _ = write_stdout(SHOW_CURSOR);
 }
 
-/// Put the screen back to a state a shell can be used in: cursor visible,
-/// colours reset, primary screen. For the paths that end at a shell prompt
-/// with a message — an attach that failed, a detach — where the last thing
-/// drawn may have been the client's, mid-frame, with the cursor hidden.
+/// Write [`RESET`], for paths that end at a shell prompt (failed attach,
+/// detach) after a client may have been cut off mid-frame.
 pub fn reset_screen() {
     let _ = write_stdout(RESET);
 }
 
-/// Home the cursor and erase the line it is on. Not part of [`RESET`], which a
-/// signal handler writes and which every nvmux screen shares: this is only for
-/// the two paths that hang up on a client and then end at a shell.
+/// Home the cursor and erase its line. Only for the two paths that hang up
+/// on a client and end at a shell, so not part of [`RESET`].
 const ERASE_LINE: &[u8] = b"\r\x1b[2K";
 
-/// Wipe the line a hung-up client printed its last words on.
+/// Erase the `Nvim: Caught deadly signal 'SIGHUP'` line a retired client
+/// prints. Neovim restores the terminal (leaving the alternate screen) before
+/// printing it, so it lands on the user's screen. The detach path relays that
+/// restore on purpose (see [`crate::pty::Attachment::drain_until_eof`]): it
+/// pops kitty keyboard, bracketed paste and the title, which nvmux does not.
 ///
-/// nvmux retires a client with SIGHUP, and Neovim's shutdown runs its terminal
-/// restore *before* its signal handler prints — leaving the alternate screen
-/// first, so `Nvim: Caught deadly signal 'SIGHUP'` lands on the user's own
-/// screen rather than on the one being torn down. The detach path relays all of
-/// that on purpose (see [`crate::pty::Attachment::drain_until_eof`]): the
-/// restore sequence carries things nvmux does not send itself — the kitty
-/// keyboard pop, bracketed paste, the title — so refusing to relay it would
-/// leave the terminal worse off than the stray line does.
-///
-/// So the line goes afterwards instead, once the client is gone and [`RESET`]
-/// has left the alternate screen — which restores the cursor to where the
-/// client printed from, so that is the line this erases. Nothing of the
-/// client's output is filtered on the way through; nvmux cleans up after it in
-/// nvmux's own bytes, which is what keeps "the bytes pass through untouched"
-/// true.
-///
-/// Erasing it is safe because of where it is: the shell's cursor was at the
-/// start of an empty line when nvmux was launched, and that is the line the
-/// prompt is about to be drawn on anyway. Most prompts — zsh, starship,
-/// powerlevel10k, fish — already erase it and so already hide this; a bare
-/// `PS1='$ '` is what leaves it standing.
+/// Called after the client is gone and [`RESET`] has left the alternate
+/// screen, which puts the cursor back on that line. The client's output is not
+/// filtered. Safe because the line is where the shell prompt goes next; most
+/// prompts erase it anyway, a bare `PS1='$ '` does not.
 pub fn erase_hung_up_clients_line() {
     let _ = write_stdout(ERASE_LINE);
 }
 
-/// Drop the state inherited from a client cut off mid-frame, without saying
-/// anything about whose screen it is.
+/// Write [`INHERITED`], for paths that stop the relay mid-stream and end at
+/// another nvmux screen (`<prefix> Space`, `c`, `?`), where no client restore
+/// sequence arrives.
 ///
-/// For the paths that end at another nvmux screen rather than at a shell:
-/// `<prefix> Space`, `<prefix> c` and `<prefix> ?` all stop the relay mid-stream
-/// and leave the client running, so nothing emits the restore sequence
-/// [`reset_screen`] relies on.
+/// The picker cannot paint over the leftovers: it sets no colours, and
+/// ratatui 0.30's crossterm backend emits SGR only when a cell differs from
+/// `Color::Reset` and skips blank cells, so the editor's last attributes would
+/// become the picker's.
 ///
-/// The picker cannot paint over the leftovers by itself, because it sets no
-/// colours: every cell it draws is `Color::Reset` and every distinction is a
-/// modifier, which is what makes it inherit the terminal's palette on purpose.
-/// Measured against ratatui 0.30's crossterm backend: `draw` tracks fg and bg
-/// from `Color::Reset` and emits SGR only on a difference, so a screen of
-/// default cells writes none at all — and it skips blank cells entirely, so the
-/// background is whatever the last erase painted. The editor's last attributes
-/// are then the picker's, which is the bug this prevents.
-///
-/// Must run before the alternate screen is entered and before the clear: both
-/// erase with the *current* background colour.
+/// Must run before entering the alternate screen and before the clear: both
+/// erase with the current background colour.
 pub fn reset_inherited_attributes() {
     let _ = write_stdout(INHERITED);
 }
 
-/// Install the restore-on-signal safety net for the whole run.
-///
-/// Called once from `main`, before any screen is drawn: the picker runs in raw
-/// mode and the alternate screen for as long as the user is choosing, and a
-/// `kill` during that time would otherwise leave the terminal that way. The
-/// termios saved here is the shell's, taken before anything changed it, which
-/// is the one every later restore should return to. [`RawMode::enter`] also
-/// calls this, for callers (tests, other embedders) that never went through
-/// `main`.
+/// Install the restore-on-signal handlers. Called from `main` before any
+/// screen is drawn, so the saved termios is the shell's. [`RawMode::enter`]
+/// also calls it, for callers that bypass `main`.
 pub fn install_signal_safety_net() {
     let mut raw_saved = std::mem::MaybeUninit::<libc::termios>::uninit();
     // SAFETY: fd 0 is valid and tcgetattr fully initialises the struct on
@@ -278,34 +196,29 @@ pub fn install_signal_safety_net() {
     install_signal_handlers();
 }
 
-/// Raw mode, restored when this is dropped. Restoring twice is harmless, so the
-/// explicit [`RawMode::restore`] and the panic-path `Drop` can both run.
+/// Raw mode, restored on drop. [`RawMode::restore`] is idempotent, so it and
+/// the panic-path `Drop` can both run.
 pub struct RawMode {
     saved: Termios,
     restored: bool,
 }
 
 impl RawMode {
-    /// Put the terminal into raw mode with signals disabled.
     pub fn enter() -> Result<Self> {
         let saved = termios::tcgetattr(stdin_fd())?;
 
-        // The signal-readable copy is taken with a raw `tcgetattr` rather than
-        // by converting the nix value: `From<Termios> for libc::termios`
-        // returns a cached inner struct **without syncing the public fields**
-        // — only `tcsetattr` syncs — so a converted value silently loses
-        // anything set through `control_chars`. A no-op when `main` already
-        // did this at startup, which is the normal case.
+        // Takes the signal-readable copy with a raw `tcgetattr`: converting
+        // the nix value returns a stale cache that lacks edits made through
+        // the public fields (only `tcsetattr` syncs it). No-op if `main` ran
+        // it already.
         install_signal_safety_net();
 
         let mut raw = saved.clone();
         termios::cfmakeraw(&mut raw);
-        // The one thing cfmakeraw does not do: a terminal whose VSUSP is not
-        // Ctrl-z could otherwise suspend nvmux mid-session.
+        // cfmakeraw leaves VSUSP set, which could suspend nvmux mid-session.
         raw.control_chars[SpecialCharacterIndices::VSUSP as usize] = termios::_POSIX_VDISABLE;
 
-        // TCSANOW, not TCSAFLUSH: discarding type-ahead would silently eat
-        // keystrokes someone typed while the session was still starting.
+        // TCSANOW, not TCSAFLUSH: keep keys typed while the session starts.
         termios::tcsetattr(stdin_fd(), SetArg::TCSANOW, &raw)?;
 
         Ok(Self {
@@ -314,11 +227,8 @@ impl RawMode {
         })
     }
 
-    /// Put the terminal back the way it was.
-    ///
-    /// `TCSADRAIN` so that anything already written — in particular the child's
-    /// own restore sequence, which nvmux passes through verbatim — reaches the
-    /// terminal before the mode changes underneath it.
+    /// `TCSADRAIN`, so output already written (notably the child's restore
+    /// sequence) reaches the terminal before the mode changes.
     pub fn restore(&mut self) {
         if self.restored {
             return;
@@ -349,16 +259,9 @@ fn install_signal_handlers() {
     });
 }
 
-/// The terminal's current size, as a PTY size.
-///
-/// Note the argument order. `crossterm::terminal::size()` returns
-/// `(columns, rows)` while `PtySize` is `{ rows, cols }`; passing them
-/// positionally transposes the screen and hands Neovim an 80x24-shaped 24x80
-/// grid, which looks like a rendering bug rather than a units bug.
-///
-/// `pixel_width` and `pixel_height` are filled in where the terminal reports
-/// them, because leaving them zero breaks the sixel and kitty image protocols
-/// inside the attached editor.
+/// The terminal's size as a PTY size. crossterm gives `(cols, rows)` but
+/// `PtySize` is `{ rows, cols }`. Pixel sizes are filled in where reported:
+/// zero breaks sixel and kitty images in the editor.
 pub fn terminal_size() -> crate::pty::PtySize {
     use ratatui::crossterm::terminal;
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -373,86 +276,45 @@ pub fn terminal_size() -> crate::pty::PtySize {
     }
 }
 
-/// What hands the terminal to a session: [`INHERITED`], then `?1049l` to leave
-/// the alternate screen, then clear + home so the session starts from a known
-/// state.
-///
-/// Every part of that order is load-bearing, and the test below pins it. An
-/// erase paints with the *current* background colour, so the attributes an
-/// outgoing client left behind have to go first; and the erase has to land on
-/// the screen the session will draw on rather than on the one being left. One
-/// string, so it is also one `write`: a terminal cannot present the moment in
-/// between, which is the outgoing session's frame.
+/// Hands the terminal to a session: [`INHERITED`], `?1049l`, then clear and
+/// home. The order matters (a test pins it): the erase uses the current
+/// background, so attributes go first, and it must land on the screen the
+/// session draws on. One `write`, so no frame in between is presented.
 pub(crate) const HANDOVER: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[2J\x1b[H";
 
-/// Leave the alternate screen and clear, without touching the terminal modes.
-///
-/// **For a client about to be spawned, and belongs before the spawn, never
-/// after.** Whatever is on the terminal stays there until this runs, and on a
-/// switch that is the session being switched away from — so with this on the
-/// far side of a spawn (two RPC round trips and a whole new `nvim` process) the
-/// old session is what the user watches for the length of the switch. The
-/// callers are therefore the picker and the prompt as they give the terminal
-/// back, `<prefix> <number>` as it leaves one relay for the next, and
-/// [`crate::pty::relay`] as the backstop for a path that did neither.
-///
-/// A client that is *resumed* rather than spawned needs the opposite —
-/// [`enter_alt_screen_and_clear`] — and the relay is what tells the two apart.
-///
-/// Written straight to stdout rather than through crossterm so it cannot
-/// re-enter any mode handling: raw mode is the caller's business, and the
-/// callers differ on whether they have dropped it yet.
+/// Leave the alternate screen and clear, for a client about to be spawned.
+/// Call it before the spawn, not after: until it runs, the old session stays
+/// on screen for the whole spawn. A resumed client needs
+/// [`enter_alt_screen_and_clear`] instead. Bypasses crossterm so raw mode
+/// stays the caller's business.
 pub fn leave_alt_screen_and_clear() {
     let _ = write_stdout(HANDOVER);
 }
 
-/// What hands the terminal back to a client nvmux took it from: [`INHERITED`],
-/// then `?1049h` to re-enter the alternate screen, then clear + home.
-///
-/// The same order as [`HANDOVER`], for the same reasons, with the one switch
-/// pointing the other way. `?1049h` on a terminal already in the alternate
-/// screen is a no-op on xterm and kitty (which is what the picker relies on to
-/// open over a client's frame), so the erase is explicit rather than left to
-/// the switch. No `\e[22;0;0t` beside it: the client's own `smcup` pushed the
-/// title once, its `rmcup` will pop it once, and a second push here would leave
-/// the stack one deep.
+/// [`HANDOVER`] with `?1049h` instead, to hand the terminal back to a resumed
+/// client. `?1049h` while already in the alternate screen is a no-op on xterm
+/// and kitty, so the erase is explicit. No title push (`\e[22;0;0t`): the
+/// client's `smcup` pushed it once and its `rmcup` pops it once.
 pub(crate) const RESUME: &[u8] = b"\x1b[?2026l\x1b[0m\x1b[?1049h\x1b[2J\x1b[H";
 
-/// Put the terminal back in the alternate screen, cleared, for a client that
-/// is about to be resumed rather than spawned.
+/// Re-enter the alternate screen and clear, for a client about to be resumed.
 ///
-/// A client enters the alternate screen once, at startup, and leaves it once,
-/// at exit. Nothing nvmux can ask of the server makes it do either again:
-/// `:mode` and a resize repaint the grid wherever the terminal is. But the
-/// picker, the prompt and the help screen all end by leaving the alternate
-/// screen (see `ui::Screen`), and a switch that names the session already
-/// attached goes through [`leave_alt_screen_and_clear`] — so a client resumed
-/// after any of them has been moved to the primary screen without being told,
-/// and repaints there.
-///
-/// Nothing looks wrong until that client leaves. Its `rmcup` then has no
-/// alternate screen to leave, and neither does the `?1049l` nvmux writes on a
-/// detach, so the editor's last frame stays put and the shell prompt is printed
-/// onto it. Whether a given detach showed the bug depended on whether the user
-/// had been to the picker and back first, which is what made it intermittent.
-///
-/// A terminal with no alternate screen ignores `?1049h` as it ignored the
-/// client's; one whose `TERM` lacks `smcup` while the terminal itself has the
-/// mode is put in the alternate screen here on a client that never asked, and
-/// taken out of it by the `?1049l` every way out of nvmux ends with.
+/// A client enters the alternate screen only at startup, but nvmux's screens
+/// end on the primary one (see `ui::Screen`). Without this a resumed client
+/// would draw on the primary screen, and on detach its last frame would stay
+/// under the shell prompt.
 pub fn enter_alt_screen_and_clear() {
     let _ = write_stdout(RESUME);
 }
 
-/// Opens and closes a synchronized update; [`HANDOVER`] and [`RESUME`] both
-/// begin by closing one.
+/// Synchronized update bounds; [`HANDOVER`] and [`RESUME`] begin with
+/// `SPAN_END`.
 const SPAN_BEGIN: &[u8] = b"\x1b[?2026h";
 const SPAN_END: &[u8] = b"\x1b[?2026l";
 
-/// [`leave_alt_screen_and_clear`], with `keep` drawn on the cleared screen in
-/// the same synchronized update, so the terminal never presents the clear
-/// without it. For the picker, which leaves the name of the session it is
-/// attaching to standing (see [`crate::handoff`]).
+/// [`leave_alt_screen_and_clear`] with `keep` drawn in the same synchronized
+/// update, so the clear is never shown without it. For the picker's hand-off
+/// name (see [`crate::handoff`]).
 pub fn leave_alt_screen_and_clear_keeping(keep: &[u8]) {
     let _ = write_stdout(&leaving_keeping(keep));
 }
@@ -467,12 +329,10 @@ fn leaving_keeping(keep: &[u8]) -> Vec<u8> {
     out
 }
 
-/// [`enter_alt_screen_and_clear`], with `first` written on the screen being
-/// left, and the synchronized update this opens left open: the caller's next
-/// frame — a dissolve's first, drawing again on the new screen what `first`
-/// took off the old one — is what closes it, so the terminal presents the
-/// switch and that frame as one. A caller with no such frame closes it with
-/// [`end_span`].
+/// [`enter_alt_screen_and_clear`] with `first` written on the screen being
+/// left, leaving the synchronized update open: the caller's next frame (a
+/// dissolve's first) closes it, so the switch and that frame are presented
+/// together. Otherwise close it with [`end_span`].
 pub(crate) fn enter_alt_screen_and_clear_after(first: &[u8]) {
     let _ = write_stdout(&entering_after(first));
 }
@@ -485,8 +345,6 @@ fn entering_after(first: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Close a synchronized update left open by
-/// [`enter_alt_screen_and_clear_after`].
 pub(crate) fn end_span() {
     let _ = write_stdout(SPAN_END);
 }
@@ -495,16 +353,13 @@ pub(crate) fn end_span() {
 mod tests {
     use super::*;
 
-    /// Both switches begin by closing a span, which the variants rely on to
-    /// cut it off and open their own.
+    /// The span variants slice this prefix off.
     #[test]
     fn the_switches_begin_by_closing_a_span() {
         assert!(HANDOVER.starts_with(SPAN_END));
         assert!(RESUME.starts_with(SPAN_END));
     }
 
-    /// Leaving with a name kept: the leave, the clear and the name all inside
-    /// one span, so the clear is never presented without the name.
     #[test]
     fn leaving_keeps_the_name_inside_the_one_span() {
         let out = leaving_keeping(b"NAME");
@@ -515,8 +370,6 @@ mod tests {
         );
     }
 
-    /// Entering after an erase: the erase lands before the switch, on the
-    /// screen being left, and the span is left open for the caller's frame.
     #[test]
     fn entering_erases_first_and_leaves_the_span_open() {
         let text = String::from_utf8(entering_after(b"ERASE")).unwrap();
@@ -525,28 +378,23 @@ mod tests {
     }
     use crate::test_support::{contains, position};
 
-    /// The two resets must go on agreeing about what a cut-off client leaves
-    /// behind. They are written out separately because the signal handler needs
-    /// `RESET` to be one fixed string it can `write`, so nothing but this stops
-    /// them drifting apart.
+    /// `RESET` is a separate fixed string for the signal handler; this keeps
+    /// the two in agreement.
     #[test]
     fn the_inherited_reset_is_the_part_of_reset_that_says_nothing_about_the_screen() {
         for undo in [&b"\x1b[?2026l"[..], &b"\x1b[0m"[..]] {
             assert!(contains(INHERITED, undo), "INHERITED dropped {undo:?}");
             assert!(contains(RESET, undo), "RESET dropped {undo:?}");
         }
-        // And only those two. Leaving the alternate screen would show the shell
-        // for a frame before the picker enters it again, and showing the cursor
-        // would undo the hide the screen about to be drawn does for itself.
+        // Only those two: leaving the alternate screen would flash the shell
+        // before the picker re-enters it, and showing the cursor would undo
+        // the next screen's hide.
         assert_eq!(INHERITED, b"\x1b[?2026l\x1b[0m");
         assert!(!contains(INHERITED, b"\x1b[?1049l"));
         assert!(!contains(INHERITED, SHOW_CURSOR));
         assert!(!contains(INHERITED, b"\x1b[?1002l"));
     }
 
-    /// The show a resume falls back on is the one every reset carries, and
-    /// says nothing else: a client is about to draw, and its screen and modes
-    /// are its own.
     #[test]
     fn the_cursor_show_is_the_one_the_reset_carries_and_nothing_more() {
         assert!(contains(RESET, SHOW_CURSOR));
@@ -557,9 +405,8 @@ mod tests {
         );
     }
 
-    /// Every path `RESET` ends on is a shell prompt, and a shell wants no mouse
-    /// reports — including after a `kill` during the picker, which is why the
-    /// mouse-off has to be part of the one string the signal handler writes.
+    /// A shell wants no mouse reports, even after a `kill` during the picker,
+    /// so mouse-off must be in the signal handler's string.
     #[test]
     fn the_reset_turns_mouse_reporting_off() {
         assert!(
@@ -568,21 +415,17 @@ mod tests {
         );
     }
 
-    /// The erase is the hangup paths' alone. Folding it into `RESET` would put
-    /// it in the signal handler and on every error path that borrows the same
-    /// string — wiping a line of someone's scrollback on a `kill` nvmux did not
-    /// ask for, when no client had written anything there to clean up.
+    /// In `RESET` it would wipe a scrollback line on every signal and error
+    /// path, where no client wrote anything.
     #[test]
     fn erasing_the_hung_up_clients_line_is_not_part_of_the_shared_reset() {
         assert_eq!(ERASE_LINE, b"\r\x1b[2K");
         assert!(!contains(RESET, ERASE_LINE));
         assert!(!contains(INHERITED, ERASE_LINE));
-        // Home first, so it erases the line the cursor is on wherever the
-        // client left the column, and leaves the shell a cursor at column 0.
+        // Home first, leaving the shell at column 0.
         assert!(ERASE_LINE.starts_with(b"\r"));
     }
 
-    /// The off string undoes exactly the modes the on string sets, last first.
     #[test]
     fn mouse_off_undoes_mouse_on_in_reverse() {
         let modes = |s: &[u8], fin: u8| -> Vec<Vec<u8>> {
@@ -604,9 +447,7 @@ mod tests {
         );
     }
 
-    /// Putting a client's button tracking back after a screen had motion
-    /// tracking on: the reset must come first, or it would clear what was
-    /// just set.
+    /// The reset must come first, or it would clear what was just set.
     #[test]
     fn restoring_button_tracking_resets_motion_before_it_sets_anything() {
         let at = |needle: &[u8]| position(MOUSE_BUTTONS, needle, "MOUSE_BUTTONS");
@@ -617,10 +458,8 @@ mod tests {
         assert!(!contains(MOUSE_BUTTONS, b"\x1b[?1006l"));
     }
 
-    /// The mouse is the screen's while a screen is up and the relay's as a
-    /// client resumes, so the strings that hand a terminal to a client, back
-    /// to one, or to a screen must not touch it: whichever of the two wrote
-    /// last would be undone.
+    /// Screens and the relay own mouse reporting; the hand-off strings must
+    /// not undo either.
     #[test]
     fn the_handover_strings_leave_mouse_reporting_alone() {
         for (name, s) in [
@@ -638,8 +477,6 @@ mod tests {
         }
     }
 
-    /// [`HANDOVER`] is three steps whose order is the whole of its correctness,
-    /// and nothing but this stops a later edit reshuffling them.
     #[test]
     fn the_handover_drops_inherited_attributes_before_it_erases() {
         assert!(
@@ -656,10 +493,8 @@ mod tests {
         assert!(at(b"\x1b[2J") < at(b"\x1b[H"));
     }
 
-    /// [`RESUME`] is [`HANDOVER`] with the switch pointing the other way, and
-    /// only that: same attributes-first order, same erase-then-home, and it
-    /// must *enter* the alternate screen — a resumed client draws on whichever
-    /// screen the terminal is on, and its exit only leaves the one it entered.
+    /// A resumed client draws on whichever screen is current, and its exit
+    /// only leaves the one it entered.
     #[test]
     fn the_resume_re_enters_the_alternate_screen_before_it_erases() {
         assert!(
@@ -684,8 +519,7 @@ mod tests {
             "the client's own smcup pushed the title; pushing it again would \
              leave the title stack one deep after its rmcup"
         );
-        // And the two hand over the same amount of state, so an edit to one
-        // that forgets the other shows up here.
+        // Catches an edit to one that forgets the other.
         assert_eq!(
             RESUME.len(),
             HANDOVER.len(),
@@ -693,13 +527,11 @@ mod tests {
         );
     }
 
-    /// The distinction the module docs rest on: `cfmakeraw` already does most of
-    /// what the design calls for, and `VSUSP` is the part it does not.
     #[test]
     fn cfmakeraw_covers_isig_and_ixon_but_not_vsusp() {
         use nix::sys::termios::{ControlFlags, InputFlags, LocalFlags, OutputFlags};
 
-        // A default-ish termios to exercise the flag maths without a real tty.
+        // No real tty needed.
         let mut t: Termios = unsafe { std::mem::zeroed::<libc::termios>() }.into();
         t.local_flags = LocalFlags::ISIG | LocalFlags::ICANON | LocalFlags::ECHO;
         t.input_flags = InputFlags::IXON | InputFlags::ICRNL;
@@ -721,7 +553,6 @@ mod tests {
         );
         assert!(!t.output_flags.contains(OutputFlags::OPOST));
 
-        // ...and the one thing it leaves alone, which is why we set it.
         assert_eq!(
             t.control_chars[SpecialCharacterIndices::VSUSP as usize],
             0x1a,
@@ -735,17 +566,9 @@ mod tests {
         );
     }
 
-    /// `Termios -> libc::termios` is LOSSY, and this pins that down.
-    ///
-    /// nix keeps a cached `libc::termios` alongside the public `control_chars`
-    /// and flag fields, and only `tcsetattr` syncs one into the other.
-    /// `.into()` hands back the stale cache, so a value edited through the
-    /// public fields converts to something that does not contain those edits.
-    ///
-    /// This is why the signal-handler copy is taken with a raw `tcgetattr`
-    /// instead of by converting. If nix ever makes the conversion sync, this
-    /// test fails and the comment in `RawMode::enter` can be revisited — that
-    /// is the point of asserting it rather than merely writing it down.
+    /// nix caches a `libc::termios` beside the public fields and only
+    /// `tcsetattr` syncs them, so `.into()` drops field edits. Hence the raw
+    /// `tcgetattr` in `RawMode::enter`; if nix starts syncing, this fails.
     #[test]
     fn converting_a_termios_to_libc_silently_drops_field_edits() {
         let mut t: Termios = unsafe { std::mem::zeroed::<libc::termios>() }.into();
@@ -760,8 +583,7 @@ mod tests {
             "nix now syncs on conversion; the raw tcgetattr in RawMode::enter \
              can be simplified"
         );
-        // The edit is still visible on the original, which is what makes the
-        // loss silent rather than obvious.
+        // The original still shows the edit, so the loss is silent.
         assert_eq!(
             t.control_chars[SpecialCharacterIndices::VSUSP as usize],
             0x1a

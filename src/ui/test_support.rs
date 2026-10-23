@@ -1,8 +1,7 @@
-//! Shared helpers for the screen tests, which all render to a `TestBackend`
-//! and assert on the result the same way. [`emitted`] is the exception: one
-//! property of the screens is only visible in the escape stream, so it renders
-//! through the same crossterm backend the binary uses. The picker builders the
-//! picker's own tests and the renderer's share live here too.
+//! Shared helpers for the screen tests, which render to a `TestBackend`.
+//! [`emitted`] renders through the binary's crossterm backend instead, for
+//! what is only visible in the escape stream. Also the picker builders shared
+//! by the picker and renderer tests.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -17,22 +16,19 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{App, Key};
 use crate::session::Session;
 
-/// The panels tests open, one test at a time: each opens on what the session
-/// loop last handed over, and leaves what it changed, which they share (see
-/// [`super::picker::hand`]).
+/// Serialises the panel tests: each opens on what the session loop last handed
+/// over and leaves its changes behind (see [`super::picker::hand`]).
 pub(crate) static PANELS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Render one frame to a `w` x `h` `TestBackend` and hand back the cell
-/// buffer, for the tests that need a cell's modifier rather than its text.
+/// Render one frame to a `w` x `h` `TestBackend` and return its cells.
 pub(super) fn buffer(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
     terminal.draw(|f| draw(f)).expect("draw");
     terminal.backend().buffer().clone()
 }
 
-/// Reconstruct the rendered lines, skipping the filler cell that follows a
-/// wide glyph so a CJK name is not reported as three columns per character.
-/// Trailing blanks are trimmed from every line.
+/// The rendered lines, trailing blanks trimmed. The filler cell after a wide
+/// glyph is skipped so CJK text is not reported with extra columns.
 pub(super) fn render(w: u16, h: u16, draw: impl FnMut(&mut Frame)) -> Vec<String> {
     let buf = buffer(w, h, draw);
     (0..buf.area.height)
@@ -53,15 +49,12 @@ pub(super) fn render(w: u16, h: u16, draw: impl FnMut(&mut Frame)) -> Vec<String
         .collect()
 }
 
-/// The bytes a screen writes to a terminal, through the same crossterm backend
-/// the binary uses. [`render`] asserts what a screen *means*; this is for what
-/// it actually puts on the wire.
-///
-/// A fixed viewport rather than [`Terminal::new`], which asks the real terminal
-/// for its size and fails under `cargo test`.
+/// The bytes a screen writes, through the binary's crossterm backend. Uses a
+/// fixed viewport: [`Terminal::new`] queries the real terminal's size, which
+/// fails under `cargo test`.
 pub(super) fn emitted(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> String {
-    /// A writer that keeps what was written, since ratatui's backend does not
-    /// hand its own back on this version.
+    /// Keeps what was written; this ratatui's backend does not return its
+    /// writer.
     #[derive(Clone)]
     struct Tap(Rc<RefCell<Vec<u8>>>);
 
@@ -75,7 +68,7 @@ pub(super) fn emitted(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Strin
         }
     }
 
-    // What `Screen::open` does, so the stream is the one the binary produces.
+    // As `Screen::open` does, so the stream matches the binary's.
     ratatui::crossterm::style::force_color_output(true);
 
     let tap = Tap(Rc::new(RefCell::new(Vec::new())));
@@ -92,9 +85,8 @@ pub(super) fn emitted(w: u16, h: u16, mut draw: impl FnMut(&mut Frame)) -> Strin
     String::from_utf8(bytes).expect("the screens write UTF-8")
 }
 
-/// No screen may emit an SGR colour: each inherits the terminal's palette and
-/// background and is correct under `NO_COLOR` by construction rather than by
-/// remembering to check a flag at each call site (see [`super::draw`]).
+/// No screen may emit an SGR colour: screens inherit the terminal's palette,
+/// so they honour `NO_COLOR` by construction (see [`super::draw`]).
 pub(super) fn assert_no_colour(w: u16, h: u16, draw: impl FnMut(&mut Frame)) {
     let buf = buffer(w, h, draw);
     for y in 0..buf.area.height {
@@ -114,16 +106,12 @@ pub(super) fn assert_no_colour(w: u16, h: u16, draw: impl FnMut(&mut Frame)) {
     }
 }
 
-/// Sizes every screen must survive: degenerate, one-row, and just big enough to
-/// tempt an off-by-one. Shared so a case added for one screen covers them all —
-/// `(10, 2)` was missing from one of the three copies this replaced, and the
-/// attach notice (see [`crate::announce`]) draws on the same terminals.
+/// Sizes every screen must survive: degenerate, one-row, and just big enough
+/// for an off-by-one. The attach notice ([`crate::announce`]) uses them too.
 pub(crate) const TINY_SIZES: &[(u16, u16)] =
     &[(1, 1), (2, 1), (1, 2), (0, 0), (80, 1), (3, 3), (10, 2)];
 
-/// No screen draws a border: they are centred text on the terminal's own
-/// background, and a box would be the one thing that has to line up with
-/// Neovim's.
+/// No screen draws a border: a box would have to line up with Neovim's.
 pub(super) fn assert_no_borders(lines: &[String]) {
     for line in lines {
         for ch in "┌┐└┘─│├┤┬┴┼╭╮╰╯═║".chars() {
@@ -132,16 +120,14 @@ pub(super) fn assert_no_borders(lines: &[String]) {
     }
 }
 
-/// Left and right padding of a rendered line on a `w`-column screen, for the
-/// horizontal-centring assertions the screens share: byte slack on the left
-/// (only spaces precede the text) and column slack on the right.
+/// Left and right padding of a line on a `w`-column screen: bytes of leading
+/// spaces, and columns of slack on the right.
 pub(super) fn padding(line: &str, w: usize) -> (usize, usize) {
     (line.len() - line.trim_start().len(), w - line.width())
 }
 
-/// A picker holding sessions of these names, numbered the way
-/// `transport::finish_listing` would have: these `App`s are built directly, so
-/// nothing else would set the resolved number.
+/// A picker of sessions with these names, numbered as
+/// `transport::finish_listing` would, since nothing else sets it here.
 pub(super) fn picker(names: &[&str]) -> App {
     App::new(
         names

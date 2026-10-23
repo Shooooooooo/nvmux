@@ -1,73 +1,31 @@
-//! The wait for a session to take its client: the screen between the picker
-//! (or a `<prefix>` switch) and the session itself.
+//! The screen shown while a session takes its client, between the picker (or
+//! a `<prefix>` switch) and the session.
 //!
-//! An attach probes the session before its client is let onto the terminal
-//! (see [`crate::pty::Probe`]), and the probe's last call is a deferred one: a
-//! session in the middle of `:!make` answers it when the make is done. That
-//! wait used to be three seconds and then a refusal. Now it is as long as it
-//! takes, and this screen is what makes that bearable — it names the session
-//! being waited for, with a spinner beside the name so the wait is visibly the
-//! session's and not a hang, and it offers `Esc` to give up on it.
+//! The attach probe ([`crate::pty::Probe`]) ends with a deferred call, which a
+//! session in `:!make` answers only when the make finishes. There is no
+//! timeout; this screen shows a spinner by the session's name and offers
+//! `Esc`. A session parked on a keypress ([`Answer::Blocked`]) is handed the
+//! terminal at once, before [`GRACE`]: only a key from its client can unblock
+//! it.
 //!
-//! The one wait that is *not* waited out is a session parked on a keypress,
-//! which the probe reports as [`Answer::Blocked`] rather than asking anything
-//! deferred of it. There is nothing to spin for there: the session will not
-//! move until a key reaches it, and the client this screen is holding back is
-//! how the user presses one. So that answer hands the terminal over at once —
-//! before `GRACE`, so this screen never appears for it at all.
+//! The screen is one centred dim line where the picker draws its list, and the
+//! dim hint row ([`draw::screen`], [`draw::centre_vertically`]).
 //!
-//! # The shape is the picker's
+//! Nothing is drawn or read for the first [`GRACE`]. Most attaches finish
+//! sooner (ms locally, a few hundred over ssh), and keys typed meanwhile must
+//! stay queued for the editor: a `:` typed right after `Enter` on the picker
+//! opens its command line, and a poll would consume it. Unlike other screens,
+//! this one never enables the mouse, so pointer reports stay out of that
+//! queue too.
 //!
-//! One centred line where the picker draws its list, and one dim hint row on
-//! the last line: [`draw::screen`], the same call every other screen makes.
-//! The line is the picker's
-//! empty-list line by another name — a single dim sentence standing in for a
-//! list that is not there — so it is drawn the same way, through
-//! [`draw::centre_vertically`].
+//! Once the spinner is up, keys typed before it are dropped (an `Esc` typed
+//! onto a blank screen was not a cancel), `Esc`/`Ctrl-c` cancel, and other
+//! keys are forwarded to the session ([`Forward`]), since a long wait may be
+//! one that only a key ends. So `Ctrl-c` is a key, not a signal: queued for
+//! the editor during the grace, a cancel after.
 //!
-//! # The grace period
-//!
-//! Nothing is drawn, and nothing is read, for the first [`GRACE`]. An attach
-//! to an idle session is milliseconds locally and a few hundred over ssh, and
-//! a spinner that flashed on every one of those would be noise on the very
-//! transition it exists to explain. Not *reading* matters more: whatever the
-//! user types while an attach is in flight sits in the terminal's input queue,
-//! and a fast attach hands all of it to the editor as the relay begins — a `:`
-//! typed straight after `Enter` on the picker opens the command line. A screen
-//! that polled the keyboard would take those bytes out of the queue.
-//!
-//! Once the spinner is up, that reverses: the screen is what the user is
-//! typing into. It reads keys from then on, and `Esc` or `Ctrl-c` ends the
-//! attach — the offer on the hint row is live from the moment it appears,
-//! which is the whole reason that row is unconditional. What was typed
-//! *before* the spinner appeared is drained and dropped at that moment rather
-//! than acted on: an `Esc` typed a tenth of a second after `Enter`, onto a
-//! blank screen, was not an answer to an offer nobody had seen yet.
-//!
-//! Any other key is sent on to the session (see [`Forward`]), which is the one
-//! thing this screen does that is not drawing or giving up. Dropping them was
-//! the obvious reading — the session is not answering, so there is nowhere to
-//! send it — and it was wrong twice over: `nvim_input` is a fast call, so a key
-//! lands whatever the editor is parked in, and the waits long enough for this
-//! screen to appear include the ones that end *only* when a key arrives. A
-//! screen that drew a spinner while swallowing the keystroke that would stop it
-//! is the shape of the bug this was written against.
-//!
-//! One consequence worth knowing: the probe used to run on a cooked terminal,
-//! where `Ctrl-c` was a signal that ended nvmux. Here it is a key — queued for
-//! the editor while the screen is blank, a cancel once the spinner is up.
-//!
-//! # No mouse
-//!
-//! The one screen that does not take the mouse, and the grace period is why:
-//! with reporting on, a pointer moved during those first milliseconds would
-//! leave SGR reports in the queue the editor is about to read.
-//!
-//! # The tick
-//!
-//! The wait is on the probe's channel, not on the keyboard: the probe's answer
-//! wakes the loop at once, so a fast attach pays nothing for the screen, and a
-//! key is read on the way round, at most a [`FRAME`] late.
+//! The loop waits on the probe's channel, so an answer is acted on at once;
+//! keys are read at most a [`FRAME`] late.
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -84,71 +42,56 @@ use crate::handoff::HandOff;
 use crate::pty::{Answer, Probe};
 use crate::rpc;
 
-/// How long an attach may take before the screen appears — and, with it,
-/// before a single key is read. The one threshold this screen has; see the
-/// module docs for both halves of what it gates.
+/// How long an attach may take before the screen appears and keys are read.
 const GRACE: Duration = Duration::from_millis(300);
 
-/// One turn of the spinner, and the wait between polls. The picker's spinner,
-/// beside a busy session (see [`super::note`]), turns at the same pace.
+/// One spinner step, and the poll interval. Also the pace of the picker's
+/// busy spinner ([`super::note`]).
 pub(super) const FRAME: Duration = Duration::from_millis(80);
 
-/// The spinner's frames. Braille, one column each, so the line's width does
-/// not change as it turns. The picker's are these too.
+/// Braille, one column each, so the line's width does not change. Shared with
+/// the picker.
 pub(super) const GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// The way out, in the grammar the hint rows use: key, then action. Two words
-/// on the last row, like the help screen's `esc back`.
 const CANCEL: &str = "esc cancel";
 
-/// How the wait ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// The session will take the client: hand it the terminal.
+    /// Hand the client the terminal.
     Ready,
-    /// The same — hand it the terminal — but the session is waiting for a key
-    /// nvmux will not press, so it will draw nothing until the user presses
-    /// one. Handing over *is* the recovery: the client's keys reach the server
-    /// on the fast path whatever it is waiting in, so the first key ends the
-    /// wait and releases the paint queued behind it. The caller says so on the
-    /// notice, since the screen itself will be blank.
+    /// Hand over too, but the session waits for a key and draws nothing until
+    /// the user presses one. Handing over is the recovery: the client's keys
+    /// reach the server on the fast path, so the first key ends the wait. The
+    /// caller says so on the notice, as the screen will be blank.
     Blocked,
-    /// The user gave up on the session. The client is the caller's to retire.
+    /// The user gave up. The caller retires the client.
     Cancelled,
 }
 
 impl Verdict {
-    /// Whether this hands the terminal to the client — see
-    /// [`super::Screen::close_for_attach`].
+    /// Whether the client gets the terminal (see
+    /// [`super::Screen::close_for_attach`]).
     fn attaches(&self) -> bool {
         matches!(self, Self::Ready | Self::Blocked)
     }
 }
 
-/// What the screen knows: which session, and how long it has been waiting.
-///
-/// Told the time rather than reading a clock, like [`crate::announce::Popup`],
-/// so every frame it can draw is reachable from a test.
+/// Given the time rather than reading a clock, like [`crate::announce::Popup`],
+/// so every frame is reachable from a test.
 struct State {
     name: String,
     elapsed: Duration,
 }
 
-/// Wait for `probe` on a screen of its own, and say how it ended.
+/// Wait for `probe` and say how it ended; a failed probe returns its error.
+/// On an error or cancel the terminal is closed normally for the picker; on
+/// [`Verdict::Ready`] or [`Verdict::Blocked`] it is handed back cleared for
+/// the relay. Dropping the probe ends its worker (see [`Probe`]).
 ///
-/// A failed probe is the error it failed with. The terminal goes back through
-/// the ordinary close then, as on a cancel: the picker comes next and takes
-/// the screen for itself. The two answers that have a client to hand —
-/// [`Verdict::Ready`] and [`Verdict::Blocked`] — give it back cleared instead,
-/// for the relay. The probe is dropped on every way out, which is what ends
-/// its worker (see [`Probe`]).
-///
-/// The grace is waited out on no screen of its own — nothing is drawn in it
-/// anyway — so a session that answers in time is handed a terminal nothing has
-/// touched since whoever handed it here. That is what lets a name the picker
-/// left standing (`hand_off`, see [`crate::handoff`]) stay up through the
-/// wait. Once the spinner is due, the name is taken down first, and the
-/// hand-off with it: what this screen draws is not where the name stood.
+/// The grace is waited out without taking the screen, so a fast answer gets a
+/// terminal untouched since the caller, and a name the picker left up
+/// (`hand_off`, see [`crate::handoff`]) stays. Once the spinner is due, the
+/// name is taken down first.
 pub fn run(
     mut probe: Probe,
     name: &str,
@@ -168,9 +111,8 @@ pub fn run(
     })
 }
 
-/// Wait for the probe until [`GRACE`] is up, in raw mode — so a key typed
-/// meanwhile is neither echoed nor read, and stays queued for the editor — and
-/// on no screen of its own. `None` when the grace ran out first.
+/// Wait for the probe until [`GRACE`], in raw mode so keys typed meanwhile
+/// are neither echoed nor read. `None` if the grace ran out first.
 fn wait_out_grace(probe: &mut Probe, started: Instant) -> Result<Option<Verdict>> {
     let _raw = crate::term::RawMode::enter()?;
     loop {
@@ -184,7 +126,6 @@ fn wait_out_grace(probe: &mut Probe, started: Instant) -> Result<Option<Verdict>
     }
 }
 
-/// What the probe's answer means for the wait.
 fn verdict(answer: Answer) -> Verdict {
     match answer {
         Answer::Ready => Verdict::Ready,
@@ -206,7 +147,7 @@ fn run_on(
         name: name.to_string(),
         elapsed: Duration::ZERO,
     };
-    // Whether the queue has been drained, which happens once, at `GRACE`.
+    // Set once the input queue is drained, at `GRACE`.
     let mut listening = false;
     let mut forward = Forward::to(sock);
 
@@ -216,8 +157,8 @@ fn run_on(
         }
         state.elapsed = started.elapsed();
 
-        // Not a key before `GRACE` — not even a poll, which would take bytes
-        // out of the queue the editor is going to read.
+        // No reads before `GRACE`, not even a poll: the bytes are the
+        // editor's.
         if state.elapsed >= GRACE {
             if !listening {
                 listening = true;
@@ -238,42 +179,24 @@ fn run_on(
     }
 }
 
-/// Where a key typed during a visible wait goes.
+/// Sends keys typed during a visible wait to the session, since the wait may
+/// be one that only a key ends. Uses its own connection: the probe's is
+/// blocked in a read on its worker thread.
 ///
-/// It used to go nowhere. What the module docs above call the cost of the
-/// offer — "the keys typed *during* a visible wait, which used to reach the
-/// editor and no longer do" — turned out to have a sharper edge than losing a
-/// keystroke: the waits long enough to draw on include the ones the session is
-/// in *because* it is waiting for a key, and dropping the keys there meant
-/// nvmux was eating the one thing that would end the wait it was drawing.
+/// `nvim_input` is a fast call, answered from the socket's read callback, so
+/// it lands whatever the editor is in. Measured: during `:!sleep 4`, where
+/// `nvim_get_mode` never answers, `nvim_input` answers in 0.1 ms (0.12.5). So
+/// a send does not stall the loop, and one failure means the session is
+/// unreachable.
 ///
-/// So they are sent on, over a connection of this screen's own: `nvim_input`
-/// is a fast call, answered from the socket's read callback, so a key lands
-/// whatever the editor is parked in — which is the whole reason it is worth
-/// sending. The probe's own connection cannot carry them, being parked in a
-/// blocking read on its worker thread.
-///
-/// "Whatever it is parked in" is stronger than the rest of this crate's
-/// fast-call caution, and is measured rather than assumed. During a `:!cmd`,
-/// where `nvim_get_mode` is queued like any deferred call and answers nothing
-/// at all, `nvim_input` still answers in 0.1 ms (0.12.5, `:!sleep 4`). So a
-/// send here does not stall the loop it is drawn from, in the one state where
-/// it might have been expected to — and a failure really does mean the session
-/// is unreachable, which is why one is enough to stop trying.
-///
-/// Only the keys nvmux can spell without guessing are sent (see [`notation`]).
-/// `Esc` and `Ctrl-c` never reach here: they are the offer on the hint row, and
-/// answering it is not typing.
+/// Only keys [`notation`] can spell are sent; `Esc` and `Ctrl-c` never get
+/// here.
 struct Forward<'a> {
     sock: &'a Path,
-    /// Opened on the first key, so an attach nobody types during — which is
-    /// nearly all of them — costs no connection at all.
+    /// Opened on the first key; most attaches see none.
     client: Option<rpc::Client<UnixStream>>,
-    /// Set once the session could not be reached or would not take a key, so
-    /// it is not dialled again on every keystroke of a long wait. Nothing is
-    /// reported: a key that did not arrive is exactly as bad as the key that
-    /// was dropped before this existed, and the wait is still the user's to
-    /// end with `Esc`.
+    /// Set on the first failure, so a long wait does not redial on every key.
+    /// Not reported: the user can still `Esc`.
     gave_up: bool,
 }
 
@@ -311,18 +234,10 @@ impl<'a> Forward<'a> {
     }
 }
 
-/// This key in Neovim's own notation, or `None` for one nvmux will not guess at.
-///
-/// Deliberately a short list. [`Key`] is lossy — everything it does not name
-/// arrives as [`Key::Other`], and a chord, a function key or an arrow cannot be
-/// recovered from that — so anything beyond these would be nvmux inventing a
-/// keystroke and typing it into somebody's editor, which is the failure the
-/// rest of this change exists to avoid. What is here is enough for the job:
-/// ending a wait takes any key at all, and these are the ones a person leans on
-/// when a screen looks stuck.
-///
-/// `<` is the one character that is not itself in this notation, being the
-/// opening of every named key; `<lt>` is how Neovim spells it.
+/// `key` in Neovim's notation, or `None` if it cannot be spelled. [`Key`] is
+/// lossy (chords and function keys arrive as [`Key::Other`]), so the list is
+/// short rather than invent keystrokes; any key ends a wait anyway. `<` opens
+/// every named key, so it is spelled `<lt>`.
 fn notation(key: Key) -> Option<String> {
     match key {
         Key::Char('<') => Some("<lt>".into()),
@@ -335,12 +250,13 @@ fn notation(key: Key) -> Option<String> {
         Key::Left => Some("<Left>".into()),
         Key::Right => Some("<Right>".into()),
         Key::Home | Key::End | Key::BackTab | Key::CtrlN | Key::CtrlP | Key::Other => None,
-        // Never reached: both are the way out, taken before this is asked.
+        // Never reached: handled as a cancel first.
         Key::Esc | Key::CtrlC => None,
     }
 }
 
-/// Discard whatever was typed before the offer appeared. Once, at [`GRACE`].
+/// Discard what was typed before the offer appeared. Called once, at
+/// [`GRACE`].
 fn drain() -> Result<()> {
     while event::poll(Duration::ZERO)? {
         event::read()?;
@@ -348,8 +264,7 @@ fn drain() -> Result<()> {
     Ok(())
 }
 
-/// The next key already waiting, without waiting for one. `None` once there
-/// is nothing left; events that are not key presses are stepped over.
+/// The next queued key press, without blocking. Other events are skipped.
 fn next_key() -> Result<Option<Key>> {
     while event::poll(Duration::ZERO)? {
         if let Event::Key(k) = event::read()? {
@@ -361,11 +276,8 @@ fn next_key() -> Result<Option<Key>> {
     Ok(None)
 }
 
-/// The screen: the spinner and what it is waiting on where the picker draws
-/// its list, the way out on the last row. Nothing at all before [`GRACE`].
-///
-/// Both rows are dim, like every hint row: a status and an offer, neither of
-/// them something the user is being asked to answer.
+/// Status where the picker draws its list, the way out on the last row, both
+/// dim like every hint row. Nothing before [`GRACE`].
 fn draw(frame: &mut Frame, state: &State) {
     if state.elapsed < GRACE {
         return;
@@ -375,13 +287,9 @@ fn draw(frame: &mut Frame, state: &State) {
     });
 }
 
-/// The status line, drawn the way the empty picker draws "no sessions": one
-/// dim sentence centred on both axes, truncated from the right rather than
-/// wrapped, so the hint row stays where it is — a hint row by another name,
-/// and drawn through the same function.
-///
-/// A terminal with no room above the hint row gets no status: the way out is
-/// worth more than the name of what it gets out of.
+/// Drawn like the empty picker's line: centred, truncated from the right
+/// rather than wrapped. With no room above the hint row, it is dropped and
+/// the way out kept.
 fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     if area.height == 0 {
         return;
@@ -394,10 +302,7 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     );
 }
 
-/// The spinner and the session it is waiting for.
-///
-/// Fitted by the caller rather than here: the two rows truncate
-/// independently, each from the right, as every other row in this UI does.
+/// Truncated by the caller, independently of the hint row.
 fn status(state: &State) -> String {
     let turn = state.elapsed.as_millis() / FRAME.as_millis();
     let glyph = GLYPHS[(turn % GLYPHS.len() as u128) as usize];
@@ -422,16 +327,13 @@ mod tests {
         test_support::render(w, h, |f| draw(f, state))
     }
 
-    /// Which line the status lands on, given the terminal's height: the middle
-    /// of everything above the hint row. Worked out the way
-    /// `draw::centre_vertically` does, so a test says where the line *should*
-    /// be rather than agreeing with wherever it went.
+    /// The middle of the area above the hint row, computed here rather than
+    /// by calling `draw::centre_vertically`, so tests check where it should be.
     fn status_row(h: u16) -> usize {
         let body = h - 1;
         usize::from((body - 1) / 2)
     }
 
-    /// Does this line open with a spinner glyph?
     fn spins(line: &str) -> bool {
         line.trim_start()
             .chars()
@@ -439,10 +341,7 @@ mod tests {
             .is_some_and(|c| GLYPHS.contains(&c))
     }
 
-    /// A fast attach — every local one, most remote ones — shows nothing at
-    /// all, so the transition it sits in is not decorated with a flash. And
-    /// nothing is read either, which is the half this cannot see; see the
-    /// module docs.
+    /// That no keys are read before `GRACE` is not covered here.
     #[test]
     fn nothing_is_drawn_before_the_grace_period() {
         let lines = render(40, 8, &at(GRACE - Duration::from_millis(1), "dotfiles"));
@@ -458,9 +357,6 @@ mod tests {
         );
     }
 
-    /// The picker's shape: the status where the list goes, centred on both
-    /// axes, and the way out alone on the last row. Nothing anywhere else —
-    /// two rows, and the screen is otherwise the terminal's own background.
     #[test]
     fn the_status_is_centred_and_the_way_out_is_on_the_last_row() {
         let lines = render(40, 8, &at(GRACE, "dotfiles"));
@@ -494,10 +390,7 @@ mod tests {
         );
     }
 
-    /// The offer is live from the moment it is drawn (see the module docs), so
-    /// the row carries it on every frame the screen is up — never a hint that
-    /// has to be waited out, and never one the status line has to make room
-    /// for.
+    /// The cancel is live as soon as it is drawn, so it shows on every frame.
     #[test]
     fn the_way_out_is_offered_for_as_long_as_the_screen_is_up() {
         let before = render(40, 6, &at(GRACE - Duration::from_millis(1), "dotfiles"));
@@ -513,9 +406,7 @@ mod tests {
         }
     }
 
-    /// One glyph per frame, round and round, so the spinner visibly turns
-    /// however long the wait is — and every glyph is one column, so the line
-    /// does not jitter as it goes.
+    /// Every glyph is one column, so the line does not jitter.
     #[test]
     fn the_spinner_turns_one_glyph_per_frame_and_wraps() {
         for k in 0..25u32 {
@@ -532,9 +423,6 @@ mod tests {
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
     }
 
-    /// Two rows, two independent truncations: a name too long for the screen
-    /// loses its tail like any other row in this UI, and takes nothing from
-    /// the row that says how to get out.
     #[test]
     fn a_long_name_is_truncated_and_the_way_out_is_untouched() {
         let long = "a".repeat(60);
@@ -547,8 +435,6 @@ mod tests {
         assert_eq!(lines[2].trim(), CANCEL, "{lines:?}");
     }
 
-    /// Two columns per character, so a Japanese name is fitted to what it
-    /// occupies rather than to how many characters it has.
     #[test]
     fn a_wide_name_is_fitted_by_column() {
         let lines = render(24, 4, &at(GRACE, "日本語のセッション"));
@@ -558,7 +444,6 @@ mod tests {
         assert_eq!(lines[3].trim(), CANCEL, "{lines:?}");
     }
 
-    /// Down to one row, where the hint row is the only row there is.
     #[test]
     fn every_tiny_size_survives() {
         for &(w, h) in test_support::TINY_SIZES {
@@ -574,10 +459,8 @@ mod tests {
         }
     }
 
-    /// Both answers that have a client to hand give it the terminal. A
-    /// blocked session is attached to like any other — that is the whole
-    /// recovery, since the key that ends its wait is one the user presses on
-    /// the client this hands over — and only the notice differs.
+    /// A blocked session is attached to like any other: the key that ends its
+    /// wait is pressed on the client this hands over.
     #[test]
     fn a_blocked_session_is_attached_to_and_only_a_cancel_is_not() {
         assert!(Verdict::Ready.attaches());
@@ -585,13 +468,6 @@ mod tests {
         assert!(!Verdict::Cancelled.attaches());
     }
 
-    /// What may be typed at a session on the user's behalf, and what may not.
-    ///
-    /// The `None`s are the point. [`Key`] collapses everything it does not
-    /// name into `Key::Other`, so a chord or a function key cannot be
-    /// recovered from it, and spelling one anyway would be nvmux inventing a
-    /// keystroke for somebody's editor. `Esc` and `Ctrl-c` are the offer on
-    /// the hint row rather than text, and never reach this at all.
     #[test]
     fn only_the_keys_nvmux_can_spell_are_sent_on() {
         assert_eq!(notation(Key::Char('a')).as_deref(), Some("a"));
@@ -600,8 +476,7 @@ mod tests {
         assert_eq!(notation(Key::Backspace).as_deref(), Some("<BS>"));
         assert_eq!(notation(Key::Up).as_deref(), Some("<Up>"));
 
-        // `<` opens every named key in this notation, so it is the one
-        // character that cannot be sent as itself.
+        // `<` opens every named key, so it cannot be sent as itself.
         assert_eq!(notation(Key::Char('<')).as_deref(), Some("<lt>"));
 
         for key in [Key::Other, Key::Esc, Key::CtrlC, Key::CtrlN, Key::CtrlP] {
@@ -609,9 +484,7 @@ mod tests {
         }
     }
 
-    /// A session that cannot be reached is not dialled again on every
-    /// keystroke, and never fails the attach: the wait is still the user's to
-    /// end with `Esc`, exactly as it was when the keys went nowhere at all.
+    /// Not redialled per key, and never fails the attach: `Esc` still works.
     #[test]
     fn a_session_that_will_not_take_a_key_is_given_up_on_once() {
         let mut forward = Forward::to(Path::new("/nonexistent/nvmux-test.sock"));
@@ -622,8 +495,6 @@ mod tests {
         assert!(forward.client.is_none());
     }
 
-    /// A key nvmux will not spell must not open a connection either: an
-    /// attach nobody types anything sendable during pays for nothing.
     #[test]
     fn an_unspellable_key_costs_no_connection() {
         let mut forward = Forward::to(Path::new("/nonexistent/nvmux-test.sock"));
@@ -645,10 +516,6 @@ mod tests {
         test_support::assert_no_borders(&render(40, 6, &at(GRACE, "dotfiles")));
     }
 
-    /// Dim throughout, both rows: the screen is telling the user what it is
-    /// waiting for and offering a key, and neither is something being asked
-    /// or typed — the distinction the hint row's `dim` flag carries
-    /// everywhere else.
     #[test]
     fn both_rows_are_dim() {
         let buf = test_support::buffer(40, 4, |f| draw(f, &at(GRACE, "dotfiles")));
