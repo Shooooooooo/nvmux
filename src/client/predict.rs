@@ -2958,8 +2958,9 @@ impl Ack {
 /// Whether Neovim may count as more than one a key the client sends as one:
 /// `<C-c>`, which interrupts as well and is counted twice, and a key with
 /// Alt, which Neovim takes as `<Esc>` and the key unless something maps it
-/// as it is. The counts are in doubt after one, until a fence ties them
-/// again (see [`Sync`]).
+/// as it is. The counts are in doubt from one on — all of them, for
+/// `<C-c>` (see [`interrupts`]) — until a fence ties them again (see
+/// [`Sync`]).
 pub fn uncertain(key: &str) -> bool {
     let Some(inner) = key.strip_prefix('<').and_then(|k| k.strip_suffix('>')) else {
         return false;
@@ -2975,6 +2976,14 @@ pub fn uncertain(key: &str) -> bool {
     }
     let mods = mods.to_ascii_uppercase();
     mods.contains(['M', 'A']) || (mods == "C" && rest.eq_ignore_ascii_case("c"))
+}
+
+/// Whether Neovim may throw away keys sent before `key` that it has yet to
+/// take: `<C-c>`, which interrupts it, and flushes its typeahead — which
+/// puts the counts in doubt before the key as well as after it (see
+/// [`Sync`]).
+fn interrupts(key: &str) -> bool {
+    key.eq_ignore_ascii_case("<C-c>")
 }
 
 /// Whether a key the client sent and one Neovim's `keytrans` wrote are the
@@ -3017,8 +3026,11 @@ const RECENT: usize = 64;
 /// took. What it cannot account for puts the counts in doubt, and nothing
 /// the agent says is taken for a key of the client's till the next fence
 /// with nothing after it ties them again: keys of another UI's, or a
-/// plugin's typed for it, `<C-c>` and Alt (see [`uncertain`]), a paste on
-/// the command line, which Neovim takes as keys typed.
+/// plugin's typed for it, a paste on the command line, which Neovim takes
+/// as keys typed, `<C-c>` (see [`interrupts`]). A key with Alt (see
+/// [`uncertain`]) puts them in doubt from that key on: Neovim counts those
+/// before it as they were sent, and what the agent says of them is still
+/// theirs.
 ///
 /// A key Neovim has taken is not always counted yet, though. One that a
 /// mapping makes nothing of — `<Nop>`, an `<expr>` that says `''` — reaches
@@ -3032,6 +3044,16 @@ pub struct Sync {
     /// The client's number for a key is the agent's count, and this.
     offset: Option<i64>,
     doubt: bool,
+    /// The client's number for the first key since the counts were last
+    /// tied that Neovim may count as more than one (see [`uncertain`]):
+    /// what the agent says of the keys before it is still theirs, and what
+    /// it says from it on is in doubt.
+    uncertain: Option<u64>,
+    /// The client's number for the last key before [`Sync::uncertain`], once
+    /// the agent has counted past it: every key to it taken, and nothing
+    /// more to be said of them by a count that is not the client's (see
+    /// [`Sync::passed`]).
+    passed: Option<u64>,
     /// The last inputs sent, by number, `None` for a mouse report: those
     /// since the offset last moved, the ones before it numbered by another.
     recent: VecDeque<(u64, Option<Box<str>>)>,
@@ -3071,8 +3093,9 @@ pub enum Answer {
     Tied,
     /// They were tied, and still agree.
     Checked,
-    /// They are not to be trusted: never tied, out of step, or the last key
-    /// sent not counted yet.
+    /// They are not to be trusted: never tied, out of step, the last key
+    /// sent not counted yet, or past a key Neovim may count as two (see
+    /// [`Sync::passed`]).
     Doubted,
 }
 
@@ -3109,6 +3132,28 @@ impl Sync {
         self.doubt = true;
     }
 
+    /// The counts are in doubt from the client's key `seq` on, one Neovim
+    /// may count as more than one (see [`uncertain`]), and not before it:
+    /// Neovim counts the keys before it as they were sent, and what the
+    /// agent says of those is theirs still.
+    pub fn uncertain_from(&mut self, seq: u64) {
+        if self.uncertain.is_none() && !self.doubt {
+            tracing::debug!(
+                seq,
+                "client: the keys Neovim has taken are in doubt from a key it may count as two"
+            );
+        }
+        self.uncertain.get_or_insert(seq);
+    }
+
+    /// The client's number for the last key before one Neovim may count as
+    /// two (see [`uncertain`]), where the last ack or fence heard counted
+    /// past it — and so Neovim has taken every key to it, though its count
+    /// says nothing more of them: said once.
+    pub fn passed(&mut self) -> Option<u64> {
+        self.passed.take()
+    }
+
     /// A fresh attach, and with it a fresh agent, counting from nought.
     pub fn attached(&mut self) {
         *self = Self {
@@ -3119,13 +3164,19 @@ impl Sync {
 
     /// Whether the agent's count can be taken for a number of the client's.
     pub fn synced(&self) -> bool {
-        self.offset.is_some() && !self.doubt && self.barrier.is_none()
+        self.offset.is_some() && !self.doubt && self.uncertain.is_none() && self.barrier.is_none()
     }
 
-    /// Whether the counts are untied, or in doubt: not merely held back by
-    /// a paste till a fence after it is answered.
-    pub fn doubted(&self) -> bool {
-        self.offset.is_none() || self.doubt
+    /// The first of the client's numbers the counts are in doubt from: all
+    /// of them where they are untied or in doubt, those from a key Neovim
+    /// may count as two where that is all, and none where they are not —
+    /// merely held back by a paste till a fence after it is answered.
+    pub fn doubted_from(&self) -> Option<u64> {
+        if self.offset.is_none() || self.doubt {
+            Some(0)
+        } else {
+            self.uncertain
+        }
     }
 
     /// Whether a fence asked now, the last input sent numbered `seq_now`,
@@ -3150,16 +3201,22 @@ impl Sync {
     /// as far back as the client remembers.
     pub fn heard(&mut self, ack: &Ack, seq_now: u64) -> Option<u64> {
         self.last = Some(ack.clone());
-        if !self.synced() {
+        if self.offset.is_none() || self.doubt || self.barrier.is_some() {
             return None;
         }
         let k = i64::try_from(ack.count)
             .ok()
             .zip(self.offset)
             .and_then(|(count, offset)| count.checked_add(offset))
-            .and_then(|k| u64::try_from(k).ok())
-            .filter(|&k| k <= seq_now);
-        let Some(k) = k else {
+            .and_then(|k| u64::try_from(k).ok());
+        // From a key Neovim may count as two on, its count is not the
+        // client's — nor, then, one past what was sent a sign of anything —
+        // but says Neovim has taken every key before it.
+        if let Some(u) = self.uncertain.filter(|&u| k.is_some_and(|k| k >= u)) {
+            self.passed = Some(u.saturating_sub(1));
+            return None;
+        }
+        let Some(k) = k.filter(|&k| k <= seq_now) else {
             self.doubt("more taken than sent");
             return None;
         };
@@ -3214,11 +3271,24 @@ impl Sync {
             }
             self.offset = Some(offset);
             self.doubt = false;
+            self.uncertain = None;
             return Answer::Tied;
         }
         let Some(offset) = self.offset else {
             return Answer::Doubted;
         };
+        // Neovim has taken a key it may count as two: its count is not the
+        // client's to check, nor to take keys by — but says Neovim has taken
+        // every key before it, where nothing else is in doubt.
+        if let Some(u) = self
+            .uncertain
+            .filter(|&u| taken.checked_add(offset).is_some_and(|k| k >= u as i64))
+        {
+            if !self.doubt && self.barrier.is_none() {
+                self.passed = Some(u.saturating_sub(1));
+            }
+            return Answer::Doubted;
+        }
         let range = at.seq as i64..=seq_now as i64;
         if !taken
             .checked_add(offset)
@@ -3297,8 +3367,18 @@ pub struct Sent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     Key(Box<str>),
-    Wheel,
+    Wheel(Turn),
     Click,
+}
+
+/// A turn of the wheel, as sent: over window grid `grid`, `way` — `down`,
+/// `up`, `right` or `left` — with modifiers `mods`, to be made out again
+/// as it was made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    pub grid: u64,
+    pub way: Box<str>,
+    pub mods: Box<str>,
 }
 
 impl Input {
@@ -3306,7 +3386,7 @@ impl Input {
     pub fn key(&self) -> Option<&str> {
         match self {
             Input::Key(key) => Some(key),
-            Input::Wheel | Input::Click => None,
+            Input::Wheel(_) | Input::Click => None,
         }
     }
 }
@@ -3968,10 +4048,10 @@ impl Predictor {
         self.keep(seq, input, now);
     }
 
-    /// Input `seq`, a turn of the wheel, sent at `now`: see
+    /// Input `seq`, `turn` of the wheel, sent at `now`: see
     /// [`Predictor::sent`].
-    pub fn turned(&mut self, seq: u64, now: Instant) {
-        self.keep(seq, Input::Wheel, now);
+    pub fn turned(&mut self, seq: u64, turn: Turn, now: Instant) {
+        self.keep(seq, Input::Wheel(turn), now);
     }
 
     fn keep(&mut self, seq: u64, input: Input, now: Instant) {
@@ -3980,8 +4060,11 @@ impl Predictor {
         }
         let key = input.key();
         self.sync.sent(seq, key);
-        if key.is_some_and(uncertain) {
-            self.sync.doubt("a key Neovim may count as two");
+        if key.is_some_and(interrupts) {
+            self.sync
+                .doubt("an interrupt, which may throw away keys sent before it");
+        } else if key.is_some_and(uncertain) {
+            self.sync.uncertain_from(seq);
         }
         if self.queue.len() == QUEUE {
             self.sync.doubt("too many keys unanswered");
@@ -3989,7 +4072,7 @@ impl Predictor {
         }
         let lost = match input {
             Input::Key(_) => self.typed.lost,
-            Input::Wheel => false,
+            Input::Wheel(_) => false,
             Input::Click => true,
         };
         self.queue.push_back(Sent {
@@ -7095,9 +7178,10 @@ mod tests {
         assert_eq!(s.heard(&ack(4, "<C-D><Space><lt><Tab>"), seq), Some(4));
     }
 
-    /// `<C-c>`, which Neovim counts twice, and a key with Alt, which it may,
-    /// put the counts in doubt as they are sent — till a fence with nothing
-    /// after it ties them again.
+    /// `<C-c>`, which Neovim counts twice, puts the counts in doubt as it is
+    /// sent — till a fence with nothing after it ties them again; and it and
+    /// a key with Alt, which Neovim may count as two, are told from the keys
+    /// it counts as one.
     #[test]
     fn ctrl_c_puts_the_count_in_doubt_until_a_quiet_fence() {
         let mut p = Predictor {
@@ -7133,6 +7217,51 @@ mod tests {
         ] {
             assert_eq!(uncertain(key), doubt, "{key}");
         }
+    }
+
+    /// A key with Alt, which Neovim may count as two, puts the counts in
+    /// doubt from it on and not before: what the agent says of the keys
+    /// before it is theirs still, what it says of it and after is not taken
+    /// for the client's — nor one past what was sent a sign of anything —
+    /// and nothing is predicted till a fence with nothing after it ties
+    /// them again. `<C-c>`, which may throw away the keys before it as
+    /// well, puts them all in doubt.
+    #[test]
+    fn a_key_with_alt_puts_the_counts_in_doubt_from_it_on() {
+        let mut p = Predictor {
+            predictions: MOTIONS,
+            sync: tied(0, 0),
+            ..Predictor::default()
+        };
+        p.sample(Duration::from_millis(100));
+        let t0 = Instant::now();
+        for key in ["j", "j", "<M-h>", "l"] {
+            p.typed.key(key, |_, _| false);
+            p.sent(p.typed.seq(), Some(key), t0);
+        }
+        assert!(!p.sync.synced());
+        assert_eq!(p.sync.doubted_from(), Some(3));
+        assert_eq!(p.heard(&ack(1, "j"), t0), Some(1));
+        assert_eq!(p.heard(&ack(2, "jj"), t0), Some(2));
+        assert_eq!(p.sync.passed(), None, "not past it yet");
+        // Taken as `<Esc>` and `h`: not the client's `l`, as its count would
+        // have it, and no doubt; but past the keys before it.
+        assert_eq!(p.heard(&ack(4, "j<Esc>h"), t0), None);
+        assert_eq!(p.sync.doubted_from(), Some(3));
+        assert_eq!(p.sync.passed(), Some(2));
+        assert_eq!(p.sync.passed(), None, "said once");
+        // And one more than was sent.
+        assert_eq!(p.heard(&ack(5, "j<Esc>hl"), t0), None);
+        assert_eq!(p.sync.doubted_from(), Some(3));
+        assert_eq!(p.sync.answered(p.sync.fenced(3), 4, 5), Answer::Doubted);
+        assert_eq!(p.sync.passed(), Some(2));
+        assert_eq!(p.sync.doubted_from(), Some(3));
+        assert_eq!(p.sync.answered(p.sync.fenced(4), 4, 5), Answer::Tied);
+        assert!(p.sync.synced());
+        assert_eq!(p.sync.doubted_from(), None);
+        p.typed.key("<C-c>", |_, _| false);
+        p.sent(p.typed.seq(), Some("<C-c>"), t0);
+        assert_eq!(p.sync.doubted_from(), Some(0), "every count");
     }
 
     /// A paste is no key to Neovim in Normal, Visual or Insert mode: what
@@ -7213,7 +7342,11 @@ mod tests {
             let mut seq = 0;
             let mut s = tied(0, 0);
             send(&mut s, &mut seq, sent);
-            s.doubt("a key Neovim may count as two");
+            if sent.ends_with("<C-c>") {
+                s.doubt("an interrupt, which may throw away keys sent before it");
+            } else {
+                s.uncertain_from(seq);
+            }
             assert_eq!(s.heard(&ack(4, taken), seq), None);
             assert_eq!(s.answered(s.fenced(seq), seq, 4), Answer::Tied);
             send(&mut s, &mut seq, "l");

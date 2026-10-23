@@ -1092,6 +1092,14 @@ impl Trace {
     /// of it and when it wrote that on; every connection's, in the order
     /// they were written.
     fn messages(&self, back: bool) -> Vec<(Instant, Instant, Value)> {
+        self.messages_on(back)
+            .into_iter()
+            .map(|(_, read, written, v)| (read, written, v))
+            .collect()
+    }
+
+    /// [`Trace::messages`], each with the connection that carried it.
+    fn messages_on(&self, back: bool) -> Vec<(usize, Instant, Instant, Value)> {
         let carried = self.carried.lock().expect("the trace");
         let mut pending: std::collections::HashMap<usize, Vec<u8>> = Default::default();
         let mut out = Vec::new();
@@ -1104,7 +1112,7 @@ impl Trace {
                 match rmpv::decode::read_value(&mut tried) {
                     Ok(value) => {
                         rest = tried;
-                        out.push((c.read, c.written, value));
+                        out.push((c.conn, c.read, c.written, value));
                     }
                     // A message the read ends in the middle of waits for the
                     // next.
@@ -1210,6 +1218,44 @@ impl Trace {
             }
         }
         unframed
+    }
+
+    /// The last word of the agent's that Neovim is still at work on the keys
+    /// typed (`behind`), by when the link began writing it on; and the round
+    /// trips the client had timed how long to wait on Neovim by when it came,
+    /// in order — its first request, and the ones it asks after the round
+    /// trip with since (see `App::start`, `App::tick`) — each from when the
+    /// link read the request to when it began writing the answer.
+    fn last_behind(&self) -> Option<(Instant, Vec<Duration>)> {
+        const TIMED: [&str; 2] = ["nvim_get_api_info", "nvim_get_mode"];
+        let asked: std::collections::HashMap<(usize, u64), Instant> = self
+            .messages_on(false)
+            .into_iter()
+            .filter_map(|(conn, read, _, v)| match v.as_array()?.as_slice() {
+                [kind, id, method, ..]
+                    if kind.as_u64() == Some(0) && TIMED.contains(&method.as_str()?) =>
+                {
+                    Some(((conn, id.as_u64()?), read))
+                }
+                _ => None,
+            })
+            .collect();
+        let (mut timed, mut last) = (Vec::new(), None);
+        for (conn, _, written, v) in self.messages_on(true) {
+            if notification(&v).is_some_and(|(method, args)| {
+                method == "nvmux_client" && args.first().and_then(Value::as_str) == Some("behind")
+            }) {
+                last = Some((written, timed.clone()));
+            }
+            let answered = match v.as_array().map(Vec::as_slice) {
+                Some([kind, id, ..]) if kind.as_u64() == Some(1) => id.as_u64(),
+                _ => None,
+            };
+            if let Some(at) = answered.and_then(|id| asked.get(&(conn, id))) {
+                timed.push(written.saturating_duration_since(*at));
+            }
+        }
+        last
     }
 
     /// How many keys the client has sent the session, as Neovim's notation
@@ -2223,17 +2269,43 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
         "not back by that page alone, Neovim at {w0:?} once caught up at {caught:?}: {when:?}"
     );
     assert_eq!(w0, Ok(Some(541)), "Neovim went elsewhere");
-    // No sooner than Neovim's frame, a way of the link after it caught up,
-    // and as long after that as a page typed then would wait — two round
-    // trips, a quarter of a second and a segment lost on the way, give or
-    // take — or twice that on a busy machine.
+    // No sooner than Neovim's frame, a way of the link after it caught up;
+    // and as long after it last said it was still at work on them as a page
+    // typed then would wait, by the round trips the client had timed by
+    // then — which on a busy machine are longer than the link's, Neovim
+    // answering late — give or take a quarter of that and a way of the
+    // link, for a client held up.
     let at = seen.last().map(|&(_, at)| at).expect("seen");
-    let wait = 4 * SLOW + Duration::from_millis(450);
+    let (since, timed) = link
+        .trace
+        .last_behind()
+        .expect("Neovim behind on the pages");
+    let wait = patience(&timed);
     assert!(
-        at > caught_up + SLOW && at < caught_up + SLOW + 2 * wait,
-        "given up on {:?} after Neovim caught up at {caught:?}: {when:?}",
-        at.saturating_duration_since(caught_up)
+        at > caught_up + SLOW && at < since + wait * 5 / 4 + SLOW,
+        "given up on {:?} after Neovim caught up at {caught:?}, and {:?} after it last said \
+         it was behind, the client waiting {wait:?} by the round trips it timed, {timed:?}: \
+         {when:?}",
+        at.saturating_duration_since(caught_up),
+        at.saturating_duration_since(since)
     );
+}
+
+/// How long the client waits on Neovim for a scroll it made, not told the
+/// motions, by the round trips it timed (see `Predictor::deadline`): two,
+/// smoothed, a quarter of a second or four times how much they vary, if
+/// that is longer, and a segment lost on the way.
+fn patience(round_trips: &[Duration]) -> Duration {
+    let (srtt, rttvar) = round_trips
+        .iter()
+        .fold(None, |was: Option<(Duration, Duration)>, &r| {
+            Some(match was {
+                Some((s, v)) => ((s * 7 + r) / 8, (v * 3 + s.abs_diff(r)) / 4),
+                None => (r, r / 2),
+            })
+        })
+        .unwrap_or_default();
+    srtt * 2 + Duration::from_millis(250).max(rttvar * 4) + Duration::from_millis(200)
 }
 
 /// Pages typed faster than a slow link answers, by a client told to work
