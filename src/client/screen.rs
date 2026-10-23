@@ -1,63 +1,25 @@
-//! What the terminal shows, and the bytes that change it into a new frame.
+//! What the terminal shows, and the bytes that turn it into a new frame.
 //!
-//! The client keeps the last frame it drew and writes only the cells that
-//! differ from it — every one of them, when it has reason to think the
-//! terminal no longer shows that frame: a resize, and Neovim clearing its
-//! screen, which is how nvmux asks for a repaint after drawing over a session
-//! (`:mode`, see `pty::repaint_through_server`).
+//! The client keeps the last frame and writes only differing cells, or all of
+//! them after a resize or when Neovim clears its screen (how nvmux asks for a
+//! repaint after drawing over a session; see `pty::repaint_through_server`).
 //!
-//! # Every frame stands alone
-//!
-//! A frame assumes nothing about where the terminal's cursor is or what its pen
-//! is set to: the first cell it writes is moved to, and its colours set, from
-//! nothing. Nor, where it moves down a row by LF, what scroll region is set: it
-//! sets the whole screen first (see [`move_to`]). nvmux writes over the session
-//! between frames — the hint row, the attach notice, the fade's frames — and
-//! puts the pen back as it was where it can, but a frame that never relies on
-//! it cannot be caught out where it cannot.
-//!
-//! # What the cells carry
-//!
-//! Every attribute Neovim's own TUI writes — bold, dim, italic, the
-//! underlines and their colour, blink, reverse, conceal, strikethrough,
-//! altfont, overline — and a highlight's hyperlink, as an OSC 8 around its
-//! cells. A link is closed before every jump of the cursor and at the end of
-//! the frame, as that TUI closes one, so it never runs on over cells that are
-//! not its own.
-//!
-//! # In as few bytes as it takes
-//!
-//! A frame goes on from where its last cell left the cursor and the pen: every
-//! move, and every change of colour, made by the shortest of the ways a
-//! terminal understands (see [`move_to`] and [`recolour`]), as Neovim's own TUI
-//! makes them. Each of those is the same screen as the absolute move and the
-//! reset would have been. A move is made from where the cursor is only where
-//! the terminal cannot have put it anywhere else: after a character a terminal
-//! may take for wider or narrower than Neovim does, or one written to the last
-//! column, where terminals part ways on what comes next, the next move is
-//! absolute again. A test can have every jump of the cursor absolute and
-//! every change of the pen a reset and the whole pen, to hold the one up
-//! against the other (see [`Screen::set_lean`]).
-//!
-//! # Rows moved
-//!
-//! A client's screen ([`Screen::moving_rows`]) has the rows a frame moved — a
-//! window scrolling, a line opened — moved by the terminal before a cell is
-//! written, and the frame diffed against the screen as that leaves it (see
-//! [`super::region`]). A plain one ([`Screen::new`]) writes every row a frame
-//! changed, moved or not.
-//!
-//! # Synchronized
-//!
-//! A frame goes out inside a synchronized update (`?2026`), so the terminal
-//! shows the whole of it or none of it — which is what lets an animation
-//! repaint the same cells sixty times a second without a frame ever being
-//! seen half drawn. `'termsync'` off leaves that out, as it does for Neovim's
-//! own TUI; and the cursor is hidden while the frame is drawn and shown where
-//! it belongs at the end, so a terminal that ignores `?2026` does not see it
-//! run across the screen either. That is the same reset nvmux ends a span with
-//! (see [`crate::fade::SYNC_END`]), and a client that brackets its own frames is
-//! left to do it (see `boundary::Boundary::session_brackets_its_own_frames`).
+//! - Every frame stands alone: it assumes nothing about cursor, pen or scroll
+//!   region (it resets the region before moving by LF; see [`move_to`]),
+//!   because nvmux draws over the session between frames.
+//! - Cells carry every attribute Neovim's TUI writes, plus OSC 8 hyperlinks.
+//!   A link is closed before every cursor jump and at frame end, as the TUI
+//!   does.
+//! - Moves and colour changes use the shortest form ([`move_to`],
+//!   [`recolour`]), as Neovim's TUI does. After an ambiguous-width character
+//!   or a last-column write, the next move is absolute, since terminals
+//!   disagree there. [`Screen::set_lean`] turns this off for tests.
+//! - [`Screen::moving_rows`] has the terminal scroll moved rows first and diffs
+//!   against the result ([`super::region`]); [`Screen::new`] rewrites them.
+//! - Frames go inside a synchronized update (`?2026`) unless `'termsync'` is
+//!   off, with the cursor hidden while drawing for terminals that ignore it
+//!   (see [`crate::fade::SYNC_END`] and
+//!   `boundary::Boundary::session_brackets_its_own_frames`).
 
 use std::io::Write as _;
 
@@ -68,53 +30,41 @@ use super::style::{Color, Style, Underline};
 use crate::fade::{SYNC_BEGIN, SYNC_END};
 use crate::palette::Rgb;
 
-/// The terminal's own cursor, as a frame leaves it.
+/// The terminal cursor as a frame leaves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
-    /// Shown at all.
     pub visible: bool,
     pub row: usize,
     pub col: usize,
-    /// `DECSCUSR`'s number: 1 to 6, a blinking or steady block, underline or
-    /// bar.
+    /// `DECSCUSR` value, 1 to 6.
     pub shape: u8,
-    /// Its colour, or `None` for the terminal's own.
+    /// `None` for the terminal's default.
     pub color: Option<Rgb>,
 }
 
-/// The end of a hyperlink: OSC 8 with no target.
+/// OSC 8 with no target: ends a hyperlink.
 const LINK_END: &[u8] = b"\x1b]8;;\x1b\\";
 
-/// `DECSTBM` with no margins: the scroll region the whole screen again, so
-/// that an LF scrolls only at the screen's foot, and the cursor sent home.
-/// What a frame that moves down a row by LF starts with (see [`move_to`]).
+/// `DECSTBM` with no margins: full-screen scroll region (so LF scrolls only at
+/// the bottom); also homes the cursor. Sent before a frame moves by LF.
 pub(super) const WHOLE_SCROLL_REGION: &[u8] = b"\x1b[r";
 
-/// What the terminal shows.
 #[derive(Debug)]
 pub struct Screen {
     shown: Option<Frame>,
-    /// A frame done with — the one shown before `shown`, or one forgotten —
-    /// kept for the buffer the next is put together in (see
-    /// [`Screen::take_spare`]).
+    /// A previous frame, reused as the next frame's buffer.
     spare: Option<Frame>,
-    /// The cursor's shape and colour as last set, so they are only set again
-    /// when they change — setting the shape restarts its blink.
+    /// Cursor shape and colour as last set; resent only on change, since
+    /// setting the shape restarts its blink.
     shape: Option<u8>,
     color: Option<Option<Rgb>>,
-    /// The cursor as the last frame written left it: a frame that writes no
-    /// cell and leaves the cursor as it is writes nothing at all (see
-    /// [`Screen::draw_into`]).
+    /// The cursor as the last frame left it (see [`Screen::draw_into`]).
     cursor: Option<Cursor>,
-    /// Each frame in as few bytes as it takes, as from the start: see
-    /// [`Screen::set_lean`].
     lean: bool,
-    /// What finds the rows a frame moved, for the terminal to move them:
-    /// none unless asked for (see [`Screen::set_regions`]).
+    /// Moved-row detection; `None` unless [`Screen::set_regions`].
     bands: Option<Bands>,
-    /// For each row of `shown`, whether it differs from the same row of
-    /// `spare`: what [`Screen::take_like_shown`] copies over. Empty where
-    /// that is not known.
+    /// Per row, whether `shown` differs from `spare` (for
+    /// [`Screen::take_like_shown`]). Empty when unknown.
     differs: Vec<bool>,
 }
 
@@ -138,47 +88,39 @@ impl Screen {
         }
     }
 
-    /// A screen as a client draws one: moving the rows a frame moved with the
-    /// terminal's own scroll regions (see [`Screen::set_regions`]).
+    /// A client's screen: moved rows are scrolled by the terminal.
     pub fn moving_rows() -> Self {
         let mut screen = Self::new();
         screen.set_regions(true);
         screen
     }
 
-    /// Write each frame from here on in as few bytes as it takes, `lean` — as
-    /// a screen does until told otherwise — or with every jump of the cursor
-    /// absolute and every change of the pen a reset (see the module docs):
-    /// for a test to hold the one up against the other. The screen is the
-    /// same either way; each frame stands alone, so the next is the first
-    /// written the new way.
+    /// With `lean` off (tests only), every cursor jump is absolute and every
+    /// pen change a full reset. The result on screen is the same.
     #[cfg(test)]
     pub fn set_lean(&mut self, lean: bool) {
         self.lean = lean;
     }
 
-    /// Have the terminal move the rows a frame moved from here on, `on`,
-    /// rather than write them again (see [`super::region`]); off, as a
-    /// screen is until told otherwise. The screen is the same either way.
+    /// Have the terminal scroll moved rows instead of rewriting them (see
+    /// [`super::region`]). Off by default.
     pub fn set_regions(&mut self, on: bool) {
         if on != self.bands.is_some() {
             self.bands = on.then(Bands::default);
         }
     }
 
-    /// A frame done with, to put the next together in its buffer (see
-    /// [`super::compose::compose_into`]); an empty one at first.
+    /// A spare frame to compose the next into (see
+    /// [`super::compose::compose_into`]); empty at first.
     pub fn take_spare(&mut self) -> Frame {
         self.spare
             .take()
             .unwrap_or_else(|| Frame::new(0, 0, Style::default()))
     }
 
-    /// The frame done with (see [`Screen::take_spare`]) made the frame the
-    /// terminal shows, `width` by `height`, by the rows of it that differ
-    /// alone: what a frame of only the rows that changed is put together
-    /// over (see [`super::compose::compose_rows`]). None where there is no
-    /// such frame, or it is another size.
+    /// The spare frame updated to equal the shown one, copying only differing
+    /// rows, as a base for [`super::compose::compose_rows`]. `None` if either
+    /// is missing or not `width` x `height`.
     pub fn take_like_shown(&mut self, width: usize, height: usize) -> Option<Frame> {
         let size = |f: &Frame| (f.width, f.height) == (width, height);
         let shown = self.shown.as_ref().filter(|f| size(f))?;
@@ -193,15 +135,12 @@ impl Screen {
         Some(spare)
     }
 
-    /// Forget where the cursor was left: the next frame puts it there again,
-    /// and so says something however little else it has to (see
-    /// [`Screen::draw_into`]).
+    /// Forget the cursor, so the next frame always writes something.
     pub fn forget_cursor(&mut self) {
         self.cursor = None;
     }
 
-    /// Forget what the terminal shows: the next frame paints every cell, and
-    /// sets the cursor, its shape and its colour afresh.
+    /// The next frame repaints every cell and resets cursor shape and colour.
     pub fn invalidate(&mut self) {
         if let Some(shown) = self.shown.take() {
             self.spare = Some(shown);
@@ -215,9 +154,8 @@ impl Screen {
         self.cursor = None;
     }
 
-    /// The bytes that turn what the terminal shows into `frame`, with the
-    /// cursor left as `cursor` says, and the cells of a hyperlink made one
-    /// with an OSC 8 to the target `links` gives it (see [`Style::link`]).
+    /// Bytes that turn the screen into `frame` with `cursor`. Hyperlink targets
+    /// come from `links` (see [`Style::link`]).
     pub fn draw(
         &mut self,
         frame: Frame,
@@ -230,16 +168,12 @@ impl Screen {
         out
     }
 
-    /// [`Screen::draw`], onto the end of `out`.
+    /// [`Screen::draw`], appended to `out`.
     ///
-    /// A frame that writes no cell, and leaves the cursor where, and as, the
-    /// last frame written left it, writes nothing: the terminal shows it
-    /// already. Its envelope alone — the synchronized update, the cursor
-    /// hidden and shown again — would wake nvmux's relay and the terminal for
-    /// nothing, which an animation's frames that round to the last do, and
-    /// output that leaves a `:terminal` looking as it did, forty times a
-    /// second. Every frame still stands alone: nvmux puts the cursor back
-    /// itself after anything it writes over the session.
+    /// A frame that changes no cell or cursor writes nothing, rather than an
+    /// envelope that wakes the relay and terminal for nothing (e.g. animation
+    /// frames that round to the last, 40 times a second). Safe, since nvmux
+    /// restores the cursor after drawing over the session.
     pub fn draw_into(
         &mut self,
         out: &mut Vec<u8>,
@@ -251,9 +185,8 @@ impl Screen {
         self.write(out, frame, cursor, sync, links, None);
     }
 
-    /// [`Screen::draw_into`], for a frame that differs from the one the
-    /// terminal shows in the rows `rows` says alone: the rest are not looked
-    /// at (see [`Screen::take_like_shown`]).
+    /// [`Screen::draw_into`], comparing only the rows flagged in `rows` (see
+    /// [`Screen::take_like_shown`]).
     pub fn draw_rows_into(
         &mut self,
         out: &mut Vec<u8>,
@@ -266,8 +199,8 @@ impl Screen {
         self.write(out, frame, cursor, sync, links, Some(rows));
     }
 
-    /// What [`Screen::draw_into`] and [`Screen::draw_rows_into`] share: the
-    /// rows `changed` says alone looked at, where it says any.
+    /// Shared by [`Screen::draw_into`] and [`Screen::draw_rows_into`]; if
+    /// given, only rows flagged in `changed` are compared.
     fn write(
         &mut self,
         out: &mut Vec<u8>,
@@ -277,22 +210,20 @@ impl Screen {
         links: &[Box<str>],
         changed: Option<&[bool]>,
     ) {
-        // Where this frame's bytes begin, for them to be taken back if they
-        // change nothing.
+        // Truncated back to here if the frame changes nothing.
         let start = out.len();
         let mut drew = false;
         if sync {
             out.extend_from_slice(SYNC_BEGIN);
         }
         out.extend_from_slice(b"\x1b[?25l");
-        // Where a frame that moves down by LF resets the scroll region: ahead
-        // of its first move, which is a CUP.
+        // Where the scroll region reset goes if the frame moves by LF: before
+        // its first move, a CUP.
         let head = out.len();
         let shown = self.shown.take();
         let fits = |old: &Frame| (old.width, old.height) == (frame.width, frame.height);
-        // The rows the frame moved, moved first, and what the terminal shows
-        // made what they leave it showing (see [`super::region`]); and with
-        // that, which rows it shows already.
+        // Scroll moved rows first; `bands` then models the screen they leave
+        // (see `super::region`), so it knows which rows are already right.
         let mut moved = false;
         let mut known = false;
         if let Some(bands) = self.bands.as_mut() {
@@ -307,32 +238,26 @@ impl Screen {
         drew |= moved;
         let bands = self.bands.as_ref().filter(|_| known);
         let old = shown.as_ref().filter(|old| fits(old));
-        // Which rows of the frame differ from the frame shown, row for row,
-        // for the next to be put together over (see [`Screen::take_like_shown`]):
-        // every one, of a frame that does not fit over it.
+        // Rows differing from the shown frame, for `take_like_shown`; all of
+        // them if the size changed.
         let mut differs = std::mem::take(&mut self.differs);
         differs.clear();
         differs.resize(frame.height, true);
         let mut pen: Option<Style> = None;
         let mut at: Option<(usize, usize)> = None;
-        // Whether the terminal's cursor is surely where `at` says, so that a
-        // move may be made from there: lean, and every cell written since the
-        // last CUP a plain ASCII character, one column wide on every terminal
-        // whatever it makes of anything else, and none of them in the last
-        // column. Neovim's TUI places the cursor afresh after a character of
-        // ambiguous width for the same reason.
+        // Whether the cursor is surely at `at`, so a relative move is safe:
+        // lean, and only plain ASCII written since the last CUP, none in the
+        // last column. Neovim's TUI also re-places the cursor after an
+        // ambiguous-width character.
         let mut sure = false;
-        // Whether the frame has moved down a row by LF.
         let mut fed = false;
-        // The hyperlink open, if one is. Closed before every jump, as
-        // Neovim's TUI does, so that a link never runs on over cells between
-        // where it was left and where the next is drawn.
+        // The open hyperlink, closed before every jump (as Neovim's TUI does)
+        // so it never spans skipped cells.
         let mut link = 0;
         for r in 0..frame.height {
-            // A row as it was is nothing to write, as none of its cells is:
-            // told apart at once, as most rows of most frames are.
+            // Most rows are unchanged; skip them whole.
             let row = r * frame.width..(r + 1) * frame.width;
-            // What the terminal shows where the row goes, where that is known.
+            // What the terminal shows on this row, if known.
             let was = match bands {
                 Some(bands) => old.map(|old| bands.was(old, r)),
                 None => old.map(|old| &old.cells[row.clone()]),
@@ -361,8 +286,7 @@ impl Screen {
                     (c..(c + span).min(frame.width))
                         .all(|k| was[k] == frame.cells[r * frame.width + k])
                 });
-                // A right half is drawn with its left; one on its own is
-                // nothing to draw.
+                // A right half is drawn with its left.
                 if same || cell.text == Text::Half {
                     c += 1;
                     continue;
@@ -376,7 +300,7 @@ impl Screen {
                     fed |= move_to(out, &frame, from, (r, c), pen.as_ref(), fed || moved);
                     sure = self.lean;
                 }
-                // The link is no part of the pen: it is the OSC 8's below.
+                // The link is handled by OSC 8 below, not the pen.
                 let style = Style {
                     link: 0,
                     ..cell.style
@@ -395,8 +319,8 @@ impl Screen {
                         .checked_sub(1)
                         .and_then(|i| links.get(i));
                     match target {
-                        // Its own id, so that a terminal hovering over one
-                        // cut by a float underlines all of it.
+                        // An id, so hovering a link split by a float
+                        // underlines all of it.
                         Some(url) => {
                             let _ = write!(out, "\x1b]8;id=nvmux-{};{url}\x1b\\", cell.style.link);
                         }
@@ -411,7 +335,7 @@ impl Screen {
                 sure &= c < frame.width && plain(cell);
             }
         }
-        // Rows moved put the region back already, ahead of every move.
+        // Moving rows already reset the region.
         if fed && !moved {
             out.splice(head..head, WHOLE_SCROLL_REGION.iter().copied());
         }
@@ -420,8 +344,7 @@ impl Screen {
                 bands.shown();
             }
         }
-        // Whatever the frame left the pen as is not what a cell of nvmux's own
-        // — the hint row, the notice — should inherit, and nor is a link.
+        // nvmux's own cells (hint row, notice) must not inherit pen or link.
         if link != 0 {
             out.extend_from_slice(LINK_END);
         }
@@ -457,29 +380,20 @@ impl Screen {
     }
 }
 
-/// The most cells of a gap written again, rather than moved over: more than
-/// three cost more than the CUF that crosses them.
+/// Max gap cells rewritten instead of crossed; more cost more than a CUF.
 const REWRITE_AT_MOST: usize = 3;
 
-/// Move the cursor from `at` — where it surely is, or `None` where that is not
-/// known: first in a frame, and after a cell that leaves it unsure (see
-/// `sure` in [`Screen::draw_into`]) — to `to`, by the fewest bytes:
+/// Move the cursor from `at` (`None` if unknown) to `to` in the fewest bytes:
 ///
-/// - forward along a row: the cells in between written again, where they are
-///   a few plain ASCII characters drawn in the pen already, or else a CUF;
-/// - to the next row: CR LF, and on from its first column as above;
-/// - otherwise, and from nowhere known, a CUP.
+/// - along a row: rewrite a few plain ASCII cells already in `pen`, or CUF;
+/// - to the next row: CR LF, then as above;
+/// - otherwise a CUP.
 ///
-/// Says whether it moved down by LF. The LF is never asked of the last row,
-/// and the frame it is in resets the scroll region ([`WHOLE_SCROLL_REGION`])
-/// before anything else, so that it moves down within the screen and never
-/// scrolls it: nothing nvmux writes leaves a region set — a frame that moves
-/// rows by one puts the whole screen back before it writes a cell (see
-/// [`super::region`]) — but a session drawn by Neovim's own TUI sets one for
-/// every scroll it makes, and a switch can come between that and its reset.
-/// That reset comes with the first LF of a frame, or with the rows it moved;
-/// `fed` says whether it has come, and an LF that brings it has to save more
-/// than it costs.
+/// Returns whether it moved by LF. LF is never used from the last row, and the
+/// frame first resets the scroll region ([`WHOLE_SCROLL_REGION`]) so LF never
+/// scrolls: Neovim's own TUI sets a region for each scroll, and a switch can
+/// land before its reset. `fed` says whether the reset was already paid for
+/// (by an earlier LF or by moved rows); if not, the LF must save its cost.
 fn move_to(
     out: &mut Vec<u8>,
     frame: &Frame,
@@ -489,7 +403,7 @@ fn move_to(
     fed: bool,
 ) -> bool {
     let (r, c) = to;
-    // At least 6: ESC, `[`, a digit, `;`, a digit, `H`.
+    // CUP length: ESC [ row ; col H.
     let absolute = 4 + digits(r + 1) + digits(c + 1);
     match at {
         Some((was_r, was_c)) if was_r == r && was_c < c => {
@@ -516,10 +430,9 @@ fn move_to(
     false
 }
 
-/// Move along row `r` from column `from` to `to`, if it can be done in fewer
-/// than `limit` bytes, and say whether it was: by writing the cells between
-/// again, where there are few enough of them and each is a plain ASCII
-/// character in `pen`, and otherwise by CUF.
+/// Move along row `r` from `from` to `to` in fewer than `limit` bytes, by
+/// rewriting the cells between (few, plain ASCII, in `pen`) or by CUF.
+/// Returns whether it moved.
 fn cross(
     out: &mut Vec<u8>,
     frame: &Frame,
@@ -554,14 +467,12 @@ fn cross(
     true
 }
 
-/// Whether `cell` is a plain ASCII character: one column wide on every
-/// terminal there is, whatever it makes of the width of anything else.
+/// Printable ASCII: one column wide on every terminal.
 fn plain(cell: &Out) -> bool {
     !cell.wide && matches!(cell.text, Text::Char(' '..='~'))
 }
 
-/// Whether the pen can go from `was` to `now` by its colours alone: every
-/// other attribute is as it was, the underline's style and colour among them.
+/// Whether `was` and `now` differ only in fg/bg.
 fn only_colours_differ(was: &Style, now: &Style) -> bool {
     Style {
         fg: now.fg,
@@ -570,9 +481,8 @@ fn only_colours_differ(was: &Style, now: &Style) -> bool {
     } == *now
 }
 
-/// Change the pen from `was` to `now`, which differ in their colours and in
-/// nothing else (see [`only_colours_differ`]): one SGR of the colours that
-/// changed, with no reset — the default spelt as `39` or `49`.
+/// One SGR of only the changed colours, no reset (default as `39`/`49`).
+/// Requires [`only_colours_differ`].
 fn recolour(out: &mut Vec<u8>, was: &Style, now: &Style) {
     out.push(0x1b);
     let open = out.len();
@@ -588,17 +498,15 @@ fn recolour(out: &mut Vec<u8>, was: &Style, now: &Style) {
             bg => colour(out, bg, 40, 100, 48),
         }
     }
-    // The first colour's `;` is where the sequence opens.
+    // Turn the first `;` into the `[`.
     out[open] = b'[';
     out.push(b'm');
 }
 
-/// How many digits `n` takes.
 fn digits(n: usize) -> usize {
     n.checked_ilog10().map_or(1, |d| d as usize + 1)
 }
 
-/// `n` in decimal.
 pub(super) fn push_dec(out: &mut Vec<u8>, mut n: usize) {
     let mut buf = [0u8; 20];
     let mut at = buf.len();
@@ -613,11 +521,9 @@ pub(super) fn push_dec(out: &mut Vec<u8>, mut n: usize) {
     out.extend_from_slice(&buf[at..]);
 }
 
-/// Set the pen to `s`, from nothing: a reset and every attribute after it, in
-/// one sequence the oldest terminal reads — and, after it, the two things only
-/// newer ones do, each in a sequence of its own so that a terminal that cannot
-/// read one loses that and nothing else: an underline's style (`4:3` and
-/// family, over the plain `4` already set) and its colour (`58`).
+/// Set the pen to `s` from scratch: reset plus all attributes in one
+/// old-terminal-safe SGR, then underline style (`4:3` etc.) and colour (`58`)
+/// each in their own sequence, so a terminal that rejects one loses only that.
 pub fn sgr(out: &mut Vec<u8>, s: &Style) {
     out.extend_from_slice(b"\x1b[0");
     for (on, n) in [
@@ -662,9 +568,8 @@ pub fn sgr(out: &mut Vec<u8>, s: &Style) {
     }
 }
 
-/// One colour of an SGR, as Neovim's TUI spells it on a 256-colour terminal:
-/// the eight and their bright eight by their own numbers, the rest as
-/// `38;5`/`48;5`, and RGB as `38;2`/`48;2`.
+/// One SGR colour as Neovim's TUI writes it on a 256-colour terminal: 0–15 by
+/// their own codes (`base`/`bright`), others as `ext;5`, RGB as `ext;2`.
 fn colour(out: &mut Vec<u8>, c: Color, base: u8, bright: u8, ext: u8) {
     let mut code = |n: u8| {
         out.push(b';');
@@ -689,8 +594,7 @@ fn colour(out: &mut Vec<u8>, c: Color, base: u8, bright: u8, ext: u8) {
     }
 }
 
-/// Every cell of `frame` that differs from `blank`, for the tests: a quick
-/// way to say what a frame drew without spelling out every blank.
+/// Cells of `frame` that differ from `blank`, for tests.
 #[cfg(test)]
 pub fn marks(frame: &Frame, blank: &super::compose::Out) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
@@ -729,8 +633,7 @@ mod tests {
         }
     }
 
-    /// What a terminal ends up showing after the bytes, read back by the same
-    /// parser the relay tests trust.
+    /// The screen after `bytes`, via vt100 as in the relay tests.
     fn shown(bytes: &[u8], w: u16, h: u16) -> String {
         let mut p = vt100::Parser::new(h, w, 0);
         p.process(bytes);
@@ -754,11 +657,8 @@ mod tests {
         assert_eq!(shown(&both, 2, 2), "ab\ncX");
     }
 
-    /// The frame done with is made the frame shown, by the rows that differ
-    /// alone, for a frame of only the rows that changed to be put together
-    /// over; drawn so, only those rows are looked at and written. There is
-    /// none to make where nothing is shown, nothing is done with yet, or the
-    /// size is another.
+    /// `take_like_shown` copies only differing rows, and `draw_rows_into`
+    /// writes only flagged rows.
     #[test]
     fn the_frame_done_with_is_made_the_one_shown() {
         let mut s = Screen::new();
@@ -790,11 +690,8 @@ mod tests {
         assert_eq!(shown(&again, 2, 1), "ab");
     }
 
-    /// A frame the same as the one shown, with the cursor where it was,
-    /// writes nothing at all; one with the cursor moved, shown or hidden
-    /// writes that and no cell; and one after the screen is forgotten writes
-    /// everything again. What was waiting ahead of a frame that writes
-    /// nothing is left as it was.
+    /// A cursor change alone writes only the cursor; bytes already in `out`
+    /// are kept when the frame writes nothing.
     #[test]
     fn a_frame_that_changes_nothing_writes_nothing() {
         let at = |row, col| Cursor {
@@ -826,8 +723,6 @@ mod tests {
         assert_eq!(shown(&again, 2, 2), "ab\ncd", "every cell again");
     }
 
-    /// The frame shown before the last is kept for its buffer, and so is one
-    /// forgotten; drawn onto the end of what is already to be written.
     #[test]
     fn a_frame_done_with_is_kept_for_the_next() {
         let mut s = Screen::new();
@@ -844,8 +739,6 @@ mod tests {
         assert_eq!((spare.width, spare.height), (3, 2), "the one forgotten");
     }
 
-    /// The frame is bracketed when asked, and the cursor is hidden while it
-    /// is drawn and shown where it belongs after.
     #[test]
     fn a_frame_is_synchronized_and_ends_with_the_cursor_in_place() {
         let mut s = Screen::new();
@@ -863,14 +756,13 @@ mod tests {
             text.ends_with("\x1b[6 q\x1b]12;#010203\x07\x1b[2;1H\x1b[?25h\x1b[?2026l"),
             "{text:?}"
         );
-        // The same shape and colour again are not set again.
+        // Unchanged shape and colour are not resent.
         let bytes = s.draw(frame(&["ab", "cd"]), &cursor, false, &[]);
         let text = String::from_utf8_lossy(&bytes);
         assert!(!text.contains(" q") && !text.contains("]12"), "{text:?}");
         assert!(!text.contains("2026"), "{text:?}");
     }
 
-    /// A wide character is written once, from its left cell.
     #[test]
     fn a_wide_character_is_written_from_its_left_half() {
         let mut f = frame(&["xxx"]);
@@ -927,9 +819,7 @@ mod tests {
         assert_eq!(out, b"\x1b[0;2;5;8;53m");
     }
 
-    /// A hyperlink's cells are written inside an OSC 8 to its target, which
-    /// is closed before the cursor jumps and at the end of the frame — never
-    /// left open over cells that are not its own.
+    /// The OSC 8 is closed before every cursor jump and at frame end.
     #[test]
     fn a_hyperlink_is_opened_over_its_cells_and_closed_after() {
         let mut f = frame(&["see here", "  and x "]);
@@ -957,17 +847,15 @@ mod tests {
         assert_eq!(shown(&bytes, 8, 2), "see here\n  and x ");
     }
 
-    /// What the second of two frames writes over the first, as text.
+    /// What `second` writes over `first`, as text.
     fn over(first: Frame, second: Frame) -> String {
         let mut s = Screen::new();
         s.draw(first, &hidden(), false, &[]);
         String::from_utf8_lossy(&s.draw(second, &hidden(), false, &[])).into_owned()
     }
 
-    /// Along a row, the cursor crosses an unchanged gap by writing its cells
-    /// again where they are a few ASCII characters in the pen, and by CUF
-    /// where they are many or anything else; the first move of a frame is a
-    /// CUP, wherever the last left the cursor.
+    /// A gap of a few ASCII cells in the pen is rewritten, otherwise CUF. A
+    /// frame's first move is always a CUP.
     #[test]
     fn a_move_along_a_row_is_made_in_the_fewest_bytes() {
         let text = over(frame(&["abcdefghij"]), frame(&["XbcYefghiZ"]));
@@ -981,7 +869,7 @@ mod tests {
 
         let mut before = frame(&["aéc"]);
         let mut after = frame(&["XéZ"]);
-        // The same cell either way, and not ASCII: crossed, not written again.
+        // Unchanged non-ASCII: crossed, not rewritten.
         before.cells[1].text = Text::Char('é');
         after.cells[1].text = Text::Char('é');
         assert_eq!(
@@ -993,16 +881,15 @@ mod tests {
         let mut after = frame(&["XbZ"]);
         let mut red = after.cells[1].style;
         red.fg = Color::Index(1);
-        // In a pen of its own, unchanged: crossed, not written in the other.
+        // Unchanged in a different pen: crossed, not rewritten.
         let mut was = before;
         was.cells[1].style = red;
         after.cells[1].style = red;
         assert_eq!(over(was, after), "\x1b[?25l\x1b[1;1H\x1b[0mX\x1b[CZ\x1b[0m");
     }
 
-    /// The next row is reached by CR LF, and from its first column on as
-    /// along a row; a row further on is a CUP. A frame that has an LF resets
-    /// the scroll region first, which its first LF has to be worth.
+    /// Next row by CR LF, further by CUP. A frame with an LF resets the scroll
+    /// region first, and its first LF must be worth that cost.
     #[test]
     fn the_next_row_is_reached_by_cr_lf() {
         let rows = || frame(&["abc", "def", "ghi"]);
@@ -1022,11 +909,8 @@ mod tests {
         );
     }
 
-    /// The cursor is moved from where it is only where the terminal cannot
-    /// have it anywhere else: after a character that is not ASCII, which a
-    /// terminal may draw wider or narrower than Neovim says, or one in the
-    /// last column, after which terminals differ on where it is, the next
-    /// move is a CUP.
+    /// After non-ASCII (width may differ from Neovim's) or a last-column write
+    /// (terminals disagree on the cursor), the next move is a CUP.
     #[test]
     fn a_move_is_absolute_where_the_cursor_may_be_elsewhere() {
         let mut after = frame(&["XécdefYh"]);
@@ -1049,8 +933,6 @@ mod tests {
         assert_eq!(text, "\x1b[?25l\x1b[1;2H\x1b[0mX\x1b[2;1HY\x1b[0m");
     }
 
-    /// Off, every jump of the cursor is a CUP and every change of the pen a
-    /// reset and the whole pen.
     #[test]
     fn off_every_move_is_absolute_and_every_pen_whole() {
         let red = Style {
@@ -1069,9 +951,7 @@ mod tests {
         );
     }
 
-    /// A change of colour alone is an SGR of the colours that changed and
-    /// nothing else, the default spelt as such; a change of anything else is
-    /// a reset and the whole pen, as the first is.
+    /// A change to anything but colours is a full reset.
     #[test]
     fn a_change_of_colour_alone_says_only_the_colour() {
         let plain = Style::default();
@@ -1108,12 +988,7 @@ mod tests {
         );
     }
 
-    /// The frames of every test above, and of anything else, come out as the
-    /// screen a fresh draw of the same frame does — moves, colours and all —
-    /// whatever the frame was drawn over, lean or not: many random frames, of
-    /// ASCII, letters that are not, wide characters, colours and attributes,
-    /// each drawn over another both ways and compared, through vt100, with
-    /// itself drawn on a screen that showed nothing.
+    /// Random frames drawn over another, lean or not, match a fresh draw.
     #[test]
     fn a_frame_drawn_over_another_shows_what_a_fresh_one_does() {
         let styles = [
@@ -1144,7 +1019,7 @@ mod tests {
             },
         ];
         let letters = [' ', ' ', ' ', 'a', 'b', 'é', '─', '中'];
-        // A small, fixed generator: the same frames on every run.
+        // Fixed-seed xorshift: the same frames every run.
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
         let mut next = move |n: usize| {
             seed ^= seed << 13;
@@ -1159,7 +1034,7 @@ mod tests {
                 let mut c = 0;
                 while c < w {
                     let at = r * w + c;
-                    // Most cells as they were, as most of a frame is.
+                    // Keep most cells, as real frames do.
                     if let Some(like) = like.filter(|_| next(4) != 0) {
                         if like.cells[at].text != Text::Half && !like.cells[at].wide {
                             f.cells[at] = like.cells[at].clone();
@@ -1185,8 +1060,8 @@ mod tests {
             }
             f
         };
-        // Every cell, with what the parser keeps of its attributes; not the
-        // cursor, which is hidden, and left wherever the last cell drawn was.
+        // Cells and attributes; not the cursor, which is hidden and wherever
+        // the last cell left it.
         let screen_of = |bytes: &[u8]| {
             let mut p = vt100::Parser::new(h as u16, w as u16, 0);
             p.process(bytes);
@@ -1212,8 +1087,7 @@ mod tests {
         }
     }
 
-    /// A scroll region left set — by a session Neovim's own TUI draws, left
-    /// in the middle of a scroll — does not make an LF of a frame's a scroll.
+    /// A region left set mid-scroll by Neovim's TUI must not make LF scroll.
     #[test]
     fn a_scroll_region_left_set_scrolls_nothing() {
         let mut s = Screen::new();

@@ -1,49 +1,24 @@
-//! The dissolve between screens.
+//! The dissolve between screens: the outgoing screen fades into the
+//! terminal's background colour and the incoming one fades up out of it, each
+//! visible cell's colour interpolated over a few frames.
 //!
-//! nvmux hard-cut between its screens. This module smooths each cut into a
-//! short fade: the outgoing screen dissolves into the terminal's own background
-//! colour, and the incoming one dissolves up out of it — a real colour fade,
-//! every visible cell interpolated toward the background over a few frames,
-//! not a dither.
+//! nvmux's own ratatui screens are faded by a post-pass over the finished
+//! frame ([`apply`]), so the screens never set colours themselves and the last
+//! frame of a fade in is byte-identical to a plain draw. Each cell fades from
+//! the colour it is drawn in: the terminal's foreground, or under a theme
+//! ([`crate::theme`]) the ink on full-strength cells.
 //!
-//! # Two kinds of screen, one effect
+//! An attached session is faded from the shadow grid ([`crate::shadow`]) by
+//! [`fade_out_session`] and [`fade_in_session`]. For a fade in, the relay
+//! holds back the session's first paint until it settles (see `pty::Hold`); a
+//! resumed session fades in from the screen the shadow still holds.
 //!
-//! nvmux's own screens — the picker, the prompt, the help — are ratatui
-//! buffers it draws itself, so the fade is a post-pass over a finished frame
-//! ([`apply`]): the screen is drawn as usual, then every visible cell's
-//! foreground is moved toward the background before the frame is presented.
-//! `draw::draw` and its siblings never set a colour and keep their tests
-//! saying so; the colour is added afterwards, and at the end of a fade-in the
-//! frame is byte-identical to a plain draw. Each cell is moved from the colour
-//! it is drawn in: the terminal's foreground, or under a theme
-//! ([`crate::theme`]) the ink the theme's pass gave it first — every cell
-//! drawn at full strength, while what is drawn dim keeps the terminal's — so a
-//! plain draw there is a themed one, and the fade ends on that.
+//! Both ends must be real colours, so the fade needs the terminal's answer to
+//! [`crate::palette::query`]. `NO_COLOR`, `[effects.fade] enabled` and
+//! `[effects] enabled` also turn it off; [`enabled`] is the one gate.
 //!
-//! An attached session is raw Neovim that nvmux only proxies bytes for. Its
-//! cells come from the shadow grid ([`crate::shadow`]) that watched those
-//! bytes go by, and [`fade_out_session`] and [`fade_in_session`] paint the
-//! frames from that. A fade *in* needs the finished screen before any of it
-//! is shown, so the relay holds a session's first paint back from the
-//! terminal until it has settled, dissolves the shadow in, and only then lets
-//! the bytes through (see `pty::Hold`); a resumed session dissolves in from
-//! the screen the shadow still holds, ahead of its repaint.
-//!
-//! # Colour, and what turns the effect off
-//!
-//! Both ends of the interpolation have to be real colours, so the fade rests
-//! on the terminal's answer to [`crate::palette::query`]: no answer, no fade,
-//! and the transitions are exactly what they were before. `NO_COLOR` turns it
-//! off too — the effect paints explicit colours — and so does switching it off
-//! in the config, as `[effects.fade] enabled` or with every other effect under
-//! `[effects] enabled`. [`enabled`] is the one gate every entry point checks.
-//!
-//! # Time
-//!
-//! A fade is paced by the clock, not by counting frames: [`Schedule`] reads
-//! how far into the fade it is at every frame, so a slow terminal skips frames
-//! rather than stretching the effect, and every fade ends on exactly its last
-//! value — fully dissolved, or fully drawn — whatever the clock did.
+//! [`Schedule`] paces fades by the clock: a slow terminal skips frames rather
+//! than stretching the fade, and each fade ends exactly on its last value.
 
 use std::io::{self, Write};
 use std::thread;
@@ -57,22 +32,17 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::palette::{self, Palette, Rgb};
 use crate::shadow::{Cursor, Kept, Over, Shadow};
 
-/// A synchronized update: the terminal presents nothing between these, so a
-/// frame is never seen half-composited. Opening one inside another is
-/// harmless, which matters where a relay stopped inside Neovim's own.
+/// A synchronized update: the terminal presents nothing between these.
+/// Nesting is harmless, which matters where a relay stopped inside Neovim's.
 pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 pub const SYNC_END: &[u8] = b"\x1b[?2026l";
 
-/// How often a frame goes out. Roughly sixty a second; more is not visible.
-///
-/// Shared with [`crate::announce`], whose fade is driven a frame at a time by
-/// the relay loop rather than by a loop of its own: the same pace, from the one
-/// place it is decided.
+/// Frame interval, about 60 fps. Also paces [`crate::announce`], whose fade
+/// the relay loop drives a frame at a time.
 pub const FRAME: Duration = Duration::from_millis(16);
 
-/// Whether the config and the environment allow a fade — everything but the
-/// terminal's answer, which is what `main` decides whether to ask for on the
-/// strength of this.
+/// Whether config and environment allow a fade, ignoring the terminal's
+/// answer (`main` uses this to decide whether to query it).
 pub fn configured() -> bool {
     is_configured(
         crate::config::get().effects.fade_enabled(),
@@ -80,16 +50,13 @@ pub fn configured() -> bool {
     )
 }
 
-/// The gate itself, factored out so the precedence is testable without the
-/// process globals [`configured`] reads. `NO_COLOR` wins over the config
-/// because the effect paints explicit colours, and honouring the request
-/// means never running it whatever the config says.
+/// `NO_COLOR` wins over the config: the effect paints explicit colours.
 fn is_configured(config_enabled: bool, no_color: bool) -> bool {
     config_enabled && !no_color
 }
 
-/// Whether transitions animate at all: configured, and the terminal said what
-/// its colours are. `false` restores the pre-fade behaviour exactly.
+/// Whether transitions animate: configured, and the terminal reported its
+/// colours.
 pub fn enabled() -> bool {
     active().is_some()
 }
@@ -103,10 +70,9 @@ fn active() -> Option<&'static Palette> {
     }
 }
 
-/// The terminal's colours, to take the session's toward its background with
-/// outside a fade: the settings floating over a session dim it through
-/// these whether or not the fade is on. `None` under `NO_COLOR`, which asks
-/// for no colour of nvmux's own, or where the terminal never said.
+/// The terminal's colours, for dimming a session outside a fade (the settings
+/// over a session use them even with the fade off). `None` under `NO_COLOR`
+/// or if the terminal never said.
 pub fn colours() -> Option<&'static Palette> {
     if std::env::var_os("NO_COLOR").is_some() {
         None
@@ -120,58 +86,38 @@ pub fn session() -> bool {
     crate::config::get().effects.fade.session
 }
 
-/// How long one direction takes: half of `effects.fade.duration_ms`, which measures
-/// a dissolve both ways (see [`crate::config::FadeSettings::one_way`]).
+/// Half of `effects.fade.duration_ms`, which covers both directions.
 fn one_way() -> Duration {
     crate::config::get().effects.fade.one_way()
 }
 
-/// Everything a caller needs to paint its own fade frames: what to interpolate
-/// between, and how long one direction takes.
-///
-/// One direction, not the configured length of both: a caller here is driving
-/// a single [`Schedule`], and the halving happens once, on the way out of the
-/// config.
-///
-/// The drivers below sleep between frames, which the relay loop cannot do — it
-/// has a child to read and keys to pass on. So the attach notice
-/// ([`crate::announce`]) drives a [`Schedule`] from its own `poll` and is
-/// handed one of these to do it with. Plain data, copied out of the config and
-/// the palette once: a caller that read process globals mid-fade would have
-/// states no test could reach, and no palette is ever installed under test.
+/// What a caller painting its own fade frames needs. [`crate::announce`]
+/// drives a [`Schedule`] from the relay's `poll` with this, as it cannot sleep
+/// between frames. Plain data copied once, so tests can build every state (no
+/// palette is installed under test).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dissolve {
-    /// One direction's length — half of `fade.duration_ms`. Named for what it
-    /// is rather than for the key it comes from, since that key measures both
-    /// directions and these two numbers are no longer the same one.
+    /// One direction's length: half of `fade.duration_ms`.
     pub one_way: Duration,
-    /// The terminal's own colours: what a glyph fully dissolved is, and — for
-    /// a caller painting the session's own cells rather than its own text —
-    /// what the default foreground and every indexed colour mean.
+    /// The terminal's colours: what a fully dissolved glyph is, and how a
+    /// session's default foreground and indexed colours resolve.
     pub palette: Palette,
-    /// What a glyph of nvmux's own is fully drawn in: the terminal's
-    /// foreground, or the theme's colour in its place (see [`crate::theme`]).
-    /// Kept apart from `palette.fg`, which a session's own cells still
-    /// resolve through.
+    /// nvmux's own glyphs at full strength: the terminal's foreground or the
+    /// theme's colour (see [`crate::theme`]). Separate from `palette.fg`,
+    /// which session cells still resolve through.
     pub ink: Rgb,
 }
 
 impl Dissolve {
-    /// The colour a glyph of nvmux's own is drawn in `t` of the way through a
-    /// fade, or `None` for one not being faded at all.
-    ///
-    /// Zero is "do not touch it" rather than "the ink at no distance" — the
-    /// same rule [`apply`] keeps for a ratatui frame. It is what lets the last
-    /// frame of a fade in set no colour of its own, so the screen it leaves
-    /// behind is byte for byte the one drawn without any fade at all.
+    /// The colour of nvmux's own glyph `t` into a fade, or `None` at `t == 0`:
+    /// as in [`apply`], zero means untouched, so the last frame of a fade in
+    /// sets no colour and matches an unfaded draw.
     pub fn colour(self, t: f32) -> Option<Rgb> {
         (t > 0.0).then(|| self.ink.lerp(self.palette.bg, t))
     }
 }
 
-/// What to fade with, or `None` when there is no fade — no palette, `NO_COLOR`,
-/// or the fade switched off in `[effects]`. Exactly the gate [`enabled`] reports, in the
-/// one form a caller that paints its own frames can use.
+/// What to fade with, or `None` exactly when [`enabled`] is false.
 pub fn dissolve() -> Option<Dissolve> {
     let palette = *active()?;
     Some(Dissolve {
@@ -190,47 +136,37 @@ pub enum Direction {
     In,
 }
 
-/// A fade shaped around one row: an iris, closing onto that row on the way
-/// out and opening out of it on the way in. An attach from the picker's (see
-/// [`crate::handoff`]): the picker closes onto the row of the session chosen,
-/// and the session opens out of the line its name stands on. And a create's
-/// (see [`crate::ui::app::App::make_room`]): the picker closes onto the row
-/// the new session will take, and the prompt opens out of its name field.
+/// A fade shaped around one row: closing onto it on the way out, opening out
+/// of it on the way in. Used by an attach from the picker (see
+/// [`crate::handoff`]) and a create (see [`crate::ui::app::App::make_room`]).
 ///
-/// Every row still goes the whole way, and on the same clock: an iris only
-/// says *when* in the fade each row does its part. Closing, the rows furthest
-/// from the iris's go first and its own last; opening, its own comes back
-/// first and the furthest last. Each row's part takes [`IRIS_SHARE`] of the
-/// fade's time, and the rows' parts start spread across the rest of it, so
-/// neighbours overlap and the edge moves as a soft band rather than a line. Both directions end exactly where an even
-/// fade does — everything gone, or everything back as drawn — so the frames
-/// either side of one are the ones they always were.
+/// Every row goes the whole way on the same clock; the iris only sets when.
+/// Closing, the furthest rows go first; opening, the iris's row returns
+/// first. Each row's part takes [`IRIS_SHARE`] of the fade and the starts are
+/// spread over the rest, so the edge is a soft band. Both ends match an even
+/// fade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Iris {
-    /// The row it closes onto and opens out of, 0-based.
+    /// 0-based.
     row: u16,
-    /// How many rows away the furthest is: never less than one.
+    /// Distance to the furthest row; at least 1.
     reach: u16,
 }
 
-/// The part of a fade each row of an iris spends going, or coming back. The
-/// rest is how far apart in time the nearest and furthest rows start.
+/// The part of a fade each iris row spends changing; the rest spreads the
+/// rows' start times.
 const IRIS_SHARE: f32 = 0.4;
 
 impl Iris {
-    /// An iris on `row` of a screen `rows` high.
     pub fn new(row: u16, rows: u16) -> Self {
         let reach = row.max(rows.saturating_sub(1).saturating_sub(row)).max(1);
         Self { row, reach }
     }
 
-    /// How far into the background row `y` is when a fade going `direction`
-    /// is `t` into it — `t` as [`Schedule::next`] hands it out, 0 the screen as
-    /// drawn and 1 gone.
+    /// How far into the background row `y` is at `t` (as [`Schedule::next`]
+    /// gives it: 0 drawn, 1 gone).
     pub fn at(&self, direction: Direction, t: f32, y: u16) -> f32 {
-        // Exactly an even fade's ends, which the arithmetic below would miss
-        // by a rounding error: the last frame out must be all background, and
-        // the last frame in the screen exactly as drawn.
+        // Exact ends, which the arithmetic below can miss by rounding.
         match direction {
             Direction::Out if t >= 1.0 => return 1.0,
             Direction::In if t <= 0.0 => return 0.0,
@@ -239,20 +175,16 @@ impl Iris {
         let far = (f32::from(y.abs_diff(self.row)) / f32::from(self.reach)).min(1.0);
         let lead = 1.0 - IRIS_SHARE;
         match direction {
-            // The furthest rows start at once; the iris's own row waits until
-            // the last of the time.
+            // The furthest rows start at once, the iris's own row last.
             Direction::Out => ((t - (1.0 - far) * lead) / IRIS_SHARE).clamp(0.0, 1.0),
-            // Back out of the background: the iris's own row starts at once,
-            // the furthest waits until the last of the time.
+            // The iris's own row starts at once, the furthest last.
             Direction::In => 1.0 - ((1.0 - t - far * lead) / IRIS_SHARE).clamp(0.0, 1.0),
         }
     }
 }
 
-/// The frames of one fade, paced by the clock.
-///
-/// Told the time rather than reading it, like [`crate::announce::Popup`], so
-/// every value it can produce is reachable from a test.
+/// The frames of one fade, paced by the clock. Told the time rather than
+/// reading it, so tests reach every value.
 #[derive(Debug)]
 pub struct Schedule {
     started: Instant,
@@ -271,12 +203,10 @@ impl Schedule {
         }
     }
 
-    /// How far dissolved the next frame should be, or `None` once the last
-    /// frame has been handed out.
-    ///
-    /// The frame is drawn for the moment it will be seen, a frame from now,
-    /// which is what skips the frame identical to the screen as it stands. The
-    /// end value is always produced exactly once, however late the clock is.
+    /// How dissolved the next frame should be, or `None` once the last has
+    /// been given. Computed for one [`FRAME`] ahead, when it will be seen,
+    /// which skips a frame identical to the current screen. The end value is
+    /// given exactly once, however late the clock.
     pub fn next(&mut self, now: Instant) -> Option<f32> {
         if self.finished {
             return None;
@@ -294,25 +224,15 @@ impl Schedule {
         })
     }
 
-    /// Whether the last frame has been handed out — and so whether there is
-    /// anything to wait for before the next.
+    /// Whether the last frame has been handed out.
     pub fn finished(&self) -> bool {
         self.finished
     }
 
-    /// Whether the fade is over by the clock, whether or not its last frame was
-    /// ever asked for.
-    ///
-    /// [`Schedule::next`] is what ends a fade being drawn frame by frame, and
-    /// it can only end one that is asked for. [`crate::announce`] cannot
-    /// promise that: its frames go out only where the session's own output
-    /// leaves a gap between sequences, and a session that never left one would
-    /// otherwise hold a fade open for ever. So it asks the clock instead, and
-    /// drains whatever is left of the schedule when the answer is yes — which
-    /// is how a fade nobody could draw still ends on exactly its last value.
-    ///
-    /// The same reckoning as `next`'s, down to the frame it looks ahead by, so
-    /// the two can never disagree about which pass a fade ends on.
+    /// Whether the fade is over by the clock, even if its last frame was never
+    /// asked for. [`crate::announce`] only draws in gaps in the session's
+    /// output, so it ends fades by this and drains the rest. Same reckoning as
+    /// `next`, so the two agree on the ending pass.
     pub fn over(&self, now: Instant) -> bool {
         self.finished || now.saturating_duration_since(self.started) + FRAME >= self.duration
     }
@@ -320,17 +240,12 @@ impl Schedule {
 
 /// Move every visible cell of `buf` `t` of the way to the background.
 ///
-/// A post-pass over a finished frame, so the screens themselves stay
-/// colourless. At `t == 0` nothing is touched at all — a faded-in frame's
-/// last state is exactly a plain draw. Otherwise every cell that shows
-/// something — a glyph, or a reversed blank, which shows its background —
-/// has its foreground moved from the colour it is drawn in ([`drawn_in`]).
-/// Backgrounds are left alone: the terminal's own, transparent or not, is
-/// what everything is dissolving into. Modifiers are left alone too.
-/// `REVERSED` then paints the interpolated colour as the cell's background,
-/// which is what a selected row dissolving should look like; `DIM` keeps the
-/// hint row starting exactly as it was drawn, since terminals dim differently
-/// and a guess at the dimmed colour would pop on the first frame.
+/// At `t == 0` nothing is touched, so a faded-in frame ends as a plain draw.
+/// Otherwise each cell showing something (a glyph, or a reversed blank) has
+/// its foreground moved from [`drawn_in`]. Backgrounds stay: the terminal's
+/// own is the target. Modifiers stay: `REVERSED` then paints the faded colour
+/// as the background, and `DIM` is kept because terminals dim differently and
+/// a guessed dim colour would pop on the first frame.
 pub fn apply(buf: &mut Buffer, palette: &Palette, t: f32) {
     if t <= 0.0 {
         return;
@@ -340,28 +255,19 @@ pub fn apply(buf: &mut Buffer, palette: &Palette, t: f32) {
     }
 }
 
-/// [`apply`], except for the cells of `keep`, which are handed off rather
-/// than dissolved (see [`crate::handoff`]), and with everything else going as
-/// an [`Iris`] closing onto `keep`'s row: the rows furthest from it first, its
-/// own last. A kept cell on the selection's bar comes off it as `t` goes, and
-/// on the last frame is plain text in the colour it was drawn in — the
-/// terminal's foreground, or a theme's ink — the very cell the screen the
-/// picker leaves behind draws it as (see [`crate::handoff`]). A kept cell
-/// that was not on a bar is left as it was drawn.
+/// [`apply`] as an [`Iris`] closing onto `keep`'s row, except for the cells
+/// of `keep`, which are handed off (see [`crate::handoff`]). A kept cell on
+/// the selection bar comes off it, ending as plain text in the colour it was
+/// drawn in, as the next screen draws it. A kept cell off the bar is left as
+/// drawn.
 ///
-/// The bar under the text sinks into the background, and the text is
-/// whichever end of the two colours stands out from it: the background's, as
-/// on the bar, until the bar is halfway down, and the foreground's after, when
-/// its bold and underline go with it. Fading the text up while the bar fades
-/// down would be the obvious move and is the wrong one — the two cross
-/// halfway, and on that frame the name is the bar's own colour and gone. This
-/// way it never stands out from the bar by less than half.
+/// The bar sinks to the background; the text takes the background's colour
+/// until halfway, then the drawn colour (losing bold and underline). Fading
+/// the text up as the bar fades down would make them match halfway and hide
+/// the name; this way the contrast never drops below half.
 ///
-/// The colours are set outright until the last frame: a bar is drawn
-/// reversed, and its text can only be given a colour of its own once the
-/// reverse is off. The last frame puts the terminal's own background back,
-/// so a transparent background ends transparent, and leaves the text the
-/// colour it was drawn in.
+/// Colours are set outright (with the reverse off) until the last frame,
+/// which restores the terminal's own background so transparency survives.
 pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
     let area = buf.area;
     let iris = Iris::new(keep.y.saturating_sub(area.y), area.height);
@@ -399,10 +305,8 @@ pub fn apply_keeping(buf: &mut Buffer, palette: &Palette, t: f32, keep: Rect) {
     }
 }
 
-/// [`apply`], shaped as an [`Iris`] on `row` of the buffer: closing onto it
-/// going [`Direction::Out`], opening out of it going [`Direction::In`]. Nothing
-/// is kept back, so both ends are exactly [`apply`]'s: every visible cell gone
-/// at the end of a fade out, the screen untouched at the end of a fade in.
+/// [`apply`] as an [`Iris`] on `row`: closing for [`Direction::Out`],
+/// opening for [`Direction::In`]. Both ends match [`apply`].
 pub fn apply_iris(buf: &mut Buffer, palette: &Palette, direction: Direction, t: f32, row: u16) {
     let area = buf.area;
     if area.width == 0 {
@@ -418,23 +322,19 @@ pub fn apply_iris(buf: &mut Buffer, palette: &Palette, direction: Direction, t: 
     }
 }
 
-/// The colour a cell of nvmux's own screens is drawn in: the one a pass
-/// before this gave it — under a theme, the ink, on everything drawn at full
-/// strength (see [`crate::theme`]) — or, with none, the terminal's
-/// foreground. Where every fade and effect over those screens starts the
-/// cell from, and ends it on.
+/// The colour a cell of nvmux's screens is drawn in: what an earlier pass gave
+/// it (the theme's ink, see [`crate::theme`]), or the terminal's foreground.
+/// Every fade and effect over those screens starts and ends there.
 pub(crate) fn drawn_in(cell: &ratatui::buffer::Cell, palette: &Palette) -> Rgb {
     match cell.fg {
         Color::Rgb(r, g, b) => Rgb(r, g, b),
-        // The screens draw no colour but the true ones the theme and the
-        // effects give them, so anything else is the terminal's own.
+        // Screens only get true colours, from the theme and effects; anything
+        // else is the terminal's own.
         _ => palette.fg,
     }
 }
 
-/// One cell of [`apply`]: its foreground moved `t` of the way from the colour
-/// it is drawn in to the background, if it shows anything — a glyph, or a
-/// reversed blank, which shows its background.
+/// One cell of [`apply`], if it shows anything (a glyph or a reversed blank).
 fn sink(cell: &mut ratatui::buffer::Cell, palette: &Palette, t: f32) {
     let shows = !cell.symbol().trim().is_empty() || cell.modifier.contains(Modifier::REVERSED);
     if shows {
@@ -453,8 +353,7 @@ where
 }
 
 /// Dissolve a ratatui screen out into the background. Ends fully dissolved,
-/// so whatever erases the screen next — a hand-off, a restore — changes
-/// nothing visible.
+/// so whatever erases the screen next changes nothing visible.
 pub fn fade_out<F>(terminal: &mut DefaultTerminal, draw: F) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
@@ -462,10 +361,8 @@ where
     run(terminal, draw, Direction::Out, Shape::Even)
 }
 
-/// [`fade_out`], handing the cells of `keep` off rather than dissolving them,
-/// and closing in onto their row (see [`apply_keeping`]): the picker's, for
-/// the name of the session it is attaching to. Ends with everything else
-/// dissolved and the name standing as plain text.
+/// [`fade_out`] handing off `keep` and closing onto its row (see
+/// [`apply_keeping`]): the picker's, for the name of the session attached.
 pub fn fade_out_keeping<F>(terminal: &mut DefaultTerminal, draw: F, keep: Rect) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
@@ -473,8 +370,8 @@ where
     run(terminal, draw, Direction::Out, Shape::Keeping(keep))
 }
 
-/// [`fade_out`], closing in onto `row` as an [`Iris`], that row last: the
-/// picker's, onto the row a session about to be created will take.
+/// [`fade_out`] as an [`Iris`] closing onto `row`: the picker's, onto the row
+/// a new session will take.
 pub fn fade_out_onto<F>(terminal: &mut DefaultTerminal, draw: F, row: u16) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
@@ -482,8 +379,8 @@ where
     run(terminal, draw, Direction::Out, Shape::Iris(row))
 }
 
-/// [`fade_in`], opening out of `row` as an [`Iris`], that row first: the
-/// create prompt's, out of its name field.
+/// [`fade_in`] as an [`Iris`] opening out of `row`: the create prompt's, from
+/// its name field.
 pub fn fade_in_from<F>(terminal: &mut DefaultTerminal, draw: F, row: u16) -> io::Result<()>
 where
     F: FnMut(&mut Frame),
@@ -494,12 +391,11 @@ where
 /// How a ratatui screen's fade is laid over it.
 #[derive(Debug, Clone, Copy)]
 enum Shape {
-    /// Every cell together ([`apply`]).
+    /// [`apply`]
     Even,
-    /// An iris onto the row of these cells, which are handed off rather than
-    /// dissolved ([`apply_keeping`]).
+    /// [`apply_keeping`]
     Keeping(Rect),
-    /// An iris on this row, nothing kept ([`apply_iris`]).
+    /// [`apply_iris`]
     Iris(u16),
 }
 
@@ -520,8 +416,7 @@ where
         crate::term::write_stdout(SYNC_BEGIN)?;
         terminal.draw(|f| {
             draw(f);
-            // The theme before the fade, as before everything that paints over
-            // a screen: each cell then dissolves from the colour it is drawn in.
+            // Theme first, so each cell dissolves from its drawn colour.
             crate::theme::paint(f.buffer_mut());
             match shape {
                 Shape::Even => apply(f.buffer_mut(), palette, t),
@@ -537,19 +432,13 @@ where
     Ok(())
 }
 
-/// Dissolve an attached session's screen out into the background, from the
-/// shadow that watched it being drawn.
-///
-/// Every frame is a diff against the one before (see [`Shadow::frame`]), so
-/// the whole fade costs about one full repaint plus the cells that change
-/// colour — which nvmux already emits on every resize and resume. The last
-/// frame has every visible cell at the background colour, which is what the
-/// hand-off's erase paints next, so the seam is flat — but for what is written
-/// on the `kept` cells, which stands at its full colour throughout: a card of
-/// nvmux's own, which the switch carries on to the next session's screen.
-/// Says whether it did, as [`fade_in_session`] does.
-///
-/// Between frames it does what `between` does (see [`Between`]).
+/// Dissolve an attached session's screen into the background, from the
+/// shadow. Frames are diffs ([`Shadow::frame`]), so the fade costs about one
+/// full repaint plus the cells that change colour. The last frame is all
+/// background, matching the hand-off's erase, except the `kept` cells (a card
+/// the switch carries over), which stay at full colour. Returns whether it
+/// ran, as [`fade_in_session`] does. Calls `between` between frames (see
+/// [`Between`]).
 pub fn fade_out_session(
     shadow: &mut Shadow,
     kept: &Kept,
@@ -558,44 +447,35 @@ pub fn fade_out_session(
     run_session(shadow, Direction::Out, None, kept, between)
 }
 
-/// What a session's fade does between its frames, given the shadow it draws
-/// them from and when the next is due: [`wait`] for it — or read what the
-/// session writes meanwhile into the shadow, so that the frames after show it:
-/// a card on the move that the `kept` cells stand for, which its client goes
-/// on drawing as the screen under it comes and goes (see [`crate::pty`]).
+/// Called between a session fade's frames with the shadow and the next frame's
+/// due time: [`wait`], or read the session's output into the shadow so later
+/// frames show it (a moving card under the `kept` cells, see [`crate::pty`]).
 pub type Between<'a> = &'a mut dyn FnMut(&mut Shadow, Instant);
 
-/// Wait for the next frame, and do nothing else: between the frames of a fade
-/// with nothing to read.
+/// A [`Between`] that only sleeps until the next frame.
 pub fn wait(_: &mut Shadow, until: Instant) {
     thread::sleep(until.saturating_duration_since(Instant::now()));
 }
 
-/// What the `kept` cells of `shadow` have written on them, drawn again at its
-/// full colour on the terminal's own background: for a switch to leave
-/// standing on the screen it hands over (see [`crate::handoff::HandOff::card`]).
-/// Nothing with the fade off, which leaves nothing standing.
+/// The `kept` cells' content redrawn at full colour on the terminal's
+/// background, for a switch to leave on screen (see
+/// [`crate::handoff::HandOff::card`]). Empty with the fade off.
 pub fn standing(shadow: &Shadow, kept: &Kept) -> Vec<u8> {
     active().map_or_else(Vec::new, |palette| shadow.kept_bytes(kept, palette))
 }
 
-/// Dissolve an attached session's screen up out of the background, from the
-/// shadow. Says whether it did: `false` when the fade is off or the shadow
-/// cannot be trusted, so the caller knows the terminal is still blank.
+/// Dissolve an attached session's screen up from the background, from the
+/// shadow. Returns `false` when the fade is off or the shadow is unusable, so
+/// the caller knows the terminal is still blank.
 ///
-/// The last frame is the shadow's screen at full colour — nvmux's rendering
-/// of it, which is close but not the client's own — with the cursor back on
-/// its cell (see [`Cursor::Restored`]). What the client wrote is written
-/// after it, so its rendering is what stays.
+/// The last frame is the shadow's screen at full colour (close to, but not,
+/// the client's rendering) with the cursor restored ([`Cursor::Restored`]);
+/// the client's own bytes follow and win.
 ///
-/// `over` is drawn over every frame, dissolving out as the session dissolves
-/// in: the name the picker handed off (see [`crate::handoff`]), fully drawn on
-/// the first frame and gone on the last. With it, the session comes back as an
-/// [`Iris`] opening out of the line the name stands on: that line first, the
-/// rows furthest from it last. What is written on the `kept` cells stands at
-/// its full colour from the first frame: the card that says where a switch
-/// landed, which the session's own client drew. Between frames it does what
-/// `between` does (see [`Between`]).
+/// `over`, the name the picker handed off (see [`crate::handoff`]), fades out
+/// as the session fades in, and the session then opens as an [`Iris`] from
+/// the name's line. The `kept` cells (the card the session's client drew)
+/// stay at full colour. Calls `between` between frames (see [`Between`]).
 pub fn fade_in_session(
     shadow: &mut Shadow,
     over: Option<&Over>,
@@ -622,8 +502,8 @@ fn run_session(
     let mut schedule = Schedule::start(one_way(), direction, Instant::now());
     let (rows, _) = shadow.size();
     let iris = over.map(|o| Iris::new(o.top, rows));
-    // The session's cells are the editor's, resolved through the terminal's
-    // palette; the name over them is nvmux's, in nvmux's colour.
+    // Session cells resolve through the palette; the name over them is
+    // nvmux's, in its ink.
     let ink = crate::theme::ink().unwrap_or(palette.fg);
     while let Some(t) = schedule.next(Instant::now()) {
         let cursor = cursor_for(direction, schedule.finished());
@@ -638,10 +518,9 @@ fn run_session(
     Ok(true)
 }
 
-/// Where a session frame leaves the cursor: hidden throughout, except on the
-/// last frame of a fade in, which is the one frame nothing is certain to
-/// follow. A fade out ends hidden — whatever takes the screen next shows the
-/// cursor for itself, and until then there is nothing for it to sit on.
+/// The cursor stays hidden except on the last frame of a fade in, the one
+/// frame nothing is certain to follow. After a fade out, whatever takes the
+/// screen shows its own cursor.
 fn cursor_for(direction: Direction, last: bool) -> Cursor {
     match direction {
         Direction::In if last => Cursor::Restored,
@@ -656,9 +535,6 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Style;
 
-    /// The gate's precedence, without touching any global: the config can
-    /// turn the effect off, and `NO_COLOR` turns it off even when the config
-    /// wants it.
     #[test]
     fn the_config_toggle_and_no_color_both_gate_the_effect() {
         assert!(is_configured(true, false), "on by default");
@@ -670,14 +546,8 @@ mod tests {
         assert!(!is_configured(false, true), "off is off");
     }
 
-    /// What the schedules are actually started with: one direction, half the
-    /// configured dissolve. The arithmetic is pinned where it happens
-    /// (`config::FadeSettings::one_way`); this pins the wiring, so a driver
-    /// that went back to reading `duration_ms` whole fails here rather than
-    /// quietly running twice as long.
-    ///
-    /// Reads the compiled default, since no test installs a config (see
-    /// [`crate::config::get`]).
+    /// Pins the wiring: a driver reading `duration_ms` whole would run twice
+    /// as long. Reads the compiled default, as no test installs a config.
     #[test]
     fn a_schedule_is_started_with_half_the_configured_dissolve() {
         let configured = Duration::from_millis(crate::config::get().effects.fade.duration_ms);
@@ -689,17 +559,14 @@ mod tests {
         );
     }
 
-    /// No palette is ever installed under test, so nothing can animate: every
-    /// driver is a no-op here, which is what keeps the screen tests fast and
-    /// the relay tests unchanged.
+    /// No palette is installed under test, so every driver is a no-op there,
+    /// keeping screen tests fast and relay tests unchanged.
     #[test]
     fn without_a_palette_nothing_is_enabled() {
         assert!(!enabled());
         assert!(active().is_none());
     }
 
-    /// The values a fade-out hands out, frame by frame on a well-behaved clock:
-    /// never the untouched screen, rising, and ending on exactly 1 once.
     #[test]
     fn a_schedule_on_time_rises_to_one_and_stops() {
         let t0 = Instant::now();
@@ -721,8 +588,6 @@ mod tests {
         assert_eq!(s.next(now), None, "nothing after the end");
     }
 
-    /// A fade-in runs the same clock backwards and ends on exactly 0 — which is
-    /// the plain draw.
     #[test]
     fn a_fade_in_falls_to_zero() {
         let t0 = Instant::now();
@@ -741,9 +606,6 @@ mod tests {
         assert_eq!(*seen.last().unwrap(), 0.0);
     }
 
-    /// A terminal that took its time drawing skips ahead rather than
-    /// stretching the fade, and a clock that is very late still gets the end
-    /// value, once.
     #[test]
     fn a_late_clock_skips_to_the_end() {
         let t0 = Instant::now();
@@ -757,10 +619,8 @@ mod tests {
         assert_eq!(s.next(t0 + Duration::from_secs(20)), None);
     }
 
-    /// The clock's own answer, for a caller that cannot draw every frame. It
-    /// must agree with `next` exactly — the pass on which one says the fade is
-    /// over is the pass on which the other hands out its end value — or a fade
-    /// would end a frame early or a frame late depending on who asked.
+    /// `over` must agree with `next`, or a fade would end a frame early or
+    /// late depending on who asked.
     #[test]
     fn a_schedule_is_over_on_the_same_frame_it_hands_out_its_last() {
         let t0 = Instant::now();
@@ -782,9 +642,6 @@ mod tests {
         assert!(cold.over(t0 + Duration::from_millis(100)));
     }
 
-    /// Exactly one frame puts the cursor back: the last of a fade in. Every
-    /// frame of a fade out hides it, including the last — the screen it would
-    /// sit on is gone, and the next owner shows it.
     #[test]
     fn only_the_last_frame_of_a_fade_in_restores_the_cursor() {
         assert_eq!(cursor_for(Direction::In, true), Cursor::Restored);
@@ -806,8 +663,6 @@ mod tests {
         buf
     }
 
-    /// The post-pass is exactly that: at zero it must not touch a single cell,
-    /// so a faded-in frame's final state is byte-identical to a plain draw.
     #[test]
     fn at_zero_nothing_changes() {
         let mut buf = buffer();
@@ -816,9 +671,6 @@ mod tests {
         assert_eq!(buf, before);
     }
 
-    /// Fully dissolved, every visible cell's foreground is the background
-    /// colour: a glyph in it is invisible, a reversed blank is background on
-    /// background.
     #[test]
     fn at_one_everything_visible_is_the_background_colour() {
         let mut buf = buffer();
@@ -838,8 +690,6 @@ mod tests {
         }
     }
 
-    /// Halfway, the foreground is halfway — and the modifiers are exactly as
-    /// drawn, so the hint row is still dim and the selection still reversed.
     #[test]
     fn halfway_is_halfway_and_modifiers_survive() {
         let mut buf = buffer();
@@ -851,9 +701,8 @@ mod tests {
         assert_eq!(buf[(1, 2)].fg, Color::Rgb(100, 100, 100));
     }
 
-    /// A selected row, `▸ 2  dotfiles` on a reversed bold bar, with a plain
-    /// row under it; and the name's cells, to keep. The iris closes onto the
-    /// selected row, so the row under it is the furthest there is.
+    /// `▸ 2  dotfiles` on a reversed bold bar over a plain row, and the name's
+    /// cells to keep. The row under it is the furthest from the iris.
     fn a_bar() -> (Buffer, Rect) {
         let mut buf = Buffer::empty(Rect::new(0, 0, 16, 2));
         let bar = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
@@ -862,9 +711,6 @@ mod tests {
         (buf, Rect::new(5, 0, 8, 1))
     }
 
-    /// Everything outside the name closes in onto its row, the furthest row
-    /// first; the name's cells come off the bar instead, the bar under them
-    /// sinking.
     #[test]
     fn the_kept_name_comes_off_its_bar_while_the_rest_closes_in() {
         let (mut buf, keep) = a_bar();
@@ -901,9 +747,8 @@ mod tests {
         assert_eq!(buf[(5, 1)].fg, Color::Rgb(0, 0, 0), "the furthest, gone");
     }
 
-    /// Closing, rows go from the furthest in; opening, from the iris's own row
-    /// out. A row nearer the iris is never further gone closing, or less far
-    /// back opening, than one further away.
+    /// A row nearer the iris is never further gone closing, or less far back
+    /// opening, than one further away.
     #[test]
     fn an_iris_closes_from_the_edges_and_opens_from_its_row() {
         let iris = Iris::new(10, 24);
@@ -939,9 +784,6 @@ mod tests {
         );
     }
 
-    /// Whatever the shape, both ends are an even fade's: nothing gone at the
-    /// start of a fade-out, everything back at the end of a fade-in, and the
-    /// reverse — so the frames either side of an iris are untouched.
     #[test]
     fn an_iris_ends_where_an_even_fade_does() {
         let iris = Iris::new(3, 8);
@@ -955,9 +797,8 @@ mod tests {
         assert_eq!(Iris::new(0, 1).at(Direction::Out, 1.0, 0), 1.0);
     }
 
-    /// The name never stands out from its bar by less than half: the text is
-    /// the bar's own colour on no frame, and turns to the foreground the
-    /// moment the bar is the darker of the two.
+    /// The text never contrasts with its bar by less than half, and turns to
+    /// the foreground once the bar is the darker.
     #[test]
     fn the_name_stays_readable_all_the_way_off_the_bar() {
         let p = palette();
@@ -980,8 +821,6 @@ mod tests {
         );
     }
 
-    /// On the last frame the name is plain text in the terminal's own colours,
-    /// and everything else has gone into the background.
     #[test]
     fn at_the_end_the_name_is_plain_text_on_nothing() {
         let (mut buf, keep) = a_bar();
@@ -998,7 +837,6 @@ mod tests {
         assert_eq!(buf[(0, 0)].fg, Color::Rgb(0, 0, 0), "the marker is gone");
     }
 
-    /// Three plain rows, `abc` on each, for the iris without a hand-off.
     fn three_rows() -> Buffer {
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
         for y in 0..3 {
@@ -1007,9 +845,6 @@ mod tests {
         buf
     }
 
-    /// Closing onto a row with nothing kept: the rows away from it go first
-    /// and it goes last, and at the end every row is gone, as an even fade
-    /// leaves them.
     #[test]
     fn an_iris_with_nothing_kept_closes_onto_its_row() {
         let p = palette();
@@ -1029,8 +864,6 @@ mod tests {
         assert_eq!(buf, even, "all the way out, the same as an even fade");
     }
 
-    /// Opening out of a row: it comes back first and the rest after, and at
-    /// the end the screen is exactly as drawn.
     #[test]
     fn an_iris_with_nothing_kept_opens_out_of_its_row() {
         let p = palette();
@@ -1044,7 +877,7 @@ mod tests {
         assert_eq!(buf, three_rows(), "all the way in, as drawn");
     }
 
-    /// A name typed by number is not on the bar: it is left exactly as drawn.
+    /// As when a session is picked by typing its number.
     #[test]
     fn a_kept_name_not_on_a_bar_is_left_as_drawn() {
         let (mut buf, _) = a_bar();

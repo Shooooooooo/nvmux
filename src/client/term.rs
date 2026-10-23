@@ -1,53 +1,42 @@
-//! The client's side of its terminal: the pty nvmux runs it on.
+//! The client's terminal setup on the pty nvmux runs it on.
 //!
-//! Everything here is said the way `nvim --remote-ui` says it, because the
-//! relay in [`crate::pty`] watches a client's output for exactly those
-//! sequences and acts on them:
+//! Sequences match `nvim --remote-ui` exactly, because the relay in
+//! [`crate::pty`] watches for them:
 //!
-//! - the opening enters the alternate screen first, which is where a held
-//!   first paint is split (see `pty::Hold`);
-//! - it ends with a device attributes request, whose answer is what tells the
-//!   relay the client's questions have all been answered and it may be parked
-//!   (see `pty::Attachment::startup_answered`) — and it is asked at no other
-//!   time, since a parked client asking it is one on its way out;
-//! - the modes it sets are the ones [`crate::ledger`] records and puts back
-//!   for a kept client: focus reports, bracketed paste, the mouse, the kitty
-//!   keyboard protocol or `modifyOtherKeys`, the title, the cursor's shape and
-//!   colour;
-//! - and the closing leaves the alternate screen, which a parked client does
-//!   only when it is finishing.
+//! - the opening enters the alternate screen first; a held first paint is
+//!   split there (see `pty::Hold`);
+//! - it ends with a device attributes request, whose answer means startup is
+//!   done and the client may be parked (see
+//!   `pty::Attachment::startup_answered`). It is sent at no other time: a
+//!   parked client sending it is exiting;
+//! - the modes it sets are those [`crate::ledger`] records and restores for a
+//!   kept client;
+//! - the closing leaves the alternate screen, which a parked client does only
+//!   when exiting.
 //!
-//! # The keyboard
-//!
-//! Like Neovim's TUI the client asks for the kitty keyboard protocol — the
-//! `CSI ? u` query, with the device attributes request behind it so that a
-//! terminal that does not know the query is found out by answering the other
-//! — and turns on its first flag, which spells every chord unambiguously,
-//! where the terminal has it; and xterm's `modifyOtherKeys` where it does not.
-//! [`super::input`] reads both, and so does nvmux's own prefix
-//! ([`crate::keyseq`]).
+//! Like Neovim's TUI, the client queries kitty keyboard support (`CSI ? u`,
+//! followed by DA so a terminal that ignores the query still answers) and
+//! enables its first flag, falling back to xterm's `modifyOtherKeys`.
+//! [`super::input`] and [`crate::keyseq`] read both.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::sys::termios::{self, SetArg, Termios};
 
-/// What the client says first: the alternate screen, the title saved, the
-/// cursor hidden until the first frame puts it somewhere, bracketed paste and
-/// focus reports on, and the keyboard question, closed by the device
-/// attributes request.
+/// Alternate screen, save title, hide cursor until the first frame, bracketed
+/// paste and focus reports on, kitty keyboard query, then DA.
 pub const OPENING: &[u8] = b"\x1b[?1049h\x1b[22;0t\x1b[?25l\x1b[?2004h\x1b[?1004h\x1b[?u\x1b[c";
 
-/// The kitty keyboard protocol's first flag, pushed: every chord spelt so
-/// that it cannot be taken for another.
+/// Push kitty keyboard flag 1 (disambiguate escape codes).
 pub const KITTY_ON: &[u8] = b"\x1b[>1u";
 
-/// xterm's `modifyOtherKeys`, level 2, for a terminal without kitty's.
+/// xterm `modifyOtherKeys` level 2, for terminals without the kitty protocol.
 pub const OTHER_KEYS_ON: &[u8] = b"\x1b[>4;2m";
 
-/// Mouse reporting as Neovim's TUI turns it on: button events, in SGR, and
-/// every motion on top where `'mousemoveevent'` asks for it — see
-/// [`crate::term`]'s `MOUSE_ON` for why in that order.
+/// Mouse reporting as Neovim's TUI sets it: SGR button events, plus all
+/// motion with `'mousemoveevent'`. See [`crate::term`]'s `MOUSE_ON` for the
+/// order.
 pub fn mouse(on: bool, moves: bool) -> &'static [u8] {
     match (on, moves) {
         (true, true) => b"\x1b[?1002h\x1b[?1006h\x1b[?1003h",
@@ -56,26 +45,22 @@ pub fn mouse(on: bool, moves: bool) -> &'static [u8] {
     }
 }
 
-/// Everything [`OPENING`] and what followed it turned on, turned off, and the
-/// terminal handed back as it was: the pen, the cursor's colour, shape and
-/// visibility, the mouse, focus reports, bracketed paste, the keyboard modes,
-/// the saved title, and the alternate screen last. Popping a keyboard mode
-/// that was never pushed, and leaving a mode never entered, change nothing,
-/// so this is one fixed string whatever the terminal turned out to have.
+/// Resets everything the client may have set, leaving the alternate screen
+/// last. Popping an unpushed keyboard mode or resetting an unset mode is a
+/// no-op, so one fixed string works on every terminal.
 pub const CLOSING: &[u8] = b"\x1b[?2026l\x1b[0m\x1b]112\x07\x1b[0 q\x1b[?25h\
 \x1b[?1003l\x1b[?1006l\x1b[?1002l\x1b[?1004l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[23;0t\x1b[?1049l";
 
-/// A title as the terminal is to show it: control characters taken out, so
-/// that one cannot end the sequence it is sent in and start another.
+/// OSC 2 title with control characters removed, so the text cannot end the
+/// sequence and start another.
 pub fn title(text: &str) -> Vec<u8> {
     let clean: String = text.chars().filter(|c| !c.is_control()).collect();
     format!("\x1b]2;{clean}\x07").into_bytes()
 }
 
-/// The pty in raw mode for as long as this lives: keys arrive as bytes, a
-/// `Ctrl-C` is a key rather than a signal, and nothing is echoed or
-/// translated on the way in or out. Put back as it was when dropped: as nvmux
-/// handed it over, its input raw already (see `pty::take_input_as_written`).
+/// Raw mode on the pty while alive; the saved termios is restored on drop
+/// (nvmux hands the pty over with input already raw, see
+/// `pty::take_input_as_written`).
 pub struct Raw {
     saved: Option<Termios>,
 }
@@ -85,8 +70,7 @@ impl Raw {
         let stdin = std::io::stdin();
         let saved = match termios::tcgetattr(&stdin) {
             Ok(t) => t,
-            // Not a terminal — a test feeding the client from a pipe. There
-            // is nothing to make raw.
+            // Not a terminal, e.g. a test feeding the client from a pipe.
             Err(_) => return Ok(Self { saved: None }),
         };
         let mut raw = saved.clone();
@@ -104,7 +88,7 @@ impl Drop for Raw {
     }
 }
 
-/// The terminal's size, as the pty says: columns and rows.
+/// `(cols, rows)`, defaulting to 80x24.
 pub fn size() -> (usize, usize) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
@@ -115,13 +99,10 @@ pub fn size() -> (usize, usize) {
     }
 }
 
-/// Whether the client's input and output are a terminal, which it tells
-/// Neovim as it attaches (`stdin_tty`, `stdout_tty`) the way Neovim's own TUI
-/// does. Under nvmux both are the pty the relay reads, and Neovim keys what it
-/// writes to a terminal on the second: `nvim_ui_send` reaches only a UI that
-/// says it has one, and the OSC 52 clipboard is turned on only for a terminal
-/// asked through such a UI (`plugin/osc52.lua`): without it, a yank to `+`
-/// finds no clipboard to go to.
+/// Reported to Neovim on attach as `stdin_tty`/`stdout_tty`, as its TUI does.
+/// `stdout_tty` matters: `nvim_ui_send` only reaches a UI that claims a
+/// terminal, and the OSC 52 clipboard (`plugin/osc52.lua`) depends on it, so
+/// without it yanks to `+` go nowhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tty {
     pub stdin: bool,
@@ -138,7 +119,7 @@ impl Tty {
     }
 }
 
-/// The write end of the hangup pipe, for the handler.
+/// Write end of the hangup pipe, for the signal handler.
 static HANGUP_FD: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_hangup(_sig: libc::c_int) {
@@ -150,11 +131,9 @@ extern "C" fn on_hangup(_sig: libc::c_int) {
     }
 }
 
-/// Being told to go: `SIGHUP`, which is how nvmux retires a client (see
-/// `pty::Attachment::hang_up`), and `SIGTERM`. A self-pipe like
-/// [`crate::winch::Winch`]'s, so the going is noticed by the loop's own `poll`
-/// and the client leaves the way it always does — saying [`CLOSING`] — rather
-/// than from inside a signal handler, part way through a frame.
+/// Self-pipe for `SIGHUP` (how nvmux retires a client, see
+/// `pty::Attachment::hang_up`) and `SIGTERM`, so the main `poll` sees it and
+/// the client exits normally with [`CLOSING`], not mid-frame from a handler.
 pub struct Hangup {
     read: OwnedFd,
     _write: OwnedFd,
@@ -206,9 +185,8 @@ impl Drop for Hangup {
 mod tests {
     use super::*;
 
-    /// The relay splits a held first paint just past the alternate screen's
-    /// entry, so it is the very first thing said; and the device attributes
-    /// request is the last, closing the questions.
+    /// The relay splits a held first paint just past the alternate-screen
+    /// entry, and treats DA as the end of startup.
     #[test]
     fn the_opening_enters_the_alternate_screen_first_and_asks_last() {
         assert!(OPENING.starts_with(b"\x1b[?1049h"));
@@ -220,9 +198,8 @@ mod tests {
         );
     }
 
-    /// The closing leaves the alternate screen, last, and asks nothing: a
-    /// client retired with its output thrown away must not leave a question
-    /// for the real terminal to answer into the shell.
+    /// A retired client's output is discarded, so a query in the closing
+    /// would be answered by the real terminal into the shell.
     #[test]
     fn the_closing_leaves_the_alternate_screen_last_and_asks_nothing() {
         assert!(CLOSING.ends_with(b"\x1b[?1049l"));
@@ -236,8 +213,6 @@ mod tests {
         }
     }
 
-    /// The ledger reads the mouse the way Neovim's TUI sets it, so this sets
-    /// it that way.
     #[test]
     fn the_mouse_is_set_as_neovims_tui_sets_it() {
         let mut ledger = crate::ledger::Ledger::new();

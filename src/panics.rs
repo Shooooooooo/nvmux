@@ -1,22 +1,18 @@
 //! What a panic does to the terminal.
 //!
-//! A panic nvmux does not catch ends it, and the terminal has to be handed
-//! back first — raw mode off, the alternate screen left — or the message goes
-//! into a screen nobody can read. [`install`] puts in the one hook that does
-//! that.
+//! An uncaught panic ends nvmux, so the terminal must be restored first (raw
+//! mode off, alternate screen left) or the message is unreadable. [`install`]
+//! adds the one hook that does this.
 //!
-//! A panic nvmux does catch is another matter. The parsers that follow a
-//! session's bytes for the shadow and the ledger are somebody else's code, fed
-//! whatever an editor writes, and a panic in one only retires what it was
-//! keeping (see [`crate::shadow`] and [`crate::ledger`]) while the relay goes
-//! on. The hook runs for that panic too, before the catch, and there it must do
-//! nothing: handing the terminal back under a live session takes the session
-//! off the alternate screen and writes the message over it. [`caught`] marks
-//! the panics it catches, and the hook lets them be.
+//! The third-party parsers following a session's bytes for the shadow and the
+//! ledger may panic on editor output; that only retires what they kept (see
+//! [`crate::shadow`] and [`crate::ledger`]) while the relay continues. The
+//! hook runs before that catch too, and must then do nothing: restoring the
+//! terminal under a live session would drop it off the alternate screen and
+//! print over it. [`caught`] marks the panics it catches for the hook to skip.
 //!
-//! ratatui's own `try_init` puts in a hook that hands the terminal back on any
-//! panic, one more each time a screen opens, and never takes it out: the
-//! screens open the terminal without it (see `ui::Screen`).
+//! Screens open the terminal without ratatui's `try_init` (see `ui::Screen`),
+//! which would add a restoring hook per screen and never remove it.
 
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
@@ -27,11 +23,10 @@ thread_local! {
     static CATCHING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Put in the hook every panic in nvmux goes through, once: it hands the
-/// terminal back and then says what happened, as the hook before it does —
-/// but for a panic [`caught`] is catching, which it only logs. Called from
-/// `main` before any screen is drawn, and by every screen as it opens, for
-/// callers that never went through `main`.
+/// Install the panic hook, once: it restores the terminal, then defers to the
+/// previous hook, except for panics [`caught`] is catching, which it only
+/// logs. Called from `main` and by every screen as it opens, for callers that
+/// bypass `main`.
 pub fn install() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
@@ -48,8 +43,8 @@ pub fn install() {
 }
 
 /// Run `f`, catching a panic in it, which the hook leaves alone (see the
-/// module docs). Unwind safety is taken on trust, as the parsers' callers take
-/// it: what `f` was part way through is thrown away with it.
+/// module docs). Unwind safety is assumed: whatever `f` was doing is
+/// discarded.
 pub fn caught<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
     let was = CATCHING.with(|c| c.replace(true));
     let outcome = panic::catch_unwind(AssertUnwindSafe(f));
@@ -65,11 +60,10 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// The child half of the test below: set on the test binary it runs again.
+    /// Set on the test binary re-run as the child of the test below.
     const CHILD: &str = "NVMUX_TEST_PANICS_CHILD";
 
-    /// What the child writes once the session's screen is up, and once it is
-    /// done.
+    /// Written by the child once the session's screen is up, and when done.
     const UP: &str = "<<up>>";
     const DONE: &str = "<<done>>";
 
@@ -77,8 +71,7 @@ mod tests {
         CATCHING.with(Cell::get)
     }
 
-    /// A panic is marked as caught only while [`caught`] runs what panics,
-    /// and the mark is taken off again however that ends — nested, too.
+    /// The mark is cleared however `caught` ends, nested calls included.
     #[test]
     fn only_what_is_caught_is_marked_caught() {
         assert!(!catching());
@@ -96,13 +89,10 @@ mod tests {
         assert!(!catching());
     }
 
-    /// **The regression test for the screen a parser bug took away.** A
-    /// session up — raw mode, the alternate screen — after the picker had
-    /// come and gone three times, and a panic caught under it: the terminal
-    /// is left as it was, and nothing is written over it. Each screen used to
-    /// put in a hook of ratatui's that ran for the caught panic too, leaving
-    /// the alternate screen once for every time a screen had opened, and the
-    /// message was printed over the session.
+    /// Regression: with a session up (raw mode, alternate screen) after three
+    /// screens opened and closed, a caught panic must leave the terminal
+    /// alone. Each screen used to add a ratatui hook that ran for caught
+    /// panics too, leaving the alternate screen and printing over the session.
     #[test]
     fn a_caught_panic_leaves_the_session_it_happens_under_alone() {
         let (pty, pts) = pty_process::blocking::open().expect("a pty");
@@ -136,8 +126,7 @@ mod tests {
         let mut writer = &pty;
         while !String::from_utf8_lossy(&out).contains(DONE) && Instant::now() < deadline {
             if let Ok(bytes) = rx.recv_timeout(Duration::from_millis(50)) {
-                // A terminal's answer to where its cursor is, should a screen
-                // ask.
+                // Answer a cursor position query, should a screen ask.
                 if bytes.windows(4).any(|w| w == b"\x1b[6n") {
                     let _ = writer.write_all(b"\x1b[1;1R");
                 }
@@ -162,7 +151,7 @@ mod tests {
         );
     }
 
-    /// The child: see the test above. Nothing without [`CHILD`].
+    /// The child of the test above; does nothing without [`CHILD`].
     #[test]
     #[ignore = "the child half of a test; run by it, not by hand"]
     fn a_session_with_a_panic_caught_under_it() {

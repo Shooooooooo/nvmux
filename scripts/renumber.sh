@@ -7,12 +7,11 @@
 #   ERROR <reason>   (on a write that failed)
 #   NVMUX_END
 #
-# Batch-shaped, like list.sh: dragging a row the length of a list would
-# otherwise cost one ssh round trip per row it passed.
+# Batch-shaped: dragging a row down a list would otherwise cost one ssh round
+# trip per row passed.
 #
-# Separate from write_meta.sh, which may *create* a session's metadata, because
-# this one may only edit it. Each JSON arrives as its own positional parameter
-# and is never re-parsed, so a name containing quotes, spaces or $(...) is data.
+# Separate from write_meta.sh because this may only edit metadata, never
+# create it. Each JSON is its own positional parameter, never re-parsed.
 
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
@@ -27,9 +26,8 @@ while [ "$#" -ge 2 ]; do
   # An id becomes a path; nothing else in the runtime directory is ours.
   is_session_id "$id" || continue
 
-  # Never conjure metadata for a session that has none. An orphan is a live
-  # socket with no <id>.json, and the picker shows it under a name it made up on
-  # the spot -- writing that here would make the placeholder real.
+  # Never create metadata: an orphan (live socket, no <id>.json) shows under a
+  # made-up name, and writing it here would make that placeholder real.
   [ -f "$dir/$id.json" ] || continue
 
   write_json "$dir" "$id" "$json" || fail "could not write metadata for $id"

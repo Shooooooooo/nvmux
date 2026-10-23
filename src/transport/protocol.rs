@@ -1,32 +1,23 @@
-//! Pure parsing and argument building for the session-host scripts. Zero I/O,
-//! so the code most likely to break silently is the code with the heaviest
-//! tests.
+//! Pure parsing and argument building for the session-host scripts, with no
+//! I/O so it can be tested heavily.
 //!
-//! If `if self.is_remote()` ever appears here the abstraction has leaked — that
-//! belongs in a script or in [`crate::transport::Transport::local_socket_for`].
+//! Local/remote differences do not belong here; they go in a script or in
+//! [`crate::transport::Transport::local_socket_for`].
 
 use crate::error::{NvmuxError, Result, SessionError};
 use crate::session::{Liveness, Session};
 
-/// The sentinel `list.sh` prints after the last record.
 const TERMINATOR: &str = "NVMUX_END";
 
-/// A script did not run, or refused. Rendered bare — see
-/// [`SessionError::ScriptFailed`].
 fn script_failed(message: impl Into<String>) -> NvmuxError {
     NvmuxError::Session(SessionError::ScriptFailed(message.into()))
 }
 
-/// Every script ends with a `NVMUX_END` sentinel; without it the run produced
-/// nothing.
+/// Every script ends with a `NVMUX_END` line; its absence is an error.
 ///
-/// # Why a missing terminator is an error
-///
-/// `ssh -n` combined with `sh -s` produces a silently **empty** result: stdin
-/// comes from `/dev/null`, `sh` reads an empty script and exits 0. Without the
-/// sentinel that is indistinguishable from a successful run that had nothing to
-/// say — for `list.sh`, from "this host has no sessions" — and the picker would
-/// show an empty list instead of reporting a broken connection.
+/// `ssh -n` with `sh -s` reads an empty script from `/dev/null` and exits 0,
+/// which without the sentinel would look like e.g. "no sessions" instead of a
+/// broken connection.
 pub fn require_terminator(stdout: &str, what: &str) -> Result<()> {
     if stdout
         .lines()
@@ -40,20 +31,18 @@ pub fn require_terminator(stdout: &str, what: &str) -> Result<()> {
     )))
 }
 
-/// One row as the script reported it, before liveness is probed properly.
+/// One row from `list.sh`, before liveness is probed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
     pub id: String,
-    /// The script's cheap liveness hint: something has the socket bound (per
-    /// `/proc/net/unix`), or a command line is `--listen`ing on it. A hint
-    /// only: it says a process exists, not that nvim is answering on the
-    /// socket, so local sessions are probed over RPC instead.
+    /// Cheap hint: the socket is bound (`/proc/net/unix`) or some command line
+    /// `--listen`s on it. It does not mean nvim answers, so local sessions are
+    /// probed over RPC instead.
     pub pid_alive: bool,
     /// Raw `<id>.json` contents, or empty if the file was missing.
     pub json: String,
 }
 
-/// Parse the output of `list.sh`.
 pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
     require_terminator(stdout, "session listing")?;
     let mut rows = Vec::new();
@@ -66,9 +55,7 @@ pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
         let mut fields = line.splitn(4, '\t');
         match fields.next() {
             Some("S") => {}
-            // The greeting `hello.sh` prints ahead of a first listing, or the
-            // remote shell talking — a profile banner, a warning. Refusing to
-            // list sessions because of a MOTD would be maddening.
+            // `hello.sh`'s greeting, or shell noise (MOTD, profile warnings).
             _ => {
                 tracing::debug!(line, "ignoring unrecognised line from list.sh");
                 continue;
@@ -88,18 +75,15 @@ pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
     Ok(rows)
 }
 
-/// What `spawn.sh` reported.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Spawned {
-    /// The pid of the new nvim, **validated** against the socket it serves.
-    /// `None` is not fatal, but nvmux must never signal an unvalidated pid:
-    /// pids are reused, and the number could name anything by now.
+    /// The new nvim's pid, validated against its socket. `None` is not fatal,
+    /// but never signal an unvalidated pid: pids are reused.
     pub pid: Option<u32>,
-    /// Whether the listen socket appeared before the script gave up waiting.
+    /// Whether the socket appeared before the script stopped waiting.
     pub socket_appeared: bool,
 }
 
-/// Parse the output of `spawn.sh`.
 pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     let mut out = Spawned::default();
     let mut error = None;
@@ -108,14 +92,13 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
         match line.split_once(' ') {
             Some(("PID", v)) => out.pid = v.trim().parse().ok().filter(|p| *p > 1),
             Some(("SOCK", v)) => out.socket_appeared = v.trim() == "ok",
-            // Surfacing the script's own reason beats a generic timeout.
             Some(("ERROR", v)) => error = Some(v.trim().to_string()),
             _ if line == TERMINATOR => {}
             _ => tracing::debug!(line, "ignoring unrecognised line from spawn.sh"),
         }
     }
-    // The script's own reason first: it is more specific than "did not
-    // complete", and it survives a pipe that was cut before the terminator.
+    // The script's reason first: it is more specific than "did not complete"
+    // and survives a pipe cut before the terminator.
     if let Some(msg) = error {
         return Err(script_failed(msg));
     }
@@ -123,14 +106,11 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
     Ok(out)
 }
 
-/// Read the outcome of `write_meta.sh` or `renumber.sh`, the two scripts that
-/// write metadata and say nothing but whether they could; `what` names the
-/// one that ran, for the error when it did not complete.
+/// Read the outcome of `write_meta.sh` or `renumber.sh`; `what` names the
+/// script for the error.
 ///
-/// Shaped like [`parse_spawn`]: the script's own `ERROR` line first, because it
-/// is more specific than "did not complete" and because without it a failed
-/// write reaches the user through `ssh::classify` as a diagnosis of the
-/// connection.
+/// An `ERROR` line wins, as in [`parse_spawn`]; otherwise a failed write would
+/// reach `ssh::classify` and be reported as a connection problem.
 pub fn parse_write(stdout: &str, what: &str) -> Result<()> {
     for line in stdout.lines() {
         if let Some(("ERROR", reason)) = line.trim_end_matches('\r').split_once(' ') {
@@ -140,24 +120,18 @@ pub fn parse_write(stdout: &str, what: &str) -> Result<()> {
     require_terminator(stdout, what)
 }
 
-/// The subdirectories of one directory, as `dirs.sh` listed them.
+/// Subdirectories of one directory, from `dirs.sh`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Listing {
-    /// Their names, not their paths, in the order the host produced them —
-    /// which is `LC_ALL=C` glob order, so it is the same order on every host.
+    /// Names, not paths, in `LC_ALL=C` glob order (the same on every host).
     pub names: Vec<String>,
-    /// The host had more to say and stopped at its cap. A partial answer, which
-    /// matters to the caller: it may be shown, but it must not be filtered down
-    /// for a longer prefix, because what it is missing may be exactly what a
-    /// longer prefix wanted.
+    /// The host stopped at its cap. A partial answer may be shown but must not
+    /// be filtered for a longer prefix: the missing names may be the matches.
     pub truncated: bool,
 }
 
-/// Read `dirs.sh`'s output.
-///
-/// Unrecognised lines are ignored for the reason [`parse_listing`] gives: this
-/// runs through the user's login shell, and a profile banner must not cost them
-/// their completions.
+/// Parse `dirs.sh`'s output. Unrecognised lines (login shell noise) are
+/// ignored.
 pub fn parse_dirs(stdout: &str) -> Result<Listing> {
     require_terminator(stdout, "directory listing")?;
     let mut out = Listing::default();
@@ -168,9 +142,8 @@ pub fn parse_dirs(stdout: &str) -> Result<Listing> {
             out.truncated = true;
             continue;
         }
-        // `splitn(2)` so a name containing a tab arrives whole. The script skips
-        // a name containing a newline, which is the one character that could
-        // break the framing; a tab cannot.
+        // `splitn(2)` keeps a tab in a name; the script skips names with a
+        // newline, the only character that breaks the framing.
         let mut fields = line.splitn(2, '\t');
         if fields.next() != Some("D") {
             continue;
@@ -184,28 +157,20 @@ pub fn parse_dirs(stdout: &str) -> Result<Listing> {
     Ok(out)
 }
 
-/// What `hello.sh` reported about a session host.
+/// What `hello.sh` reported.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HostProbe {
-    /// The runtime directory on the host that owns the sessions.
     pub runtime_dir: String,
-    /// The first line of `nvim --version`, empty if nvim is not on PATH there.
+    /// First line of `nvim --version`; empty if nvim is not on PATH.
     pub nvim_banner: String,
-    /// The home directory of the user the sessions run as, empty if the host
-    /// could not say. Where a new session starts unless the user says
-    /// otherwise; never guessed at from ours, which is a different machine's.
+    /// The session user's home, where new sessions start by default. Empty if
+    /// unknown; never guessed from the local one.
     pub home: String,
 }
 
-/// Read the greeting out of `hello.sh`'s output.
-///
-/// That output carries a listing after the few lines read here — the whole
-/// point of the script — so this ignores everything it does not recognise, and
-/// [`parse_listing`] reads the same bytes for the other half.
-///
-/// Only the runtime directory is required. A missing `HOME` is a host that could
-/// not say, or an older `hello.sh` than this nvmux, and costs a default rather
-/// than a connection.
+/// Read the greeting from `hello.sh`'s output, ignoring the listing that
+/// follows (read by [`parse_listing`]). Only the runtime directory is required;
+/// `HOME` may be missing (unknown, or an older `hello.sh`).
 pub fn parse_probe(stdout: &str) -> Result<HostProbe> {
     require_terminator(stdout, "probe")?;
     let mut out = HostProbe::default();
@@ -225,21 +190,18 @@ pub fn parse_probe(stdout: &str) -> Result<HostProbe> {
     Ok(out)
 }
 
-/// What `kill.sh` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillOutcome {
     /// The process is gone and its files were removed.
     Killed,
-    /// There was no such process; the files were removed.
+    /// No such process; the files were removed.
     Absent,
-    /// It was signalled and is still alive; nothing was removed.
+    /// Signalled but still alive; nothing removed.
     Orphaned,
-    /// We could not determine what owns the socket, so nothing was signalled
-    /// and nothing was removed.
+    /// The socket's owner is unknown; nothing signalled or removed.
     Unknown,
 }
 
-/// Parse the output of `kill.sh`.
 pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
     require_terminator(stdout, "kill command")?;
     let mut outcome = None;
@@ -257,16 +219,13 @@ pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
     outcome.ok_or_else(|| script_failed("the kill command reported no outcome"))
 }
 
-/// Turn parsed rows into sessions, dropping ones whose metadata is unusable.
-///
-/// A socket with no readable metadata is reported rather than silently hidden:
-/// it means an interrupted create, and the user should be able to see and kill
-/// it. It gets a placeholder name derived from its id.
+/// Turn parsed rows into sessions, dropping malformed ids. A socket without
+/// readable metadata (an interrupted create) is kept under a placeholder name
+/// so the user can see and kill it.
 pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
     rows.into_iter()
         .filter(|row| {
-            // A malformed id means something not ours is in the runtime
-            // directory. Skip it rather than turning it into a path.
+            // Not ours; never turn it into a path.
             let ok = crate::ids::is_valid_id(&row.id);
             if !ok {
                 tracing::warn!(id = %row.id, "ignoring a file with a malformed session id");
@@ -286,9 +245,8 @@ pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
                 }
             };
 
-            // The FILENAME is the identity, not the `id` field inside the file.
-            // Every path nvmux builds derives from it, so trusting the contents
-            // would let a hand-edited `<id>.json` aim a kill somewhere else.
+            // The filename is the identity, not the `id` field: paths derive
+            // from it, and a hand-edited `<id>.json` must not redirect a kill.
             if session.id != row.id {
                 tracing::warn!(
                     file_id = %session.id,
@@ -308,8 +266,7 @@ pub fn rows_to_sessions(rows: Vec<Listed>) -> Vec<Session> {
 }
 
 fn orphan(id: &str) -> Session {
-    // Unnumbered: `finish_listing` gives it a display number, so a broken
-    // session is still something the user can select and kill.
+    // Unnumbered; `finish_listing` numbers it so it can be selected and killed.
     let mut s = Session::new(id.to_string(), format!("<orphan {id}>"), 0, 0);
     s.created = 0;
     s
@@ -361,7 +318,7 @@ mod tests {
         assert!(parse_listing("NVMUX_END\n").expect("parse").is_empty());
     }
 
-    /// The `ssh -n` trap: empty output, exit 0, and it must not read as success.
+    /// The `ssh -n` trap: empty output with exit 0 must not read as success.
     #[test]
     fn output_with_no_terminator_is_an_error() {
         assert!(
@@ -376,7 +333,7 @@ mod tests {
 
     #[test]
     fn shell_noise_before_the_records_is_ignored() {
-        // Login shells print things: MOTDs, `nvm` banners, warnings on stdout.
+        // Login shells print MOTDs, `nvm` banners, warnings on stdout.
         let out = format!(
             "Welcome to Ubuntu!\n\
              bash: warning: setlocale: LC_ALL: cannot change locale\n\
@@ -410,8 +367,8 @@ mod tests {
 
     #[test]
     fn names_with_tabs_cannot_break_the_record_format() {
-        // `splitn(4)` keeps tabs inside the json field rather than shifting
-        // later fields. list.sh strips them too.
+        // `splitn(4)` keeps tabs inside the json field. list.sh strips them
+        // too.
         let out = listing(
             "S\tabcdefgh\t1\t{\"id\":\"abcdefgh\",\"name\":\"a\tb\",\"created\":1,\"pid\":2}\n",
         );
@@ -454,11 +411,8 @@ mod tests {
         assert!(!s.socket_appeared);
     }
 
-    /// `spawn.sh` refuses on a bad runtime directory and says why. That reason
-    /// must reach the user as itself: it used to be wrapped in
-    /// `SessionError::NotFound`, which renders `no session named {0:?}`, so a
-    /// permissions problem printed as `nvmux: no session named "runtime
-    /// directory /tmp/nvmux-1000 is not owned by us"`.
+    /// Regression: the reason was wrapped in `SessionError::NotFound` and
+    /// printed as `no session named "..."`.
     #[test]
     fn a_refusal_from_the_script_is_reported_in_the_scripts_own_words() {
         let err =
@@ -470,10 +424,8 @@ mod tests {
         );
     }
 
-    /// A metadata write that failed must reach the user as itself. Without the
-    /// `ERROR` line the script exits with nothing on stdout, and
-    /// `checked_script` hands that to `ssh::classify` — so a full disk would be
-    /// reported as a broken connection.
+    /// Without the `ERROR` line, `ssh::classify` would report e.g. a full disk
+    /// as a broken connection.
     #[test]
     fn a_failed_write_is_reported_in_the_scripts_own_words() {
         parse_write("NVMUX_END\n", "renumber").expect("a bare terminator means it ran");
@@ -496,8 +448,6 @@ mod tests {
         assert!(err.to_string().contains("metadata write"), "{err}");
     }
 
-    /// The script's own reason beats "did not complete", and survives a pipe
-    /// that was cut before the terminator.
     #[test]
     fn a_refusal_outranks_a_missing_terminator() {
         let err = parse_spawn("ERROR could not inspect runtime directory /tmp/x\n")
@@ -541,8 +491,6 @@ mod tests {
         assert!(parse_kill("").is_err());
     }
 
-    /// The filename is the identity; a metadata file claiming another id must
-    /// not be able to redirect a kill or a rename at a different session.
     #[test]
     fn a_metadata_file_cannot_claim_another_sessions_id() {
         let out = format!(
@@ -557,7 +505,6 @@ mod tests {
         );
     }
 
-    /// An id that would escape the runtime directory must never become a path.
     #[test]
     fn malformed_ids_are_dropped_from_the_listing() {
         for bad in [
@@ -607,10 +554,6 @@ mod tests {
         assert!(!l.truncated);
     }
 
-    /// The cap is what keeps a huge directory from becoming a huge transfer,
-    /// and the flag is what stops the caller filtering a partial answer down
-    /// for a longer prefix — which would silently hide directories that are
-    /// there.
     #[test]
     fn a_truncated_directory_listing_says_so() {
         let l = parse_dirs("D\ta\nTRUNCATED\nNVMUX_END\n").expect("parse");
@@ -618,9 +561,6 @@ mod tests {
         assert!(l.truncated);
     }
 
-    /// This runs through the user's login shell, so a profile banner or a
-    /// warning must cost them nothing. The same rule the session listing lives
-    /// by.
     #[test]
     fn a_directory_listing_ignores_anything_that_is_not_a_record() {
         let out = "Welcome to example.com\n\
@@ -633,9 +573,6 @@ mod tests {
         assert_eq!(l.names, ["src"], "only D records, and only named ones");
     }
 
-    /// A name containing a tab arrives whole: the split is on the first one, so
-    /// everything after it is the name. `dirs.sh` skips the one character that
-    /// could break the framing, a newline, and a tab is not it.
     #[test]
     fn a_directory_name_containing_a_tab_survives() {
         let l = parse_dirs("D\ta\tb\nNVMUX_END\n").expect("parse");
@@ -645,16 +582,12 @@ mod tests {
     #[test]
     fn a_directory_listing_without_a_terminator_is_an_error() {
         assert!(parse_dirs("D\tsrc\n").is_err(), "no terminator");
-        // An empty directory is a valid answer; an empty *output* is not, and
-        // is what `ssh -n` produces when the script never ran at all.
+        // An empty directory is valid; empty output (`ssh -n`) is not.
         assert!(parse_dirs("NVMUX_END\n").expect("parse").names.is_empty());
         assert!(parse_dirs("").is_err());
     }
 
-    /// A host that could not say where home is — `$HOME` unset or relative, or
-    /// an older `hello.sh` than this nvmux — still opens. Only the runtime
-    /// directory is load-bearing; a missing home costs a default, not a
-    /// connection.
+    /// `$HOME` unset or relative, or an older `hello.sh`.
     #[test]
     fn a_host_that_reports_no_home_still_opens() {
         let p =
@@ -662,7 +595,7 @@ mod tests {
         assert_eq!(p.runtime_dir, "/tmp/nvmux-0");
         assert!(p.home.is_empty());
 
-        // And one from before the line existed at all.
+        // An older `hello.sh` without the line.
         let p = parse_probe("DIR /tmp/nvmux-0\nNVIM NVIM v0.11.4\nNVMUX_END\n").expect("parse");
         assert!(p.home.is_empty());
     }

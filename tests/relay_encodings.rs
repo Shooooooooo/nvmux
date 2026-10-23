@@ -1,40 +1,22 @@
-//! End-to-end: the prefix must reach the prefix machine however the terminal
-//! spells it, through a real `nvim --remote-ui` client.
+//! End-to-end relay tests through a real `nvim --remote-ui` client.
 //!
-//! The client asks the terminal for the kitty keyboard protocol when it
-//! starts, or failing that for xterm's `modifyOtherKeys`, and nvmux relays
-//! that negotiation untouched — so a terminal that grants the first (Windows
-//! Terminal from 1.25, kitty, Ghostty, ...) then sends `Ctrl-Space` as
-//! `CSI 32 ; 5 u`, and one that grants the second (xterm, WezTerm) as
-//! `CSI 27 ; 5 ; 32 ~`, instead of the byte `NUL`. Until `keyseq`, either
-//! went straight through to the editor: `<prefix> d` reached it as the chord
-//! and a pending delete, and nobody could detach.
+//! The prefix must reach the prefix machine however the terminal encodes it.
+//! The client negotiates the kitty keyboard protocol, or else xterm's
+//! `modifyOtherKeys`, through the relay untouched, so `Ctrl-Space` arrives as
+//! `CSI 32 ; 5 u` (kitty, Ghostty, Windows Terminal 1.25+) or
+//! `CSI 27 ; 5 ; 32 ~` (xterm, WezTerm) instead of `NUL`. Before `keyseq` these
+//! went straight to the editor and nobody could detach.
 //!
-//! The relay talks to its terminal on fds 0 and 1, so it has to run in a
-//! process of its own. Each test spawns this very test binary again, on a pty,
-//! to run [`relay_child`], and plays the terminal on the master side: it
-//! answers the client's queries the way a terminal with the protocol under
-//! test does, waits for the client to turn the protocol on, and types.
-//! Skipped without a usable `nvim`, like the other suites.
+//! The relay uses fds 0 and 1, so each test re-runs this binary on a pty as
+//! [`relay_child`] and plays the terminal on the master side: it answers the
+//! client's queries, waits for the protocol to be enabled, and types. Skipped
+//! without a usable `nvim`.
 //!
-//! One test here is not about a spelling at all. The hint bar the prefix puts up
-//! ([`nvmux::hint`]) is written over a live editor's last row and taken off it
-//! again, and neither half can be shown to work anywhere but here: it needs a
-//! real client painting a real screen to cover, and the shadow's copy of that
-//! screen to put back. Nor is the bar staying on that row while the editor
-//! redraws it underneath — a statusline ticking over with a language server's
-//! progress — which needs the same, and every moment in between as a terminal
-//! could have shown it.
-//!
-//! Nor are the last two. With `[client] per_session` a client is parked while
-//! something else has the front, and when it comes back nvmux paints the
-//! screen from its own copy of it and asks the server for its repaint on top —
-//! which only a real client on a real pty, and a real server made too busy to
-//! answer, can show.
-//!
-//! Nor is a client started ahead of its first visit (`[client] lazy = false`),
-//! whose startup questions reach the terminal only on that visit, and have to
-//! be answered and acted on then: which only a real client can show.
+//! Also covered here, since they need a real client painting a real screen:
+//! the hint bar ([`nvmux::hint`]) covering and restoring the last row (also
+//! while the editor redraws it), resuming a parked client (`[client]
+//! per_session`) with a busy server, and a client started ahead (`[client]
+//! lazy = false`) answering its startup queries on first visit.
 
 #[macro_use]
 mod common;
@@ -48,148 +30,117 @@ use common::Scratch;
 use nvmux::transport::Transport;
 use pty_process::blocking::{Command, Pty};
 
-/// The session socket and id the child attaches to.
+/// The session socket and id for the child.
 const CHILD_SOCK: &str = "NVMUX_TEST_RELAY_SOCK";
 const CHILD_ID: &str = "NVMUX_TEST_RELAY_ID";
-/// Set on a child that must keep a shadow of the session's screen — which is
-/// what the hint bar puts the row it covered back from. A shadow needs a palette
-/// and the fade on, and nothing here queries a real terminal, so the colours are
-/// handed to the child rather than asked for.
+/// Give the child a palette (no real terminal to query), enabling the fade
+/// and the shadow screen the hint bar restores its row from.
 const CHILD_PALETTE: &str = "NVMUX_TEST_RELAY_PALETTE";
-/// The grey that palette has for text: what a session's text and a card's
-/// come up to.
+/// That palette's text grey.
 const PALETTE_FG: u8 = 200;
-/// Set on a child that keeps its client (`[client] per_session`): where
-/// `<prefix> Space` would open the picker it parks the client instead, for
-/// [`PARKED_FOR`], and then takes it back and relays it again.
+/// Child keeps its client (`[client] per_session`): `<prefix> Space` parks
+/// it for [`PARKED_FOR`] instead of opening the picker, then resumes it.
 const CHILD_KEEP: &str = "NVMUX_TEST_RELAY_KEEP";
 
-/// How long a keeping child leaves its client parked: long enough for the
-/// parent to have made the server busy before the client comes back.
+/// Long enough for the parent to make the server busy before the resume.
 const PARKED_FOR: Duration = Duration::from_secs(1);
 
-/// How long, in milliseconds, a keeping child leaves its client parked, where
-/// it is not [`PARKED_FOR`].
+/// Overrides [`PARKED_FOR`], in milliseconds.
 const CHILD_PARKED_MS: &str = "NVMUX_TEST_RELAY_PARKED_MS";
 
-/// Set on a child whose client is started ahead of its first visit
-/// (`[client] lazy = false`): begun and handed to the pool, held there out of
-/// sight for [`AHEAD_FOR`], then taken back and relayed for the first time.
+/// Child starts its client ahead (`[client] lazy = false`): pooled for
+/// [`AHEAD_FOR`], then relayed for the first time.
 const CHILD_AHEAD: &str = "NVMUX_TEST_RELAY_AHEAD";
 
-/// How long a child starting its client ahead holds it before relaying it:
-/// long enough for the parent to see the client attached to its server with
-/// nothing yet on the terminal.
+/// Long enough for the parent to see the client attached with nothing yet on
+/// the terminal.
 const AHEAD_FOR: Duration = Duration::from_secs(2);
 
-/// What that child writes once its client has been started ahead.
+/// Written once the client has been started ahead.
 const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 
-/// How long, in milliseconds, that child holds its client, where it is not
-/// [`AHEAD_FOR`].
+/// Overrides [`AHEAD_FOR`], in milliseconds.
 const CHILD_AHEAD_MS: &str = "NVMUX_TEST_RELAY_AHEAD_MS";
 
-/// What the child's relay announces the session as — on a card nvmux's own
-/// client draws (see [`nvmux::card`]), and Neovim's draws none — on its first
-/// attach and, kept, on every return to the front: as a switch would. Unset,
-/// it announces nothing, which is what the tests about the prefix want.
+/// Label announced on attach and each resume, as a switch would (a card; see
+/// [`nvmux::card`]). Unset, nothing is announced.
 const CHILD_LABEL: &str = "NVMUX_TEST_RELAY_LABEL";
 
-/// Set on a child whose client is nvmux's own — this crate's binary, run with
-/// `--client` — rather than Neovim's: the client that draws cards (see
-/// [`nvmux::card`]).
+/// Use nvmux's own client (`nvmux --client`), which draws cards.
 const CHILD_OWN: &str = "NVMUX_TEST_RELAY_OWN_CLIENT";
 
-/// Set on a child to post a card on the board, for its own session, a moment
-/// into its first relay — as the notifier does — that goes to the session
-/// with the id this names, or with `buf:<n>` to buffer `n` of its own.
+/// Post a card during the first relay, as the notifier does, leading to the
+/// session with this id, or with `buf:<n>` to the child's buffer `n`.
 const CHILD_POST: &str = "NVMUX_TEST_RELAY_POST";
 
-/// Set on a child whose relay is told, on a switch, that the switch lands with
-/// a card naming this — as `main` tells it of the session it goes to.
+/// The card a switch lands with, named this, as `main` passes it.
 const CHILD_LANDS: &str = "NVMUX_TEST_RELAY_LANDS";
 
-/// Set on a child whose switch lands with a card ([`CHILD_LANDS`]) to have
-/// that card a step along its row, as `<prefix> n` makes it: from `aa` to the
-/// session it names, with twelve `b`s next and `cc` going off the far end.
+/// Make that card a step along its row, as `<prefix> n` does: from `aa` to
+/// the named session, with twelve `b`s next and `cc` leaving the far end.
 const CHILD_STEPS: &str = "NVMUX_TEST_RELAY_STEPS";
 
-/// Set on a child to move commands to other keys: the body of a `[keys.bind]`
-/// table, read as the config file's would be.
+/// The body of a `[keys.bind]` table, parsed as in the config file.
 const CHILD_BIND: &str = "NVMUX_TEST_RELAY_BIND";
 
-/// How long into the first relay that card is posted: after the first paint.
+/// When the card is posted: after the first paint.
 const POST_AFTER: Duration = Duration::from_millis(1500);
 
-/// Set on a child that asks its relay to say when the session has painted
-/// (see `nvmux::pty::Attachment::tell_when_painted`), and writes [`PAINTED`]
-/// when told — or [`UNPAINTED`] if it is let go of untold.
+/// Child uses `nvmux::pty::Attachment::tell_when_painted` and writes
+/// [`PAINTED`] when told, or [`UNPAINTED`] if dropped untold.
 const CHILD_PAINTED: &str = "NVMUX_TEST_RELAY_PAINTED";
 
-/// What that child writes when told, and when let go of untold.
 const PAINTED: &[u8] = b"\x1b]9999;painted\x07";
 const UNPAINTED: &[u8] = b"\x1b]9999;unpainted\x07";
 
-/// What a posted card says, so that the parent can find it on the screen.
+/// A posted card's text, for the parent to find on screen.
 const POSTED: &str = "posted for the session in front";
 
-/// The exit code of a child whose relay ended in a switch to a session by
-/// its id, which only `<prefix> Enter` on a card asks for.
+/// Exit code for a relay ending in a switch by session id, which only
+/// `<prefix> Enter` on a card requests.
 const SWITCHED_BY_CARD: i32 = 5;
 
-/// The fade a child draws, both ways, in milliseconds, where the default is
-/// not what the test wants (see [`LONG_FADE_MS`]). Only a child with a
-/// palette (see [`CHILD_PALETTE`]) has a fade to draw.
+/// Fade duration in milliseconds; needs [`CHILD_PALETTE`].
 const CHILD_FADE_MS: &str = "NVMUX_TEST_RELAY_FADE_MS";
 
-/// What a keeping child writes once its client is parked, so the parent knows
-/// the relay has let go of the terminal: an OSC no terminal acts on, which
-/// the screen the tests read is none the worse for.
+/// Written once the client is parked, so the parent knows the relay released
+/// the terminal. An OSC no terminal acts on.
 const PARKED: &[u8] = b"\x1b]9999;parked\x07";
 
-/// The rows and columns of the pty every [`Terminal`] opens. Named because the
-/// hint bar's whole geometry is "the last row", and a test that asks what is on
-/// it has to agree with the child about which row that is.
+/// Pty size for every [`Terminal`]; tests must agree with the child on which
+/// row is the last (the hint bar's).
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 
-/// The client's kitty keyboard query and DA1, and the terminal's answers. The
-/// kitty reply says "supported, no flags set yet"; the DA1 reply is a
-/// VT220's. A terminal without the kitty protocol answers only the DA1, and
-/// the client then falls back to `modifyOtherKeys`.
+/// The client's kitty keyboard query and DA1, and replies: kitty "supported,
+/// no flags yet", DA1 as a VT220. Without the kitty reply, the client falls
+/// back to `modifyOtherKeys`.
 const KITTY_QUERY: &[u8] = b"\x1b[?u";
 const KITTY_REPLY: &[u8] = b"\x1b[?0u";
 const DA1: &[u8] = b"\x1b[c";
 const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
-/// What the client sends to turn `modifyOtherKeys` on.
+/// Enables `modifyOtherKeys`.
 const XTERM_PUSH: &[u8] = b"\x1b[>4;2m";
-/// The client asking whether the terminal reports its size in band (DEC mode
-/// 2048), and a terminal that does saying so — supported, and not yet set.
+/// In-band resize (DEC mode 2048) query, and a "supported, not set" reply.
 const IN_BAND_QUERY: &[u8] = b"\x1b[?2048$p";
 const IN_BAND_REPLY: &[u8] = b"\x1b[?2048;2$y";
 
-/// The child half: attach to the session named in the environment and relay
-/// until the prefix machine ends it, then say how through the exit code.
-///
-/// Ignored so `cargo test` does not run it on its own; the parent runs it with
-/// `--ignored --exact`. Without the environment it does nothing, so a stray
-/// `--ignored` run is harmless.
+/// The child half: relay the session from the environment and report how it
+/// ended via the exit code. Ignored, so only the parent runs it (`--ignored
+/// --exact`); without the environment it does nothing.
 #[test]
 #[ignore = "the child half of the relay tests; run by them, not by hand"]
 fn relay_child() {
     let (Ok(sock), Ok(id)) = (std::env::var(CHILD_SOCK), std::env::var(CHILD_ID)) else {
         return;
     };
-    // The defaults, but with a command wait no scheduler hiccup can beat —
-    // the gap the parent leaves between the prefix and its command is meant
-    // to clear the sequence wait, not to race this one — and the client kept
-    // only in a child that asks for it (CHILD_KEEP): the tests about spellings
-    // and the hint row are about a relay that never parks.
+    // A command timeout no scheduler hiccup can hit (the parent's gap after
+    // the prefix is meant to clear the sequence wait, not race this), and
+    // clients kept only with CHILD_KEEP.
     let mut settings = nvmux::config::with_prefix(nvmux::keys::PREFIX);
     settings.keys.timeout_ms = 10_000;
-    // Neovim's own client, which these tests are about: it is the one that
-    // negotiates the keyboard with the terminal through the relay, and the
-    // default's own client is `nvmux --client`, which this binary is not.
+    // Neovim's client negotiates the keyboard through the relay; the default
+    // `nvmux --client` is not this binary.
     settings.client.ui = nvmux::config::Ui::Nvim;
     let own = std::env::var_os(CHILD_OWN).is_some();
     if own {
@@ -197,9 +148,8 @@ fn relay_child() {
     }
     let keep = std::env::var_os(CHILD_KEEP).is_some();
     settings.client.per_session = keep;
-    // The picker full screen, which ends the relay: where these tests park a
-    // kept client, and what a moved picker key is seen to do. Floating, it
-    // would stay in the relay, over the session.
+    // A full-screen picker ends the relay, which is where these tests park
+    // and observe moved picker keys; a floating one stays in the relay.
     settings.style.float = false;
     if let Ok(bind) = std::env::var(CHILD_BIND) {
         let moved: nvmux::config::Settings =
@@ -214,11 +164,8 @@ fn relay_child() {
     }
     nvmux::config::init(settings);
 
-    // Without this the fade is off — `palette::get` is `None`, so `fade::enabled`
-    // is false — and there is no shadow of the session's screen. The tests about
-    // spellings want it that way: no fade means no held first paint and no
-    // frames, so what reaches the parent is the client's own bytes and nothing
-    // else. The bar test needs the shadow, and says so.
+    // Without a palette there is no fade or shadow, so the parent sees only
+    // the client's bytes, as the encoding tests want.
     if std::env::var_os(CHILD_PALETTE).is_some() {
         nvmux::palette::init(Some(nvmux::palette::Palette {
             fg: nvmux::palette::Rgb(PALETTE_FG, PALETTE_FG, PALETTE_FG),
@@ -227,9 +174,7 @@ fn relay_child() {
         }));
     }
 
-    // An empty notice announces nothing, and is the one most of these tests
-    // want: they are about the prefix reaching the machine, and a message in
-    // the editor would be noise in the stream the parent is reading.
+    // Empty by default: an announcement would be noise in the stream.
     let label = std::env::var(CHILD_LABEL).unwrap_or_default();
     let mut pool = nvmux::pool::Pool::configured();
     let mut attachment = if std::env::var_os(CHILD_AHEAD).is_some() {
@@ -306,8 +251,7 @@ fn relay_child() {
     let code = loop {
         match nvmux::pty::relay(attachment, 0, &mut landing) {
             Ok((nvmux::pty::Outcome::Detached, _)) => break 0,
-            // The picker's place, in a child that keeps its client: parked for
-            // as long as a picker might have been up, then taken back.
+            // Instead of the picker: park, wait, take back.
             Ok((nvmux::pty::Outcome::ToPicker, held)) if keep => {
                 assert!(pool.set_aside(held).is_none(), "the client was not parked");
                 let mut out = std::io::stdout();
@@ -318,8 +262,7 @@ fn relay_child() {
                     nvmux::pool::Taken::Kept(back) => *back,
                     other => panic!("the parked client did not come back: {other:?}"),
                 };
-                // Back in place of another session's, as far as the notice is
-                // concerned: what `main` asks of a kept client that is.
+                // As `main` does for a resumed client.
                 if !label.is_empty() {
                     attachment.announce_on_arrival(label.clone());
                 }
@@ -341,10 +284,9 @@ fn relay_child() {
     std::process::exit(code);
 }
 
-/// A client started as `main` starts one ahead, held by the pool for
-/// [`AHEAD_FOR`] — or [`CHILD_AHEAD_MS`] — and then taken back, never yet
-/// relayed, with its probe answered, which a local server does in well under
-/// that. nvmux's own if `own`.
+/// Start a client ahead as `main` does, pool it for [`AHEAD_FOR`] (or
+/// [`CHILD_AHEAD_MS`]), and take it back unrelayed with its probe answered (a
+/// local server answers well within that). nvmux's own client if `own`.
 fn start_ahead(
     pool: &mut nvmux::pool::Pool,
     id: &str,
@@ -376,81 +318,58 @@ fn start_ahead(
     back
 }
 
-/// Which keyboard protocol the fake terminal admits to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
-    /// Answers the kitty query, so the client pushes the kitty protocol.
     Kitty,
-    /// Ignores it, so the client falls back to `modifyOtherKeys`.
+    /// Ignores the kitty query, so the client uses `modifyOtherKeys`.
     Xterm,
 }
 
-/// The terminal side of a relay running in a child process.
 struct Terminal {
     protocol: Protocol,
-    /// Whether this terminal claims in-band size reports (DEC mode 2048),
-    /// which a client then turns on and takes its size from instead of from
-    /// `SIGWINCH`.
+    /// Claims in-band size reports (DEC mode 2048), which the client then
+    /// uses instead of `SIGWINCH`.
     in_band: bool,
     child: std::process::Child,
-    /// The exit code, once the child has been seen to exit; it must not be
-    /// signalled or waited for again after that.
+    /// Set once the child exited; it must not be signalled or waited on again.
     exited: Option<u32>,
-    /// The pty's master, which what is typed goes in through and the
-    /// terminal's size is set on. Held so the pty outlives the child, which
-    /// `Drop` reaps before the fields go.
+    /// The pty master. Held so the pty outlives the child, which `Drop` reaps
+    /// before the fields drop.
     pty: Pty,
-    /// Everything the child has written, in order.
     output: Vec<u8>,
-    /// How far `output` has been scanned for queries.
+    /// How far `output` was scanned for queries.
     answered: usize,
     incoming: mpsc::Receiver<Vec<u8>>,
 }
 
-/// What a [`Terminal`]'s child is asked for, past the session and the
-/// protocol: each is one of the `CHILD_*` switches, and none is the default.
+/// The `CHILD_*` switches for a [`Terminal`]'s child (`shadow` is
+/// [`CHILD_PALETTE`]; `in_band` is the terminal's), all off by default.
 #[derive(Default)]
 struct Asks {
-    /// [`CHILD_PALETTE`].
     shadow: bool,
-    /// [`CHILD_KEEP`].
     keep: bool,
-    /// Whether the terminal reports its size in band (DEC mode 2048).
     in_band: bool,
-    /// [`CHILD_AHEAD`].
     ahead: bool,
-    /// [`CHILD_AHEAD_MS`].
     ahead_ms: Option<u64>,
-    /// [`CHILD_PARKED_MS`].
     parked_ms: Option<u64>,
-    /// [`CHILD_LABEL`].
     label: Option<&'static str>,
-    /// [`CHILD_FADE_MS`].
     fade_ms: Option<u64>,
-    /// [`CHILD_OWN`].
     own: bool,
-    /// [`CHILD_POST`]: where the posted card goes.
     post: Option<&'static str>,
-    /// [`CHILD_LANDS`]: what a switch lands with.
     lands: Option<&'static str>,
-    /// [`CHILD_STEPS`].
     steps: bool,
-    /// [`CHILD_BIND`]: the commands moved, as a `[keys.bind]` table says it.
     bind: Option<&'static str>,
-    /// [`CHILD_PAINTED`].
     painted: bool,
 }
 
 impl Terminal {
-    /// Re-run this test binary as `relay_child` on a fresh pty, with no palette
-    /// and so no fade, and a client that is not kept — what every test about a
-    /// spelling wants.
+    /// Re-run this binary as `relay_child` on a fresh pty: no palette (so no
+    /// fade) and no kept client, as the encoding tests want.
     fn spawn(sock: &Path, id: &str, protocol: Protocol) -> Self {
         Self::spawn_with(sock, id, protocol, false)
     }
 
-    /// [`Terminal::spawn`], with `shadow` asking the child for the palette that
-    /// gives it a shadow of the session's screen (see [`CHILD_PALETTE`]).
+    /// [`Terminal::spawn`], with [`CHILD_PALETTE`] if `shadow`.
     fn spawn_with(sock: &Path, id: &str, protocol: Protocol, shadow: bool) -> Self {
         Self::spawn_child(
             sock,
@@ -463,8 +382,7 @@ impl Terminal {
         )
     }
 
-    /// A child that keeps its client (see [`CHILD_KEEP`]), on a terminal that
-    /// reports its size in band if `in_band`, and with the fade on if `fade`.
+    /// A [`CHILD_KEEP`] child.
     fn spawn_keeping(sock: &Path, id: &str, in_band: bool, fade: bool) -> Self {
         Self::spawn_child(
             sock,
@@ -479,9 +397,8 @@ impl Terminal {
         )
     }
 
-    /// A child whose client is started ahead of its first visit (see
-    /// [`CHILD_AHEAD`]) and kept, as `[client] lazy = false` leaves it with
-    /// the defaults, with the fade on if `fade`.
+    /// A [`CHILD_AHEAD`] child that also keeps its client, as with the
+    /// default config.
     fn spawn_ahead(sock: &Path, id: &str, fade: bool) -> Self {
         Self::spawn_child(
             sock,
@@ -496,8 +413,7 @@ impl Terminal {
         )
     }
 
-    /// A child that announces the session as `label` (see [`CHILD_LABEL`]),
-    /// and keeps its client if `keep`.
+    /// A [`CHILD_LABEL`] child.
     fn spawn_announcing(sock: &Path, id: &str, label: &'static str, keep: bool) -> Self {
         Self::spawn_child(
             sock,
@@ -533,20 +449,17 @@ impl Terminal {
             .expect("size the pty");
 
         let mut cmd = Command::new(std::env::current_exe().expect("current exe"))
-            // `--nocapture`, or the child's diagnostics would sit in libtest's
-            // capture buffer when it exits, and never reach this pty.
+            // Otherwise the child's diagnostics stay in libtest's capture
+            // buffer and never reach this pty.
             .args(["--ignored", "--exact", "relay_child", "--nocapture"])
             .env(CHILD_SOCK, sock)
             .env(CHILD_ID, id)
-            // What Windows Terminal, and most others, set. Not that it matters
-            // for the kitty query, which is sent whatever the terminal claims
-            // to be; but the `modifyOtherKeys` fallback is withheld from a
-            // terminal that says it is an old VTE.
+            // As most terminals set. The kitty query is sent regardless, but
+            // the `modifyOtherKeys` fallback is withheld from old VTE.
             .env("TERM", "xterm-256color")
             .env_remove("VTE_VERSION")
-            // `NO_COLOR` forces the fade off whatever the config says, and with
-            // it the shadow: removed so the child's screen does not depend on
-            // the environment whoever ran `cargo test` happened to have.
+            // `NO_COLOR` forces the fade and shadow off; keep the child
+            // independent of the caller's environment.
             .env_remove("NO_COLOR");
         if shadow {
             cmd = cmd.env(CHILD_PALETTE, "1");
@@ -587,7 +500,7 @@ impl Terminal {
         if painted {
             cmd = cmd.env(CHILD_PAINTED, "1");
         }
-        // Takes the slave, or the master would never see EOF once the child
+        // Moves the slave in, or the master never sees EOF after the child
         // exits.
         let child = cmd.spawn(pts).expect("spawn relay child");
 
@@ -619,9 +532,8 @@ impl Terminal {
         }
     }
 
-    /// Relay output for up to `within`, answering the client's queries as the
-    /// terminal would, until `done` holds over everything received so far.
-    /// Returns whether it did.
+    /// Read output for up to `within`, answering queries, until `done` holds
+    /// for all output so far. Returns whether it did.
     fn pump_until(&mut self, within: Duration, done: impl Fn(&[u8]) -> bool) -> bool {
         let deadline = Instant::now() + within;
         loop {
@@ -643,9 +555,8 @@ impl Terminal {
         }
     }
 
-    /// Answer every query in the output not yet answered. A query may straddle
-    /// two reads, so the scan restarts a little before where it left off and
-    /// counts only matches that end past it.
+    /// Answer new queries. One may straddle two reads, so the scan backs up a
+    /// little and counts only matches ending past the last scan.
     fn answer(&mut self) {
         let from = self.answered.saturating_sub(8);
         let mut replies = Vec::new();
@@ -668,7 +579,7 @@ impl Terminal {
                 at = i + query.len();
             }
         }
-        // In the order the client asked, which is the order it expects.
+        // In the order asked, as the client expects.
         replies.sort_by_key(|&(i, _)| i);
         for (_, reply) in replies {
             self.reply(reply);
@@ -676,9 +587,9 @@ impl Terminal {
         self.answered = self.output.len();
     }
 
-    /// Answer the child as its terminal would, and not at all once it has
-    /// gone: what it asks on its way out it does not wait for, and may be
-    /// read only after, when a write to the pty fails on macOS.
+    /// Reply unless the child exited: it does not wait for replies to what it
+    /// asks on exit, which may be read only afterwards, when a pty write fails
+    /// on macOS.
     fn reply(&mut self, bytes: &[u8]) {
         if self.exited.is_some() {
             return;
@@ -701,8 +612,8 @@ impl Terminal {
         self.pty.flush().expect("flush pty");
     }
 
-    /// The child's exit code, if it exits within `within`, with all it wrote
-    /// on its way out read.
+    /// The child's exit code if it exits within `within`, with all its output
+    /// read.
     fn exit_code(&mut self, within: Duration) -> Option<u32> {
         let deadline = Instant::now() + within;
         while self.exited.is_none() && Instant::now() < deadline {
@@ -710,12 +621,11 @@ impl Terminal {
                 self.exited = Some(common::exit_code(status));
                 break;
             }
-            // Keep answering: the client's own exit waits on a DA1 reply.
+            // Keep answering: the client's exit waits on a DA1 reply.
             self.pump_until(Duration::from_millis(50), |_| false);
         }
-        // Its last frames can still be on their way from the pty when it is
-        // seen to have gone: read on to the end of what it wrote, which the
-        // reader comes to once nothing has the pty's slave open.
+        // Its last frames may still be in flight: read to EOF, which comes
+        // once nothing holds the slave open.
         if self.exited.is_some() {
             self.pump_until(Duration::from_secs(5), |_| false);
         }
@@ -736,8 +646,7 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // A child already reaped must not be signalled: its pid may be
-        // someone else's by now.
+        // A reaped child's pid may have been reused.
         if self.exited.is_none() {
             common::hang_up_and_reap(&mut self.child);
         }
@@ -748,9 +657,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// The flags of the client's kitty keyboard push, `CSI > flags u`, if it has
-/// sent one. Neovim 0.10 and 0.11 push 1, 0.12 pushes 3; matched by shape so
-/// the test follows whichever Neovim is installed.
+/// Flags of the client's kitty push `CSI > flags u`, if sent. Neovim 0.10 and
+/// 0.11 push 1, 0.12 pushes 3, so match by shape.
 fn kitty_push_flags(out: &[u8]) -> Option<u32> {
     let mut at = 0;
     while let Some(i) = find(&out[at..], b"\x1b[>").map(|i| at + i) {
@@ -767,9 +675,8 @@ fn kitty_push_flags(out: &[u8]) -> Option<u32> {
     None
 }
 
-/// Attach a real client to a real session, let it negotiate `protocol`, then
-/// type the prefix spelled as `prefix` followed by `d`, and expect a detach —
-/// with nothing reaching the editor on the way.
+/// Attach a real client, let it negotiate `protocol`, type `prefix` then `d`,
+/// and expect a detach.
 fn detaches_with(tag: &str, protocol: Protocol, prefix: &[u8]) {
     require_nvim!();
     let scratch = Scratch::new(tag);
@@ -781,9 +688,8 @@ fn detaches_with(tag: &str, protocol: Protocol, prefix: &[u8]) {
 
     let mut term = Terminal::spawn(&sock, &session.id, protocol);
 
-    // The client only spells keys the new way once it has turned the
-    // protocol on, and it only does that after our replies reach it —
-    // through nvmux, in both directions.
+    // The client enables the protocol only after our replies reach it
+    // through nvmux.
     let pushed = match protocol {
         Protocol::Kitty => term.pump_until(Duration::from_secs(15), |out| {
             kitty_push_flags(out).is_some_and(|flags| flags & 1 != 0)
@@ -802,17 +708,16 @@ fn detaches_with(tag: &str, protocol: Protocol, prefix: &[u8]) {
 
     term.type_bytes(prefix);
     if flags & 2 != 0 {
-        // A client that asked for release reports gets one for the prefix,
-        // which must not count as its command.
+        // With release reports on, the prefix's release must not count as
+        // its command.
         term.type_bytes(b"\x1b[32;5:3u");
     }
     // A human gap, well past the sequence wait.
     term.pump_until(Duration::from_millis(150), |_| false);
     term.type_bytes(b"d");
 
-    // The detach is the whole signal, and a leak has nowhere else to show: a
-    // prefix that reached the editor would leave `d` pending there as an
-    // operator — silent on screen — and no detach would ever happen.
+    // The detach is the only signal: a leaked prefix would leave `d` pending
+    // silently as an operator.
     let code = term.exit_code(Duration::from_secs(10));
     assert_eq!(
         code,
@@ -826,22 +731,18 @@ fn detaches_with(tag: &str, protocol: Protocol, prefix: &[u8]) {
     );
 }
 
-/// The bug as reported: Windows Terminal 1.25 with the kitty keyboard
-/// protocol, where the prefix arrives as `CSI 32 ; 5 u`.
+/// The reported bug: Windows Terminal 1.25 with the kitty protocol.
 #[test]
 fn a_kitty_encoded_prefix_detaches_through_a_real_client() {
     detaches_with("kitty", Protocol::Kitty, b"\x1b[32;5u");
 }
 
-/// A terminal without the kitty protocol, where the client falls back to
-/// `modifyOtherKeys` and the prefix arrives as `CSI 27 ; 5 ; 32 ~`.
 #[test]
 fn an_xterm_encoded_prefix_detaches_through_a_real_client() {
     detaches_with("xterm", Protocol::Xterm, b"\x1b[27;5;32~");
 }
 
-/// And the control byte still works, in a terminal that speaks the protocol
-/// too: Neovim accepts both, and so must the machine.
+/// Neovim accepts `NUL` even with the protocol on, so the machine must too.
 #[test]
 fn the_control_byte_still_detaches_through_a_real_client() {
     detaches_with("byte", Protocol::Kitty, b"\x00");
@@ -851,26 +752,19 @@ fn the_control_byte_still_detaches_through_a_real_client() {
 fn the_push_is_matched_by_shape() {
     assert_eq!(kitty_push_flags(b"\x1b[?2004h\x1b[>1u\x1b[?1004h"), Some(1));
     assert_eq!(kitty_push_flags(b"\x1b[>3u"), Some(3));
-    // The terminal's own reply, the xterm push, and a pop are not pushes.
+    // The terminal's reply, the xterm push and a pop are not pushes.
     assert_eq!(kitty_push_flags(b"\x1b[?0u\x1b[>4;2m\x1b[<u"), None);
     assert_eq!(kitty_push_flags(b"\x1b[>"), None);
 }
 
-/// One row of the screen the child's output describes, as a terminal would show
-/// it.
-///
-/// The byte stream cannot answer this question. nvmux's writes, the client's
-/// paints and the fade's frames all cross the same wire in whatever order the
-/// relay managed, and "the bar is gone" is a statement about cells rather than
-/// about bytes — so the test keeps a parser, as `src/shadow.rs` keeps one, and
-/// reads the row off it.
+/// One row of the screen `out` produces. nvmux, client and fade output
+/// interleave, so rows are read from a parser, not the bytes.
 fn row_on_screen(out: &[u8], row: u16) -> String {
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     parser.process(out);
     row_of(parser.screen(), row)
 }
 
-/// One row of a parsed screen, as text, trimmed.
 fn row_of(screen: &vt100::Screen, row: u16) -> String {
     (0..COLS)
         .map(|col| match screen.cell(row, col) {
@@ -882,25 +776,17 @@ fn row_of(screen: &vt100::Screen, row: u16) -> String {
         .to_string()
 }
 
-/// What a terminal could have put on the glass of `row`, at every moment it
-/// could have put anything there: the end of each synchronized update, and
-/// every byte of what is written outside one. A run of moments that show the
-/// same thing is one, at the first of them, and each comes with how far into
-/// `out` it is.
-///
-/// [`row_on_screen`] reads the end of the stream, where a row wiped by every
-/// frame of the session's and put back after each looks exactly like one that
-/// was never touched. What the user sees is everything in between, because a
-/// terminal presents on a clock of its own: outside an update it may show any
-/// prefix of the stream, and inside one only the whole of it.
+/// Every distinct state `row` could be presented in, with its offset: after
+/// each byte outside a synchronized update, and at each update's end. Unlike
+/// [`row_on_screen`], this catches a row wiped and restored by every frame.
 fn presented(out: &[u8], row: u16) -> Vec<(usize, String)> {
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     let mut moments: Vec<(usize, String)> = Vec::new();
     let mut held = false;
     for (i, byte) in out.iter().enumerate() {
         parser.process(std::slice::from_ref(byte));
-        // Held as a mode, as terminals hold it: a second begin inside an
-        // update changes nothing, and the first end lets it all go.
+        // A mode, as in terminals: nested begins do nothing, the first end
+        // releases.
         let so_far = &out[..=i];
         if so_far.ends_with(nvmux::fade::SYNC_BEGIN) {
             held = true;
@@ -918,20 +804,10 @@ fn presented(out: &[u8], row: u16) -> Vec<(usize, String)> {
     moments
 }
 
-/// The prefix puts the key row up over a live editor, and the next key takes it
-/// off again with the editor's own row underneath it — the two halves of the
-/// feature, neither of which is visible from a unit test.
-///
-/// `<prefix> <prefix>` is the dismissal to test on, because it is one of the
-/// three that leave the relay *running*: the picker, a detach and a switch all
-/// end it, and there the screen is dissolved or cleared on the way out and would
-/// clear the bar whether or not anything had taken it off. Here nothing else
-/// touches the row, so if the bar is still on it, it stays.
-///
-/// `shadow` picks which way the row is put back, and both have to work: from the
-/// shadow's copy of the screen, which is local and exact, or — with the fade off,
-/// and so no shadow — by blanking the row and asking the server to repaint it,
-/// the way the attach notice always leaves.
+/// Dismissed with `<prefix> <prefix>`, which keeps the relay running; the
+/// picker, detach and switch clear the screen and would hide a stuck bar.
+/// `shadow` picks restoring from the shadow, or blanking and asking the server
+/// to repaint, as the attach notice does.
 fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
     require_nvim!();
     let scratch = Scratch::new(tag);
@@ -940,11 +816,8 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
         .create_session(&common::unique(tag), &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
-    // No 'showcmd': the literal prefix below reaches Neovim, which shows the
-    // key it was given there — `<20>`, for the space in Ctrl-Space — on the
-    // very row this reads, until the key is done with. Whether that frame is
-    // read before the bar is down or after is the runner's timing, not the
-    // relay's.
+    // The literal prefix below reaches Neovim, whose 'showcmd' would show
+    // `<20>` on the row under test for a timing-dependent moment.
     nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
         .expect("connect")
         .command("set noshowcmd")
@@ -952,7 +825,6 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
 
     let mut term = Terminal::spawn_with(&sock, &session.id, Protocol::Kitty, shadow);
 
-    // The client is up and painting once it has turned the protocol on.
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
             kitty_push_flags(out).is_some()
@@ -960,19 +832,17 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
         "the client never started; got: {}",
         term.since(0)
     );
-    // Let the first paint land: with the fade on it is held back and dissolved
-    // in, so the screen the bar covers does not exist until that is over.
+    // Wait for the first paint; with the fade on it is held and dissolved in.
     term.pump_until(Duration::from_secs(2), |out| {
         !row_on_screen(out, 0).is_empty()
     });
     let under = row_on_screen(&term.output, ROWS - 1);
 
-    // The prefix alone. The child's `timeout_ms` is ten seconds, so the bar has
-    // as long as it needs to find a lull.
+    // The prefix alone; the child's 10 s `timeout_ms` leaves the bar time to
+    // find a lull.
     term.type_bytes(&[nvmux::keys::PREFIX]);
     let mark = term.output.len();
-    // The whole of the row, not as far as a read happens to end in the
-    // middle of the write that draws it.
+    // Wait for the whole row, not a read that ended mid-write.
     let listed = term.pump_until(Duration::from_secs(10), |out| {
         let row = row_on_screen(out, ROWS - 1);
         row.contains("␣ picker") && row.contains("d detach")
@@ -989,8 +859,8 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
         row_on_screen(&term.output, ROWS - 1)
     );
 
-    // A second prefix is a literal: Neovim gets the byte and the relay carries
-    // on, so the bar has to take itself off.
+    // A second prefix is sent literally and the relay continues, so the bar
+    // must remove itself.
     let mark = term.output.len();
     term.type_bytes(&[nvmux::keys::PREFIX]);
     let back = term.pump_until(Duration::from_secs(10), |out| {
@@ -1008,7 +878,6 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
         "the editor's own row did not come back"
     );
 
-    // And the relay really is still running: the prefix still detaches.
     term.type_bytes(&[nvmux::keys::PREFIX]);
     term.pump_until(Duration::from_millis(150), |_| false);
     term.type_bytes(b"d");
@@ -1020,15 +889,13 @@ fn the_hint_row_goes_up_and_comes_down(tag: &str, shadow: bool) {
     );
 }
 
-/// The ordinary path: a shadow of the session's screen, so the row goes back
-/// exactly and nothing is asked of the server.
+/// With a shadow: restored locally, nothing asked of the server.
 #[test]
 fn a_prefix_raises_the_hint_row_and_the_next_key_takes_it_off() {
     the_hint_row_goes_up_and_comes_down("hint", true);
 }
 
-/// One row of the screen the child's output describes, the terminal made
-/// `rows` tall `at` that far into it, as the test made it.
+/// [`row_on_screen`] with the terminal resized to `rows` at offset `at`.
 fn row_on_resized_screen(out: &[u8], at: usize, rows: u16, row: u16) -> String {
     let at = at.min(out.len());
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
@@ -1038,11 +905,8 @@ fn row_on_resized_screen(out: &[u8], at: usize, rows: u16, row: u16) -> String {
     row_of(parser.screen(), row)
 }
 
-/// The terminal made taller while a session is attached: the hint row the
-/// prefix puts up goes on its new last row. The relay reads the terminal's
-/// size when it starts and again on each `SIGWINCH`, not on every pass, so a
-/// size not read again would put the bar on the old last row, now rows above
-/// the bottom.
+/// The relay reads the size at start and on `SIGWINCH` only; a missed update
+/// would put the bar on the old last row.
 #[test]
 fn the_hint_row_goes_on_the_last_row_of_a_terminal_made_taller() {
     require_nvim!();
@@ -1053,8 +917,7 @@ fn the_hint_row_goes_on_the_last_row_of_a_terminal_made_taller() {
         .create_session(&common::unique(tag), &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
-    // No 'showcmd', as for the bar above: the key Neovim shows would be on
-    // the row this reads.
+    // No 'showcmd', as above.
     nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
         .expect("connect")
         .command("set noshowcmd")
@@ -1072,7 +935,6 @@ fn the_hint_row_goes_on_the_last_row_of_a_terminal_made_taller() {
         !row_on_screen(out, 0).is_empty()
     });
 
-    // Four rows taller, while attached, and the editor redrawn for it.
     let taller = ROWS + 4;
     let resized = term.output.len();
     term.pty
@@ -1093,8 +955,7 @@ fn the_hint_row_goes_on_the_last_row_of_a_terminal_made_taller() {
         term.since(mark)
     );
 
-    // And the relay goes on: a literal prefix takes the bar down, and the
-    // prefix still detaches.
+    // A literal prefix takes the bar down, then detach.
     term.type_bytes(&[nvmux::keys::PREFIX]);
     term.pump_until(Duration::from_millis(300), |_| false);
     term.type_bytes(&[nvmux::keys::PREFIX]);
@@ -1108,38 +969,24 @@ fn the_hint_row_goes_on_the_last_row_of_a_terminal_made_taller() {
     );
 }
 
-/// And with the fade off there is no shadow, so the bar blanks its row and the
-/// relay asks the server for what was under it — the one path on which taking
-/// the bar down costs a round trip, and the one a `NO_COLOR` user is on.
+/// Fade off (e.g. `NO_COLOR`), no shadow: the row is blanked and repainted by
+/// the server.
 #[test]
 fn the_hint_row_comes_down_through_the_server_without_a_shadow() {
     the_hint_row_goes_up_and_comes_down("hint-no-shadow", false);
 }
 
-/// How often the editor redraws its last row in
-/// [`the_hint_row_stays_over_a_last_row_that_keeps_changing`]: about as often
-/// as a language server reports progress while it indexes, and far enough
-/// apart for a lull between two of them.
+/// Last-row redraw interval, like LSP progress while indexing, with lulls.
 const TICK_MS: u64 = 50;
 
-/// A last row the editor keeps redrawing — a statusline with a language
-/// server's progress in it — does not show through the bar while the prefix
-/// waits: at every moment the terminal could have presented, from the bar
-/// going up to the key that takes it down, the row is the bar, whole.
+/// A constantly redrawn last row must never show through the bar at any
+/// moment the terminal could present. The statusline (`cmdheight=0`) is one
+/// letter across, changing every [`TICK_MS`] (letters: an all-digit `%{}` is
+/// read as a huge number). Regression: the bar was wiped by the next tick and
+/// restored only at the next lull.
 ///
-/// The row is a statusline with no command line under it (`cmdheight=0`),
-/// one letter the whole way across and the next letter every [`TICK_MS`], so
-/// every cell of the bar is drawn over on every tick. A letter rather than a
-/// digit, because a `%{}` that comes to nothing but digits is read as a
-/// number, and a row of them is one far too big to show. The ticks leave lulls,
-/// so a bar that waits for one goes up between them — which is how it used to
-/// be lost: wiped by the next tick, and put back at the lull after it.
-///
-/// `own` is whose client draws the session. Neovim's brackets nothing here,
-/// since this terminal never answers its `?2026` query, so the bar goes into
-/// a synchronized update nvmux opens around each of the client's writes;
-/// nvmux's own brackets every frame, and the bar goes in front of the
-/// frame's close.
+/// `own` picks the client: Neovim's brackets nothing (its `?2026` query goes
+/// unanswered), so nvmux wraps its writes; nvmux's own brackets each frame.
 fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) {
     require_nvim!();
     let scratch = Scratch::new(tag);
@@ -1149,7 +996,7 @@ fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) 
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
     let mut editor = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
-    // No 'showcmd', for the reason the test above gives.
+    // No 'showcmd', as above.
     for cmd in [
         "let g:n = 0",
         "set noshowcmd laststatus=2 cmdheight=0 \
@@ -1175,19 +1022,16 @@ fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) 
             ..Asks::default()
         },
     );
-    // One letter across the whole row: the statusline, as the editor has it.
+    // The statusline: one letter across the row.
     let ticking = |row: &str| {
         row.len() == usize::from(COLS)
             && row
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() && row.starts_with(b as char))
     };
-    // And not before the client's first paint has been let through. With the
-    // fade on, the row is on the screen first in the fade's frames, drawn from
-    // the shadow while the relay is still dissolving the paint in and reading
-    // no keys; the DA1 in the paint goes by only after them. Waiting on the
-    // row alone, the ticks were started and the prefix pressed in the middle
-    // of the fade, and the prefix was not read until the fade was over.
+    // Also wait for the DA1 in the first paint: the row appears earlier in
+    // fade frames drawn from the shadow, while the relay reads no keys, so a
+    // prefix sent then would not be read until the fade ended.
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
             find(out, DA1).is_some() && ticking(&row_on_screen(out, ROWS - 1))
@@ -1216,15 +1060,13 @@ fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) 
     );
     let before = ticks();
     term.pump_until(Duration::from_millis(20 * TICK_MS), |_| false);
-    // Ten ticks at the least, however long a busy machine takes over them,
-    // within the ten seconds the child gives the prefix to be resolved.
+    // At least ten ticks, within the child's 10 s prefix timeout.
     let enough = Instant::now() + Duration::from_secs(3);
     while ticks() < before + 10 && Instant::now() < enough {
         term.pump_until(Duration::from_millis(TICK_MS), |_| false);
     }
     let after = ticks();
-    // What the relay wrote before the key that takes the bar down: all of it
-    // was written with the bar wanted up.
+    // Everything before this was written while the bar should be up.
     let resolved = term.output.len();
     assert!(
         after >= before + 10,
@@ -1254,8 +1096,7 @@ fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) 
         &through[..through.len().min(3)]
     );
 
-    // A second prefix is a literal, and takes the bar down; the editor's row,
-    // still ticking, is what is left.
+    // A literal prefix takes the bar down; the ticking row returns.
     term.type_bytes(&[nvmux::keys::PREFIX]);
     assert!(
         term.pump_until(Duration::from_secs(10), |out| {
@@ -1274,21 +1115,17 @@ fn the_hint_row_stays_over_a_last_row_that_keeps_changing(tag: &str, own: bool) 
     );
 }
 
-/// Neovim's own client, whose writes nvmux has to hold together with the bar.
 #[test]
 fn the_hint_row_stays_over_a_last_row_that_keeps_changing_under_neovims_client() {
     the_hint_row_stays_over_a_last_row_that_keeps_changing("hint-tick", false);
 }
 
-/// nvmux's own client, the default, which brackets its frames itself.
 #[test]
 fn the_hint_row_stays_over_a_last_row_that_keeps_changing_under_its_own_client() {
     the_hint_row_stays_over_a_last_row_that_keeps_changing("hint-tick-own", true);
 }
 
-/// A command `[keys.bind]` moves runs on its new key through a real client, and
-/// the row the prefix puts up names that key: the machine and the bar both
-/// follow the config rather than the table's own keys.
+/// Both the machine and the hint row follow `[keys.bind]`.
 #[test]
 fn a_moved_command_runs_on_its_new_key_through_a_real_client() {
     require_nvim!();
@@ -1320,8 +1157,7 @@ fn a_moved_command_runs_on_its_new_key_through_a_real_client() {
         !row_on_screen(out, 0).is_empty()
     });
 
-    // The prefix as the kitty protocol spells it, which is how this terminal
-    // sends it now that the client has asked.
+    // Kitty-encoded, as this terminal now sends it.
     let mark = term.output.len();
     term.type_bytes(b"\x1b[32;5u");
     assert!(
@@ -1343,29 +1179,16 @@ fn a_moved_command_runs_on_its_new_key_through_a_real_client() {
     );
 }
 
-/// What a resumed relay writes before anything of the client's: back onto the
-/// alternate screen, and cleared. After it, whatever is on the screen is what
-/// the client has drawn since.
+/// Written by a resumed relay before any client output.
 const RESUMED: &[u8] = b"\x1b[?1049h\x1b[2J";
 
-/// With `[client] per_session`, a client that comes back to the front has
-/// its screen put straight back from the copy kept while it was parked, the
-/// server's own repaint asked for on top of it, and — if the terminal changed
-/// size meanwhile — the new size told to it: by the pty, or by an in-band
-/// report for a client on a terminal that sends those (`in_band`: DEC mode
-/// 2048, which such a client takes its size from instead of from `SIGWINCH`,
-/// and which the reports sent while it was parked never reached).
+/// A resumed client's screen comes back from the kept copy (the shadow, and
+/// dissolved in, with `fade`), with the server's repaint requested, and a new
+/// size passed via the pty or, with `in_band`, an in-band report (those sent
+/// while parked were lost).
 ///
-/// Three returns. At the same size, where nothing but the server's repaint
-/// clears the screen — so the one that comes was asked for. After the
-/// terminal was made narrower, where the server has to end up at the new
-/// size. And with the server spinning in Lua for the whole of the wait,
-/// unable to answer a repaint or anything else, where the screen has to come
-/// back all the same: from the kept copy, which is what the user looks at
-/// until the server is free.
-///
-/// With the fade on (`fade`), the copy is the fade's shadow and the screen is
-/// dissolved back in from it rather than painted straight back.
+/// Three resumes: same size (only the requested repaint clears the screen),
+/// narrower, and with the server busy in Lua (the copy must still show).
 fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
     require_nvim!();
     let scratch = Scratch::new(tag);
@@ -1376,16 +1199,13 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
     let sock = t.local_socket_for(&session).expect("socket path");
     let marker = "kept, and painted straight back";
     let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
-    // No swap file: two of these run at once, each with an unnamed buffer,
-    // and would otherwise race for the same one.
+    // No swap file: these run in parallel and would race for the same one.
     rpc.command(&format!(
         "setlocal noswapfile | call setline(1, '{marker}')"
     ))
     .expect("setline");
 
     let mut term = Terminal::spawn_keeping(&sock, &session.id, in_band, fade);
-    // Painted, and — on a terminal that offers them — taking its size in
-    // band, which the client turns on once the terminal's answers are in.
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
             row_on_screen(out, 0).contains(marker)
@@ -1399,10 +1219,9 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
         in_band,
         "the client did not take up in-band size reports as the terminal offered them"
     );
-    // A client is parked only once the terminal has answered its DA1. With
-    // the fade, the marker is on the screen in the fade's frames before the
-    // client's first paint, the DA1 in it, is let through: so until the DA1
-    // has gone by, and a moment for the answer to reach the client.
+    // A client is parked only after its DA1 is answered. With the fade the
+    // marker shows in fade frames before the paint carrying the DA1, so wait
+    // for the DA1 and a moment for the reply.
     assert!(
         term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
         "the client never asked its DA1; got: {}",
@@ -1410,11 +1229,8 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
     );
     term.pump_until(Duration::from_millis(300), |_| false);
 
-    // Away to the picker's place — parked, in the child — and back, at the
-    // same size, until the output after the resume has cleared the screen.
     let after = away_and_back(&mut term, |_| {});
-    // As far as row 0 of the repaint: a read can end part way through the
-    // write that clears the screen and draws it again.
+    // Through row 0 of the repaint; a read can end mid-write.
     let landed = term.pump_until(Duration::from_secs(5), |out| {
         find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
             && row_on_screen(out, 0).contains(marker)
@@ -1429,19 +1245,16 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
         "the repainted screen is not the session's: {:?}",
         row_on_screen(&term.output, 0)
     );
-    // Its mouse reporting was put back from what it told the terminal —
-    // Neovim's default `'mouse'` turns on button tracking — after the resume
-    // took the screen.
+    // Mouse reporting restored after the resume (Neovim's default `'mouse'`
+    // enables button tracking).
     assert!(
         find(&term.output[after..], b"\x1b[?1002h").is_some(),
         "the client's mouse reporting was not put back; the child wrote: {}",
         term.since(after)
     );
 
-    // Away again, the terminal made narrower while the client is parked, and
-    // back: the server has to be told the new size — through the pty for a
-    // client that listens to it, and, for one that takes its size in band and
-    // ignores the pty, only by the report nvmux writes it.
+    // Narrow the terminal while parked; an in-band client ignores the pty
+    // and learns the size only from nvmux's report.
     term.pump_until(Duration::from_millis(300), |_| false);
     let narrower = COLS - 20;
     away_and_back(&mut term, |term| {
@@ -1467,20 +1280,18 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
         width()
     );
 
-    // Away again, and this time the server made too busy to answer anything
-    // for longer than the rest of this waits.
+    // Again, with the server too busy to answer for longer than this waits.
     term.pump_until(Duration::from_millis(300), |_| false);
     let mark = term.output.len();
     term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
-    // Written `4 > …` rather than `… < 4`: the input is key notation, where
-    // a `<` would start a key name and take the `<CR>` with it.
+    // `4 > …`, not `… < 4`: in key notation `<` would start a key name.
     rpc.input(":lua local t = os.clock() while 4 > os.clock() - t do end<CR>")
         .expect("make the server busy");
     let came_back = term.pump_until(Duration::from_secs(3), |out| {
         let since = &out[mark.min(out.len())..];
         find(since, RESUMED).is_some() && row_on_screen(out, 0).contains(marker)
     });
-    // Asked after the screen came back, so it says the server was busy then.
+    // Checked after the screen came back: the server was busy then.
     let busy = nvmux::rpc::Client::connect(&sock, Duration::from_millis(300))
         .and_then(|mut c| c.get_mode())
         .is_err();
@@ -1496,7 +1307,6 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
          it came from"
     );
 
-    // And it is a live relay again: the prefix still detaches.
     term.type_bytes(&[nvmux::keys::PREFIX]);
     term.pump_until(Duration::from_millis(150), |_| false);
     term.type_bytes(b"d");
@@ -1508,9 +1318,9 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
     );
 }
 
-/// `<prefix> Space` to a keeping child, `meanwhile` done once the child has
-/// parked its client, and the child's resume waited for. Returns where in the
-/// output the resumed relay's own bytes begin.
+/// Send `<prefix> Space` to a keeping child, run `meanwhile` once parked, and
+/// wait for the resume. Returns the offset where the resumed relay's bytes
+/// begin.
 fn away_and_back(term: &mut Terminal, meanwhile: impl FnOnce(&mut Terminal)) -> usize {
     let mark = term.output.len();
     term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
@@ -1532,50 +1342,41 @@ fn away_and_back(term: &mut Terminal, meanwhile: impl FnOnce(&mut Terminal)) -> 
     mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len()
 }
 
-/// A client that takes its size from the pty, and so is told a new one by
-/// the resize alone.
 #[test]
 fn a_kept_clients_screen_comes_back_through_the_pty() {
     a_kept_clients_screen_comes_back("kept-pty", false, false);
 }
 
-/// A client that takes its size in band, and ignores the signal (kitty,
-/// ghostty, foot): told the new one with a report instead.
+/// Like kitty, Ghostty, foot: size comes in band, `SIGWINCH` is ignored.
 #[test]
 fn a_kept_clients_screen_comes_back_on_an_in_band_terminal() {
     a_kept_clients_screen_comes_back("kept-in-band", true, false);
 }
 
-/// With the fade on, as it is wherever the terminal answers the colour
-/// query: dissolved back in from the shadow, the pen and cursor then handed
-/// back to the client.
+/// The fade is on wherever the terminal answers the colour query; pen and
+/// cursor are handed back to the client after.
 #[test]
 fn a_kept_clients_screen_dissolves_back_in() {
     a_kept_clients_screen_comes_back("kept-fade", false, true);
 }
 
-/// The fade [`a_kept_clients_repaint_is_asked_under_its_fade_in`] has its
-/// child draw, both ways: as long as a fade is allowed to be, so that "while
-/// the fade in is still being drawn" is a second wide.
+/// The longest allowed fade, so "during the fade-in" is a wide window for
+/// [`a_kept_clients_repaint_is_asked_under_its_fade_in`].
 const LONG_FADE_MS: u64 = 2_000;
 
-/// A kept client's repaint is asked as its screen starts to dissolve back in,
-/// not once it has: the server redraws underneath frames nvmux draws from its
-/// copy, so the exact screen, which the copy stands in for until it comes, is
-/// there as the fade ends rather than a whole redraw after it.
+/// The repaint is requested as the fade-in starts, not after, so the server
+/// redraws under the fade and the exact screen is there when it ends.
 ///
-/// Seen from the server, which counts the windows it redraws. Idle, its
-/// client parked, it redraws none; half way through the fade in, the count
-/// has moved while nothing the client drew has reached the terminal yet — the
-/// repaint, which clears it, comes after the fade.
+/// The server counts window redraws: none while parked, some by mid-fade,
+/// while no client output has reached the terminal (the repaint's clear comes
+/// after the fade).
 #[test]
 fn a_kept_clients_repaint_is_asked_under_its_fade_in() {
     require_nvim!();
     let tag = "kept-early";
     let scratch = Scratch::new(tag);
     let t = scratch.transport();
-    // Clean, so nothing of a config redraws on a timer while the client is
-    // parked and the count is meant to be still.
+    // `--clean`, so no config redraws on a timer while parked.
     let session = t
         .create_session(
             &common::unique(tag),
@@ -1622,7 +1423,7 @@ fn a_kept_clients_repaint_is_asked_under_its_fade_in() {
         "the session never painted; got: {}",
         term.since(0)
     );
-    // Parked only once the terminal has answered the client's DA1.
+    // Parked only after the DA1 is answered.
     assert!(
         term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
         "the client never asked its DA1; got: {}",
@@ -1661,7 +1462,6 @@ fn a_kept_clients_repaint_is_asked_under_its_fade_in() {
          for the fade to be over"
     );
 
-    // And it lands once the fade is over, with the session's screen.
     let landed = term.pump_until(Duration::from_secs(5), |out| {
         repainted(out) && row_on_screen(out, 0).contains(marker)
     });
@@ -1683,16 +1483,10 @@ fn a_kept_clients_repaint_is_asked_under_its_fade_in() {
     );
 }
 
-/// `[client] lazy = false`, end to end. A client started ahead of its first
-/// visit is a UI of its session from the start, and says nothing to the
-/// terminal until that visit; then it says everything, its startup questions
-/// first, which the terminal answers late and the client acts on as though
-/// they had come at once: it draws the session's screen and turns the kitty
-/// protocol on, leaves the front and comes back as a kept client, and a
-/// prefix spelled that way detaches.
-///
-/// With the fade on (`fade`), what it kept goes through the hold, as a fresh
-/// client's first paint does, and is dissolved in.
+/// `[client] lazy = false`: a client started ahead is attached but writes
+/// nothing until its first visit; then its startup queries are answered late
+/// and acted on, and it behaves as any kept client. With `fade`, its output is
+/// held and dissolved in like a fresh first paint.
 fn a_client_started_ahead_negotiates_on_its_first_visit(tag: &str, fade: bool) {
     require_nvim!();
     let scratch = Scratch::new(tag);
@@ -1715,7 +1509,6 @@ fn a_client_started_ahead_negotiates_on_its_first_visit(tag: &str, fade: bool) {
         "the child never started its client; it wrote: {}",
         term.since(0)
     );
-    // Attached to its server, while the child still holds it.
     assert!(
         common::wait_until(AHEAD_FOR / 2, || {
             nvmux::rpc::Client::connect(&sock, Duration::from_secs(2))
@@ -1724,7 +1517,6 @@ fn a_client_started_ahead_negotiates_on_its_first_visit(tag: &str, fade: bool) {
         }),
         "the client started ahead never attached to its session"
     );
-    // And not a word of it on the terminal.
     assert!(
         !term.pump_until(Duration::from_millis(200), |out| {
             find(out, KITTY_QUERY).is_some()
@@ -1733,7 +1525,6 @@ fn a_client_started_ahead_negotiates_on_its_first_visit(tag: &str, fade: bool) {
         term.since(0)
     );
 
-    // The visit: its questions asked, answered, and acted on.
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
             kitty_push_flags(out).is_some_and(|flags| flags & 1 != 0)
@@ -1754,12 +1545,9 @@ fn a_client_started_ahead_negotiates_on_its_first_visit(tag: &str, fade: bool) {
         term.since(asked)
     );
 
-    // Its questions answered, it is a kept client like any other from here:
-    // parked, and painted straight back.
     term.pump_until(Duration::from_millis(300), |_| false);
     let after = away_and_back(&mut term, |_| {});
-    // As far as row 0 of the repaint: a read can end part way through the
-    // write that clears the screen and draws it again.
+    // Through row 0 of the repaint; a read can end mid-write.
     let landed = term.pump_until(Duration::from_secs(5), |out| {
         find(&out[after.min(out.len())..], b"\x1b[2J").is_some()
             && row_on_screen(out, 0).contains(marker)
@@ -1801,12 +1589,10 @@ fn a_client_started_ahead_is_dissolved_in_on_its_first_visit() {
     a_client_started_ahead_negotiates_on_its_first_visit("ahead-fade", true);
 }
 
-/// A relay says when its session has painted, once, and only after the
-/// session's screen has reached the terminal — with the first paint held and
-/// dissolved in if `fade`, and relayed as it comes if not. It is what the
-/// clients a dropped link took wait for before they are started again behind
-/// the session in front (`[client] lazy` off): each has its session's screen
-/// sent over the same link.
+/// The relay reports "painted" once, only after the screen reached the
+/// terminal (held and dissolved in with `fade`). After a dropped link,
+/// clients restarted behind the front session (`[client] lazy` off) wait for
+/// this, since each screen goes over the same link.
 fn a_relay_says_when_its_session_has_painted(tag: &str, fade: bool) {
     require_nvim!();
     let scratch = Scratch::new(tag);
@@ -1851,7 +1637,6 @@ fn a_relay_says_when_its_session_has_painted(tag: &str, fade: bool) {
         "said to have painted before the session's screen had reached the terminal: {}",
         term.since(0)
     );
-    // Once: nothing else is said, however long the session goes on.
     term.pump_until(Duration::from_millis(500), |_| false);
     assert!(
         find(&term.output[said + PAINTED.len()..], PAINTED).is_none()
@@ -1872,13 +1657,11 @@ fn a_relay_says_when_its_session_has_painted_once_dissolved_in() {
     a_relay_says_when_its_session_has_painted("painted-fade", true);
 }
 
-/// A client started ahead of a session that
-/// draws all the while — a build running in a `:terminal`, a log — is kept to
-/// its first visit. Away, it draws a frame a second rather than every change
-/// (see `nvmux::card::Command::Away`), and what it writes for the terminal
-/// stays far under what would have it retired as having said too much (see
-/// `nvmux::pty::AHEAD_MAX`). And on that visit the session is drawn as it is
-/// by then, not as it was the last time it was drawn away.
+/// A client started ahead of a constantly drawing session (a `:terminal`
+/// build, a log) survives to its first visit: away, it draws one frame a
+/// second (`nvmux::card::Command::Away`), staying far under
+/// `nvmux::pty::AHEAD_MAX`. On the visit the screen is current, not the last
+/// away frame.
 #[test]
 fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
     require_nvim!();
@@ -1894,8 +1677,8 @@ fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
     let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
-    // Every row of the screen rewritten every 5 ms: a frame of several
-    // kilobytes each time, a megabyte in well under the time it is held.
+    // Every row rewritten every 5 ms: several KB per frame, a megabyte well
+    // within the hold.
     rpc.command(
         "setlocal noswapfile | lua vim.g.ticks = 0; vim.fn.timer_start(5, function() \
          vim.g.ticks = vim.g.ticks + 1; local d = tostring(vim.g.ticks % 10); \
@@ -1933,10 +1716,9 @@ fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
         "the session's screen never came up; the child wrote: {}",
         term.since(started)
     );
-    // And kept as it is from then on, as in front: never a second behind,
-    // which is two hundred ticks. Neovim asked first, and the screen read
-    // after, so that the time the reading takes — megabytes of frames by
-    // then, on a slow machine — is not counted against the client.
+    // Kept current from then on, as in front. Ask Neovim first, then parse,
+    // so parsing megabytes of frames on a slow machine is not counted against
+    // the client.
     term.pump_until(Duration::from_millis(300), |_| false);
     let mut screen = vt100::Parser::new(ROWS, COLS, 0);
     let mut read = 0;
@@ -1961,26 +1743,15 @@ fn a_client_started_ahead_of_a_busy_session_is_kept_to_its_first_visit() {
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
-/// A client started ahead, drawing at a crawl out of sight, was sized for
-/// the terminal as it was then. Made shorter since,
-/// the terminal has the client resized on the first visit, and the paint that
-/// visit holds and dissolves in is drawn for the size it has now — not the old
-/// screen cut short. The client is told it is back in front before it is
-/// resized: away, its redraw would come at the crawl it draws at there (see
-/// `nvmux::card::Command::Away`), after the held paint had gone out without
-/// it.
+/// After the terminal shrank, the first visit's held paint is drawn for the
+/// new size, not the old screen cut short. The client is told it is in front
+/// before the resize, or its redraw would come at the away rate
+/// (`nvmux::card::Command::Away`), after the paint.
 ///
-/// Held for a time that is no whole number of seconds: away, a client draws
-/// a frame a second at most, counted from its first, and a visit on the
-/// second finds it free to draw whatever it is told then.
-///
-/// And the session draws all the while, a line rewritten every 10 ms, so
-/// that a client left at the crawl has drawn within the last second whenever
-/// the visit comes, and its redraw for the size waits: the paint goes out
-/// without it. A client back in front draws it at once, and what it draws as
-/// the session goes keeps the held paint waiting the longer. Neovim's own
-/// redraw for the size may still come after the paint on a slow machine,
-/// which is why the first frame is held only to being drawn for the size.
+/// Held 2.5 s, off the one-second away beat, while the session redraws every
+/// 10 ms: an away client would always have drawn within the last second and
+/// have to wait. Neovim's redraw may trail the paint on a slow machine, so the
+/// first frame need only be drawn for the new size.
 #[test]
 fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
     require_nvim!();
@@ -2028,7 +1799,7 @@ fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
     term.pty
         .resize(pty_process::Size::new(rows, COLS))
         .expect("resize the terminal");
-    // The first frame the session is on: the fade's, all of it there at once.
+    // The first frame showing the session: the fade's, whole.
     assert!(
         term.pump_until(Duration::from_secs(15), |out| {
             row_on_resized_screen(out, at, rows, 0).starts_with("tick ")
@@ -2036,13 +1807,8 @@ fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
         "the session's screen never came up; the child wrote: {}",
         term.since(at)
     );
-    // Drawn for the new size: the session's status line above its last row,
-    // or, where Neovim has yet to redraw for the size, the client's own frame
-    // for it — its window running on to the last row, or ending two rows
-    // above it, over the rows Neovim has still to draw. Not the old screen cut
-    // short: its window's `~` rows running on to the row above the last, and
-    // the rows below that — its status line, its command line — all written
-    // onto the last.
+    // The old screen cut short would have `~` up to the row above the last,
+    // with the status and command lines both written onto the last.
     let above = row_on_resized_screen(&term.output, at, rows, rows - 2);
     let last = row_on_resized_screen(&term.output, at, rows, rows - 1);
     assert!(
@@ -2050,7 +1816,6 @@ fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
         "the first frame is the old screen cut short: {above:?} over {last:?}, and the child wrote: {}",
         term.since(at)
     );
-    // And the status line where it goes, soon after if not at once.
     assert!(
         term.pump_until(Duration::from_secs(5), |out| {
             row_on_resized_screen(out, at, rows, rows - 2).contains("[No Name]")
@@ -2061,7 +1826,6 @@ fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
-/// The session's `:messages`.
 fn messages(sock: &Path) -> String {
     nvmux::rpc::Client::connect(sock, Duration::from_secs(3))
         .and_then(|mut c| c.eval("execute('messages')"))
@@ -2070,14 +1834,11 @@ fn messages(sock: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// `<prefix> d`, as the kitty protocol spells the prefix, and the child's exit
-/// waited for.
 fn detach(term: &mut Terminal) -> Option<u32> {
     prefix_then(term, b"d")
 }
 
-/// The prefix as the kitty protocol spells it, then `key`, and the child's
-/// exit waited for.
+/// Kitty-encoded prefix then `key`; waits for the exit.
 fn prefix_then(term: &mut Terminal, key: &[u8]) -> Option<u32> {
     let flags = kitty_push_flags(&term.output).unwrap_or(0);
     term.type_bytes(b"\x1b[32;5u");
@@ -2089,7 +1850,6 @@ fn prefix_then(term: &mut Terminal, key: &[u8]) -> Option<u32> {
     term.exit_code(Duration::from_secs(10))
 }
 
-/// A child relaying nvmux's own client, which says the session is `label`.
 fn spawn_own(sock: &Path, id: &str, label: &'static str, asks: Asks) -> Terminal {
     Terminal::spawn_child(
         sock,
@@ -2103,19 +1863,16 @@ fn spawn_own(sock: &Path, id: &str, label: &'static str, asks: Asks) -> Terminal
     )
 }
 
-/// The rows of the screen the output makes, as text.
 fn screen_rows(out: &[u8]) -> Vec<String> {
     (0..ROWS).map(|row| row_on_screen(out, row)).collect()
 }
 
-/// Whether a card saying `label` is in the margin, set flush right on the
-/// row under the top one.
+/// Whether a card for `label` is flush right on the second row.
 fn carded(out: &[u8], label: &str) -> bool {
     row_on_screen(out, 1).ends_with(label)
 }
 
-/// Where a switch landed is a card nvmux's own client draws, in the margin:
-/// nothing is said to the editor, which keeps nothing of it.
+/// Nothing reaches the editor's `:messages`.
 #[test]
 fn a_fresh_client_is_announced_by_a_card() {
     require_nvim!();
@@ -2142,11 +1899,9 @@ fn a_fresh_client_is_announced_by_a_card() {
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
-/// A detach hands the shell back a clean screen, with nothing on it of what
-/// the relay told the client. With the fade off, a fresh client is told where
-/// it landed the moment its relay starts — before it has made its pty raw, on
-/// the primary screen the relay has just cleared, which is the one a detach
-/// goes back to — and a pty that echoed the card left it there, as hex.
+/// With the fade off, the card is sent as the relay starts, before the
+/// client's pty is raw; an echoing pty would leave it as hex on the primary
+/// screen a detach returns to.
 #[test]
 fn a_detach_leaves_nothing_of_the_cards_behind() {
     require_nvim!();
@@ -2166,8 +1921,7 @@ fn a_detach_leaves_nothing_of_the_cards_behind() {
         screen_rows(&term.output)
     );
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
-    // What the child wrote last can still be on its way when its exit is
-    // seen.
+    // Its last output may still be in flight.
     term.pump_until(Duration::from_millis(200), |_| false);
     let left: Vec<String> = screen_rows(&term.output)
         .into_iter()
@@ -2176,12 +1930,10 @@ fn a_detach_leaves_nothing_of_the_cards_behind() {
     assert!(left.is_empty(), "the detach left the shell this: {left:#?}");
 }
 
-/// A kept client draws at a crawl while it is
-/// parked: a change its session makes just after it went waits a second to be
-/// drawn. Brought back sooner, with no card — as from the picker or the help
-/// full screen — it draws that change on its way back, and the relay waits
-/// for it: the screen dissolves in as the session is now, not as it was last
-/// drawn, to jump to the present once the fade is over.
+/// A parked client draws at the away rate, so a change just after parking
+/// waits up to a second. Resumed sooner without a card (from the picker or
+/// full-screen help), it draws the change on the way back and the relay waits
+/// for it, so the fade-in shows the current screen instead of jumping after.
 #[test]
 fn a_crawling_client_comes_back_as_its_session_is_now() {
     require_nvim!();
@@ -2224,18 +1976,16 @@ fn a_crawling_client_comes_back_as_its_session_is_now() {
         term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
         "the client never asked its DA1"
     );
-    // Parked, the line changed, and brought back, until the change comes in
-    // with the screen, six times at most. The relay gives the client
-    // `CARD_WAIT` to draw it (see `nvmux::pty`), no longer: a client too busy
-    // for that, as on a busy machine, has the screen come back as it was and
-    // jump once the fade is over, which says nothing of what is drawn in
-    // time. A relay that never waits has every return late, and fails.
+    // Park, change the line, resume; up to six tries for the change to come
+    // with the screen. The relay waits at most `CARD_WAIT` (see `nvmux::pty`),
+    // so a client too slow on a busy machine is late without proving
+    // anything; a relay that never waits is late every time, and fails.
     let mut was = String::from("as it was");
     let mut late = 0;
     loop {
         let now = format!("as it is now, {late}");
-        // Long enough since its last frame that the client draws the one it
-        // goes with at once, and then nothing for a second.
+        // Long enough that the client draws the parking frame at once, then
+        // nothing for a second.
         term.pump_until(Duration::from_millis(1500), |_| false);
 
         let mark = term.output.len();
@@ -2273,7 +2023,6 @@ fn a_crawling_client_comes_back_as_its_session_is_now() {
             late < 6,
             "the screen came back as it was, {late} times in a row"
         );
-        // Drawn as it is now once the fade is over, before the next return.
         assert!(
             term.pump_until(Duration::from_secs(5), |out| {
                 row_on_screen(out, 0).contains(&now)
@@ -2286,10 +2035,8 @@ fn a_crawling_client_comes_back_as_its_session_is_now() {
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
-/// A kept client coming back has the card drawn before its screen dissolves
-/// in, and the card stands as the screen comes in: on it, at its full colour,
-/// half way through the fade in, before anything the client draws after the
-/// fade has arrived.
+/// On resume the card is drawn before the screen dissolves in and stays at
+/// full colour through the fade-in.
 #[test]
 fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
     require_nvim!();
@@ -2322,22 +2069,19 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
         "the first attach had no card; the screen: {:#?}",
         screen_rows(&term.output)
     );
-    // Parked only once the terminal has answered the client's DA1, and well
-    // after the first card has gone.
+    // Park only after the DA1 is answered and the first card is gone.
     assert!(
         term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
         "the client never asked its DA1"
     );
-    // Its life, and three of the fade's one way to go: see `client::cards`.
+    // Its life plus three one-way fades (see `client::cards`).
     let gone = nvmux::card::ARRIVAL_LIFE + Duration::from_millis(3 * LONG_FADE_MS / 2 + 500);
     term.pump_until(gone, |_| false);
     assert!(!carded(&term.output, label), "the first card never went");
 
-    // Parked and brought back until the card comes in with the screen, three
-    // times at most. The relay gives the client `CARD_WAIT` to draw it before
-    // the screen dissolves in (see `nvmux::pty`), no longer: a client too busy
-    // for that, as on a busy machine, has the screen come in without it and
-    // the card after, which says nothing of how the card stands.
+    // Up to three tries for the card to come with the screen: the relay
+    // waits at most `CARD_WAIT` for it (see `nvmux::pty`), so a client too
+    // slow on a busy machine proves nothing.
     let mut late = 0;
     while late < 3 {
         let mark = term.output.len();
@@ -2355,11 +2099,8 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
             "the parked client never came back"
         );
         let after = mark + find(&term.output[mark..], RESUMED).expect("resumed") + RESUMED.len();
-        // The screen from there on a frame at a time, as it came, rather than
-        // as it is at moments of the test's own: a test reading behind the
-        // fade, as one parsing the whole output again for every look does on a
-        // slow machine, sees the card further into its life, which the client
-        // times, than it means to look.
+        // Follow frame by frame: re-parsing the whole output for each look
+        // lags on a slow machine and sees the card later in its life.
         let mut frames = Frames::from(&term.output, after);
         let until = Instant::now() + Duration::from_secs(5);
         while !frames.row(1).ends_with(label) {
@@ -2371,9 +2112,8 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
         }
         let name = COLS - 2 - label.len() as u16;
         let (card_first, tilde_first) = (frames.fg(1, name), frames.fg(2, 0));
-        // From the fade's first frame the card is on the screen as it is,
-        // while the session comes in under it: a `~` far from it, say, still
-        // dark. Gone before the client is parked again where it came after.
+        // From the first fade frame the card is final while the session is
+        // still dark (a far `~`). If late, wait for it to go and retry.
         let dark =
             matches!(tilde_first, vt100::Color::Rgb(..)) && bright(tilde_first) < PALETTE_FG / 2;
         if !dark {
@@ -2382,8 +2122,7 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
             assert!(!carded(&term.output, label), "the card never went");
             continue;
         }
-        // Half way through the fade in, as the screen has it: the `~` half as
-        // bright as the text it comes up to — or the fade over before that.
+        // Mid-fade: the `~` at half the text brightness, or the fade over.
         let over = |frames: &Frames, term: &Terminal| {
             find(&term.output[after..frames.read], b"\x1b[2J").is_some()
         };
@@ -2419,9 +2158,8 @@ fn a_kept_clients_return_is_announced_as_its_screen_comes_back() {
     panic!("the card came after the screen had come in, {late} times in a row");
 }
 
-/// A card posted for the session in front — the notifier's, here the child's
-/// own — comes up in the margin, and `<prefix> Enter` goes to the session it
-/// is about: the relay ends in a switch to it.
+/// A card posted for the front session (as the notifier does) shows, and
+/// `<prefix> Enter` ends the relay in a switch to its session.
 #[test]
 fn a_posted_card_comes_up_and_prefix_enter_goes_there() {
     require_nvim!();
@@ -2465,8 +2203,7 @@ fn a_posted_card_comes_up_and_prefix_enter_goes_there() {
     );
 }
 
-/// A card about a terminal of the session in front: `<prefix> Enter` shows
-/// it, in the session, and the relay goes on.
+/// For a card about a buffer of the front session, the relay continues.
 #[test]
 fn prefix_enter_on_a_card_about_a_terminal_here_shows_it() {
     require_nvim!();
@@ -2482,7 +2219,7 @@ fn prefix_enter_on_a_card_about_a_terminal_here_shows_it() {
         rpc.eval("bufnr()").ok().and_then(|v| v.as_i64())
     };
     let shown = current(&mut rpc).expect("the current buffer");
-    // A buffer no window shows, as a terminal off the screen is.
+    // A buffer no window shows, like an off-screen terminal.
     let hidden = rpc
         .eval("nvim_create_buf(v:true, v:false)")
         .ok()
@@ -2528,8 +2265,6 @@ fn prefix_enter_on_a_card_about_a_terminal_here_shows_it() {
     assert_eq!(detach(&mut term), Some(0), "the relay did not go on");
 }
 
-/// The foreground the cell at (`row`, `col`) of the screen the output makes
-/// is drawn in.
 fn fg_on_screen(out: &[u8], row: u16, col: u16) -> vt100::Color {
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     parser.process(out);
@@ -2539,9 +2274,8 @@ fn fg_on_screen(out: &[u8], row: u16, col: u16) -> vt100::Color {
         .map_or(vt100::Color::Default, vt100::Cell::fgcolor)
 }
 
-/// How bright a grey is, in the palette these tests hand the child (see
-/// [`PALETTE_FG`]), which draws in greys: nothing for one of the terminal's
-/// own colours.
+/// Brightness of a grey from the test palette ([`PALETTE_FG`]); 0 for
+/// terminal colours.
 fn bright(color: vt100::Color) -> u8 {
     match color {
         vt100::Color::Rgb(r, _, _) => r,
@@ -2549,27 +2283,22 @@ fn bright(color: vt100::Color) -> u8 {
     }
 }
 
-/// The screen a terminal's output makes, taken in a frame at a time as the
-/// output comes — to the end of each synchronized update, which is when a
-/// terminal shows it — and never parsed again from the start, as
-/// [`row_on_screen`] parses it: for a test that follows a fade frame by
-/// frame, wherever its own reading has got to.
+/// An incremental parser advanced one synchronized update at a time (when a
+/// terminal presents), unlike [`row_on_screen`], which re-parses from the
+/// start. For following a fade frame by frame.
 struct Frames {
     parser: vt100::Parser,
-    /// How far into the output it has taken in.
     read: usize,
 }
 
 impl Frames {
-    /// The screen as the output up to `from` leaves it.
     fn from(out: &[u8], from: usize) -> Self {
         let mut parser = vt100::Parser::new(ROWS, COLS, 0);
         parser.process(&out[..from]);
         Self { parser, read: from }
     }
 
-    /// Take in `term`'s next frame, waiting until `until` for it to come.
-    /// Says whether one did.
+    /// Take in the next frame, waiting until `until`. Returns whether one came.
     fn next(&mut self, term: &mut Terminal, until: Instant) -> bool {
         let end = nvmux::fade::SYNC_END;
         loop {
@@ -2595,7 +2324,6 @@ impl Frames {
         (0..ROWS).map(|row| self.row(row)).collect()
     }
 
-    /// The foreground the cell at (`row`, `col`) is drawn in.
     fn fg(&self, row: u16, col: u16) -> vt100::Color {
         self.parser
             .screen()
@@ -2604,10 +2332,9 @@ impl Frames {
     }
 }
 
-/// A switch lands with its card standing: the session's own client draws it
-/// as the switch begins, and it stays at its full colour while the session
-/// dissolves out from under it — and on the screen the relay hands over to
-/// the next, with nothing else.
+/// The client draws the card as the switch begins; it stays at full colour
+/// while the session dissolves out, and is all that is left on the screen
+/// handed over.
 #[test]
 fn a_switch_lands_with_its_card_standing() {
     require_nvim!();
@@ -2657,7 +2384,7 @@ fn a_switch_lands_with_its_card_standing() {
     }
     term.pump_until(Duration::from_millis(150), |_| false);
     term.type_bytes(b"3");
-    // Flush right, two columns in: the first of the two is the line's last.
+    // Flush right, two columns in; the first of those is the line's last.
     let standing = format!("{lands}u");
     assert!(
         term.pump_until(Duration::from_secs(5), |out| {
@@ -2690,7 +2417,7 @@ fn a_switch_lands_with_its_card_standing() {
         carded(&term.output, lands),
         "the card did not stay: {rows:#?}"
     );
-    // The child's own word on how its relay ended aside, on its stderr.
+    // Except the child's stderr note on how the relay ended.
     assert!(
         rows.iter()
             .enumerate()
@@ -2699,15 +2426,12 @@ fn a_switch_lands_with_its_card_standing() {
     );
 }
 
-/// A switch a step along the row lands with the row on the move from the
-/// key: the session's own client goes on drawing it as it moves, and the fade
-/// out draws it as the client does, at its full colour, while the session
-/// dissolves out from under it — so the row is further along by the end of
-/// the fade than at its start, and the screen handed over has it as far
-/// along as it came.
+/// On a step switch the row moves from the key on: the fade-out draws it at
+/// full colour as it moves, so it is further along at the end than the start,
+/// and the handed-over screen keeps it where it got to.
 ///
-/// Read a frame at a time once the relay has ended, not as it runs: what the
-/// test reads the screen with is slower than the fade.
+/// Frames are read after the relay ends, since parsing is slower than the
+/// fade.
 #[test]
 fn a_step_lands_with_its_row_on_the_move() {
     require_nvim!();
@@ -2762,9 +2486,8 @@ fn a_step_lands_with_its_row_on_the_move() {
         "the relay did not end in a switch"
     );
 
-    // Each frame from the switch on with the card in it: the column the
-    // name it lands on starts at, and its colour; and whether the session's
-    // screen is still under it, and the colour of its text.
+    // Per frame with the card: the landing name's column and colour,
+    // whether the session is still under it, and its text colour.
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     parser.process(&term.output[..mark]);
     let rest = &term.output[mark..];
@@ -2797,7 +2520,7 @@ fn a_step_lands_with_its_row_on_the_move() {
     }
     let light = |c: vt100::Color| match c {
         vt100::Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
-        // The child's palette's text colour.
+        // The default is the child palette's text grey.
         vt100::Color::Default => 600,
         other => panic!("not a colour a frame here is drawn in: {other:?}"),
     };
@@ -2833,9 +2556,8 @@ fn a_step_lands_with_its_row_on_the_move() {
     );
 }
 
-/// Neovim's own client has no way to be asked to draw a card, and is never
-/// sent one: it would pass it on to the editor, as the terminal's answer to
-/// something (`TermResponse`), for every plugin that listens for those.
+/// Neovim's client cannot draw cards, and would pass one to the editor as a
+/// `TermResponse`, so none is sent.
 #[test]
 fn neovims_own_client_is_sent_no_card() {
     require_nvim!();

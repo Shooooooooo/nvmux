@@ -1,19 +1,16 @@
-//! What a `redraw` notification says, as events the client's model takes.
+//! Decodes `redraw` notifications into events for the client's model.
 //!
 //! A notification carries batches, each a name and one or more argument
 //! lists: `["grid_line", [1, 0, 0, …], [1, 1, 0, …]]`. Each list becomes one
-//! [`Event`]. Neovim adds parameters to events as it goes — `win_float_pos`
-//! has grown from eight to eleven — so a list longer than what is read here is
-//! read as far as it goes, and one shorter than that, or the wrong shape, is
-//! dropped on its own rather than taking its batch with it. An event this
-//! module does not know is dropped the same way: the set Neovim sends is the
-//! set this client asked for (see `super::App`), and anything else
-//! is something a newer Neovim says that an older client has no use for.
+//! [`Event`]. Neovim adds parameters over time (`win_float_pos` went from
+//! eight to eleven), so extra arguments are ignored; a list too short or
+//! malformed, or an unknown event, is dropped alone rather than with its
+//! batch. The client asks for its event set (see `super::App`), so unknown
+//! events come from a newer Neovim.
 //!
-//! Decoded from borrowed values ([`rmpv::ValueRef`]), so the text of a cell is
-//! copied once, into the cell, and nowhere else — and a `grid_line`, nearly
-//! all of what Neovim sends, straight from the notification's bytes, without
-//! a value tree at all ([`decode_bytes`]).
+//! Decoded from borrowed values ([`rmpv::ValueRef`]) so cell text is copied
+//! once; `grid_line`, nearly all of the traffic, is read straight from the
+//! bytes without a value tree ([`decode_bytes`]).
 
 use rmpv::ValueRef;
 
@@ -82,7 +79,7 @@ pub enum Event {
         compindex: i64,
         row: i64,
         col: i64,
-        /// The grid it is anchored to: where its text is drawn, it is.
+        /// The grid it is anchored to, whose text it moves with.
         anchor: Option<u64>,
     },
     WinHide {
@@ -136,8 +133,8 @@ pub enum Event {
     VisualBell,
     Flush,
     SetTitle(String),
-    /// Bytes for the terminal, as they are: Neovim's way of reaching it
-    /// through a UI — an OSC 52 copy, a query of its own (0.12 on).
+    /// Raw bytes for the terminal, Neovim's way of reaching it through a UI:
+    /// an OSC 52 copy, or a query of its own (0.12 on).
     UiSend(Vec<u8>),
     /// The server is going, and says with what status.
     ErrorExit(i64),
@@ -180,7 +177,6 @@ pub struct ModeInfo {
 }
 
 impl ModeInfo {
-    /// Whether this mode's cursor blinks.
     pub fn blinks(&self) -> bool {
         self.blinkwait > 0 && self.blinkon > 0 && self.blinkoff > 0
     }
@@ -212,10 +208,8 @@ impl OptionValue {
     }
 }
 
-/// Every event in a `redraw` notification's parameters, in order.
-///
-/// What cannot be read is dropped and counted, never fatal: see the module
-/// docs.
+/// Every event in a `redraw` notification's parameters, in order. Unreadable
+/// events are dropped and counted, never fatal.
 pub fn decode(params: &ValueRef<'_>, into: &mut Vec<Event>) -> usize {
     let mut dropped = 0;
     let Some(batches) = params.as_array() else {
@@ -249,16 +243,11 @@ pub fn decode(params: &ValueRef<'_>, into: &mut Vec<Event>) -> usize {
     dropped
 }
 
-/// [`decode`], straight from the bytes of a `redraw` notification's
-/// parameters: what [`decode`] makes of them, event for event and drop for
-/// drop, without building a value tree for the whole notification. A
-/// `grid_line` — nearly all of what Neovim sends — is read from the bytes as
-/// it stands; every other event is decoded on its own, from the bytes of its
-/// own argument list, and read by [`event`] as before.
-///
-/// The one notification the two read differently is one nested deeper than
-/// rmpv will follow, which [`decode`] never gets to see at all: this reads
-/// what it can of it.
+/// [`decode`] straight from the bytes: the same events and drops, without a
+/// value tree for the whole notification. `grid_line` is read from the bytes
+/// directly; every other event is decoded from its own argument list's bytes
+/// and read by [`event`]. They differ only on a notification nested deeper
+/// than rmpv follows, which [`decode`] never sees: this reads what it can.
 pub fn decode_bytes(params: &[u8], into: &mut Vec<Event>) -> usize {
     let mut rd = Cursor { buf: params, at: 0 };
     let Some(batches) = rd.array_len() else {
@@ -589,12 +578,10 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
             height: size(a.get(5)?)?,
         },
         // `[grid, win, anchor, anchor_grid, anchor_row, anchor_col,
-        // mouse_enabled, zindex, compindex, screen_row, screen_col]`: the last
-        // four came later, and the last two are the only position the client
-        // needs — the anchoring is Neovim's to resolve, and it has. Which grid
-        // it is anchored to is kept all the same: a window's text the client
-        // draws further in than Neovim put it takes its floats with it (see
-        // `super::wide`).
+        // mouse_enabled, zindex, compindex, screen_row, screen_col]`. The last
+        // four came later; only the screen position is needed, as Neovim
+        // resolves the anchoring. The anchor grid is kept because a window the
+        // client draws further in takes its floats along (see `super::wide`).
         "win_float_pos" => Event::WinFloatPos {
             grid: uint(a.first()?)?,
             win: a.get(1).and_then(handle),
@@ -628,7 +615,7 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
             curcol: int(a.get(5)?)?,
             line_count: int(a.get(6)?)?,
             // Missing from servers older than the client needs; read as no
-            // scroll at all, which is what an animation should make of it.
+            // scroll, which is right for animation.
             scroll_delta: a.get(7).and_then(int).unwrap_or(0),
         },
         "win_viewport_margins" => Event::WinViewportMargins {
@@ -665,12 +652,10 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
         "set_title" => Event::SetTitle(as_str(a.first()?)?.to_string()),
         "ui_send" => Event::UiSend(bytes(a.first()?)?.to_vec()),
         "error_exit" => Event::ErrorExit(int(a.first()?)?),
-        // Known, and nothing for this client to do: the icon is a title the
-        // terminal has nowhere to put; a change of directory, a menu, a
-        // screenshot are a GUI's; `suspend` would stop a client that has no
-        // shell behind it to stop to (see `pty::check_child`); `connect` and
-        // `restart` would take the client off the session nvmux attached it
-        // to, which is nvmux's to decide; and `win_extmark` and
+        // Known and ignored: the terminal has nowhere for an icon title;
+        // directories, menus and screenshots are a GUI's; `suspend` has no
+        // shell to return to (see `pty::check_child`); `connect` and `restart`
+        // would leave the session nvmux chose; `win_extmark` and
         // `win_external_pos` answer requests this client never makes.
         "set_icon" | "chdir" | "update_menu" | "screenshot" | "suspend" | "connect" | "restart"
         | "win_extmark" | "win_external_pos" => return Some(None),
@@ -858,8 +843,8 @@ mod tests {
         (out, dropped)
     }
 
-    /// Every way a grid_line can be odd reads the same from the bytes as from
-    /// the tree: random mutations of a real batch.
+    /// Random mutations of a real batch read the same from the bytes as from
+    /// the tree.
     #[test]
     fn decode_bytes_matches_decode_on_mutated_batches() {
         let line = |hl: Value, text: Value, rep: Value| {
@@ -966,8 +951,7 @@ mod tests {
         buf
     }
 
-    /// A `redraw` is known by its header, written however msgpack lets it
-    /// be, and nothing else is taken for one.
+    /// However msgpack encodes the header; nothing else is taken for one.
     #[test]
     fn a_redraw_is_known_from_its_bytes() {
         let params = arr(vec![batch("flush", vec![arr(vec![])])]);
@@ -996,8 +980,7 @@ mod tests {
         }
     }
 
-    /// A response's id is read from its header, whatever width it is
-    /// written in; anything that is not a response has none.
+    /// Whatever integer width the id uses; a non-response has none.
     #[test]
     fn a_response_is_known_from_its_bytes() {
         let answer =
@@ -1028,8 +1011,7 @@ mod tests {
         Value::Ext(1, payload)
     }
 
-    /// The runs of a line, with the highlight carried over where it is left
-    /// out and a repeat of nought kept as no cells.
+    /// A left-out highlight carries over; a repeat of 0 is no cells.
     #[test]
     fn a_grid_line_keeps_each_runs_text_highlight_and_repeat() {
         let line = arr(vec![
@@ -1084,8 +1066,7 @@ mod tests {
         );
     }
 
-    /// A float's position is where Neovim says it ended up, read from the
-    /// last two of its eleven parameters.
+    /// Read from the last two of its eleven parameters.
     #[test]
     fn a_float_is_placed_where_neovim_resolved_it() {
         let call = arr(vec![
@@ -1128,8 +1109,8 @@ mod tests {
         assert_eq!(handle(&v), Some(-1));
     }
 
-    /// One bad call is dropped and counted; its neighbours, in its batch and
-    /// in the next, still arrive. And a name nobody knows is the same.
+    /// Neighbours in its batch and the next still arrive; an unknown name
+    /// likewise.
     #[test]
     fn what_cannot_be_read_is_dropped_alone() {
         let good = arr(vec![Value::from(1), Value::from(5), Value::from(6)]);
@@ -1153,8 +1134,6 @@ mod tests {
         assert_eq!(dropped, 2);
     }
 
-    /// Arguments past the ones the client reads are a newer Neovim's, and
-    /// read past.
     #[test]
     fn extra_arguments_are_read_past() {
         let call = arr(vec![
@@ -1175,8 +1154,7 @@ mod tests {
         );
     }
 
-    /// Highlights carry their colours, attributes and blend; an absent colour
-    /// is none, and so is -1.
+    /// An absent colour is none, and so is -1.
     #[test]
     fn a_highlight_carries_colours_attributes_and_blend() {
         let rgb = Value::Map(vec![
@@ -1209,8 +1187,7 @@ mod tests {
         assert_eq!(cterm.fg, Some(10));
     }
 
-    /// `default_colors_set` spells its cterm colours one-based, with nought
-    /// for none.
+    /// `default_colors_set` cterm colours, with 0 for none.
     #[test]
     fn default_cterm_colours_are_one_based() {
         let call = arr(vec![
@@ -1260,7 +1237,7 @@ mod tests {
         assert!(!modes[1].blinks());
     }
 
-    /// The bytes of a `ui_send` are the terminal's as they come, UTF-8 or not.
+    /// UTF-8 or not.
     #[test]
     fn ui_send_keeps_its_bytes() {
         let call = arr(vec![Value::from("\x1b]52;c;aGk=\x1b\\")]);

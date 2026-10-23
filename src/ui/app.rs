@@ -1,9 +1,8 @@
 //! Picker state.
 //!
-//! Deliberately free of I/O and of ratatui: this is a state machine that takes
-//! key events and returns [`Request`]s for the caller to carry out. That is what
-//! makes every keybind, the filtering, and the prompt behaviour testable without
-//! a terminal, a transport, or a running Neovim.
+//! Free of I/O and ratatui: a state machine that takes key events and returns
+//! [`Request`]s for the caller, so keybinds, filtering and prompts are testable
+//! without a terminal, transport or Neovim.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -21,72 +20,50 @@ use super::swap::Swap;
 use crate::notes::Note;
 use crate::session::Session;
 
-/// What the picker is currently doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    /// Typing a filter. The list narrows live as the query changes.
+    /// Typing a filter; the list narrows live.
     Filter,
-    /// Waiting for y/N on a kill.
     Confirm {
         id: String,
         prompt: String,
     },
-    /// A session has been picked up and is being moved. `was` is every visible
-    /// row's `(id, state.num)` as it stood when the grab started: all `Esc`
-    /// needs to put everything back, and all a placing `Space` needs to tell a
-    /// real move from a grab that went nowhere.
+    /// A session picked up and being moved. `was` is every visible row's
+    /// `(id, state.num)` at the start of the grab, for `Esc` to restore and
+    /// for `Space` to tell a real move from a no-op.
     Reorder {
         id: String,
         was: Vec<(String, u32)>,
     },
-    /// Asking before quitting with settings changed and unsaved (see
-    /// [`App::set_unsaved`]): `w` saves first, `q` quits anyway, `Esc`
-    /// stays. `prompt` is the question on the hint row; `overwrite`, that the
-    /// file has changed the same settings and `w` overwrites them.
+    /// Confirming a quit with unsaved settings (see [`App::set_unsaved`]).
+    /// `overwrite`: the file changed the same settings and `w` overwrites.
     Leave {
         prompt: String,
         overwrite: bool,
     },
 }
 
-/// Work the picker wants the caller to do.
-///
-/// The picker never performs I/O itself; it asks.
+/// Work for the caller; the picker never performs I/O itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     None,
     Attach(String),
-    /// Ask for a name for a new session; naming happens on its own screen.
-    ///
-    /// The session goes in just after the row highlighted when this was asked,
-    /// which nothing moves while the prompt is up — see [`App::placement_of`].
+    /// Prompt for a name; the session goes after the highlighted row, which
+    /// stays put meanwhile (see [`App::placement_of`]).
     NewSession,
-    /// Ask for a new name for this session.
     RenameSession(String),
     Kill(String),
-    /// Persist this arrangement: every visible session paired with the number it
-    /// should now store.
-    ///
-    /// The whole arrangement rather than only the rows that moved. What is
-    /// persisted is [`Session::num`], and a row's stored number can already
-    /// differ from the resolved one it is showing — `finish_listing` re-derives
-    /// a number for a duplicate and for the `num == 0` of legacy metadata and
-    /// orphans. A row skipped as "unchanged" would keep a stored number that
-    /// then collides with one this batch just wrote, and the next listing would
-    /// resolve the collision the other way round: not a partly-moved list but an
-    /// arbitrary one. Sending the arrangement entire costs the same — one ssh
-    /// round trip either way — and repairs those numbers on its way past.
-    ///
-    /// Never sent empty: a grab that changed nothing returns [`Request::None`],
-    /// so picking a session up and putting it straight down costs no I/O.
+    /// Every visible session with the number to store. The whole arrangement,
+    /// not a diff: a stored [`Session::num`] can differ from the shown one
+    /// (`finish_listing` re-derives duplicates and legacy `num == 0`), and a
+    /// skipped row could then collide with a number just written. Never
+    /// empty; a no-op grab returns [`Request::None`].
     Reorder(Vec<(String, u32)>),
-    /// Show the key bindings; help happens on its own screen.
     Help,
-    /// Show the settings, on their own screen ([`super::settings`]).
     Settings,
-    /// Save the settings that are unsaved, and quit if that worked —
-    /// overwriting what the file changed of them too, if `overwrite`.
+    /// Save unsaved settings and quit if that worked; `overwrite` also
+    /// overwrites the file's own changes to them.
     SaveAndQuit {
         overwrite: bool,
     },
@@ -99,106 +76,66 @@ pub struct App {
     /// Index into the *visible* (filtered) list.
     selected: usize,
     mode: Mode,
-    /// A transient message shown where the hints normally are.
+    /// Transient message shown in place of the hints.
     message: Option<String>,
-    /// Digits typed so far towards a session number, when more digits could
-    /// still change which session is meant. See [`App::on_digit`].
+    /// Digits typed while more could change the match (see
+    /// [`App::on_digit`]).
     pending: Option<u32>,
-    /// The session the picker was opened from and can be dismissed back to.
-    /// See [`App::set_came_from`].
+    /// The session `Esc` returns to (see [`App::set_came_from`]).
     came_from: Option<String>,
-    /// The session the cursor was asked onto while the rows did not have it,
-    /// and the row it stayed on instead, for a listing to bring it. See
-    /// [`App::select_session`].
+    /// See [`App::select_session`].
     wanted: Option<(String, usize)>,
-    /// What the left button last went down on, until it comes up. See
-    /// [`App::on_mouse`].
     pressed: Option<Pressed>,
-    /// Scratch buffers for the filter's scorer, kept across queries: building
-    /// a `Matcher` allocates its whole matrix up front, and [`App::visible`]
-    /// is asked several times per keystroke. In a `RefCell` because scoring
-    /// takes `&mut` and `visible` is a read.
+    /// Reused: building a `Matcher` allocates its whole matrix, and
+    /// [`App::visible`] (`&self`) runs several times per keystroke.
     matcher: RefCell<Matcher>,
-    /// Whether a session in flight leaves a trail at all, and so trades places
-    /// visibly and lands: `[effects.move] enabled`, under `[effects] enabled`,
-    /// read once when the picker opens, as the rest of the config is.
+    /// `[effects.move] enabled`, read once at open, like the flags below.
     trail: bool,
-    /// The trails a session in flight leaves (see [`starfield`]): off the end
-    /// of its name, flying right, and off the other end of its row, flying
-    /// left. Two fields rather than one drawn twice, so the two ends are not
-    /// mirror images of each other. Kept between grabs, so each one carries on
-    /// the same generators rather than drawing the same stars.
+    /// Trails off each end of a moved row (see [`starfield`]); two fields so
+    /// the ends are not mirror images.
     after: Starfield,
     before: Starfield,
-    /// The landing under way, from the key that put a session down until its
-    /// dust settles. See [`super::landing`].
     landing: Option<Landing>,
-    /// What the last moves of a session in flight are still doing to the rows
-    /// it traded places with: stepping aside, letting its bar go, sparks off
-    /// the seam. See [`super::swap`].
     swap: Swap,
-    /// Whether the row the cursor leaves glows as it lets the bar go:
-    /// `[effects.cursor] enabled`, under `[effects] enabled`. Read once when
-    /// the picker opens, like `trail`.
+    /// `[effects.cursor] enabled`.
     lights: bool,
-    /// The row the cursor has just left, while it is still glowing. One at a
-    /// time: the next move takes the glow off it and puts it on the row that
-    /// move left, so a held key never smears a tail of rows. See
-    /// [`App::glow`].
+    /// Only one row glows at a time, so a held key leaves no smear.
     glow: Option<Glow>,
-    /// Whether a filter keystroke's dropped rows fade out (`[effects.filter]
-    /// enabled`).
+    /// `[effects.filter] enabled`.
     sift: bool,
-    /// The rows the last filter keystroke dropped, while they fade. See
-    /// [`App::rows`].
     leaving: Option<Leaving>,
-    /// Whether a kill is drawn — the name struck through while the `[y/N]`
-    /// asks, and the row erased once it is confirmed: `[effects.kill]
-    /// enabled`.
+    /// `[effects.kill] enabled`.
     kill: bool,
-    /// The line through the name a `[y/N]` is asking about, while it is drawn
-    /// on and, once the answer is no, back off. See [`App::strike`].
     strike: Option<Strike>,
-    /// The row a kill is erasing, by session id, until a fresh listing
-    /// replaces it. See [`App::start_backspace`].
+    /// Row being erased, by session id, until a fresh listing replaces it.
     backspace: Option<(String, Backspace)>,
-    /// Whether `c` opens a gap where the new session will go before the prompt
-    /// comes up: `[effects.create] enabled`.
+    /// `[effects.create] enabled`.
     create: bool,
-    /// That gap, from `c` until the prompt is back down. See
-    /// [`App::make_room`].
     room: Option<Room>,
-    /// What each session last said it had to report, by id (see
-    /// [`crate::notes`]): replaced whole by each round of reads, which is the
-    /// truth about them all.
+    /// Latest note per session id (see [`crate::notes`]).
     notes: HashMap<String, Note>,
-    /// How long the spinner beside a busy session has been turning, which is
-    /// all that says which of its frames is up. Moved on whether or not one is
-    /// on screen: a spinner that comes up starts wherever this has got to.
+    /// Spinner clock; runs even with no spinner shown.
     spin: Duration,
-    /// How many settings are changed and not saved, which quitting asks about
-    /// first (see [`Mode::Leave`]).
+    /// Unsaved settings count, asked about on quit (see [`Mode::Leave`]).
     unsaved: usize,
 }
 
-/// The id of the row standing in the gap [`App::make_room`] opens: no session's,
-/// since `+` is not in the alphabet an id is written in (see
-/// [`crate::ids::is_valid_id`]), so nothing that looks a row up by id can find
-/// a real session there, or find this row by a real session's id.
+/// Id of the placeholder row in the gap [`App::make_room`] opens. `+` is not
+/// a valid id character (see [`crate::ids::is_valid_id`]), so it never
+/// collides with a real session.
 pub const GHOST_ID: &str = "+";
 
 /// The gap a session about to be created will land in.
 #[derive(Debug, Clone)]
 struct Room {
-    /// The row in it: the session as it will be listed, under the name the
-    /// prompt will offer and the number it will be given.
+    /// The placeholder row, with the name the prompt will offer and the
+    /// number the session will get.
     ghost: Session,
-    /// Where it goes among the visible rows.
+    /// Index among the visible rows.
     at: usize,
-    /// The number one past every row's, which the last row takes once
-    /// everything under the gap has moved down one.
+    /// One past every row's number; the last row takes it once everything
+    /// below the gap has moved down.
     last: u32,
-    /// How long the gap has been open.
     age: Duration,
 }
 
@@ -209,10 +146,9 @@ struct Glow {
     age: Duration,
 }
 
-/// The line through a name, by session id: how much of it is drawn, `0..=1`,
-/// and whether it is going back off. Kept as an amount rather than an age so a
-/// `[y/N]` answered before the line was all the way across draws it back from
-/// where it had got to.
+/// Strike-through on a session's name: fraction drawn (`0..=1`) and whether
+/// it is retracting. An amount, not an age, so a `[y/N]` answered mid-draw
+/// retracts from where it got to.
 #[derive(Debug, Clone)]
 struct Strike {
     id: String,
@@ -220,22 +156,20 @@ struct Strike {
     back: bool,
 }
 
-/// What one filter keystroke dropped, and how long ago.
+/// Rows one filter keystroke dropped, and how long ago.
 #[derive(Debug, Clone)]
 struct Leaving {
     ids: Vec<String>,
     age: Duration,
 }
 
-/// One row of the list as it is drawn: a session, whether it is one the
-/// filter has just dropped and is only on screen while it fades, whether it is
-/// the session about to be created standing in the gap made for it (see
-/// [`App::make_room`]), and the number it shows.
+/// One drawn row. `leaving`: dropped by the filter and fading. `ghost`: the
+/// placeholder in a create gap (see [`App::make_room`]).
 ///
-/// The number is the session's own except under a gap, where every row below
-/// it shows the number of the row below it: the numbers stay where they are on
-/// the screen and the rows move down past them, which is what the create is
-/// about to store (see [`App::placement_of`]).
+/// `num` is the session's own, except below a gap, where each row shows the
+/// number of the row below: numbers stay put on screen while rows move down
+/// past them, matching what the create will store (see
+/// [`App::placement_of`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Row<'a> {
     pub session: &'a Session,
@@ -258,23 +192,18 @@ impl<'a> Row<'a> {
 /// Where a left press landed, which decides what its release means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pressed {
-    /// On a row that was not the selection: the press selected it, and the
-    /// release does nothing. A drag in between picks the row up.
+    /// An unselected row: the press selected it and the release does
+    /// nothing. A drag picks it up.
     Row,
-    /// On the row already selected: the release attaches, unless a drag in
-    /// between turned the gesture into a move.
+    /// The selected row: the release attaches, unless a drag made it a move.
     Selected,
 }
 
-/// What the filter is matched against: the name, and the last component of
-/// the working directory — the project folder, for a session whose name does
-/// not say (`scratch`, or the `session 3` the prompt suggested).
+/// Filter targets: the name and the last component of the working directory
+/// (the project folder, for sessions named `scratch` or `session 3`).
 ///
-/// The last component only, never the path. Every session on a host shares
-/// most of its path with every other, and a fuzzy match over `/home/you/...`
-/// would admit the whole list for any query that could be spelled out of it.
-/// The folder is the one part that tells sessions apart, and the one part a
-/// user would think to type.
+/// Not the full path: sessions share most of it, so a fuzzy match over
+/// `/home/you/...` would admit nearly every row.
 fn haystacks(s: &Session) -> impl Iterator<Item = &str> {
     let folder = s
         .directory
@@ -316,16 +245,14 @@ impl App {
         }
     }
 
-    /// How many settings are changed and not saved: told by the caller, who
-    /// reads the settings, as the picker reads nothing.
+    /// Set by the caller, since the picker reads nothing itself.
     pub fn set_unsaved(&mut self, unsaved: usize) {
         self.unsaved = unsaved;
     }
 
-    /// The save asked for on the way out did not happen, for the reason
-    /// `why`. Settings the file has changed too keep the question up, saying
-    /// so, for a second `w` to overwrite them; anything else puts the picker
-    /// back, saying why.
+    /// The save on quit failed with `why`. On a `clash` (the file changed the
+    /// same settings) the question stays up so a second `w` overwrites;
+    /// otherwise the picker returns, showing `why`.
     pub fn not_saved(&mut self, why: String, clash: bool) {
         if clash {
             self.mode = Mode::Leave {
@@ -338,9 +265,8 @@ impl App {
         }
     }
 
-    /// `q`, or `Ctrl-c` wherever the picker is: quit — but with settings
-    /// changed and unsaved, ask first on the hint row, whatever was open put
-    /// away as `Esc` would put it.
+    /// `q`, or `Ctrl-c` anywhere. With unsaved settings, first cancels the
+    /// current mode as `Esc` would and asks on the hint row.
     fn quit(&mut self) -> Request {
         if self.unsaved == 0 {
             return Request::Quit;
@@ -362,7 +288,6 @@ impl App {
         Request::None
     }
 
-    /// The question before quitting: only its three keys answer it.
     fn on_key_leave(&mut self, key: Key) -> Request {
         let Mode::Leave { overwrite, .. } = &self.mode else {
             return Request::None;
@@ -379,9 +304,8 @@ impl App {
         }
     }
 
-    /// Read the effects the picker keeps a copy of again, from the settings
-    /// as they now are: what the settings screen changed comes back with the
-    /// picker it closes onto (see [`crate::ui::settings`]).
+    /// Re-read the cached effect flags after the settings screen closes (see
+    /// [`crate::ui::settings`]).
     pub fn reload_effects(&mut self) {
         let effects = crate::config::get().effects;
         self.trail = effects.move_enabled();
@@ -391,30 +315,24 @@ impl App {
         self.create = effects.create_enabled();
     }
 
-    /// What every session has to report, as the latest round of reads found
-    /// it (see [`crate::notes::Poller`]). A session missing from it has
-    /// nothing to say.
+    /// The latest round of notes (see [`crate::notes::Poller`]); a session
+    /// missing from it has none.
     pub fn set_notes(&mut self, notes: HashMap<String, Note>) {
         self.notes = notes;
     }
 
-    /// The note session `id` has to show, if it has one.
     pub fn note(&self, id: &str) -> Option<&Note> {
         self.notes.get(id)
     }
 
-    /// Which frame of the spinner is up, round and round: [`note::sign`]
-    /// takes it modulo its frames.
+    /// Unbounded; [`note::sign`] takes it modulo its frame count.
     pub fn spin_frame(&self) -> usize {
         (self.spin.as_millis() / note::SPIN.as_millis()) as usize
     }
 
-    /// Whether a spinner is on screen, beside a busy session that has not
-    /// said how far it is: the caller then draws at the spinner's pace, a
-    /// frame every [`note::SPIN`], rather than waiting on the keyboard. Not
-    /// [`App::animating`], which asks for a frame every sixtieth of a second
-    /// and for the terminal to keep up with each, for something that moves
-    /// once in five of those.
+    /// Whether a spinner is on screen (a busy session with no progress). The
+    /// caller then redraws every [`note::SPIN`] instead of waiting on keys.
+    /// Separate from [`App::animating`], which asks for 60 fps.
     pub fn spinning(&self) -> bool {
         self.rows()
             .iter()
@@ -423,12 +341,10 @@ impl App {
             .any(note::turns)
     }
 
-    /// Replace the session list, keeping the selection on the same session where
-    /// possible — by identity, not position, so a rename that re-sorts the list
-    /// does not move the highlight to an unrelated row.
+    /// Replace the session list, keeping the selection on the same session
+    /// (by id, not position, so a re-sorting rename does not move it).
     ///
-    /// A fresh listing is the truth about the rows, so whatever was passing
-    /// over the old ones — an erased row, a glow, a fade — ends with it.
+    /// Ends any effect on the old rows (erase, glow, fade, ...).
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let previously = self.selected_id();
         let wanted = self
@@ -451,20 +367,9 @@ impl App {
             .unwrap_or_else(|| self.selected.min(self.visible().len().saturating_sub(1)));
     }
 
-    /// Put the cursor on this session, if the visible list still has it.
-    ///
-    /// How the picker opens on the session the user is attached to rather than
-    /// on the first row: `<prefix> Space` leaves the client running, so coming
-    /// back to a cursor on row one throws away the one thing the picker already
-    /// knew. A session that has since gone — killed elsewhere, or the child
-    /// exited — leaves the cursor where it was.
-    ///
-    /// Gone from the rows is not always gone: the rows in hand on the way back
-    /// from a session whose client exited leave that session out, and its
-    /// client may have been ended by `:detach` with the session still there
-    /// (see `main`). So one not found is looked for in the next listing the
-    /// picker takes, which puts the cursor on it if it is there and nothing
-    /// has been pressed, clicked or scrolled since.
+    /// Select this session if visible. If not, the next listing selects it
+    /// if present and the cursor has not moved: a client ended by `:detach`
+    /// is missing from the held rows though its session lives (see `main`).
     pub fn select_session(&mut self, id: &str) {
         match self.visible().iter().position(|s| s.id == id) {
             Some(at) => {
@@ -475,21 +380,14 @@ impl App {
         }
     }
 
-    /// Name the session the picker was opened from, so `Esc` can dismiss the
-    /// picker back to it.
-    ///
-    /// Only worth setting when there is still a client behind that session —
-    /// `<prefix> Space` leaves one running, a failed attach and an exited child
-    /// do not. A session that has gone from the list since is not gone back to
-    /// either: killing the session you came from leaves `Esc` with nothing to
-    /// do, which is better than dismissing the picker onto a dead client.
+    /// The session `Esc` returns to; set only while its client still runs.
+    /// Once it leaves the list, `Esc` does nothing.
     pub fn set_came_from(&mut self, id: &str) {
         self.came_from = Some(id.to_string());
     }
 
-    /// The session the picker was opened from, while the list still has it:
-    /// what `Esc` goes back to, and what the settings float over once they
-    /// are turned to on the picker's `,`. See [`App::set_came_from`].
+    /// The [`App::set_came_from`] session while still listed; also what the
+    /// settings float over when opened with `,`.
     pub fn came_from(&self) -> Option<&Session> {
         self.came_from.as_deref().and_then(|id| self.session(id))
     }
@@ -506,8 +404,7 @@ impl App {
         self.message.as_deref()
     }
 
-    /// The half-typed session number, if one is waiting for another digit. The
-    /// hint row shows it so the state is never invisible.
+    /// The half-typed session number, shown on the hint row.
     pub fn pending(&self) -> Option<u32> {
         self.pending
     }
@@ -516,21 +413,14 @@ impl App {
         self.message = Some(msg.into());
     }
 
-    /// Whether a session in flight is trailing stars: one is, and the trails
-    /// are on. What the renderer draws them for, and what the caller keeps a
-    /// faster clock running for, so they move — with the trails off, a move
-    /// is drawn still and the clock never speeds up.
+    /// Whether a moved session is trailing stars (a move with trails on). The
+    /// caller runs a faster clock while true.
     pub fn trailing(&self) -> bool {
         self.trail && matches!(self.mode, Mode::Reorder { .. })
     }
 
-    /// Move the trails behind a session in flight on by `elapsed`. Nothing
-    /// happens while none is trailing.
-    ///
-    /// The clock is the caller's, as it is for a half-typed number: `App`
-    /// stays free of it, and a test can step it by exactly the time it wants.
-    ///
-    /// The spinner beside a busy session moves on too, on screen or not.
+    /// Advance every animation and the spinner by `elapsed`. The clock is the
+    /// caller's, so tests can step it exactly.
     pub fn tick(&mut self, elapsed: Duration) {
         self.spin = self.spin.saturating_add(elapsed);
         if self.trailing() {
@@ -575,14 +465,9 @@ impl App {
         }
     }
 
-    /// Whether anything on screen is moving, and so whether the caller should
-    /// draw at a frame's pace rather than wait on the keyboard: a trail, rows
-    /// trading places, a glow, a fading row, a line being struck or
-    /// drawn back, a row being erased, or a row coming up in a gap made for a
-    /// new session. A line all the way across is still, and asks for nothing
-    /// while the `[y/N]` waits; so is the mark on the session `Esc` goes back
-    /// to, which never moves. With every effect off this is only ever false,
-    /// and the picker changes on a key and nothing else.
+    /// Whether anything is moving, so the caller should draw at frame rate
+    /// instead of waiting on keys. A completed strike-through is still. With
+    /// every effect off this is always false.
     pub fn animating(&self) -> bool {
         self.trailing()
             || self.glow.is_some()
@@ -594,21 +479,17 @@ impl App {
             || self.room().is_some()
     }
 
-    /// The landing under way, if a session has just been put down.
     pub fn landing(&self) -> Option<&Landing> {
         self.landing.as_ref()
     }
 
-    /// What the last moves of a session in flight are still doing to the rows
-    /// it traded places with, for the renderer and the effects' post-pass.
     pub fn swap(&self) -> &Swap {
         &self.swap
     }
 
-    /// Put the session in flight down: back to the ordinary list, landing it
-    /// first if the trail is on — the landing is how a trail ends. Every way of placing one comes through here —
-    /// the keys and the mouse's release — so none of them can forget the
-    /// landing. `Esc` does not: a cancelled move did not land anywhere.
+    /// Drop the moved session, starting the landing if trails are on. Every
+    /// placing path (keys, mouse release) goes through here; `Esc` does not,
+    /// as a cancelled move lands nowhere.
     fn put_down(&mut self) {
         self.mode = Mode::Normal;
         if self.trail {
@@ -616,8 +497,7 @@ impl App {
         }
     }
 
-    /// The row the cursor last left, by session id, with how far through its
-    /// glow it is, `0..1`, or `None` once it has settled.
+    /// Session id of the row the cursor last left, and glow progress `0..1`.
     pub fn glow(&self) -> Option<(&str, f32)> {
         let length = effects::AFTERGLOW.as_secs_f32();
         self.glow
@@ -625,31 +505,28 @@ impl App {
             .map(|g| (g.id.as_str(), g.age.as_secs_f32() / length))
     }
 
-    /// How far through their fade the rows the last filter keystroke dropped
-    /// are, `0..1`, or `None` when none are on screen.
+    /// Fade progress `0..1` of rows the last filter keystroke dropped.
     pub fn leaving(&self) -> Option<f32> {
         self.leaving
             .as_ref()
             .map(|l| l.age.as_secs_f32() / effects::SIFT.as_secs_f32())
     }
 
-    /// The session a `[y/N]` is asking about, by id, with how much of the line
-    /// through its name is drawn, `0..=1`: on its way across while the
-    /// question is up, on its way back once it is answered no.
+    /// Session id under a `[y/N]` and how much of the strike-through is
+    /// drawn, `0..=1` (retracting after a no).
     pub fn strike(&self) -> Option<(&str, f32)> {
         self.strike.as_ref().map(|s| (s.id.as_str(), s.drawn))
     }
 
-    /// Whether the line through a name is on its way across or back. All the
-    /// way across, it is still.
+    /// Whether the strike-through is moving; fully drawn, it is still.
     fn striking(&self) -> bool {
         self.strike
             .as_ref()
             .is_some_and(|s| s.back || s.drawn < 1.0)
     }
 
-    /// Start the row `id` erasing, for a kill just confirmed. Says whether
-    /// there is anything to watch: the effect is on, and the row is on screen.
+    /// Start erasing row `id` after a confirmed kill. Returns whether there
+    /// is anything to show (effect on and row visible).
     pub fn start_backspace(&mut self, id: &str) -> bool {
         if !self.kill || !self.visible().iter().any(|s| s.id == id) {
             return false;
@@ -658,34 +535,22 @@ impl App {
         true
     }
 
-    /// The row being erased and its backspace, for the renderer. Still here
-    /// once it is done — the row stays empty until a listing replaces it.
+    /// Kept after it finishes: the row stays empty until a listing replaces
+    /// it.
     pub fn backspace(&self) -> Option<(&str, &Backspace)> {
         self.backspace.as_ref().map(|(id, b)| (id.as_str(), b))
     }
 
-    /// Whether a row is still being erased.
     pub fn erasing(&self) -> bool {
         self.backspace.as_ref().is_some_and(|(_, b)| !b.done())
     }
 
-    /// Open a gap after the highlighted row for the session `c` is about to
-    /// create, and stand it there, named `name`: what the prompt will offer.
-    /// Says whether there is anything to watch — whether the effect is on.
+    /// Open a gap with a placeholder named `name` where [`App::placement_of`]
+    /// will put the new session, showing the numbers it will assign. Returns
+    /// whether the effect is on.
     ///
-    /// The gap goes where [`App::placement_of`] will put the session once it
-    /// exists, and the rows show the numbers it will deal out: the new row the
-    /// number of the row it pushes down, each row below it the next, and the
-    /// last row the number one past every row's. With nothing highlighted, or
-    /// the last row, the gap is at the end and only the new row's number is
-    /// new. So the screen says, before the prompt asks anything, where the
-    /// session will be and what it will be called.
-    ///
-    /// Whatever else was passing — a glow, a fading row, a line
-    /// being drawn back off a name a `[y/N]` was declined for — ends here:
-    /// the picker is on its way out, and the gap is all that should be moving.
-    /// The gap stays until [`App::close_room`] or a fresh listing, so the
-    /// picker can be drawn closing in onto it.
+    /// Ends other effects so only the gap moves. Lasts until
+    /// [`App::close_room`] or a fresh listing.
     pub fn make_room(&mut self, name: &str) -> bool {
         if !self.create {
             return false;
@@ -707,18 +572,15 @@ impl App {
         true
     }
 
-    /// The number a session created now will be given, and so the one its
-    /// default name is numbered after (see [`super::prompt::default_name`]):
-    /// that of the row after the highlighted one, which it pushes down, or one
-    /// past every row's when it goes at the end. What [`App::make_room`]
-    /// shows on the row in the gap, and what [`App::placement_of`] stores.
+    /// Number a session created now gets (also used for its default name,
+    /// see [`super::prompt::default_name`]): that of the row after the
+    /// highlighted one, or one past every row's at the end.
     pub fn new_number(&self) -> u32 {
         self.slot().1
     }
 
-    /// Where among the visible rows a session created now goes — after the
-    /// highlighted row, or first in an empty list — and the number it will be
-    /// given there. See [`App::new_number`].
+    /// Visible index (after the highlighted row, or 0 if empty) and number
+    /// for a session created now.
     fn slot(&self) -> (usize, u32) {
         let rows = self.snapshot();
         let at = if rows.is_empty() {
@@ -732,21 +594,16 @@ impl App {
         (at, num)
     }
 
-    /// The number one past every row's: what a session appended to the list
-    /// would be given.
+    /// One past every row's number.
     fn last_number(&self) -> u32 {
         self.sessions.iter().map(|s| s.state.num).max().unwrap_or(0) + 1
     }
 
-    /// Close the gap [`App::make_room`] opened: the prompt has gone, and the
-    /// rows go back to where they were — or, for a session that was created,
-    /// to the listing that has it.
     pub fn close_room(&mut self) {
         self.room = None;
     }
 
-    /// How far the row in the gap has come up out of the background, `0..1`,
-    /// while it is still coming; `None` once it is all the way up, or there is
+    /// Fade-in progress `0..1` of the gap's row; `None` once complete or with
     /// no gap.
     pub fn room(&self) -> Option<f32> {
         let room = self.room.as_ref()?;
@@ -754,31 +611,26 @@ impl App {
         (progress < 1.0).then_some(progress)
     }
 
-    /// Whether there is a gap open, coming up or all the way up.
     pub fn has_room(&self) -> bool {
         self.room.is_some()
     }
 
-    /// The trail off the end of the name, for the renderer.
+    /// Trail off the end of the name.
     pub fn trail_after(&self) -> &Starfield {
         &self.after
     }
 
-    /// The trail off the other end of the row, for the renderer.
+    /// Trail off the other end of the row.
     pub fn trail_before(&self) -> &Starfield {
         &self.before
     }
 
-    /// Turn the trails on or off whatever the config says, for a test that
-    /// needs one or the other.
     #[cfg(test)]
     pub(super) fn set_trail(&mut self, on: bool) {
         self.trail = on;
     }
 
-    /// Turn the picker's own effects — the afterglow, the filter's fade, the kill's strike and backspace — on
-    /// or off whatever the config says, for a test that
-    /// needs one or the other.
+    /// Override every effect except trails, regardless of config.
     #[cfg(test)]
     pub(super) fn set_effects(&mut self, on: bool) {
         self.lights = on;
@@ -793,21 +645,11 @@ impl App {
         }
     }
 
-    /// Sessions matching the current filter, in display order.
+    /// Sessions matching the filter, fuzzily, with the same scorer and smart
+    /// case as [`super::complete`].
     ///
-    /// The match is fuzzy — `asv` finds `api-server` — and is the same scorer,
-    /// with the same case and accent rules, that ranks the create prompt's
-    /// directory completions ([`super::complete`]): case-insensitive unless the
-    /// query has a capital in it, and `Pattern::parse`'s syntax throughout, so
-    /// a query of two words wants both.
-    ///
-    /// Fuzzy in what it *admits*, and nothing else. A completion menu sorts by
-    /// score because its rows are interchangeable; these are not. A row's number
-    /// is its position in the list, `<prefix> 3` and the digit keys name it by
-    /// that number, and a reorder under a filter deals the visible numbers back
-    /// out down the visible rows — all of which assume the filtered view is the
-    /// full list with rows removed. So the score is a yes or a no here, and the
-    /// order is the list's own.
+    /// The score only filters, never reorders: row numbers, digit keys and
+    /// filtered reordering assume the full list with rows removed.
     pub fn visible(&self) -> Vec<&Session> {
         if self.filter.is_empty() {
             return self.sessions.iter().collect();
@@ -827,18 +669,12 @@ impl App {
             .collect()
     }
 
-    /// The rows the list draws: the visible ones and, for a moment after a
-    /// filter keystroke narrowed the list, the ones it dropped, where they
-    /// stood; or, while [`App::make_room`] has a gap open, the visible ones
-    /// with the session about to be created in it. In the list's own order.
-    ///
-    /// Only the drawing sees the dropped rows and the new one. Keys, numbers
-    /// and the mouse go on resolving against [`App::visible`], so a row on its
-    /// way out, or not yet in, can be seen and not touched.
+    /// Rows to draw: the visible ones plus fading or placeholder rows. Input
+    /// resolves against [`App::visible`] instead.
     pub fn rows(&self) -> Vec<Row<'_>> {
         let visible = self.visible();
         if let Some(room) = &self.room {
-            // Nothing is leaving under a gap: making room ended that.
+            // `make_room` ended any fade.
             let mut rows: Vec<Row> = visible.into_iter().map(|s| Row::of(s, false)).collect();
             let at = room.at.min(rows.len());
             let below: Vec<u32> = rows[at..].iter().map(|r| r.num).collect();
@@ -880,8 +716,7 @@ impl App {
             .collect()
     }
 
-    /// The selection's index into [`App::rows`]. The same as
-    /// [`App::selected_index`] whenever no row is leaving.
+    /// The selection's index into [`App::rows`].
     pub fn selected_row(&self) -> usize {
         let Some(id) = self.selected_id() else {
             return 0;
@@ -892,18 +727,12 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// The selected session's id, if anything is selected.
     pub fn selected_row_id(&self) -> Option<&str> {
         self.selected_session().map(|s| s.id.as_str())
     }
 
-    /// Which characters of `name` the filter matched, as `char` indices in
-    /// order — what the renderer underlines. Empty with no filter, or when the
-    /// session matched on its folder rather than its name.
-    ///
-    /// The matcher counts grapheme clusters, which are `char`s for every name
-    /// without combining marks; one with them can have its underline land a
-    /// letter off, which is the price of not taking a dependency for it.
+    /// Sorted `char` indices of `name` the filter matched. The matcher counts
+    /// graphemes, so combining marks may shift the underline.
     pub fn matched(&self, name: &str) -> Vec<usize> {
         if self.filter.is_empty() {
             return Vec::new();
@@ -923,18 +752,14 @@ impl App {
         indices.into_iter().map(|i| i as usize).collect()
     }
 
-    /// Every row the picker is holding, in the order it is holding them.
-    ///
-    /// For a caller that carries the listing on rather than asking for another
-    /// — see [`crate::ui::Outcome::Attach`]. `visible` is the filtered view and
-    /// answers a different question.
+    /// The full, unfiltered listing, for callers that carry it on (see
+    /// [`crate::ui::Outcome::Attach`]).
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
     }
 
-    /// The session with this id, from the list the picker is showing. What a
-    /// [`Request`] carrying an id resolves against, so acting on a row costs no
-    /// round trip beyond the action itself.
+    /// Lookup in the held listing, so acting on a [`Request`]'s id needs no
+    /// extra round trip.
     pub fn session(&self, id: &str) -> Option<&Session> {
         self.sessions.iter().find(|s| s.id == id)
     }
@@ -947,8 +772,8 @@ impl App {
         self.visible().get(self.selected).copied()
     }
 
-    /// A request naming whatever is selected, or nothing when the list is empty
-    /// — every key that acts on a row has to answer for both.
+    /// `request` for the selected id, or `Request::None` if the list is
+    /// empty.
     fn on_selection(&self, request: impl FnOnce(String) -> Request) -> Request {
         self.selected_id().map_or(Request::None, request)
     }
@@ -961,11 +786,8 @@ impl App {
         self.session(id).map(|s| s.name.clone()).unwrap_or_default()
     }
 
-    /// The row `delta` away from the selection, wrapping at both ends.
-    ///
-    /// Shared by the cursor and by a session being moved, so "the arrows wrap"
-    /// stays one fact about the picker rather than two implementations that
-    /// could drift apart.
+    /// The row `delta` from the selection, wrapping; shared by cursor and
+    /// move so both wrap the same way.
     fn wrapped(&self, delta: isize) -> usize {
         let len = self.visible().len();
         if len == 0 {
@@ -975,17 +797,12 @@ impl App {
         (((self.selected as isize + delta) % len + len) % len) as usize
     }
 
-    /// Move the selection, wrapping at both ends.
     fn move_by(&mut self, delta: isize) {
         self.selected = self.wrapped(delta);
     }
 
-    /// The row `delta` away from the selection, stopping at both ends.
-    ///
-    /// For the wheel, which unlike the keys does not wrap: a list that jumps
-    /// from its last row to its first under a scrolling finger reads as the
-    /// list having lost its place, where a key pressed once too often reads as
-    /// the key having done what it always does.
+    /// The row `delta` from the selection, stopping at the ends. For the
+    /// wheel, where wrapping would look like the list lost its place.
     fn clamped(&self, delta: isize) -> usize {
         let len = self.visible().len();
         if len == 0 {
@@ -994,24 +811,10 @@ impl App {
         (self.selected as isize + delta).clamp(0, len as isize - 1) as usize
     }
 
-    /// Where the session `new_id` — just created from this picker — belongs, as
-    /// the arrangement to store: every visible row and the new session, in
-    /// their new order, each paired with the number it should now hold.
-    ///
-    /// Just after the highlighted row, so a session lands next to the one the
-    /// user was looking at when they made it rather than at the bottom of the
-    /// list, and everything after it moves down one.
-    ///
-    /// The new session is treated as though it had been appended and then moved
-    /// up to that row, which is exactly what storing it this way does: it was
-    /// created last, and this moves it. So its number is the one past every
-    /// row's, and the visible numbers plus that one are dealt back out down the
-    /// new order — the same deal a reorder makes (see
-    /// [`App::shift_grabbed_to`]), with the same result under a filter: the
-    /// hidden rows keep their numbers and stay out of the payload.
-    ///
-    /// Empty when there is nothing to write: no row was highlighted, or the
-    /// last one was, and after it is where a new session goes anyway.
+    /// Arrangement to store for the just-created `new_id`, placed after the
+    /// highlighted row. Treated as appended then moved up: visible numbers
+    /// plus a new last one are dealt down the new order, as in
+    /// [`App::shift_grabbed_to`]. Empty if it goes at the end anyway.
     pub fn placement_of(&self, new_id: &str) -> Vec<(String, u32)> {
         let rows = self.snapshot();
         let at = self.selected + 1;
@@ -1024,14 +827,12 @@ impl App {
         ids.into_iter().zip(numbers).collect()
     }
 
-    /// Pick the session `id` up — the space bar and a drag both come here — with
-    /// the arrangement as it stands, for `Esc` to put back, and fresh trails
-    /// off both ends of it, which catch rather than appear whole (see
-    /// [`Starfield::ignite`]).
+    /// Pick up `id` (space or drag), saving the arrangement for `Esc` and
+    /// igniting fresh trails (see [`Starfield::ignite`]).
     fn pick_up(&mut self, id: String) {
         let was = self.snapshot();
-        // A grab holds an arrangement of the visible rows; nothing else may be
-        // on screen while it does, the last grab's swap included.
+        // Nothing else may be on screen during a grab, including the last
+        // grab's swap.
         self.leaving = None;
         self.swap.clear();
         self.mode = Mode::Reorder { id, was };
@@ -1049,21 +850,10 @@ impl App {
             .collect()
     }
 
-    /// Move the grabbed row to `to`, sliding everything between it and where it
-    /// came from one place the other way — and, with the trail on, start the
-    /// rows that traded places stepping aside (see [`super::swap`]).
-    ///
-    /// The numbers stay where they are on the screen; it is the sessions that
-    /// move between them. The list arrives from `finish_listing` sorted by
-    /// `state.num`, so dealing those same numbers back out down the new row
-    /// order leaves the column reading exactly as it did — which is what lets
-    /// `visible`, `scroll_offset` and the renderer stay unaware that a move
-    /// happened at all, and what keeps the numbers distinct and gap-preserving
-    /// however long the drag runs.
-    ///
-    /// One re-assignment rather than a loop of adjacent swaps: a
-    /// `while self.selected != to` around a mover that clamps by returning is an
-    /// unguarded loop, and no key can interrupt one.
+    /// Move the grabbed row to `to`. Numbers stay put and sessions move
+    /// between them: the same numbers are dealt down the new order, so they
+    /// stay distinct with gaps kept. One reassignment rather than a loop of
+    /// adjacent swaps, which could spin forever.
     fn shift_grabbed_to(&mut self, to: usize) {
         let rows = self.snapshot();
         if rows.len() < 2 {
@@ -1080,9 +870,8 @@ impl App {
         ids.insert(to, moved);
 
         if self.trail {
-            // The rows passed, nearest the session's new row first, and the
-            // seam it last crossed: its top edge going down, its bottom edge
-            // going up.
+            // Rows passed, nearest the new position first, and the last seam
+            // crossed: the row's top edge going down, bottom edge going up.
             let passed: Vec<String> = if to > from {
                 rows[from + 1..=to]
                     .iter()
@@ -1107,20 +896,14 @@ impl App {
             }
         }
 
-        // Rows the filter is hiding keep their numbers, so the whole vector is
-        // still sorted by number once the visible ones have been dealt.
+        // Hidden rows keep their numbers, so re-sorting keeps the whole list
+        // ordered.
         self.sessions.sort_by_key(|s| s.state.num);
         self.selected = to;
     }
 
-    /// Put the numbers back exactly as they were when the grab started, and the
-    /// cursor back on the session that was grabbed.
-    ///
-    /// By id rather than by the row it came from, so it stays right even if the
-    /// list ever moved underneath.
-    ///
-    /// What the moves were still drawing goes too: the rows it was drawn over
-    /// are back where they were, and a cancelled move did not happen.
+    /// Restore the numbers from the grab's start and reselect `id` (by id, in
+    /// case the list moved underneath). Clears the swap effect.
     fn restore(&mut self, was: &[(String, u32)], id: &str) {
         self.swap.clear();
         for (row, num) in was {
@@ -1139,8 +922,7 @@ impl App {
         }
     }
 
-    /// Show the kill confirmation. Killing is unconditional, so the `[y/N]` is
-    /// the whole safeguard — nothing is asked of the session itself.
+    /// Killing is unconditional, so this `[y/N]` is the only safeguard.
     fn show_kill_confirm(&mut self, id: &str) {
         let name = self.session_name(id);
         self.mode = Mode::Confirm {
@@ -1156,8 +938,7 @@ impl App {
         }
     }
 
-    /// The `[y/N]` answered no, by a key or a click: back to the list, and the
-    /// line through the name drawn back off from wherever it had got to.
+    /// `[y/N]` answered no (key or click): retract the strike-through.
     fn decline(&mut self) {
         self.mode = Mode::Normal;
         if let Some(strike) = &mut self.strike {
@@ -1165,14 +946,11 @@ impl App {
         }
     }
 
-    /// Handle one key. Returns whatever the caller now has to do.
     pub fn on_key(&mut self, key: Key) -> Request {
-        // A stale message must not linger over an unrelated action.
+        // Any key clears a stale message, a pending `wanted` selection, and
+        // the previous keystroke's fading rows (so fast typing never waits).
         self.message = None;
-        // Nor a session the cursor was waiting for: the user has taken over.
         self.wanted = None;
-        // Nor the rows the last keystroke dropped: the list is the query's
-        // again, so a fast typist never waits on rows ruled out a letter ago.
         self.leaving = None;
         let was = self.cursor();
         let visible = self.visible_ids();
@@ -1189,17 +967,14 @@ impl App {
         request
     }
 
-    /// The session under the cursor, where the cursor is one that glows when
-    /// it leaves a row: in the list as it is browsed or filtered, not on a
-    /// session in flight or under a `[y/N]`.
+    /// The selected id in Normal or Filter mode, where leaving a row glows.
     fn cursor(&self) -> Option<String> {
         matches!(self.mode, Mode::Normal | Mode::Filter)
             .then(|| self.selected_id())
             .flatten()
     }
 
-    /// If the cursor has moved off the session `was`, start that row glowing.
-    /// Whatever row was glowing before stops: only the row just left glows.
+    /// If the cursor left `was`, make it the (only) glowing row.
     fn glow_from(&mut self, was: Option<String>) {
         if !self.lights {
             return;
@@ -1207,7 +982,7 @@ impl App {
         let (Some(was), Some(now)) = (was, self.cursor()) else {
             return;
         };
-        // A row the filter just took is leaving, not glowing.
+        // A row the filter just dropped fades instead.
         if was == now || !self.visible().iter().any(|s| s.id == was) {
             return;
         }
@@ -1221,8 +996,7 @@ impl App {
         self.visible().iter().map(|s| s.id.clone()).collect()
     }
 
-    /// Keep the rows that were visible and are not now on screen a moment
-    /// longer, fading, so the eye sees which ones a filter keystroke took.
+    /// Start fading the rows a filter keystroke dropped.
     fn note_dropped(&mut self, before: Vec<String>) {
         if !self.sift || !matches!(self.mode, Mode::Filter | Mode::Normal) {
             return;
@@ -1237,25 +1011,19 @@ impl App {
         }
     }
 
-    /// Handle a digit typed in the picker.
+    /// Numbers resolve against the *visible* list, so a row hidden by a
+    /// filter (still applied in Normal mode) is never attached.
     ///
-    /// The numbers are resolved against the *visible* list, not the whole one:
-    /// a filter can still be applied in normal mode, and a number belonging to a
-    /// row the filter has hidden must not silently attach. You can press what
-    /// you can see.
-    ///
-    /// Because `App` holds the sessions, most keystrokes need no timer at all —
-    /// a digit that no longer number could extend is acted on at once. Only a
-    /// genuinely ambiguous one (sessions 1 and 12 both present) waits, and the
-    /// caller resolves that with [`App::resolve_pending`].
+    /// A digit acts at once unless another digit could still change the
+    /// match (sessions 1 and 12): then it waits for the caller's
+    /// [`App::resolve_pending`].
     fn on_digit(&mut self, d: u32) -> Request {
         let Some(n) = self
             .pending
             .take()
             .map(|p| p.saturating_mul(10).saturating_add(d))
         else {
-            // A session number never starts with 0, so a leading one is not the
-            // beginning of anything.
+            // Session numbers never start with 0.
             if d == 0 {
                 return Request::None;
             }
@@ -1270,14 +1038,13 @@ impl App {
             .into_iter()
             .find(|s| s.state.num == n)
             .map(|s| s.id.clone());
-        // Could another digit still name a different session?
         let extendable = self
             .visible()
             .iter()
             .any(|s| s.state.num > n && s.state.num / 10 == n);
 
         match (exact, extendable) {
-            // Ambiguous: 1 is a session but so is 12. Only this waits.
+            // Ambiguous: 1 is a session but so is 12.
             (Some(_), true) => {
                 self.pending = Some(n);
                 Request::None
@@ -1294,8 +1061,8 @@ impl App {
         }
     }
 
-    /// Called by the driver once `keys.timeout_ms` has passed with a
-    /// number half-typed: settle for the session it already names.
+    /// Called once `keys.timeout_ms` passes with a number half-typed: attach
+    /// to the session it already names.
     pub fn resolve_pending(&mut self) -> Request {
         match self.pending.take() {
             Some(n) => self
@@ -1308,40 +1075,20 @@ impl App {
         }
     }
 
-    /// Leave the picker for the session it was opened from.
-    ///
-    /// Nothing to go back to — opened from no session, or from one that has
-    /// since gone — is not an error and not a quit: the picker stays, because
-    /// dismissing it would leave the user looking at a terminal with nothing in
-    /// it. `q` is how you leave for good.
+    /// Return to the session the picker was opened from. With none, the
+    /// picker stays rather than leave an empty terminal; `q` quits.
     fn dismiss(&self) -> Request {
         self.came_from()
             .map_or(Request::None, |s| Request::Attach(s.id.clone()))
     }
 
-    /// Handle one mouse gesture. Returns whatever the caller now has to do.
+    /// Rows are indices into [`App::visible`], resolved by the caller.
     ///
-    /// The rows a gesture names are indices into [`App::visible`], resolved by
-    /// the caller from where the pointer was against the screen it last drew —
-    /// so the picker knows rows, never coordinates, and stays as testable as it
-    /// is for keys.
-    ///
-    /// The highlight follows the pointer: hovering over a row selects it, so
-    /// the keyboard and the mouse share one cursor. A press selects the row
-    /// under it; a press on the row already selected arms its release to
-    /// attach. With the pointer's row always selected that makes a single
-    /// click open the session it is over — and on a terminal that reports no
-    /// motion (one without any-event tracking), the same two rules read as
-    /// "click to select, click again to open", with no double-click clock
-    /// either way. A drag with the button held picks the row up — the
-    /// same [`Mode::Reorder`] the space bar enters — carries it, and the
-    /// release places it, with the same request `Enter` would make. The wheel
-    /// moves the selection, or the row in flight, one row at a time and stops
-    /// at the ends.
-    ///
-    /// A press or a wheel step ends what a key would end: a stale message and a
-    /// half-typed number. A hover, a drag or a release ends nothing, since none
-    /// of them is something the user did on purpose *to* the picker.
+    /// Hover selects; a press on the selected row arms its release to attach,
+    /// so one click opens the hovered row, and without motion reporting it is
+    /// "click to select, click again to open" with no timer. A drag enters
+    /// [`Mode::Reorder`]. Only press and wheel clear the message and pending
+    /// number, as a key does.
     pub fn on_mouse(&mut self, mouse: Mouse) -> Request {
         if matches!(mouse, Mouse::Press(_) | Mouse::ScrollUp | Mouse::ScrollDown) {
             self.message = None;
@@ -1358,10 +1105,8 @@ impl App {
         match &self.mode {
             Mode::Normal | Mode::Filter => self.on_mouse_normal(mouse),
             Mode::Confirm { .. } => {
-                // Only an explicit `y` kills, and a click is not one; but a
-                // click is a deliberate act, so it declines the question the
-                // way any key but `y` does. The wheel is not deliberate enough
-                // to dismiss a `[y/N]`.
+                // Only `y` kills. A click declines, like any other key; the
+                // wheel does nothing.
                 if matches!(mouse, Mouse::Press(_)) {
                     self.decline();
                     self.pressed = None;
@@ -1369,7 +1114,7 @@ impl App {
                 Request::None
             }
             Mode::Reorder { .. } => self.on_mouse_reorder(mouse),
-            // A click stays, as it declines a `[y/N]`; the wheel does not.
+            // A click means "stay", as it declines a `[y/N]`.
             Mode::Leave { .. } => {
                 if matches!(mouse, Mouse::Press(_)) {
                     self.mode = Mode::Normal;
@@ -1400,11 +1145,10 @@ impl App {
                 self.selected = row;
                 Request::None
             }
-            // Off the list, the cursor stays on the last row it was over.
+            // Off the list, the selection stays.
             Mouse::Hover(_) => Request::None,
-            // Dragged off the row it went down on: the row comes with it. Only
-            // from a press that landed on a row — a drag that started on the
-            // blank space must not pick up whatever happens to be selected.
+            // Dragging off the pressed row picks it up. Requires a press on a
+            // row, so a drag from blank space picks up nothing.
             Mouse::Drag(Some(row))
                 if row < len && self.pressed.is_some() && row != self.selected =>
             {
@@ -1421,8 +1165,7 @@ impl App {
                 if !attach {
                     return Request::None;
                 }
-                // As `Enter` does from the filter: the query stays applied,
-                // the prompt closes.
+                // As `Enter` from the filter: the query stays applied.
                 self.mode = Mode::Normal;
                 self.on_selection(Request::Attach)
             }
@@ -1437,11 +1180,8 @@ impl App {
         }
     }
 
-    /// The mouse over a session in flight, whether a drag or the space bar
-    /// picked it up: a press or a drag carries it to the row under the
-    /// pointer, and a release places it — "click where you want it" — with the
-    /// request `Enter` would make. The pointer merely passing over rows
-    /// carries nothing: a row in flight moves on a button, the wheel or a key.
+    /// During a move (from drag or space): press or drag carries the row to
+    /// the pointer, release places it as `Enter` would. Hover does nothing.
     fn on_mouse_reorder(&mut self, mouse: Mouse) -> Request {
         let Mode::Reorder { was, .. } = &self.mode else {
             return Request::None;
@@ -1478,10 +1218,8 @@ impl App {
     }
 
     fn on_key_normal(&mut self, key: Key) -> Request {
-        // Any key that is not a digit ends a half-typed number rather than
-        // letting it linger into an unrelated keystroke. Whether there was one
-        // is what tells an `Esc` aimed at the number from one aimed at the
-        // picker.
+        // A non-digit ends a half-typed number; if there was one, `Esc` only
+        // cancels it.
         let was_pending = !matches!(key, Key::Char('0'..='9')) && self.pending.take().is_some();
         match key {
             Key::Char(c @ '0'..='9') => self.on_digit(u32::from(c) - u32::from('0')),
@@ -1510,8 +1248,7 @@ impl App {
                 }
                 Request::None
             }
-            // Guarded the way `x` is: without it, Space on an empty list would
-            // enter the mode over the "no sessions" screen with nothing to move.
+            // Guarded like `x`, so an empty list never enters Reorder.
             Key::Char(' ') => {
                 if let Some(id) = self.selected_id() {
                     self.pick_up(id);
@@ -1524,10 +1261,8 @@ impl App {
             }
             Key::Char('?') => Request::Help,
             Key::Char(',') => Request::Settings,
-            // One layer at a time, innermost first: a half-typed number, then
-            // a filter narrowing the list, then the picker itself. Each of the
-            // first two is something the user put there and can see, and would
-            // be thrown away unremarked by an Esc that left outright.
+            // One layer at a time: a half-typed number, then the filter, then
+            // the picker.
             Key::Esc => {
                 if was_pending {
                     return Request::None;
@@ -1548,8 +1283,7 @@ impl App {
         match key {
             Key::Char(c) => {
                 self.filter.push(c);
-                // The list narrows under the cursor, so the selection has to be
-                // pulled back into range or it points past the end.
+                // The list narrows under the cursor.
                 self.clamp_selection();
                 Request::None
             }
@@ -1581,27 +1315,9 @@ impl App {
         }
     }
 
-    /// Handle a key while a session is in flight.
-    ///
-    /// Anything not named here does nothing **and keeps the grab** — deliberately
-    /// unlike [`Mode::Confirm`], where everything but `y` dismisses. A `[y/N]` is
-    /// one question; a reorder is a multi-key edit holding an arrangement nothing
-    /// has written yet, and a stray keystroke must not silently decide whether it
-    /// is kept or thrown away. It also means `/` cannot re-filter under a grabbed
-    /// session, so the snapshot describes the same rows for the whole edit.
-    ///
-    /// `Enter` places, and is the only key the hint row names for it. It is the
-    /// confirm key everywhere else a mode is open, so it is the one to advertise;
-    /// the older reading — that Enter means "attach" and so must not commit an
-    /// arrangement — cost more than the ambiguity was worth, since nothing
-    /// attaches while a session is in flight.
-    ///
-    /// Space places as well, unadvertised. It is the key that picked the session
-    /// up, so a hand that found it once finds it again, and dropping the binding
-    /// to match the row would punish exactly that habit. It also makes an
-    /// autorepeat or a nervous double-tap grab-then-place on the spot, which
-    /// moves nothing and so writes nothing — it ends back in normal mode rather
-    /// than holding an edit the screen barely shows.
+    /// Unlisted keys do nothing **and keep the grab** (unlike
+    /// [`Mode::Confirm`]): a stray key must not decide the edit, and `/`
+    /// cannot re-filter under the snapshot. `Enter` and Space both place.
     fn on_key_reorder(&mut self, key: Key) -> Request {
         let Mode::Reorder { id, was } = &self.mode else {
             return Request::None;
@@ -1631,8 +1347,7 @@ impl App {
                 let now = self.snapshot();
                 self.put_down();
                 if now == was {
-                    // Picked up and put straight back down, or moved and moved
-                    // back: nothing to write and nothing to re-list.
+                    // No net move: nothing to write.
                     return Request::None;
                 }
                 Request::Reorder(now)
@@ -1653,9 +1368,8 @@ impl App {
         };
         let id = id.clone();
         match key {
-            // Only an explicit `y` kills. Everything else, including Enter,
-            // declines — that is what `[y/N]` promises.
-            // The row is erased next, and the line goes with it.
+            // Only `y` kills; everything else, Enter included, declines. The
+            // strike goes because the row is erased next.
             Key::Char('y') | Key::Char('Y') => {
                 self.mode = Mode::Normal;
                 self.strike = None;
@@ -1670,8 +1384,7 @@ impl App {
     }
 }
 
-/// A key press, decoupled from crossterm so the state machine can be tested
-/// without constructing backend types.
+/// A key press, decoupled from crossterm for testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Char(char),
@@ -1680,41 +1393,32 @@ pub enum Key {
     Backspace,
     Up,
     Down,
-    /// Only the prompt binds these three: `Left` and `Right` move within a
-    /// field, and `Tab` completes where there is something to complete. The
-    /// picker's handlers ignore them, as they do any other key they do not name.
+    /// Used only by the prompt (cursor movement, completion).
     Left,
     Right,
     Tab,
-    /// Shift-Tab: the settings screen's way back along its tabs.
+    /// Shift-Tab, used by the settings screen.
     BackTab,
     Home,
     End,
     CtrlC,
-    /// Ctrl-N — the readline-style companion to `j`/Down.
     CtrlN,
-    /// Ctrl-P — the readline-style companion to `k`/Up.
     CtrlP,
     Other,
 }
 
-/// A mouse gesture, with the visible row it landed on already resolved by the
-/// caller — see [`App::on_mouse`]. Decoupled from crossterm, as [`Key`] is, and
-/// from the screen's geometry too.
-///
-/// Only the left button and the wheel: nothing here has a use for the other
-/// buttons, and the caller drops them before they get this far.
+/// A mouse gesture with its visible row already resolved by the caller (see
+/// [`App::on_mouse`]); decoupled from crossterm and screen geometry. Left
+/// button and wheel only; the caller drops other buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mouse {
-    /// The pointer moved with no button held, and is now over this row, or
-    /// over nothing.
+    /// Motion with no button held; the row under the pointer, if any.
     Hover(Option<usize>),
-    /// The left button went down on this row, or on nothing.
+    /// Left button down.
     Press(Option<usize>),
-    /// The pointer moved with the left button held, and is now over this row,
-    /// or over nothing.
+    /// Motion with the left button held.
     Drag(Option<usize>),
-    /// The left button came up.
+    /// Left button up.
     Release,
     ScrollUp,
     ScrollDown,
@@ -1730,8 +1434,6 @@ mod tests {
         app.visible().iter().map(|s| s.name.clone()).collect()
     }
 
-    /// The three ways to move are one behaviour, wrapping included — previously
-    /// only `j`/`k` was checked for the wrap.
     #[test]
     fn every_movement_key_moves_and_wraps_in_both_directions() {
         for (down, up) in [
@@ -1755,8 +1457,7 @@ mod tests {
 
     #[test]
     fn ctrl_n_and_ctrl_p_move_while_filtering() {
-        // In Filter mode every printable key is query text, so Ctrl-N/P are the
-        // only letters that can still move the cursor.
+        // In Filter mode printable keys are query text.
         let mut a = app(&["one", "two"]);
         a.on_key(Key::Char('/'));
         a.on_key(Key::CtrlN);
@@ -1805,8 +1506,6 @@ mod tests {
         assert_eq!(app(&["x"]).on_key(Key::Char(',')), Request::Settings);
     }
 
-    /// With settings unsaved, quitting asks first, on the hint row: `w`
-    /// saves and quits, a second `q` quits anyway, and `Esc` stays.
     #[test]
     fn quitting_with_settings_unsaved_asks_first() {
         let mut a = app(&["x"]);
@@ -1839,9 +1538,8 @@ mod tests {
         assert_eq!(a.on_key(Key::CtrlC), Request::Quit, "Ctrl-c quits anyway");
     }
 
-    /// A save on the way out that the file had changed under keeps the
-    /// question up, for a second `w` to overwrite; one that failed otherwise
-    /// puts the picker back with the reason.
+    /// A clash keeps the question up for a second `w`; other failures return
+    /// to the picker with the reason.
     #[test]
     fn a_save_on_the_way_out_that_did_not_happen_says_why() {
         let mut a = app(&["x"]);
@@ -1866,8 +1564,6 @@ mod tests {
         assert_eq!(a.message(), Some("not saved: it no longer reads"));
     }
 
-    /// Whatever was open is put away as `Esc` would put it, and a click
-    /// stays, as it declines a `[y/N]`.
     #[test]
     fn quitting_mid_move_puts_the_move_back_and_a_click_stays() {
         let mut a = app(&["one", "two"]);
@@ -1926,8 +1622,7 @@ mod tests {
         assert_eq!(names(&a), ["API-Server"]);
     }
 
-    /// A capital in the query asks for one in the name, as it does in the create
-    /// prompt's completion. Lower-case queries stay as forgiving as ever.
+    /// Smart case, as in the create prompt's completion.
     #[test]
     fn a_capital_in_the_query_makes_it_case_sensitive() {
         let a = filtering(&["API-Server", "api-client"], "API");
@@ -1944,28 +1639,22 @@ mod tests {
         assert!(names(&a).is_empty(), "but not out of order");
     }
 
-    /// Two words are two requirements, both of which the same row has to meet.
     #[test]
     fn a_query_of_two_words_wants_both() {
         let a = filtering(&["api server", "api client", "web server"], "api ser");
         assert_eq!(names(&a), ["api server"]);
     }
 
-    /// The rows a fuzzy filter admits keep the list's order and their numbers;
-    /// nothing is sorted by how well it matched.
     #[test]
     fn a_filtered_list_keeps_its_order_rather_than_ranking_by_score() {
-        // `ts` is a far better match for "ts" than for "notes-tests-server",
-        // and comes after it in the list all the same.
+        // "ts" matches `ts` far better, yet stays second.
         let a = filtering(&["notes-tests-server", "ts", "api"], "ts");
         assert_eq!(names(&a), ["notes-tests-server", "ts"]);
         let numbers: Vec<u32> = a.visible().iter().map(|s| s.state.num).collect();
         assert_eq!(numbers, [1, 2], "the numbers travel with the rows");
     }
 
-    /// A session is where it runs as much as what it is called: `scratch` in
-    /// `~/work/billing` is found by `billing`. Only the last component takes
-    /// part, though — see `haystacks`.
+    /// Only the last component counts (see `haystacks`).
     #[test]
     fn the_filter_also_matches_the_working_directorys_last_component() {
         let mut a = app(&["scratch", "notes", "session 3"]);
@@ -2004,8 +1693,6 @@ mod tests {
         );
     }
 
-    /// The list shrinks under the cursor as the query grows; the selection must
-    /// not be left pointing past the end.
     #[test]
     fn selection_stays_in_range_while_filtering() {
         let mut a = app(&["aaa", "bbb", "ccc", "abc"]);
@@ -2050,9 +1737,6 @@ mod tests {
         assert_eq!(a.filter(), "", "esc in normal mode clears the filter");
     }
 
-    /// `<prefix> Space` leaves the client running, so the picker is a layer over
-    /// a session rather than a replacement for it, and `Esc` is the way back
-    /// down — same as everywhere else it means "never mind".
     #[test]
     fn esc_dismisses_the_picker_back_to_the_session_it_came_from() {
         let mut a = app(&["one", "two", "three"]);
@@ -2066,9 +1750,8 @@ mod tests {
         assert_eq!(a.on_key(Key::Esc), Request::Attach("id000001".into()));
     }
 
-    /// The first screen of the program is the picker, with nothing behind it.
-    /// Dismissing it would leave the user looking at an empty terminal, so `Esc`
-    /// does nothing and `q` is still the way out.
+    /// At startup nothing is behind the picker; dismissing it would leave an
+    /// empty terminal.
     #[test]
     fn esc_does_nothing_when_the_picker_was_not_opened_from_a_session() {
         let mut a = app(&["one", "two"]);
@@ -2079,9 +1762,6 @@ mod tests {
         assert_eq!(a.on_key(Key::Esc), Request::None);
     }
 
-    /// Killing the session you came from takes the client with it, so there is
-    /// nothing left to go back to — and attaching to it would be attaching to
-    /// something that is gone.
     #[test]
     fn esc_does_not_go_back_to_a_session_that_has_since_been_killed() {
         let mut a = app(&["one", "two"]);
@@ -2094,8 +1774,6 @@ mod tests {
         assert_eq!(a.on_key(Key::Esc), Request::None);
     }
 
-    /// Innermost first. Both of these are things the user typed and can see, and
-    /// an `Esc` that left outright would throw them away without saying so.
     #[test]
     fn esc_clears_what_is_half_typed_before_it_dismisses_anything() {
         let mut a = app(&["one", "two"]);
@@ -2107,7 +1785,7 @@ mod tests {
         assert_eq!(a.on_key(Key::Esc), Request::None, "the filter goes first");
         assert_eq!(a.filter(), "");
 
-        // Sessions 1 and 12 both present, so the digit is genuinely half-typed.
+        // Sessions 1 and 12 both present, so the digit is half-typed.
         let mut a = app(&[
             "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
             "eleven", "twelve",
@@ -2125,8 +1803,7 @@ mod tests {
         );
     }
 
-    /// Naming a session happens on the prompt's own screen, so the picker's job
-    /// is only to say it was asked for — no mode, no buffer, no name.
+    /// Naming happens on the prompt's own screen; the picker only asks.
     #[test]
     fn c_asks_for_a_new_session() {
         let mut a = app(&[]);
@@ -2145,19 +1822,13 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Normal);
     }
 
-    /// With nothing selected there is nothing to rename, and `r` must not ask
-    /// the caller to open a prompt for a session that does not exist.
     #[test]
     fn r_does_nothing_on_an_empty_list() {
         let mut a = app(&[]);
         assert_eq!(a.on_key(Key::Char('r')), Request::None);
     }
 
-    /// `x` opens the confirm immediately and consults nothing.
-    ///
-    /// Killing is unconditional, so there is no unsaved-buffer count to fetch
-    /// and no round trip to the session. That also means the picker cannot
-    /// stall behind a busy session just to draw a prompt.
+    /// Killing is unconditional, so no round trip to a possibly busy session.
     #[test]
     fn x_opens_the_confirm_without_asking_the_session_anything() {
         let mut a = app(&["dotfiles"]);
@@ -2182,7 +1853,6 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Normal);
     }
 
-    /// `[y/N]` means the default is No. Only `y` may destroy a session.
     #[test]
     fn only_y_confirms_a_kill() {
         for key in [
@@ -2209,12 +1879,7 @@ mod tests {
         }
     }
 
-    /// While the filter is open, ordinary keys are text, not commands: a query
-    /// containing "x" must not trigger a kill, and one containing "c" or "r"
-    /// must not open the naming prompt.
-    ///
-    /// Filter is the picker's only text entry now that naming has its own
-    /// screen, so this is where the invariant lives.
+    /// "x", "c" and "r" in a query must not kill or open the prompt.
     #[test]
     fn filter_keys_are_text_not_commands() {
         let mut a = app(&["one"]);
@@ -2226,7 +1891,6 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Filter);
     }
 
-    /// One session, numbered as a listing would have numbered it.
     fn session(id: &str, name: &str, num: u32) -> Session {
         let mut s = Session::new(id.to_string(), name.to_string(), 100, num);
         s.state.num = num;
@@ -2244,8 +1908,6 @@ mod tests {
         assert_eq!(a.pending(), None);
     }
 
-    /// Nine or fewer sessions means no digit can be extended, so none of them
-    /// ever waits.
     #[test]
     fn every_digit_resolves_at_once_when_no_number_can_be_extended() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -2263,7 +1925,6 @@ mod tests {
         assert_eq!(a.pending(), None);
     }
 
-    /// A number never starts with zero.
     #[test]
     fn zero_does_nothing_on_its_own() {
         let mut a = app(&["aaa", "bbb"]);
@@ -2278,7 +1939,7 @@ mod tests {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut a = app(&refs);
 
-        // 1 is ambiguous while 10, 11 and 12 exist, so it waits.
+        // 1 waits while 10, 11 and 12 exist.
         assert_eq!(a.on_key(Key::Char('1')), Request::None);
         assert_eq!(a.pending(), Some(1));
 
@@ -2290,7 +1951,6 @@ mod tests {
         assert_eq!(a.pending(), None);
     }
 
-    /// The ambiguous case is the only one that waits, and the caller settles it.
     #[test]
     fn a_half_typed_number_settles_on_the_session_it_already_names() {
         let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
@@ -2304,8 +1964,6 @@ mod tests {
         assert_eq!(a.resolve_pending(), Request::None, "idempotent");
     }
 
-    /// `11` shares its first digit with 1, 10 and 12, so the first keystroke
-    /// cannot decide anything and the second one settles it.
     #[test]
     fn a_repeated_digit_reaches_the_session_it_spells() {
         let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
@@ -2331,8 +1989,6 @@ mod tests {
         assert_eq!(a.pending(), None, "esc ends it too");
     }
 
-    /// Numbers address the rows on screen. A session the filter has hidden must
-    /// not be reachable by a keystroke that names nothing visible.
     #[test]
     fn a_digit_only_reaches_a_session_the_filter_still_shows() {
         let mut a = app(&["alpha", "beta", "gamma"]);
@@ -2342,7 +1998,7 @@ mod tests {
         }
         a.on_key(Key::Enter); // back to normal mode, filter still applied
 
-        // Only "beta" is visible, and it is number 2.
+        // Only "beta" (number 2) is visible.
         assert_eq!(a.on_key(Key::Char('2')), Request::Attach("id000001".into()));
 
         let mut a = app(&["alpha", "beta", "gamma"]);
@@ -2384,8 +2040,7 @@ mod tests {
         a.on_key(Key::Char('j')); // on "bbb"
         assert_eq!(a.selected_session().expect("selected").name, "bbb");
 
-        // "aaa" is killed and something else takes its number, so "bbb" moves
-        // to row 0; the highlight should travel with it rather than staying put.
+        // "aaa" is killed and "bbb" moves to row 0; the highlight follows it.
         a.set_sessions(vec![
             session("id000001", "bbb", 1),
             session("id000002", "ccc", 2),
@@ -2395,8 +2050,6 @@ mod tests {
         assert_eq!(a.selected_session().expect("selected").name, "bbb");
     }
 
-    /// A rename no longer reorders the list — sorting is by number — but the
-    /// selection must still be anchored to the session rather than the row.
     #[test]
     fn selection_follows_a_renamed_session() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -2447,8 +2100,7 @@ mod tests {
 
     // --- reordering ---------------------------------------------------------
 
-    /// The arrangement on screen: names in display order, and the numbers
-    /// beside them.
+    /// Visible names and their numbers, in display order.
     fn arrangement(app: &App) -> (Vec<String>, Vec<u32>) {
         (
             app.visible().iter().map(|s| s.name.clone()).collect(),
@@ -2470,8 +2122,6 @@ mod tests {
         }
     }
 
-    /// Without the guard, Space would enter the mode over the "no sessions"
-    /// screen, with a hint row offering to move something that is not there.
     #[test]
     fn space_on_an_empty_list_picks_nothing_up() {
         let mut a = app(&[]);
@@ -2479,8 +2129,6 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Normal);
     }
 
-    /// All three families carry the grabbed row, as all three move the cursor,
-    /// and they wrap at both ends the same way.
     #[test]
     fn every_movement_key_carries_the_grabbed_session() {
         for (down, up) in [
@@ -2534,15 +2182,12 @@ mod tests {
         }
     }
 
-    /// The invariant the whole design rests on. A move exchanges which session
-    /// holds a number, never what the numbers are — so the column stays exactly
-    /// as it was, gaps included, and no number is invented, lost, duplicated or
-    /// zeroed however long the drag runs.
+    /// Core invariant: a move changes which session holds a number, never the
+    /// set of numbers (gaps included).
     #[test]
     fn the_numbers_on_screen_do_not_change_while_a_session_is_moving() {
-        // Gapped on purpose, though a listing is dense: the picker is handed
-        // whatever numbers it is handed, and a drag must deal those same ones
-        // back out rather than renumber from the row order it happens to see.
+        // Gapped on purpose: a drag must reuse the given numbers, not
+        // renumber by row.
         let mut a = App::new(vec![
             session("id000000", "aaa", 1),
             session("id000001", "bbb", 2),
@@ -2561,12 +2206,8 @@ mod tests {
         assert_eq!(names, ["bbb", "ccc", "aaa"], "the sessions moved, though");
     }
 
-    /// Every visible row, not only the ones whose number changed.
-    ///
-    /// A diff would be wrong: what is persisted is the *stored* number, and a
-    /// row can already be showing a number `finish_listing` derived for it
-    /// rather than one it stores. Skipping such a row as "unchanged" leaves it
-    /// storing a number that collides with one this batch just wrote.
+    /// A diff would skip rows showing a derived number, leaving a stored one
+    /// that collides (see `Request::Reorder`).
     #[test]
     fn placing_asks_for_the_whole_arrangement_not_a_diff() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -2585,9 +2226,6 @@ mod tests {
         );
     }
 
-    /// The confirm key everywhere else a mode is open, so it confirms here too.
-    /// It cannot mean "attach" while a session is in flight — nothing attaches
-    /// from a grab — so the only reading left is the one the hint row offers.
     #[test]
     fn enter_places_like_space() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -2605,7 +2243,7 @@ mod tests {
             "the same payload Space would have asked for"
         );
 
-        // And the same quiet exit when the arrangement came back unchanged.
+        // No request when the arrangement is unchanged.
         let mut b = app(&["aaa", "bbb"]);
         b.on_key(Key::Char(' '));
         assert_eq!(
@@ -2662,10 +2300,6 @@ mod tests {
         );
     }
 
-    /// Unlike the kill confirm, where anything but `y` dismisses. A `[y/N]` is
-    /// one question; this is a multi-key edit holding an arrangement nothing has
-    /// written yet, and a stray keystroke must not decide its fate. `Enter` is
-    /// not in the list: it places, alongside Space, and the hint row says so.
     #[test]
     fn a_stray_key_does_not_end_a_reorder() {
         for key in [
@@ -2701,9 +2335,6 @@ mod tests {
         assert_eq!(a.on_key(Key::CtrlC), Request::Quit);
     }
 
-    /// Moving obeys the same rule digits do — "you can press what you can see".
-    /// A row jumps over what the filter hides, and the hidden rows keep their
-    /// numbers and stay out of the payload, so nothing writes them.
     #[test]
     fn a_filtered_reorder_jumps_the_hidden_rows_and_leaves_their_numbers_alone() {
         let mut a = app(&["alpha", "zzz", "gamma"]);
@@ -2741,8 +2372,6 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Normal);
     }
 
-    /// Coming back from a session, the cursor is on the session that was
-    /// attached — not on the first row.
     #[test]
     fn the_cursor_starts_on_the_session_it_is_told_to_focus() {
         let mut a = app(&["one", "two", "three"]);
@@ -2751,8 +2380,6 @@ mod tests {
         assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("three"));
     }
 
-    /// A session that ended while it was attached, or was killed from
-    /// elsewhere, is not in the listing the picker just read.
     #[test]
     fn focusing_a_session_that_is_gone_leaves_the_cursor_alone() {
         let mut a = app(&["one", "two"]);
@@ -2765,9 +2392,6 @@ mod tests {
         assert_eq!(empty.selected_index(), 0);
     }
 
-    /// The focused row keeps the cursor across a rename or a kill, which
-    /// re-list: `set_sessions` restores by identity, and the id it restores is
-    /// the focused one.
     #[test]
     fn a_focused_row_survives_a_refresh_that_reorders_the_list() {
         let mut a = app(&["one", "two", "three"]);
@@ -2786,7 +2410,6 @@ mod tests {
 
     // --- the mouse ----------------------------------------------------------
 
-    /// A press and a release on the same row.
     fn click(a: &mut App, row: usize) -> Request {
         let down = a.on_mouse(Mouse::Press(Some(row)));
         assert_eq!(down, Request::None, "a press alone asks for nothing");
@@ -2803,23 +2426,20 @@ mod tests {
         assert_eq!(a.selected_index(), 0);
     }
 
-    /// Click to select, click again to open: the second click is the one that
-    /// attaches, and it is told apart from the first by where the cursor was,
-    /// not by a clock.
+    /// Click to select, click again to open, decided by the selection, not a
+    /// timer.
     #[test]
     fn a_click_on_the_selected_row_attaches() {
         let mut a = app(&["one", "two", "three"]);
         click(&mut a, 1);
         assert_eq!(click(&mut a, 1), Request::Attach("id000001".into()));
 
-        // The cursor put there by a key counts the same as one put by a click.
+        // A key-placed cursor counts the same.
         let mut b = app(&["one", "two", "three"]);
         b.on_key(Key::Char('j'));
         assert_eq!(click(&mut b, 1), Request::Attach("id000001".into()));
     }
 
-    /// The attach is decided on the release, so a press that selected a row
-    /// and a release that follows it are one click, not a click and a half.
     #[test]
     fn a_release_after_selecting_does_not_attach() {
         let mut a = app(&["one", "two"]);
@@ -2835,14 +2455,12 @@ mod tests {
         assert_eq!(a.on_mouse(Mouse::Press(None)), Request::None);
         assert_eq!(a.on_mouse(Mouse::Release), Request::None);
         assert_eq!(a.selected_index(), 1, "the cursor stayed");
-        // A row the caller should never name, but the picker guards it anyway.
+        // Out of range; the caller never sends it, but it is guarded.
         assert_eq!(a.on_mouse(Mouse::Press(Some(7))), Request::None);
         assert_eq!(a.on_mouse(Mouse::Release), Request::None);
         assert_eq!(a.selected_index(), 1);
     }
 
-    /// From the filter, a click accepts the query as `Enter` does: the list
-    /// stays narrowed and the prompt closes on the attach.
     #[test]
     fn a_click_attaches_from_the_filter_and_leaves_the_query_applied() {
         let mut a = app(&["api-server", "dotfiles", "notes"]);
@@ -2886,9 +2504,6 @@ mod tests {
         );
     }
 
-    /// What a key ends, a press or a wheel step ends too: neither should leave
-    /// a stale message over the row it just moved to, or a number waiting for
-    /// a digit the mouse will never type.
     #[test]
     fn a_press_or_a_wheel_step_ends_a_message_and_a_half_typed_number() {
         let names: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
@@ -2902,7 +2517,7 @@ mod tests {
             assert_eq!(a.message(), None, "{gesture:?}");
             assert_eq!(a.pending(), None, "{gesture:?}");
         }
-        // A drag or a release is not something done to the picker on purpose.
+        // Drag and release are not deliberate enough.
         for gesture in [
             Mouse::Hover(Some(1)),
             Mouse::Hover(None),
@@ -2911,8 +2526,7 @@ mod tests {
             Mouse::Release,
         ] {
             let mut a = app(&refs);
-            // The key first: a keypress ends a message, and the message is
-            // what the gesture is being asked to leave alone.
+            // Key first, since a key clears the message.
             a.on_key(Key::Char('1'));
             a.set_message("still here");
             a.on_mouse(gesture);
@@ -2933,8 +2547,6 @@ mod tests {
         assert_eq!(a.selected_index(), 0);
     }
 
-    /// The cursor stays on the last row the pointer was over — it does not
-    /// snap back, and it does not chase the pointer off the list.
     #[test]
     fn hovering_off_the_list_leaves_the_cursor_where_it_was() {
         let mut a = app(&["one", "two", "three"]);
@@ -2949,8 +2561,6 @@ mod tests {
         assert_eq!(a.selected_index(), 1);
     }
 
-    /// With the highlight following the pointer, the row a click lands on is
-    /// already the selection, so one click opens it.
     #[test]
     fn a_single_click_on_a_hovered_row_attaches() {
         let mut a = app(&["one", "two", "three"]);
@@ -2984,8 +2594,6 @@ mod tests {
         );
     }
 
-    /// A row in flight moves on a button, the wheel or a key — not because the
-    /// pointer happened to pass over the list.
     #[test]
     fn hovering_does_not_carry_a_grabbed_row() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -3039,8 +2647,6 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Normal);
     }
 
-    /// A drag that starts on the selected row is a move, not an attach: the
-    /// release that would have opened the session places it instead.
     #[test]
     fn dragging_the_selected_row_moves_it_rather_than_attaching() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -3073,8 +2679,7 @@ mod tests {
         assert_eq!(a.selected_index(), 1);
     }
 
-    /// Dragging within the row it went down on, or off the list altogether,
-    /// picks nothing up — the pointer wobbles.
+    /// Pointer wobble within the pressed row, or off the list, grabs nothing.
     #[test]
     fn a_drag_that_leaves_no_row_grabs_nothing() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3084,8 +2689,7 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Normal);
         assert_eq!(a.on_mouse(Mouse::Release), Request::None);
 
-        // And a drag that began on the blank space must not pick up whatever
-        // happened to be selected.
+        // A drag from blank space must not grab the selection.
         let mut b = app(&["aaa", "bbb"]);
         b.on_mouse(Mouse::Press(None));
         b.on_mouse(Mouse::Drag(Some(1)));
@@ -3093,8 +2697,6 @@ mod tests {
         assert_eq!(arrangement(&b).0, ["aaa", "bbb"]);
     }
 
-    /// Once a row is in flight, the pointer leaving the list does not drop it:
-    /// it stays where it last was until the button comes up.
     #[test]
     fn a_row_in_flight_stays_put_while_the_pointer_is_off_the_list() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -3113,7 +2715,6 @@ mod tests {
         );
     }
 
-    /// The space bar picked it up; a click puts it down where the click is.
     #[test]
     fn a_keyboard_grab_can_be_dropped_with_a_click() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -3136,8 +2737,7 @@ mod tests {
         assert_eq!(*a.mode(), Mode::Normal);
     }
 
-    /// A click on the grabbed row itself, or beside the list, is a release
-    /// where it already is: picked up and put down.
+    /// Clicking the grabbed row, or beside the list, places it where it is.
     #[test]
     fn a_click_that_moves_a_grabbed_row_nowhere_just_places_it() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3183,8 +2783,7 @@ mod tests {
         );
     }
 
-    /// A drag can start from the filter, where the space bar cannot: the
-    /// hint row already knows how to show a reorder with a query applied.
+    /// Unlike Space, a drag can start from the filter.
     #[test]
     fn a_drag_reorders_the_filtered_rows_and_leaves_hidden_ones_alone() {
         let mut a = app(&["alpha", "zzz", "gamma"]);
@@ -3202,8 +2801,6 @@ mod tests {
         assert_eq!(a.filter(), "a", "the query stays applied");
     }
 
-    /// `[y/N]` means the default is No: a click is any key but `y`, and the
-    /// wheel is not even that.
     #[test]
     fn a_click_declines_a_kill_confirm_and_the_wheel_leaves_it_open() {
         let mut a = app(&["dotfiles", "notes"]);
@@ -3257,8 +2854,6 @@ mod tests {
 
     // ---- the trail behind a session in flight ------------------------------
 
-    /// The trails run while a session is in flight, however it was picked up,
-    /// and stop with the move — placed or put back.
     #[test]
     fn a_session_in_flight_keeps_the_clock_running() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3283,8 +2878,6 @@ mod tests {
         assert!(!a.trailing());
     }
 
-    /// The trails are laid out when a session is picked up, and only then: the
-    /// rest of the time nothing moves them, and nothing draws them.
     #[test]
     fn the_trails_are_laid_out_when_a_session_is_picked_up() {
         let mut a = app(&["aaa"]);
@@ -3306,8 +2899,7 @@ mod tests {
         }
     }
 
-    /// `[effects.move] enabled = false`: a move is still a move, but nothing trails
-    /// it and nothing asks for the faster clock.
+    /// `[effects.move] enabled = false`.
     #[test]
     fn with_the_trail_off_a_move_is_drawn_still() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3319,8 +2911,7 @@ mod tests {
         assert!(a.trail_after().render(starfield::TRAIL).trim().is_empty());
     }
 
-    /// On unless the config says otherwise — what an `App` built in a test, with
-    /// no config loaded, reads.
+    /// On by default; tests load no config.
     #[test]
     fn the_trail_follows_the_config() {
         assert!(crate::config::get().effects.move_enabled());
@@ -3329,9 +2920,6 @@ mod tests {
 
     // --- the swap -----------------------------------------------------------
 
-    /// A move starts the rows that traded places stepping aside, the carried
-    /// session one way and the one it passed the other, and the picker draws at
-    /// a frame's pace until the swap is over — however the move was made.
     #[test]
     fn a_move_starts_a_swap_by_key_or_by_mouse() {
         for by_mouse in [false, true] {
@@ -3353,8 +2941,6 @@ mod tests {
         }
     }
 
-    /// A jump passes every row between, and the row next to where the session
-    /// lands is the nearest: last to let its bar go.
     #[test]
     fn a_jump_passes_every_row_between_nearest_first() {
         let mut a = app(&["aaa", "bbb", "ccc", "ddd"]);
@@ -3373,9 +2959,6 @@ mod tests {
         assert_eq!(echoes, ["id000000", "id000001", "id000002"], "and going up");
     }
 
-    /// Putting the session down leaves the swap to finish under the landing;
-    /// cancelling the move takes it off at once, since the rows it was drawn
-    /// over are back where they were.
     #[test]
     fn placing_lets_the_swap_finish_and_cancelling_ends_it() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3396,8 +2979,6 @@ mod tests {
         assert!(!a.swap().moving(), "a cancelled move leaves nothing behind");
     }
 
-    /// With the trail off, a move starts no swap and never asks for the faster
-    /// clock.
     #[test]
     fn with_the_trail_off_a_move_starts_no_swap() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3409,8 +2990,6 @@ mod tests {
         assert!(!a.animating());
     }
 
-    /// A fresh listing is the truth about the rows, and the swap goes with the
-    /// rows it was drawn over.
     #[test]
     fn a_fresh_listing_ends_the_swap() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3425,8 +3004,6 @@ mod tests {
 
     // ---- where a new session goes ------------------------------------------
 
-    /// Straight after the highlighted row, with everything after it moving
-    /// down one.
     #[test]
     fn a_new_session_goes_in_after_the_highlighted_row() {
         let a = app(&["aaa", "bbb", "ccc"]);
@@ -3453,9 +3030,7 @@ mod tests {
         );
     }
 
-    /// After the last row is where a new session goes anyway, so there is
-    /// nothing to write — and no round trip to pay for it. Nor is there with
-    /// no rows at all.
+    /// Also with no rows at all.
     #[test]
     fn a_new_session_after_the_last_row_stores_nothing() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3464,9 +3039,6 @@ mod tests {
         assert!(app(&[]).placement_of("new").is_empty());
     }
 
-    /// Under a filter the highlight is on a row the filter left, and the rows
-    /// it hides keep their numbers and stay out of the payload — the rule a
-    /// reorder follows.
     #[test]
     fn a_filtered_placement_leaves_the_hidden_rows_alone() {
         let mut a = app(&["alpha", "zzz", "gamma"]);
@@ -3484,8 +3056,6 @@ mod tests {
         );
     }
 
-    /// Asking for a name moves nothing: the highlight the session will go
-    /// after is still where it was when the prompt comes back.
     #[test]
     fn asking_for_a_name_leaves_the_highlight_where_it_is() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -3497,7 +3067,7 @@ mod tests {
 
     // ---- the gap a new session opens ---------------------------------------
 
-    /// Every row drawn, as `(id, number shown)`.
+    /// Every drawn row as `(id, number shown)`.
     fn drawn(a: &App) -> Vec<(String, u32)> {
         a.rows()
             .iter()
@@ -3505,9 +3075,8 @@ mod tests {
             .collect()
     }
 
-    /// The gap shows exactly what the create will store: the new row where
-    /// [`App::placement_of`] puts it, and every row with the number it will
-    /// be given — for every row the highlight could be on, filtered or not.
+    /// For every highlight position, filtered or not, the gap matches
+    /// [`App::placement_of`].
     #[test]
     fn the_gap_shows_the_placement_the_create_will_store() {
         let filtered = || {
@@ -3532,8 +3101,6 @@ mod tests {
         }
     }
 
-    /// The row in the gap is named as asked, after the highlighted row, and
-    /// the rows below it move down a place and take the next number.
     #[test]
     fn the_rows_under_the_highlight_move_down_for_the_new_one() {
         let mut a = app(&["api-server", "dotfiles", "notes"]);
@@ -3558,8 +3125,6 @@ mod tests {
         assert_eq!(a.session("id000002").expect("notes").state.num, 3);
     }
 
-    /// With the last row highlighted, or none at all, the gap is at the end,
-    /// and its number is the one past every row's.
     #[test]
     fn with_nothing_after_the_highlight_the_gap_is_at_the_end() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3579,8 +3144,7 @@ mod tests {
         assert_eq!(drawn(&a), [(GHOST_ID.to_string(), 1)]);
     }
 
-    /// The row comes up over [`effects::ROOM`], asking for frames while it
-    /// does, and then stands still in its gap until the gap is closed.
+    /// Animates over [`effects::ROOM`], then stays until closed.
     #[test]
     fn the_row_in_the_gap_comes_up_and_then_stands() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3600,8 +3164,6 @@ mod tests {
         assert_eq!(a.rows().len(), 2);
     }
 
-    /// A fresh listing is the truth about the rows, and ends the gap with
-    /// everything else that was passing over them.
     #[test]
     fn a_fresh_listing_closes_the_gap() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3612,8 +3174,6 @@ mod tests {
         assert!(a.rows().iter().all(|r| !r.ghost));
     }
 
-    /// The picker is on its way out: whatever else was passing ends, so the
-    /// gap is all that moves.
     #[test]
     fn making_room_ends_what_else_was_passing() {
         let mut a = app(&["aaa", "bbb", "ccc"]);
@@ -3630,7 +3190,6 @@ mod tests {
         assert!(a.strike().is_none());
     }
 
-    /// Off, `c` opens no gap and the rows are as they were.
     #[test]
     fn with_the_effect_off_no_gap_opens() {
         let mut a = app(&["aaa", "bbb"]);
@@ -3640,9 +3199,8 @@ mod tests {
         assert_eq!(a.rows().len(), 2);
     }
 
-    /// The number a new session will be given is the one the gap shows on
-    /// its row, and the one the create stores for it: after `dotfiles`, the
-    /// 3 that `notes` had; after the last row, one past it.
+    /// After `dotfiles`, the 3 that `notes` had; after the last row, one past
+    /// it.
     #[test]
     fn the_new_number_is_the_one_the_session_will_be_given() {
         for at in 0..3 {
@@ -3665,7 +3223,6 @@ mod tests {
         assert_eq!(a.new_number(), 3, "after alpha, the number gamma shows");
     }
 
-    /// The id the row in the gap goes by is no session's, and could never be.
     #[test]
     fn the_gap_row_has_an_id_no_session_can_have() {
         assert!(!crate::ids::is_valid_id(GHOST_ID));

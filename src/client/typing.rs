@@ -1,25 +1,18 @@
-//! Typing ahead of a slow link: what a key typed in Insert mode does to the
-//! cursor's line, worked out by the client before Neovim has heard of it
-//! (see `super::predict`).
+//! Insert-mode typeahead over a slow link: what a key does to the cursor's
+//! line, computed by the client before Neovim sees it (see `super::predict`).
 //!
-//! Most keys typed in Insert mode do one plain thing: a character goes in
-//! where the cursor is, and the cursor goes on past it; `<BS>` takes out the
-//! character before the cursor, and the cursor goes back over it. A key does
-//! more, or something else, only where something says so — a mapping that
-//! starts with it, an abbreviation it ends, a re-indent it sets off, a line
-//! broken at `'textwidth'`, a bracket shown matched, a softtabstop's worth of
-//! blanks taken out at once — and the agent says, of each buffer, what there
-//! is of that ([`Facts`]). Where none of it bears on a key ([`refused`]),
-//! the client draws what the key does at once: Neovim's own row for the line,
-//! laid out afresh around the text the key leaves ([`relayout`]).
+//! Most keys just insert a character (or `<BS>` deletes one) and move the
+//! cursor. Anything more (a mapping or abbreviation, a re-indent, a
+//! `'textwidth'` break, `'showmatch'`, a softtabstop delete) is reported per
+//! buffer by the agent ([`Facts`]). If none applies to a key ([`refused`]),
+//! the client draws the result at once, re-laying out Neovim's row around the
+//! new text ([`relayout`]).
 //!
-//! What the agent cannot say is what a plugin's autocommand does as a key is
-//! typed — `InsertCharPre`, or `TextChangedI` and `CursorMovedI` of its own —
-//! or as Insert mode is entered or left: `InsertEnter`, `InsertLeavePre`,
-//! `InsertLeave` and `ModeChanged`. It says only that there is one, and the
-//! client works out what it types in such a buffer, or the keys into Insert
-//! mode or out of it, without drawing them, till enough of them have been
-//! judged right (see `super::predict::Trust`).
+//! The agent cannot tell what a plugin autocommand does on a key
+//! (`InsertCharPre`, `TextChangedI`, `CursorMovedI`) or on entering or leaving
+//! Insert mode (`InsertEnter`, `InsertLeavePre`, `InsertLeave`, `ModeChanged`),
+//! only that one exists. Then the client predicts without drawing until enough
+//! predictions prove right (see `super::predict::Trust`).
 
 use rmpv::ValueRef;
 use unicode_width::UnicodeWidthChar;
@@ -29,99 +22,79 @@ use super::predict::{self, Look, Shape};
 use super::redraw;
 use super::words;
 
-/// What the agent says of Insert mode in a buffer, as it last said it: what
-/// would make a key typed there do other than what typing it plainly does —
-/// each of Neovim's own, looked up as Neovim 0.12 was found to act on it.
+/// What the agent last reported about Insert mode in a buffer: everything that
+/// would make a key do more than plain typing, as Neovim 0.12 behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Facts {
-    /// Said as the buffer was last entered in Insert mode, with the
-    /// mappings a plugin loaded on the way in has made by then; not merely
-    /// as the buffer came into a window, or an option changed, before the
-    /// first time it was.
+    /// Reported on entering Insert mode (so including mappings plugins made
+    /// then), not merely on a window or option change before the first entry.
     pub from_insert: bool,
-    /// The keys a mapping in Insert mode starts with — or a language
-    /// mapping, where `'iminsert'` turns those on — in the buffer or
-    /// everywhere: each as Neovim's `keytrans` writes it.
+    /// First keys of Insert-mode mappings (or language mappings, when
+    /// `'iminsert'` enables them), local or global, in `keytrans` form.
     pub firsts: Vec<Box<str>>,
-    /// What each abbreviation of Insert mode is typed as.
+    /// Insert-mode abbreviations, as typed.
     pub abbrevs: Vec<Box<str>>,
-    /// An `InsertCharPre` autocommand, or one for `TextChangedI` or
-    /// `CursorMovedI`, of something other than Neovim's own matchparen and
-    /// nvmux's agents: what it does to a key typed, nothing says (see the
-    /// module docs).
+    /// An `InsertCharPre`, `TextChangedI` or `CursorMovedI` autocommand other
+    /// than matchparen's or nvmux's: its effect on a key is unknown.
     pub unseen: bool,
-    /// The same of entering Insert mode, an autocommand of `InsertEnter` or
-    /// `ModeChanged`; and of leaving it, one of `InsertLeavePre`,
-    /// `InsertLeave` or `ModeChanged`: what it does — move the cursor, edit
-    /// the buffer — nothing says.
+    /// Likewise for entering (`InsertEnter`, `ModeChanged`) and leaving
+    /// (`InsertLeavePre`, `InsertLeave`, `ModeChanged`) Insert mode; it may
+    /// move the cursor or edit the buffer.
     pub unseen_entered: bool,
     pub unseen_left: bool,
-    /// The column past which a character typed breaks the line, nought for
-    /// none: `'textwidth'`, or the window's width less `'wrapmargin'` and
-    /// its gutter, as Neovim's `comp_textwidth` works it out — or narrower.
+    /// Column past which typing breaks the line, 0 for none: `'textwidth'`, or
+    /// window width minus `'wrapmargin'` and gutter, as `comp_textwidth`
+    /// computes it (or narrower).
     pub tw: usize,
     /// `'formatoptions'`.
     pub fo: Box<str>,
-    /// The keys that have Neovim indent the line again: `'indentkeys'`
-    /// where `'indentexpr'` is set, `'cinkeys'` where `'cindent'` is, none
-    /// otherwise.
+    /// Keys that re-indent: `'indentkeys'` with `'indentexpr'`, `'cinkeys'`
+    /// with `'cindent'`, else none.
     pub indentkeys: Indentkeys,
-    /// `'smartindent'`, `'lisp'`, `'showmatch'` and `'matchpairs'`, the
-    /// pairs as their opening and closing characters.
+    /// `'smartindent'`, `'lisp'`, `'showmatch'`, `'matchpairs'` (open, close).
     pub smartindent: bool,
     pub lisp: bool,
     pub showmatch: bool,
     pub matchpairs: Vec<(char, char)>,
-    /// `'autocomplete'`, which opens a completion menu as text is typed.
+    /// `'autocomplete'`: opens a completion menu while typing.
     pub autocomplete: bool,
-    /// Whether text can go in as typed: the buffer `'modifiable'`, and not
-    /// `'readonly'` and unchanged, which warns and waits at the first
-    /// change, nor a prompt buffer, whose text goes in after its prompt
-    /// wherever Insert mode is entered there.
+    /// `'modifiable'`, and neither `'readonly'` and unchanged (warns and waits
+    /// on the first change) nor a prompt buffer (text goes after the prompt
+    /// wherever Insert mode starts).
     pub editable: bool,
     /// None of `'revins'`, `'rightleft'`, `'paste'`, an input method
-    /// (`'iminsert'` 2) or `'digraph'`, which type otherwise — a character,
-    /// `<BS>` and another a digraph, with the last.
+    /// (`'iminsert'` 2) or `'digraph'` (char, `<BS>`, char makes a digraph).
     pub plain: bool,
     /// `'backspace'`.
     pub bs: Box<str>,
-    /// Whether `<BS>` takes out blanks a softtabstop's worth at a time:
-    /// `'softtabstop'` or `'varsofttabstop'` set; and before a line's first
-    /// character other than a blank, a `'shiftwidth'`'s with `'smarttab'`.
+    /// `<BS>` deletes several blanks at once: `softtabs` if `'softtabstop'` or
+    /// `'varsofttabstop'` is set; `smarttab` a `'shiftwidth'` before the first
+    /// non-blank.
     pub softtabs: bool,
     pub smarttab: bool,
-    /// `'delcombine'`: `<BS>` takes out a character's last combining mark
-    /// alone.
+    /// `'delcombine'`: `<BS>` deletes only the last combining mark.
     pub delcombine: bool,
-    /// The modes `'concealcursor'` hides text on the cursor's line in, by
-    /// their letters, where `'conceallevel'` hides any: `i`, the line typed
-    /// into drawn otherwise than its text; `n` and not `i`, or `i` and not
-    /// `n`, the line drawn otherwise as Insert mode is entered or left.
+    /// `'concealcursor'` mode letters, when `'conceallevel'` conceals any.
+    /// `i`: the typed line is not drawn as its text; exactly one of `n` and
+    /// `i`: the line's drawing changes on entering or leaving Insert mode.
     pub conceals: Box<str>,
-    /// What `'iskeyword'` makes of each character under 256, by its code:
-    /// see [`Facts::keyword`].
+    /// `'iskeyword'` class of each character below 256 (see
+    /// [`Facts::keyword`]).
     pub classes: Vec<u8>,
-    /// `'autoindent'`; and `'cindent'` or `'indentexpr'`, which Neovim
-    /// indents the line again with as `<C-u>` takes out what is past its
-    /// indent.
+    /// `'autoindent'`; and `'cindent'` or `'indentexpr'`, with which Neovim
+    /// re-indents when `<C-u>` deletes the text after the indent.
     pub autoindent: bool,
     pub cindent: bool,
-    /// Whether `<C-w>` and `<C-u>` are mapped as Neovim's own mappings have
-    /// them, typing `<C-g>u` first: from which they stop where Neovim's
-    /// `Insstart_orig` sticks (see `super::predict::Stop`).
+    /// Whether `<C-w>`/`<C-u>` have Neovim's default mappings (`<C-g>u`
+    /// first), so they stop at `Insstart_orig` (see `super::predict::Stop`).
     pub word_undo: bool,
     pub line_undo: bool,
 }
 
 impl Facts {
-    /// As the agent sends them: `[buf, from_insert, firsts, abbrevs, unseen,
-    /// tw, fo, indentkeys, smartindent, lisp, showmatch, matchpairs,
-    /// autocomplete, editable, plain, bs, softtabs, smarttab, delcombine,
-    /// conceals, classes, unseen_entered, unseen_left, autoindent, cindent,
-    /// word_undo, line_undo]` — `matchpairs` and
-    /// `conceals` as the options have them, and `classes` a character a
-    /// code, `0` for a blank, `1` for one of punctuation and `2` for one of
-    /// a word. Says the buffer, and them.
+    /// Parse the agent's array into `(buf, facts)`, in the index order below.
+    /// `matchpairs` and `conceals` are raw option values; `classes` has one
+    /// digit per character code: `0` blank, `1` punctuation, `2` word.
     pub fn read(v: &[ValueRef<'_>]) -> Option<(i64, Self)> {
         let int = |i: usize| v.get(i).and_then(redraw::int);
         let flag = |i: usize| matches!(v.get(i), Some(ValueRef::Boolean(true)));
@@ -164,28 +137,26 @@ impl Facts {
         Some((int(0)?, facts))
     }
 
-    /// Whether `'backspace'` has `<C-w>` and `<C-u>` go on past where Insert
-    /// mode began, rather than stop there once: `nostop`, or 3.
+    /// Whether `'backspace'` lets `<C-w>`/`<C-u>` go past the Insert start
+    /// instead of stopping there once: `nostop`, or `3`.
     pub fn nostop(&self) -> bool {
         self.bs.contains("nostop") || &*self.bs == "3"
     }
 
-    /// Whether a mapping of Insert mode starts with `key`, as Neovim writes
-    /// keys.
+    /// Whether an Insert-mode mapping starts with `key` (Neovim notation).
     pub fn starts(&self, key: &str) -> bool {
         self.firsts.iter().any(|k| same_key(k, key))
     }
 
-    /// Whether `c` is a character of a word, as `'iskeyword'` has it — or,
-    /// past the 256 it says, as Neovim's own classes have most of them; but
-    /// not every one, so `None` for those.
+    /// Whether `c` is a word character per `'iskeyword'`; `None` past the 256
+    /// characters `classes` covers.
     pub fn keyword(&self, c: char) -> Option<bool> {
         let code = usize::try_from(u32::from(c)).ok()?;
         self.classes.get(code).map(|class| *class >= 2)
     }
 }
 
-/// `'matchpairs'`, as its opening and closing characters.
+/// `'matchpairs'` as (open, close) pairs.
 fn pairs(option: &str) -> Vec<(char, char)> {
     option
         .split(',')
@@ -199,22 +170,20 @@ fn pairs(option: &str) -> Vec<(char, char)> {
         .collect()
 }
 
-/// `'indentkeys'` or `'cinkeys'`, as Neovim's `in_cinkeys` reads them: those
-/// that a character typed can set off. Each `*` or `!` before one — indent
-/// before the key goes in, or instead — is passed over: either way the key
-/// does more than go in.
+/// The `'indentkeys'`/`'cinkeys'` entries a typed character can trigger, as
+/// Neovim's `in_cinkeys` reads them. A leading `*` or `!` (indent before or
+/// instead of inserting) is skipped: either way the key does more than insert.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Indentkeys(Vec<Key>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Key {
-    /// A character, anywhere — or, `first`, only with nothing but blanks
-    /// before the cursor (`0x`). In `<…>`, a few of the characters the
-    /// notation would otherwise take, and those Neovim has names for.
+    /// A character anywhere, or with `first` (`0x`) only after blanks. `<…>`
+    /// gives characters the notation reserves, or Neovim's key names.
     Char { c: char, first: bool },
-    /// `=word`, `=~word` (`icase`) or `0=word` (`first`): the word's last
-    /// character typed completing it, with no character of a word before
-    /// it — or, `first`, with only blanks.
+    /// `=word`, `=~word` (`icase`) or `0=word` (`first`): typing the word's
+    /// last character completes it, with no word character before it (or,
+    /// with `first`, only blanks).
     Word {
         word: String,
         icase: bool,
@@ -222,15 +191,14 @@ enum Key {
     },
     /// `e`: `else` completed with only blanks before it.
     Else,
-    /// `:`, which Neovim acts on at the end of a label or a `case`, or after
-    /// a `::` it was in: as good as always.
+    /// `:`: Neovim acts on it after a label, a `case` or a `::`; treated as
+    /// always.
     Colon,
 }
 
 impl Indentkeys {
-    /// The option's value, entry by entry as `in_cinkeys` walks it: past
-    /// each, a comma and the blanks after it, if one comes next; the keys
-    /// that are not characters — `^X`, `o`, `O`, `<CR>` — left out.
+    /// Parse entries as `in_cinkeys` walks them (comma, then optional blanks),
+    /// dropping non-character keys (`^X`, `o`, `O`, `<CR>`).
     pub fn parse(option: &str) -> Self {
         let s: Vec<char> = option.chars().collect();
         let mut keys = Vec::new();
@@ -302,9 +270,8 @@ impl Indentkeys {
         Self(keys)
     }
 
-    /// Whether `c`, typed with `before` the line's text before the cursor,
-    /// has Neovim indent the line again: as `in_cinkeys` has it, over the
-    /// line as it is once `c` has gone in.
+    /// Whether typing `c` after `before` (the text before the cursor) makes
+    /// Neovim re-indent, as `in_cinkeys` judges the line with `c` inserted.
     fn indents(&self, c: char, before: &str, facts: &Facts) -> bool {
         let blank = |c: char| matches!(c, ' ' | '\t');
         let in_indent = before.chars().all(blank);
@@ -326,9 +293,8 @@ impl Indentkeys {
                 } else {
                     tail == word
                 };
-                // A word of its own: at the line's start, or after what is
-                // not a word's character — the byte before it, as Neovim
-                // looks at it.
+                // A whole word: at line start or after a non-word byte (Neovim
+                // checks the byte, not the character).
                 let alone = start == 0
                     || facts.keyword(char::from(typed.as_bytes()[start - 1])) != Some(true);
                 same && alone && (!first || typed[..start].chars().all(blank))
@@ -337,10 +303,9 @@ impl Indentkeys {
     }
 }
 
-/// What a key typed in Insert mode does, where it does only what typing it
-/// plainly does: a character goes in, or the one before the cursor comes
-/// out — or, for `<C-w>`, the word before it, and for `<C-u>`, what was
-/// typed on the line, or the line before it (see [`rubbed`]).
+/// A plain Insert-mode edit: insert a character, delete the one before the
+/// cursor, or for `<C-w>`/`<C-u>` the word or line before it (see
+/// [`rubbed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edit {
     Char(char),
@@ -350,10 +315,9 @@ pub enum Edit {
 }
 
 impl Edit {
-    /// The edit a key Neovim's notation writes as `key` makes: a character
-    /// on its own, other than a control character — or `<Space>`, `<lt>`,
-    /// `<Bar>` or `<Bslash>` for one — or `<BS>` and `<C-h>`, `<C-w>` and
-    /// `<C-u>`. `None` for any other.
+    /// The edit for `key` in Neovim notation: a non-control character (or
+    /// `<Space>`, `<lt>`, `<Bar>`, `<Bslash>`), `<BS>`/`<C-h>`, `<C-w>` or
+    /// `<C-u>`; else `None`.
     pub fn of(key: &str) -> Option<Self> {
         let mut cs = key.chars();
         if let (Some(c), None) = (cs.next(), cs.next()) {
@@ -372,9 +336,7 @@ impl Edit {
     }
 }
 
-/// How a key typed in Normal mode enters Insert mode, where it does nothing
-/// more: `i` before the cursor's character, `a` after it, `A` at the line's
-/// end, `I` before its first character other than a blank.
+/// A plain Normal-mode key entering Insert mode: `i`, `a`, `A` or `I`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Enter {
     Before,
@@ -384,8 +346,6 @@ pub enum Enter {
 }
 
 impl Enter {
-    /// The way of entering Insert mode a key Neovim's notation writes as
-    /// `key` takes, if it is one of those.
     pub fn of(key: &str) -> Option<Self> {
         Some(match key {
             "i" => Enter::Before,
@@ -397,12 +357,10 @@ impl Enter {
     }
 }
 
-/// Where Insert mode entered as `e` puts the cursor, from byte `byte` of a
-/// line of `text` in Normal mode, in a window of `shape`: its byte, and the
-/// display column it is drawn in and wants (see [`sits`]) — as Neovim 0.12.6
-/// was found to put it. `a` goes past the cursor's character and its
-/// combining marks, a tab or a character two cells wide whole, and nowhere
-/// on an empty line; `I` to the line's end on a line all blanks.
+/// Cursor `(byte, display column)` after entering Insert mode by `e` from
+/// Normal-mode `byte` (column per [`sits`]), as in Neovim 0.12.6. `a` skips
+/// the character with its combining marks (a tab or wide char whole) and
+/// stays put on an empty line; `I` on an all-blank line goes to its end.
 pub fn entered(e: Enter, text: &str, shape: &Shape, byte: usize) -> (usize, usize) {
     let cs = predict::chars(text, shape);
     let at = match e {
@@ -420,11 +378,9 @@ pub fn entered(e: Enter, text: &str, shape: &Shape, byte: usize) -> (usize, usiz
     (at, sits(text, shape, at))
 }
 
-/// Where `<Esc>` puts the cursor, leaving Insert mode at byte `byte` of a
-/// line of `text`, in a window of `shape`: back on the character before it
-/// — where the cursor is not at the line's start — its byte, and the
-/// display column it is drawn in there in Normal mode, and wants: a tab's
-/// last, as Neovim 0.12.6 was found to put it.
+/// Cursor `(byte, display column)` after `<Esc>` at `byte`: on the previous
+/// character unless at line start, drawn as in Normal mode (a tab's last
+/// column), as in Neovim 0.12.6.
 pub fn left(text: &str, shape: &Shape, byte: usize) -> (usize, usize) {
     let cs = predict::chars(text, shape);
     let at = cs
@@ -435,12 +391,10 @@ pub fn left(text: &str, shape: &Shape, byte: usize) -> (usize, usize) {
     (at, super::moves::drawn(text, shape, at))
 }
 
-/// Why `<Esc>`, leaving Insert mode at byte `byte` of a line of `text`,
-/// might do more than put the cursor back a character, as the buffer's
-/// `facts` say: `None` where it will not. An abbreviation before the cursor
-/// is expanded; the blanks of an indent nothing was typed after, which
-/// `'autoindent'` and an untouched comment leader leave, are taken out —
-/// which the client cannot tell from blanks typed, and so takes for those.
+/// Why `<Esc>` at `byte` might do more than move back a character, or `None`.
+/// It expands an abbreviation before the cursor, and removes an unused
+/// `'autoindent'` or comment-leader indent; the client cannot tell that from
+/// typed blanks, so blanks before the cursor are refused.
 pub fn unleft(text: &str, byte: usize, facts: &Facts) -> Option<&'static str> {
     let Some(before) = text.get(..byte) else {
         return Some("the cursor inside a character");
@@ -455,8 +409,8 @@ pub fn unleft(text: &str, byte: usize, facts: &Facts) -> Option<&'static str> {
     None
 }
 
-/// A key as a mapping's first is compared with it: a character as itself,
-/// whatever Neovim's notation writes it as; a name in `<…>` in any case.
+/// Compare keys: characters by value whatever their notation, `<…>` names
+/// case-insensitively.
 fn same_key(a: &str, b: &str) -> bool {
     let norm = |k: &str| -> String {
         match Edit::of(k) {
@@ -467,10 +421,8 @@ fn same_key(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
-/// Why `key`, making `e` at byte `byte` of a line of `text` — the cursor on
-/// display column `vcol` — in a window of `shape`, might not do there what
-/// typing it plainly does, as the buffer's `facts` say: `None` where it
-/// will. Each as Neovim 0.12 was found to do.
+/// Why `key` (edit `e` at `byte`, cursor on display column `vcol`) might do
+/// more than plain typing, per `facts` and Neovim 0.12; `None` if it will not.
 pub fn refused(
     key: &str,
     e: Edit,
@@ -494,10 +446,9 @@ pub fn refused(
     let blank = |c: char| matches!(c, ' ' | '\t');
     match e {
         Edit::Char(c) => {
-            // One or two cells wide to Neovim as to the client: no
-            // character but ASCII where Neovim may take one for another
-            // width than the client does, and none of the emoji, and the
-            // symbols drawn as emoji or not by what comes after them.
+            // Width must agree with Neovim's: only ASCII where widths may
+            // differ, and no emoji or symbols whose emoji presentation
+            // depends on what follows.
             let w = c.width().unwrap_or(0);
             let widths = shape.stepping.as_ref().is_none_or(|s| s.widths);
             let emoji = matches!(c,
@@ -505,18 +456,16 @@ pub fn refused(
             if !(1..=2).contains(&w) || c.is_control() || (!c.is_ascii() && (widths || emoji)) {
                 return Some("a character Neovim may not draw as the client does");
             }
-            // An abbreviation is expanded by a character not of a word
-            // typed after it — whatever comes before it, as far as the
-            // client goes.
+            // A non-word character after an abbreviation expands it (the
+            // client ignores what precedes the abbreviation).
             if f.keyword(c) != Some(true) && f.abbrevs.iter().any(|a| before.ends_with(&**a)) {
                 return Some("it ends an abbreviation");
             }
-            // A character other than a blank that would end past
-            // `'textwidth'` breaks the line, where `'formatoptions'` has it
-            // broken — in a comment only, for `c`, which the client does
-            // not tell apart; and `a` formats the paragraph at every key.
-            // Neovim measures the cursor's column without `'list'`, a tab
-            // drawn `^I` as wide as a tab, which the client does not.
+            // A non-blank past `'textwidth'` breaks the line with `t` or `c`
+            // in `'formatoptions'` (`c` only in comments, which the client
+            // cannot tell); `a` formats on every key. Neovim measures the
+            // column without `'list'` (a `^I` tab as a full tab), which the
+            // client does not.
             let formats = f.tw > 0 && f.fo.contains(['t', 'c']) && !blank(c);
             let unlisted = shape.list && shape.tab.is_empty() && before.contains('\t');
             if f.fo.contains('a') || (formats && (unlisted || vcol + w > f.tw)) {
@@ -556,8 +505,8 @@ pub fn refused(
             if !(bs.contains("start") || bs.contains("nostop") || matches!(&**bs, "2" | "3")) {
                 return Some("'backspace' may not take out what was there before");
             }
-            // Without `indent`, Neovim takes out nothing of an indent
-            // `'autoindent'` put in, which the client cannot tell.
+            // Without `indent`, Neovim keeps `'autoindent'` indent, which the
+            // client cannot tell apart.
             if !(bs.contains("indent") || matches!(&**bs, "1" | "2" | "3")) {
                 return Some("'backspace' may not take out an indent");
             }
@@ -572,18 +521,14 @@ pub fn refused(
     }
 }
 
-/// Where the cursor goes in Insert mode once `e` is made at byte `byte` of a
-/// line of `text`, and the line's text then: past a character typed, or
-/// back over the one taken out — a character with its combining marks, as
-/// Neovim takes it out without `'delcombine'`. `None` where there is no
-/// character before the cursor to take out, and for `<C-w>` and `<C-u>`,
-/// which take out more (see [`rubbed`]).
+/// The line and cursor byte after `e` at `byte`. `<BS>` deletes a character
+/// with its combining marks (Neovim without `'delcombine'`). `None` if nothing
+/// precedes the cursor, and for `<C-w>`/`<C-u>` (see [`rubbed`]).
 pub fn edited(e: Edit, text: &str, byte: usize) -> Option<(String, usize)> {
     let (before, after) = (text.get(..byte)?, text.get(byte..)?);
     match e {
         Edit::Char(c) => Some((format!("{before}{c}{after}"), byte + c.len_utf8())),
         Edit::Rub => {
-            // Back over the marks, and the character they go with.
             let at = before
                 .char_indices()
                 .rev()
@@ -595,18 +540,15 @@ pub fn edited(e: Edit, text: &str, byte: usize) -> Option<(String, usize)> {
     }
 }
 
-/// Where `<C-w>` or `<C-u>`, `e`, typed at byte `byte` of a line of `text`
-/// takes the cursor in Insert mode, and the line's text then, as Neovim's
-/// `ins_bs` takes characters out — a character with its combining marks at
-/// a time: for `<C-w>`, back over blanks and then over characters of a
-/// word, or of none but not blanks, of one class (see
-/// [`super::words::class`], `classes` what `'iskeyword'` makes of those
-/// under 256); for `<C-u>`, back to the line's start — or, where it `keeps`
-/// the indent, with `'autoindent'`, `'cindent'` or `'indentexpr'`, to the
-/// line's first character that is not a blank, where the cursor is past
-/// that. Either stops where Insert mode began, `stop`, where it comes to it
-/// — once: from there, it goes on past it. `None` with nothing before the
-/// cursor to take out.
+/// The line and cursor byte after `<C-w>` or `<C-u>` at `byte`, as Neovim's
+/// `ins_bs` deletes (a character with its combining marks at a time).
+///
+/// `<C-w>` deletes blanks, then a run of one class (see
+/// [`super::words::class`]; `classes` from `'iskeyword'`, below 256). `<C-u>`
+/// deletes to line start, or to the first non-blank if past it and `keeps`
+/// (`'autoindent'`, `'cindent'` or `'indentexpr'`). Either stops once at the
+/// Insert start `stop`; a repeat goes past it. `None` if nothing precedes the
+/// cursor.
 pub fn rubbed(
     e: Edit,
     (text, byte): (&str, usize),
@@ -629,8 +571,8 @@ pub fn rubbed(
         _ => 0,
     };
     let mut i = cs.len();
-    // Of a word or not, the first character that is not a blank, and the
-    // class of the one before.
+    // Whether the first non-blank is a word character, and the previous
+    // character's class.
     let mut word: Option<bool> = None;
     let mut last = 0;
     loop {
@@ -657,9 +599,8 @@ pub fn rubbed(
     Some((format!("{}{after}", &text[..at]), at))
 }
 
-/// Where the cursor is drawn in Insert mode at byte `byte` of a line of
-/// `text`, in display columns: on its character's first column — a tab's
-/// first, unlike Normal mode — or just past the line's end.
+/// Insert-mode cursor display column at `byte`: its character's first column
+/// (a tab's first, unlike Normal mode), or just past the line's end.
 pub fn sits(text: &str, shape: &Shape, byte: usize) -> usize {
     predict::chars(text, shape)
         .iter()
@@ -667,33 +608,20 @@ pub fn sits(text: &str, shape: &Shape, byte: usize) -> usize {
         .map_or_else(|| predict::width(text, shape), |ch| ch.vcol)
 }
 
-/// Neovim's row for a line whose text was `old`, `row` its cells past the
-/// gutter as Neovim drew them, as it is once the text is `new`, `put` bytes
-/// taking the place of the bytes `from..from + gone` of `old` — with the
-/// cursor on display column `cursor` — in a window of `shape`: the glyphs as
-/// the client lays `new` out (see `predict::render`), `'listchars'` and tabs
-/// as wide as they are there; the colours of the characters the two have
-/// alike carried over from Neovim's cells for them, kind for kind — a
-/// character drawn as itself in both, or as the same kind of glyph of
-/// `'list'`'s — those of a glyph that is new in the colours of the row's own
-/// of its kind, or `look`'s, and those of text that is new as [`colour`] has
-/// them; and past the end, what Neovim drew there as [`Past`] tells it
-/// apart: what moves with the line's end — virtual text after it — moved
-/// with it, and the rest — the row's fill, a bar of `'cursorline'`, the
-/// columns `'colorcolumn'` colours — left in the window's columns, where
-/// Neovim draws it whatever the text.
+/// Rebuild Neovim's drawn `row` (cells past the gutter) for `new`, where `put`
+/// bytes replaced `old[from..from + gone]`, cursor on display column `cursor`.
 ///
-/// `None` where `old` is not what the row shows, as the client lays it out,
-/// or where `new` would not be drawn on the row as `old` was: in a window
-/// that wraps, a line going on to the next row, or the cursor going there
-/// at the end of a line that fills its row; in one that does not, a view
-/// Neovim would move sideways to keep the cursor in it, or one it has. And
-/// where the client cannot say what Neovim draws of it: a column of
-/// `'colorcolumn'` among the characters the edit moves or makes, whose
-/// colours there are the column's and the character's at once; past the
-/// end, a column of it drawn other than blank (see [`Past::of`]), what moves
-/// with the end going over such a column or from one, or going back to show
-/// more of itself than the row had room for.
+/// Glyphs come from the client's layout (`predict::render`); unchanged
+/// characters keep Neovim's colours by glyph kind, new `'list'` glyphs take
+/// the row's (or `look`'s) colour for their kind, and new text [`colour`]'s.
+/// Past the end ([`Past`]), virtual text moves with the end; fill,
+/// `'cursorline'` and `'colorcolumn'` stay put.
+///
+/// `None` if `old` does not match the row; if `new` would wrap (or put the
+/// cursor) onto the next row, or the view is or would be scrolled sideways;
+/// or if colours are unknowable: a `'colorcolumn'` among moved or new
+/// characters or non-blank past the end ([`Past::of`]), or end content
+/// crossing one or needing more room than the row had.
 pub fn relayout(
     row: &[Cell],
     (old, new): (&str, &str),
@@ -708,9 +636,8 @@ pub fn relayout(
     {
         return None;
     }
-    // Laid out with an id of their own for each kind of glyph — text, and
-    // what `'list'` draws, and Neovim's own forms of what it shows as
-    // something else — so as to tell each cell's kind.
+    // Lay out with a sentinel id per glyph kind (text, `'list'` glyphs,
+    // special keys) to tell each cell's kind.
     let kinds = Look {
         text: TEXT,
         whitespace: WHITESPACE,
@@ -739,9 +666,8 @@ pub fn relayout(
     let (old_w, new_w) = (predict::width(old, shape), predict::width(new, shape));
     let past = Past::of(row, old_end, cc)?;
     let mut colours: Vec<Option<u32>> = vec![None; new_end];
-    // A character of `new` before the edit, or after it, is the one of
-    // `old`'s there: its cells, kind for kind, as Neovim drew them — a tab
-    // grown or shrunk as its first and last.
+    // Characters outside the edit keep Neovim's colours, kind for kind; a
+    // tab that changed width maps onto its first and last cells.
     let old_cs = predict::chars(old, shape);
     for ch in predict::chars(new, shape) {
         let then = match ch.byte {
@@ -761,15 +687,14 @@ pub fn relayout(
             }
         }
     }
-    // The line's end, where `'listchars'` draws one, is its own as well.
+    // So does a `'listchars'` `eol` glyph.
     if new_w < new_end && old_w < old_end {
         colours[new_w] = Some(row[old_w].hl);
     }
-    // Past the end, what Neovim drew there: what moves with the end moved
-    // with it, a character two cells wide cut by the row's end not one to
-    // draw half of — and not where it was cut, should it go back, nor over
-    // a column of `'colorcolumn'`'s, or from one; and the rest of the row in
-    // its fill, but for the columns `'colorcolumn'` colours, in theirs.
+    // Past the end: move the end's run with it (blanking a wide char cut by
+    // the row edge; refusing if a cut run would come back, or it crosses a
+    // `'colorcolumn'`), and fill the rest, with `'colorcolumn'` columns in
+    // their colour.
     let (run, to) = (past.run.clone(), new_end);
     if (run.end == room && to < run.start)
         || cc
@@ -808,11 +733,10 @@ pub fn relayout(
             blank(past.fill)?
         });
     }
-    // What has no colour carried over: a glyph in the colours of the row's
-    // own of its kind, or the window's; text by its neighbours, left to
-    // right, the right half of a character two cells wide as its left. Not
-    // by a cell of a column of `'colorcolumn'`'s, whose colours are the
-    // column's as well.
+    // Cells without carried colour: a glyph takes the row's colour for its
+    // kind (or the window's); text goes by its neighbours, left to right, a
+    // right half as its left. `'colorcolumn'` cells are never used, as
+    // their colour is mixed.
     let own = |kind: u32| -> u32 {
         let window = match kind {
             WHITESPACE => look.whitespace,
@@ -844,10 +768,8 @@ pub fn relayout(
             let at = new_cs.iter().rposition(|ch| ch.vcol <= n);
             let c = at.map_or(' ', |i| new_cs[i].c);
             let left_char = at.and_then(|i| i.checked_sub(1)).map(|i| new_cs[i].c);
-            // A neighbour to go by: text, not a glyph of `'list'`'s — a
-            // blank, a tab, which take the window's colours for them — nor
-            // a cell of a column of `'colorcolumn'`'s, nor text yet to be
-            // coloured.
+            // Neighbours must be already-coloured text: not `'list'` glyphs
+            // (window colours) nor `'colorcolumn'` cells.
             let by = |k: usize| {
                 let glyph = kind.get(k).is_some_and(|k| *k != TEXT);
                 let later = unset.get(k).copied().unwrap_or(false);
@@ -865,29 +787,23 @@ pub fn relayout(
     Some(out)
 }
 
-/// What Neovim drew on a line's row past the line's end, as far as the
-/// client tells it apart, and as Neovim 0.12.6 was found to draw it: the
-/// row's fill, in the colours of most of its blanks — the bar of
-/// `'cursorline'` across the cursor's line among them — and, blank, the
-/// columns `'colorcolumn'` colours, both of them the window's whatever the
-/// text; and from the line's end to the last of anything else, what moves
-/// with the end — virtual text after it, its own blanks and the fill between
-/// them and all — but for virtual text drawn in a column of the window's,
-/// which the agent says of instead (see `super::predict::Predictor::pinned`).
+/// What Neovim (0.12.6) drew past a line's end: the fill (the most common
+/// blank colour, `'cursorline'` included) and blank `'colorcolumn'` columns,
+/// both fixed to the window; and from the end to the last other cell, a run
+/// that moves with the end (virtual text with its blanks). Virtual text at a
+/// fixed window column is reported by the agent instead (see
+/// `super::predict::Predictor::pinned`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Past {
-    /// The fill's colours: `None` where the row has no blank past the end
-    /// but in a column of `'colorcolumn'`'s.
+    /// `None` if the only blanks past the end are `'colorcolumn'` ones.
     fill: Option<u32>,
-    /// The columns of what moves with the line's end.
+    /// Columns that move with the line's end.
     run: std::ops::Range<usize>,
 }
 
 impl Past {
-    /// What Neovim drew on `row` from column `end`, the first past the
-    /// line's text and its `eol` glyph, on, in a window whose
-    /// `'colorcolumn'` colours columns `cc`: `None` where something not
-    /// blank is drawn in one of those columns.
+    /// Read `row` from `end` (past the text and `eol` glyph), with
+    /// `'colorcolumn'` columns `cc`; `None` if one of those is not blank.
     fn of(row: &[Cell], end: usize, cc: &[usize]) -> Option<Self> {
         let blank = |c: &Cell| c.text == Text::Char(' ');
         let mut counts: Vec<(u32, usize)> = Vec::new();
@@ -916,8 +832,7 @@ impl Past {
     }
 }
 
-/// The display columns `'colorcolumn'` colours in a window of `shape`, as
-/// the agent says them.
+/// `'colorcolumn'` display columns, as the agent reports them.
 fn colorcolumn(shape: &Shape) -> &[usize] {
     shape
         .stepping
@@ -925,19 +840,16 @@ fn colorcolumn(shape: &Shape) -> &[usize] {
         .map_or(&[], |s| s.colorcolumn.as_slice())
 }
 
-/// The ids [`relayout`] lays a line out with, for the kinds of its glyphs:
-/// none an id the client gives a highlight of Neovim's, which count up from
-/// one and come nowhere near.
+/// Glyph-kind ids for [`relayout`]; real highlight ids count up from 1 and
+/// never get near.
 const TEXT: u32 = u32::MAX - 3;
 const WHITESPACE: u32 = u32::MAX - 2;
 const NONTEXT: u32 = u32::MAX - 1;
 const SPECIALKEY: u32 = u32::MAX;
 
-/// The colour a character `c` typed is drawn in till Neovim draws it — a
-/// guess, and never judged: its neighbours' where the two have the same,
-/// inside a string or a comment; the one's before it where both are
-/// characters of a word, carrying on a name; else the colour Neovim fills
-/// the row with past the line's end, `fill`.
+/// A guessed (never judged) colour for typed `c` until Neovim draws it: the
+/// neighbours' if equal (inside a string or comment), the left one's if both
+/// are word characters (continuing a name), else the row's `fill`.
 fn colour(
     (left, c, right): (Option<&Cell>, char, Option<&Cell>),
     left_char: Option<char>,
@@ -957,8 +869,7 @@ mod tests {
     use super::*;
     use crate::client::predict::{Cursorline, Listchars, Stepping, Stop};
 
-    /// A window 20 columns wide with no gutter, `'wrap'` as `wrap` says, a
-    /// tab 8 wide, nothing that takes a character for another width.
+    /// 20 columns, no gutter, tabstop 8, unambiguous widths.
     fn shape(wrap: bool) -> Shape {
         Shape {
             buf: 1,
@@ -1011,8 +922,7 @@ mod tests {
         }
     }
 
-    /// [`shape`], with `'list'` and `'listchars'` as `tab`, `trail`, `space`
-    /// and `eol` say.
+    /// [`shape`] with `'list'` and the given `'listchars'`.
     fn listing(tab: &str, trail: Option<char>, space: Option<char>, eol: Option<char>) -> Shape {
         Shape {
             list: true,
@@ -1027,8 +937,7 @@ mod tests {
         }
     }
 
-    /// Neovim's defaults: nothing that types otherwise, `'iskeyword'` as it
-    /// comes.
+    /// Neovim's defaults.
     fn facts() -> Facts {
         Facts {
             from_insert: true,
@@ -1066,7 +975,7 @@ mod tests {
         }
     }
 
-    /// The window's colours: the text in 1, `NonText` 2, `Whitespace` 3.
+    /// Text 1, `NonText` 2, `Whitespace` 3, `SpecialKey` 4.
     fn look() -> Look {
         Look {
             text: 1,
@@ -1077,9 +986,8 @@ mod tests {
         }
     }
 
-    /// A row as Neovim draws it, 20 cells: `text`, a character a cell or
-    /// two — `_` for the right half of a character two cells wide — each
-    /// in the highlight `hls` has for it, a digit, and 1 past them.
+    /// A 20-cell row: `text` (`_` is a wide char's right half), with one
+    /// highlight digit per cell from `hls`, 1 past them.
     fn row(text: &str, hls: &str) -> Vec<Cell> {
         let mut hls = hls.chars().map(|h| h.to_digit(10).unwrap_or(1));
         let mut cells: Vec<Cell> = text
@@ -1099,9 +1007,7 @@ mod tests {
         cells
     }
 
-    /// The text of a row, `_` for the right half of a character two cells
-    /// wide, and its highlights as digits, past the blanks at its end in
-    /// the window's.
+    /// A row's text and highlight digits, trailing blanks trimmed.
     fn drawn(cells: &[Cell]) -> (String, String) {
         let text: String = cells
             .iter()
@@ -1119,10 +1025,7 @@ mod tests {
         (text.trim_end().to_string(), hls)
     }
 
-    /// `keys` typed at byte `byte` of a line of `text`, in a window of
-    /// `shape` whose row Neovim drew as `cells`: each key's row, laid out
-    /// from the one before, and `None` from the first that is not drawn on
-    /// it as the line was.
+    /// Each key's relaid row; `None` from the first not drawn ahead.
     fn typed(
         shape: &Shape,
         (text, byte): (&str, usize),
@@ -1158,9 +1061,8 @@ mod tests {
         Some((text.into(), hls.into()))
     }
 
-    /// Text typed before a tab takes it in: the tab grows narrower, and what
-    /// comes after it stays where it was — `b` at the tab stop — in the
-    /// colours Neovim drew it in, as Neovim 0.12.6 was found to draw it.
+    /// The tab narrows and `b` stays at the tab stop in its colours, as in
+    /// Neovim 0.12.6.
     #[test]
     fn a_tab_after_the_cursor_takes_in_what_is_typed() {
         let rows = typed(
@@ -1178,9 +1080,8 @@ mod tests {
         );
     }
 
-    /// With `'list'`, a blank typed at a line's end is drawn as `trail`
-    /// says, in `Whitespace`, before `eol`; and one typed after it turns the
-    /// blanks before it back into blanks. `<BS>` brings the `trail` back.
+    /// Trailing blanks show as `trail` in `Whitespace` until text follows;
+    /// `<BS>` restores them.
     #[test]
     fn listchars_are_drawn_as_neovim_draws_them_as_text_is_typed() {
         let shape = listing(">-", Some('-'), None, Some('$'));
@@ -1200,8 +1101,7 @@ mod tests {
                 seen("ab-$", "1132"),
             ]
         );
-        // A tab drawn as `tab`, narrower as text goes in before it, and a
-        // blank as `space`.
+        // A `tab` glyph narrowing, and a blank as `space`.
         let shape = listing(">-", None, Some('.'), None);
         let rows = typed(
             &shape,
@@ -1219,16 +1119,12 @@ mod tests {
         );
     }
 
-    /// A character two cells wide goes in as both its halves, and comes
-    /// out whole.
     #[test]
     fn a_character_two_cells_wide_goes_in_and_out_whole() {
         let rows = typed(&shape(true), ("ab", 1), row("ab", "11"), &["日", "<BS>"]);
         assert_eq!(rows, [seen("a日_b", "1111"), seen("ab", "11")]);
     }
 
-    /// Virtual text Neovim draws past a line's end goes with the end, in its
-    /// own colours.
     #[test]
     fn what_is_drawn_past_the_end_moves_with_it() {
         let rows = typed(
@@ -1247,9 +1143,7 @@ mod tests {
         );
     }
 
-    /// `key` typed at byte `byte` of a line of `text`, in a window of `shape`
-    /// whose row Neovim drew as `cells`: the row laid out, every cell's
-    /// highlight a digit, or `None` where it is not drawn ahead.
+    /// The relaid row's highlight digits, or `None` if not drawn ahead.
     fn laid(
         shape: &Shape,
         (text, byte): (&str, usize),
@@ -1278,7 +1172,7 @@ mod tests {
         )
     }
 
-    /// [`shape`], with `'colorcolumn'` colouring display columns `cc`.
+    /// [`shape`] with `'colorcolumn'` at `cc`.
     fn coloured(cc: &[usize]) -> Shape {
         let mut s = shape(true);
         if let Some(stepping) = s.stepping.as_mut() {
@@ -1287,12 +1181,8 @@ mod tests {
         s
     }
 
-    /// `'colorcolumn'` colours columns of the window, not characters: past
-    /// the line's end, the column stays where it is, in Neovim's colours for
-    /// it, however much is typed or taken out before it — with virtual text
-    /// at the end moving short of it; and an edit that would move a
-    /// character into the column, or out of it, or the virtual text over
-    /// it, is not drawn ahead, as Neovim 0.12.6 was found to draw them.
+    /// The column stays put past the end; edits moving a character or
+    /// virtual text into or out of it are not drawn ahead (Neovim 0.12.6).
     #[test]
     fn colorcolumn_stays_in_its_columns() {
         let cc = coloured(&[12]);
@@ -1304,8 +1194,7 @@ mod tests {
                 "{key}"
             );
         }
-        // Virtual text at the end goes with it, short of the column; not
-        // over it.
+        // Virtual text moves up to the column, not over it.
         let vt = row("foo <-E      ", "1111666111117");
         assert_eq!(
             laid(&cc, ("foo", 3), &vt, "x").as_deref(),
@@ -1326,8 +1215,8 @@ mod tests {
         );
         let (cc, drawn) = vt(10);
         assert_eq!(laid(&cc, ("foobar", 6), &drawn, "x"), None);
-        // Inside the text, a column after the edit is moved over; one before
-        // it is not.
+        // A column after the edit within the text refuses; one before does
+        // not.
         let cc = coloured(&[8]);
         let drawn = row("foobarbazqux", "111111117111");
         assert_eq!(laid(&cc, ("foobarbazqux", 1), &drawn, "x"), None);
@@ -1335,7 +1224,7 @@ mod tests {
             laid(&cc, ("foobarbazqux", 12), &drawn, "x").as_deref(),
             Some("11111111711111111111")
         );
-        // A character typed next to the column does not take its colours.
+        // Typed next to the column, a character does not take its colour.
         let cc = coloured(&[2]);
         let drawn = row("abcd", "1171");
         assert_eq!(
@@ -1344,13 +1233,9 @@ mod tests {
         );
     }
 
-    /// What Neovim draws past a line's end moves with the end, from it to
-    /// the last of it, the fill between and all — a diagnostic's virtual
-    /// text, its spacing the fill's, as Neovim 0.12.6 draws it — and the
-    /// rest of the row stays the fill; but virtual text cut by the row's end
-    /// is not drawn going back over what it did not show, nor is anything
-    /// drawn in a column of `'colorcolumn'`'s past the end, which is not
-    /// the column's.
+    /// A diagnostic's virtual text moves as one run with its fill gaps
+    /// (Neovim 0.12.6). Text cut by the row edge cannot move back, and nothing
+    /// non-blank may sit in a `'colorcolumn'` past the end.
     #[test]
     fn what_is_drawn_past_the_end_moves_with_the_end_as_a_whole() {
         let plain = shape(true);
@@ -1370,9 +1255,6 @@ mod tests {
         assert_eq!(laid(&coloured(&[9]), ("abc", 3), &over, "x"), None);
     }
 
-    /// Text typed between glyphs of `'list'`'s takes the colours of the
-    /// row's fill, not the glyphs' `Whitespace`; and one typed before the
-    /// `eol` glyph, the fill past it, not its `NonText`.
     #[test]
     fn text_typed_between_glyphs_is_not_coloured_as_them() {
         let shape = listing(">-", None, Some('.'), None);
@@ -1387,11 +1269,9 @@ mod tests {
         );
     }
 
-    /// In a window that wraps, a character that fills the row's last column
-    /// at the line's end sends the cursor to the next row, as Neovim draws
-    /// it, and is not drawn ahead — unless the line's end, drawn, fills it;
-    /// in one that does not, one that would move the view sideways is not
-    /// either, `'sidescrolloff'` from its edge.
+    /// With `'wrap'`, filling the row's last column at line end moves the
+    /// cursor to the next row (unless an `eol` glyph fills it). Without, a
+    /// key that would scroll sideways (per `'sidescrolloff'`) is refused.
     #[test]
     fn a_key_that_would_wrap_or_move_the_view_is_not_drawn() {
         let full = "0123456789abcdef";
@@ -1430,9 +1310,7 @@ mod tests {
         assert!(rows[3].is_some() && rows[4].is_none(), "{rows:?}");
     }
 
-    /// Whether `key` typed at the end of `before`, the line's text up to
-    /// the cursor, is refused, as the buffer's `f` and a window of
-    /// [`shape`] have it.
+    /// Whether `key` typed after `before` is refused.
     fn refuses(f: &Facts, key: &str, before: &str) -> bool {
         let shape = shape(true);
         let e = Edit::of(key).expect("an edit");
@@ -1441,12 +1319,9 @@ mod tests {
         refused(key, e, (&text, before.len(), vcol), f, &shape).is_some()
     }
 
-    /// The keys that have Neovim indent the line again, as `in_cinkeys`
-    /// finds them in `'cinkeys'` and `'indentkeys'`, and as Neovim 0.12.6
-    /// was found to: C's `}`, `#` and `{` as a line's first character but
-    /// not after another, `else` completed and `:`; Lua's `end` completed
-    /// with only blanks before it; Python's `elif` completed after anything
-    /// but a character of a word.
+    /// As in Neovim 0.12.6: C's `}`, `#`, `{` only as the first non-blank,
+    /// `else` and `:`; Lua's `end` after blanks only; Python's `elif` after
+    /// any non-word character.
     #[test]
     fn keys_that_indent_the_line_again_are_left_to_neovim() {
         let c = Facts {
@@ -1515,9 +1390,7 @@ mod tests {
         assert!(refuses(&f, ">", "x") && refuses(&f, "D", "x en") && !refuses(&f, "d", "xen"));
     }
 
-    /// A character not of a word typed after an abbreviation — whatever is
-    /// before it — waits for Neovim, which may expand it; one of a word
-    /// does not.
+    /// Only a non-word character after an abbreviation is refused.
     #[test]
     fn a_key_after_an_abbreviation_is_left_to_neovim() {
         let f = Facts {
@@ -1542,10 +1415,8 @@ mod tests {
         }
     }
 
-    /// A character other than a blank that would end past `'textwidth'`,
-    /// where `'formatoptions'` breaks lines there, waits for Neovim; one
-    /// that ends on it does not, nor a blank, as Neovim 0.12.6 was found
-    /// to break them. `a` in `'formatoptions'` formats at every key.
+    /// A non-blank ending past `'textwidth'` is refused; one ending on it, or
+    /// a blank, is not (Neovim 0.12.6). `fo+=a` refuses every key.
     #[test]
     fn a_key_that_would_break_the_line_is_left_to_neovim() {
         let f = Facts {
@@ -1578,10 +1449,8 @@ mod tests {
         assert!(refuses(&auto, "x", ""));
     }
 
-    /// With `'showmatch'`, a closing bracket of `'matchpairs'` sends the
-    /// cursor to the one it closes for a while: left to Neovim, as is every
-    /// key where text is typed otherwise in the buffer, or a mapping starts
-    /// with it — compared as Neovim writes keys, a character as itself.
+    /// `'showmatch'` closing brackets, buffers that type otherwise, and
+    /// mapped first keys (compared by character, whatever the notation).
     #[test]
     fn keys_neovim_does_more_with_are_left_to_it() {
         let f = Facts {
@@ -1630,9 +1499,6 @@ mod tests {
         }
     }
 
-    /// Characters Neovim may lay out otherwise than the client does are left
-    /// to it: emoji, and any but ASCII where it may take a character for
-    /// another width. The rest of those one or two cells wide are not.
     #[test]
     fn characters_of_widths_neovim_may_differ_on_are_left_to_it() {
         let f = facts();
@@ -1647,11 +1513,9 @@ mod tests {
         assert!(refused("ö", e, (text, 1, 1), &f, &shape).is_some());
     }
 
-    /// `<BS>` over blanks a softtabstop's worth at a time — `'softtabstop'`
-    /// set, or in a line's leading blanks with `'smarttab'` — is left to
-    /// Neovim, as is one over a combining mark with `'delcombine'`, at the
-    /// start of a line, and before where Insert mode began without `start`
-    /// in `'backspace'`. Over a character, or a blank mid-line, it is not.
+    /// Refused: softtabstop or `'smarttab'` indent blanks, a combining mark
+    /// with `'delcombine'`, line start, and past the Insert start without
+    /// `start` in `'backspace'`.
     #[test]
     fn bs_over_more_than_a_character_is_left_to_neovim() {
         let sts = Facts {
@@ -1686,9 +1550,6 @@ mod tests {
         assert!(refuses(&dc, "<C-h>", "e\u{301}") && !refuses(&facts(), "<C-h>", "e\u{301}"));
     }
 
-    /// What a key does to the line: a character in before the cursor, and the
-    /// cursor past it; or the character before it out — with its combining
-    /// marks, two cells wide or not — and the cursor back over it.
     #[test]
     fn an_edit_puts_a_character_in_or_takes_one_out() {
         assert_eq!(edited(Edit::Char('x'), "ab", 1), Some(("axb".into(), 2)));
@@ -1716,13 +1577,11 @@ mod tests {
         }
     }
 
-    /// A line, and the byte the cursor is left on in it.
+    /// A line and the cursor byte.
     type Left<'a> = (&'a str, usize);
 
-    /// The line and the cursor's byte once `keys` are typed after `A` on a
-    /// line of `line`, `<C-w>` and `<C-u>` stopping as [`Stop`] has them —
-    /// mapped as Neovim's own mappings map them if `undo` — and `<C-u>`
-    /// keeping the indent if `keeps`.
+    /// Line and cursor after `A` then `keys`. `undo`: `<C-w>`/`<C-u>` have
+    /// Neovim's default mappings; `keeps`: `<C-u>` keeps the indent.
     fn typed_out(line: &str, keys: &str, keeps: bool, undo: bool) -> (String, usize) {
         let classes = facts().classes;
         let (mut text, mut byte) = (line.to_string(), line.len());
@@ -1749,13 +1608,8 @@ mod tests {
         (text, byte)
     }
 
-    /// `<C-w>` and `<C-u>` typed after `A`, and keys before them, as Neovim
-    /// 0.12.6 was found to take them out, with `'autoindent'` and without:
-    /// a word, or a run of punctuation, after the blanks before it, a
-    /// script's characters a class of their own; what was typed, or the
-    /// line before the cursor — but its indent, with `'autoindent'` — each
-    /// stopping where Insert mode began, once, and going on past it from
-    /// there, or where the line was taken out back past it.
+    /// Cases from Neovim 0.12.6, with and without `'autoindent'`. Each
+    /// script is its own class; both stop once at the Insert start.
     #[test]
     fn words_and_lines_come_out_as_neovim_takes_them_out() {
         #[rustfmt::skip]
@@ -1791,16 +1645,12 @@ mod tests {
                 );
             }
         }
-        // Nothing before the cursor, nothing to take out.
         let classes = facts().classes;
         assert_eq!(rubbed(Edit::Word, ("abc", 0), None, &classes, true), None);
     }
 
-    /// Where `<C-w>` and `<C-u>` stop once they have taken out what was
-    /// there before Insert mode began, as Neovim 0.12.6 was found to stop
-    /// them: mapped as its own mappings map them, at the line's start they
-    /// went back to, from then on; not so mapped, where Insert mode began,
-    /// again, a key taking out before it moving that only for itself.
+    /// As in Neovim 0.12.6: with its default mappings the stop sticks at the
+    /// line start reached; without, it stays at the Insert start each time.
     #[test]
     fn where_words_and_lines_stop_sticks_as_neovims_own_mappings_have_it() {
         #[rustfmt::skip]
@@ -1824,11 +1674,6 @@ mod tests {
         }
     }
 
-    /// `<C-w>` and `<C-u>` are left to Neovim where they would join the line
-    /// to the one before, where `'backspace'` would not have them take out
-    /// what was there before Insert mode or an indent, where `'delcombine'`
-    /// may have them take out a mark alone, and `<C-u>` where the line may
-    /// be indented again; otherwise not.
     #[test]
     fn words_and_lines_are_refused_where_neovim_may_take_out_otherwise() {
         let shape = shape(true);
@@ -1875,7 +1720,6 @@ mod tests {
         );
     }
 
-    /// The agent's word on a buffer's Insert mode, read.
     #[test]
     fn facts_are_read_as_the_agent_sends_them() {
         use rmpv::Value;
@@ -1927,8 +1771,7 @@ mod tests {
         );
     }
 
-    /// The agent's word on autocommands of entering Insert mode and of
-    /// leaving it, last of all it says of a buffer's Insert mode.
+    /// `unseen_entered`/`unseen_left` are the last two fields.
     #[test]
     fn what_entering_and_leaving_insert_mode_set_off_is_read() {
         use rmpv::Value;
@@ -1966,9 +1809,7 @@ mod tests {
         assert_eq!(said(false, false), (false, false, false));
     }
 
-    /// A window, a line's text, the byte the cursor is on in Normal mode, a
-    /// key that enters Insert mode, and where it puts the cursor and `<Esc>`
-    /// after it does, each a byte and a display column.
+    /// Shape, text, byte, key, `(byte, vcol)` after it and after `<Esc>`.
     type Case<'a> = (
         &'a Shape,
         &'a str,
@@ -1978,11 +1819,8 @@ mod tests {
         (usize, usize),
     );
 
-    /// Where `i`, `a`, `A` and `I` put the cursor, and `<Esc>` after them,
-    /// as Neovim 0.12.6 was found to: by byte and display column, over a
-    /// tab, characters two cells wide, one with a combining mark, an empty
-    /// line and one all blanks — and with `'list'` drawing a tab, which has
-    /// the cursor on its first cell in Normal mode as well.
+    /// Cases from Neovim 0.12.6. With `'list'` drawing a tab, Normal mode
+    /// also puts the cursor on its first cell.
     #[test]
     fn insert_mode_is_entered_and_left_where_neovim_puts_the_cursor() {
         let plain = shape(true);
@@ -2021,9 +1859,6 @@ mod tests {
         }
     }
 
-    /// `<Esc>` after an abbreviation, which it expands, or after blanks —
-    /// an indent nothing was typed after, which it takes out, or a comment
-    /// leader's — is left to Neovim; anywhere else, it is not.
     #[test]
     fn esc_that_may_do_more_is_left_to_neovim() {
         let f = Facts {

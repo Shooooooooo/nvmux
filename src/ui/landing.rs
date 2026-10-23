@@ -1,41 +1,20 @@
-//! The landing: what happens to a session in flight when it is put down.
+//! The landing animation when a moved session is put down, within half a
+//! second of the key; the in-flight trail is [`super::starfield`].
 //!
-//! The trail ([`super::starfield`]) says a session is in the air; this says it
-//! has come down, and has to be seen to, or a move ends on the trail simply
-//! stopping. Three beats, all within half a second of the key:
+//! 1. **Pull** ([`PULL`]): both trails' stars are drawn back into the row,
+//!    which keeps its in-flight look (`⇕`, blank number) until the end.
+//! 2. **Bounce** ([`BOUNCE`]): the reversed bar extends two cells at each
+//!    end, snaps back, extends one, and rests. The marker and numbers return
+//!    on its first frame.
+//! 3. **Spray**: braille dust shoots out of both ends level with the text,
+//!    using only the two middle dot rows, half the grains in each so it
+//!    centres on the name. A smaller splash goes onto the rows above and
+//!    below, using the dot row nearest the landed row.
 //!
-//! 1. **Pull** ([`PULL`]): the stars of both trails are drawn back into the
-//!    row, as if the row caught them. The row still looks in flight — the `⇕`
-//!    and the blank number column — until the end of this beat.
-//! 2. **Bounce** ([`BOUNCE`]): the reversed bar runs two cells further at each
-//!    end, snaps back, runs one cell further, and rests: the row bouncing once
-//!    as it hits the floor. On its first frame the marker and the numbers come
-//!    back. It is the frame the eye reads as the landing.
-//! 3. **Spray**: dust shoots straight out of both ends of the row, level with
-//!    the text, and settles. A little more is kicked onto the rows above and
-//!    below, beside the list: the splash.
-//!
-//! # Level with the text
-//!
-//! The spray is braille built from the two middle rows of dots only: `⠶` at
-//! first, thinning to one row (`⠒` or `⠤`) and then to one dot. Half the
-//! grains keep to the upper middle row and half to the lower, so the spray is
-//! centred on the name rather than hanging above or below it.
-//!
-//! The splash keeps to the edge of its row nearest the one that landed: the
-//! bottom row of dots on the row above, the top row on the row below, both
-//! dots at first and then the one at its leading edge. So it reads as kicked
-//! up off the landed row rather than as dust of the rows it lands on.
-//!
-//! Braille is one column on every terminal and sets no colour, so, like the
-//! trail, this is correct under `NO_COLOR` by construction; the bounce is the
-//! reversed modifier.
-//!
-//! # Time, and the seed
-//!
-//! Moved on by elapsed time. Nothing is kept per grain: where a grain is and
-//! what it shows are worked out from the seed and the age, so the same seed
-//! and age always draw the same frame.
+//! Braille is one column wide and sets no colour, so this is correct under
+//! `NO_COLOR`; the bounce uses the reversed modifier. Grains are computed from
+//! the seed and elapsed time alone, so the same seed and age draw the same
+//! frame.
 
 use std::time::Duration;
 
@@ -44,8 +23,8 @@ use super::starfield::Rng;
 /// How long the trail takes to be pulled into the row.
 pub const PULL: Duration = Duration::from_millis(70);
 
-/// The bounce, from the end of the pull: how many cells further the bar runs
-/// at each end, and for how long — out, back, out by less, and then still.
+/// The bounce after the pull, as (duration, extra cells at each end): out,
+/// back, out by less; then still.
 pub const BOUNCE: [(Duration, u16); 3] = [
     (Duration::from_millis(55), 2),
     (Duration::from_millis(30), 0),
@@ -75,18 +54,17 @@ const FAR: f32 = 0.45;
 const UPPER: [char; 5] = ['⠶', '⠒', '⠒', '⠂', '⠐'];
 const LOWER: [char; 5] = ['⠶', '⠤', '⠤', '⠄', '⠠'];
 
-/// Grains of the splash, shared between the two ends and the rows above and
-/// below. Fewer than the spray, and they go less far and last less long: it is
-/// what the spray kicks up, not a second spray.
+/// The splash: fewer grains than the spray, shared between both ends and both
+/// rows, going less far for less long.
 const SPLASH: usize = 8;
 const SPLASH_NEAREST: f32 = 1.0;
 const SPLASH_FURTHER: f32 = 4.0;
 const SPLASH_SHORTEST: f32 = 0.15;
 const SPLASH_LONGER: f32 = 0.10;
 
-/// A splash grain's glyph through its life, flying right: both dots of the
-/// row nearest the landed row, then the one at the leading edge. The bottom
-/// dots on the row above, the top dots on the row below.
+/// A splash grain's glyph through its life, flying right, in the dot row
+/// nearest the landed row (bottom above it, top below): both dots, then the
+/// leading one.
 const ABOVE: [char; 2] = ['⣀', '⢀'];
 const BELOW: [char; 2] = ['⠉', '⠈'];
 
@@ -123,15 +101,13 @@ pub enum Tier {
 pub struct Grain {
     pub side: Side,
     pub tier: Tier,
-    /// Cells out from the end of the row it left, past the cell next to it:
-    /// 1 leaves that one cell clear. On the landed row the spray always does;
-    /// the splash, a row away, starts right beside it.
+    /// Cells out from the row's end; 1 leaves the adjacent cell clear, as the
+    /// spray always does. The splash, a row away, may start beside it.
     pub offset: u16,
     pub glyph: char,
     pub dim: bool,
 }
 
-/// One landing. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Landing {
     seed: u64,
@@ -215,7 +191,7 @@ impl Landing {
             })
         });
         let splash = (0..SPLASH).filter_map(|i| {
-            // A stream of its own, so the splash leaves the spray as it was.
+            // Its own stream, independent of the spray's.
             let mut rng = Rng::new(self.seed ^ (i as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9));
             let reach = SPLASH_NEAREST + rng.unit() * SPLASH_FURTHER;
             let life = SPLASH_SHORTEST + rng.unit() * SPLASH_LONGER;
@@ -283,8 +259,6 @@ mod tests {
         l
     }
 
-    /// The beats come in order: pulling, then the bounce — two cells out,
-    /// back, one out, still — with the dust flying through it and after it.
     #[test]
     fn the_beats_come_in_order() {
         let pull = at(30);
@@ -304,8 +278,7 @@ mod tests {
         assert!(!spray.spray().is_empty(), "dust in the air");
     }
 
-    /// The bounce is over well before the dust is, and runs no further than
-    /// its first stretch.
+    /// It also runs no further than its first stretch.
     #[test]
     fn the_bounce_settles_inside_the_landing() {
         let lasts: Duration = BOUNCE.iter().map(|(d, _)| *d).sum();
@@ -328,8 +301,7 @@ mod tests {
             .collect()
     }
 
-    /// Every grain of the spray is braille lit only in the two middle rows of
-    /// dots, so the spray stays level with the text.
+    /// Only the two middle dot rows are lit.
     #[test]
     fn the_spray_is_level_with_the_text() {
         const MIDDLE: u32 = 0x02 | 0x04 | 0x10 | 0x20;
@@ -341,8 +313,6 @@ mod tests {
         }
     }
 
-    /// Both ends throw dust, it goes outwards and stays within its reach, and
-    /// it dims before it goes.
     #[test]
     fn dust_flies_out_of_both_ends_and_dims() {
         let early = level(&at(90));
@@ -357,9 +327,8 @@ mod tests {
         assert!(late.iter().all(|g| g.dim), "{late:?}");
     }
 
-    /// The splash goes onto both neighbouring rows from both ends, keeps to
-    /// the dots nearest the landed row, stays short, and is gone before the
-    /// spray is.
+    /// Onto both rows from both ends, only in the dots nearest the landed row,
+    /// short, and gone before the spray.
     #[test]
     fn the_splash_is_kicked_onto_the_rows_beside() {
         let early = splash(&at(100));
@@ -392,7 +361,6 @@ mod tests {
         );
     }
 
-    /// A grain flying left is the mirror image of one flying right.
     #[test]
     fn grains_flying_left_are_mirrored() {
         assert_eq!(mirror('⠂'), '⠐');
@@ -403,7 +371,6 @@ mod tests {
         assert_eq!(mirror('⠈'), '⠁');
     }
 
-    /// It ends on time, with nothing left in the air.
     #[test]
     fn it_ends_on_time() {
         assert!(!at(LENGTH.as_millis() as u64 - 1).done());

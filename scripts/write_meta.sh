@@ -7,9 +7,8 @@
 #   ERROR <reason>   (on a write that failed)
 #   NVMUX_END
 #
-# Locally nvmux writes this file itself; over ssh this script is the only way to
-# reach it. The JSON arrives as a positional parameter and is never re-parsed,
-# so a name containing quotes, spaces or $(...) is data, not code.
+# For ssh only; locally nvmux writes the file itself. The JSON is a positional
+# parameter, never re-parsed.
 
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 

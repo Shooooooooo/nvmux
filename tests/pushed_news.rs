@@ -1,11 +1,11 @@
-//! Sessions saying their news, end to end, against real `nvim --headless`
-//! processes: the notifier listens to each session, a card comes as what it
-//! tells happens rather than at the next of the reads every two seconds, and
-//! those reads stop once the session is told. A binary of its own, because the
-//! board the cards go on is the whole process's: its tests take turns.
+//! End-to-end tests of sessions pushing news, against real `nvim --headless`:
+//! the notifier listens to each session, a card arrives as its news happens
+//! rather than at the next 2 s read, and those reads stop once the session is
+//! listened to. A separate binary because the card board is process-wide; the
+//! tests take turns.
 //!
-//! They skip, rather than fail, when there is no usable `nvim` on `$PATH` —
-//! unless `$NVMUX_TEST_REQUIRE` names `nvim`, as it does in CI.
+//! They skip, rather than fail, when there is no usable `nvim` on `$PATH`,
+//! unless `$NVMUX_TEST_REQUIRE` names `nvim` (as in CI).
 
 #[macro_use]
 mod common;
@@ -20,14 +20,14 @@ use nvmux::notes::{self, Heard};
 use nvmux::rpc::Client;
 use nvmux::tell::Notifier;
 
-/// The tests' turns: the board is the process's.
+/// Serialises the tests: the board is process-wide.
 fn one_at_a_time() -> MutexGuard<'static, ()> {
     static TURN: Mutex<()> = Mutex::new(());
     TURN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Give the session the watcher, and have it count its reads from now on: the
-/// test's own way of seeing how often the notifier asks.
+/// Give the session the watcher and have it record each read from now on, so
+/// the test can see how often the notifier asks.
 fn count_reads(sock: &Path) {
     assert!(
         matches!(notes::hear(sock, None), Heard::Said { .. }),
@@ -60,12 +60,11 @@ return { #reads, last and math.floor((vim.uv.hrtime() - last) / 1e6) or -1 }",
     (count, ago)
 }
 
-/// Whether `post` is a card that says `what`.
 fn says(post: &Post, what: &str) -> bool {
     shown(post).is_some_and(|(c, _)| c.body.as_deref() == Some(what))
 }
 
-/// Wait for a card saying `what`, and say how long it took from `since`.
+/// Wait for a card saying `what`; returns the time since `since`.
 fn card_saying(what: &str, since: Instant) -> Duration {
     let posts = posts_until(Duration::from_secs(8), |posts| {
         posts.iter().any(|p| says(p, what))
@@ -78,8 +77,8 @@ fn card_saying(what: &str, since: Instant) -> Duration {
     took
 }
 
-/// Wait for the mark of session `id` to be let go of, and say how long it
-/// took from `since`.
+/// Wait for session `id`'s mark to be dropped; returns the time since
+/// `since`.
 fn forgotten(id: &str, since: Instant) -> Duration {
     let forget = |p: &Post| p.what == Posted::Forget(id.to_string());
     let posts = posts_until(Duration::from_secs(8), |posts| posts.iter().any(forget));
@@ -89,10 +88,9 @@ fn forgotten(id: &str, since: Instant) -> Duration {
 }
 
 /// A session is read until its watcher is found telling the notifier's
-/// listener, and then left alone; and what it tells comes as a card as it
-/// happens, with one read for it. What it kept, seen, has its mark let go of
-/// at once; and so does a session that goes, which its listener hears as it
-/// goes.
+/// listener, then left alone; its news arrives as a card at once, with one
+/// read. A seen mark is dropped at once, as is the mark of a session that
+/// exits.
 #[test]
 fn a_card_comes_as_its_news_happens_and_the_reads_stop() {
     require_nvim!();
@@ -125,8 +123,8 @@ fn a_card_comes_as_its_news_happens_and_the_reads_stop() {
         "read {before} times before it was left alone"
     );
 
-    // Timed from the job's end, which is the news: its start is a pty, a
-    // shell and its exit before that, which a busy machine makes longer.
+    // Timed from the job's end, the news itself: startup (pty, shell) varies
+    // with load.
     a_job_that_exits(&other_sock, "exit 0", false);
     let started = Instant::now();
     let took = card_saying("sh: exited with code 0", started);
@@ -144,9 +142,8 @@ fn a_card_comes_as_its_news_happens_and_the_reads_stop() {
     let took = forgotten(&other.id, started);
     assert!(took < Duration::from_secs(1), "let go of after {took:?}");
 
-    // A program that sends notification after notification, forty in a
-    // second: read four times a second or so, not forty, and the last of
-    // them told.
+    // Forty notifications in a second: read about four times a second, not
+    // forty, and the last one shown.
     let (before, _) = reads(&other_sock);
     lua(
         &other_sock,
@@ -172,8 +169,8 @@ end)"#,
         after - before
     );
 
-    // One event said twice — a command's end, by its shell and then by its
-    // terminal closing — is read once, and told once, as the second.
+    // One event reported twice (a command's end by its shell, then by its
+    // terminal closing) is read once and shown once, as the second.
     let (before, _) = reads(&other_sock);
     let started = Instant::now();
     a_job_that_exits(
@@ -203,9 +200,8 @@ end)"#,
         started.elapsed()
     );
 
-    // Busy for two seconds straight after its news: the read the news brings
-    // on is not answered, and the session, which has said it once, is read
-    // again two seconds on rather than at the next read it would have had.
+    // Busy for 2 s after its news: the read it triggers goes unanswered, and
+    // the session is read again 2 s later rather than at its next poll.
     lua(
         &other_sock,
         r"vim.api.nvim_create_autocmd('TermClose', {
@@ -227,8 +223,8 @@ end)"#,
     let started = Instant::now();
     a_job_that_exits(&doomed_sock, "exit 3", false);
     card_saying("sh: exited with code 3", started);
-    // Timed from the signal: the process is gone at once, its connections
-    // with it, though the pid may wait a second longer to be reaped.
+    // Timed from the signal: connections close at once, though reaping the
+    // pid may take a second longer.
     let started = Instant::now();
     let doomed_pid = nix::unistd::Pid::from_raw(i32::try_from(doomed.pid).expect("a pid"));
     nix::sys::signal::kill(doomed_pid, nix::sys::signal::Signal::SIGKILL).expect("kill -9");
@@ -237,9 +233,8 @@ end)"#,
     assert!(took < Duration::from_secs(1), "let go of after {took:?}");
 }
 
-/// A session that cannot be listened to — waiting for a key when its listener
-/// starts — is read every two seconds as it always was, and what it tells
-/// comes as a card all the same.
+/// A session that cannot be listened to (waiting for a key when its listener
+/// starts) is still read every 2 s, and its news still arrives as a card.
 #[test]
 fn a_session_not_listened_to_is_read_as_ever() {
     require_nvim!();
@@ -261,8 +256,7 @@ fn a_session_not_listened_to_is_read_as_ever() {
         .input("<Esc>")
         .expect("press a key");
 
-    // Read once it can answer, which says how far it has got — and names no
-    // listener, there being none on it yet.
+    // Read once it can answer; no listener is registered on it yet.
     assert!(
         wait_until(notes::POLL + Duration::from_secs(1), || {
             reads(&waiting_sock).0 > 0

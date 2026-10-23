@@ -1,99 +1,70 @@
-//! The sonar: rings rippling out from a row of the picker, a pulse at a time.
+//! Sonar: rings rippling out from both ends of a picker row, one pulse every
+//! [`PERIOD`].
 //!
-//! Nothing sends it out at the moment. It marked the session you came back to
-//! the picker from, so you could see at a glance which one `Esc` returns to,
-//! until a still mark beside that row took the job over (see
-//! [`super::draw`]). It is kept, with the renderer that draws it
-//! ([`super::effects`]), for another use.
+//! Currently unused; kept with its renderer ([`super::effects`]) for reuse.
+//! Rings land only on the terminal background, never on a row. Between pulses
+//! nothing moves, so callers can sleep (see [`Sonar::until_next`]).
 //!
-//! Three rings leave both ends of the row, a beat apart, and thin out as they
-//! go: a pulse of two thirds of a second, sent out again every [`PERIOD`] for
-//! as long as the sonar is kept. A ring only ever lands on the terminal's own
-//! background, never on a row, so it is in nobody's way. Between pulses
-//! nothing moves, and a caller can sleep until the next is due rather than
-//! draw frames that would all be the same (see [`Sonar::until_next`]).
+//! A ring's edge is a braille column that thins from four dots to two to one
+//! (`⡇` `⠆` `⠂`, mirrored on the right). From two cells out it also arcs over
+//! the rows above and below, one cell further in (`⡀` above, `⠁` below).
+//! Braille is one column wide everywhere; colour comes from the post-pass.
 //!
-//! # Braille, in three weights
-//!
-//! A ring's edge is a column of braille dots: all four of the cell's column
-//! near the row, then the middle two, then one, as it spreads (`⡇` `⠆` `⠂`
-//! on the left, mirrored on the right). Once it is two cells out, the ring
-//! also curves over the rows above and below, one cell further in, as a
-//! single dot on the side nearest the row (`⡀` above, `⠁` below), so the three
-//! rows together read as a ring rather than as two brackets. Braille is one
-//! column on every terminal and sets no colour; the colour, where there is
-//! any, is the post-pass's (see [`super::effects`]).
-//!
-//! # Time
-//!
-//! Moved on by elapsed time. Nothing is kept per ring: where each is and what
-//! it shows are worked out from the age, so the same age always draws the same
-//! frame.
+//! State is just the age: the same age always draws the same frame.
 
 use std::time::Duration;
 
-/// How many rings leave the row.
 const RINGS: u32 = 3;
 
-/// How long after one ring the next leaves.
+/// Delay between ring starts.
 const GAP: Duration = Duration::from_millis(150);
 
-/// How long one ring lasts, from the row to where it fades out.
 const LIFE: Duration = Duration::from_millis(320);
 
-/// The furthest a ring gets, in cells past the one next to the row.
+/// Max distance, in cells past the one next to the row.
 const REACH: f32 = 7.0;
 
-/// The parts of a ring's life it is drawn in its heavier weights: the full
-/// column of dots until the first, the middle two until the second, and one
-/// after that.
+/// Life fractions at which the edge drops from four dots to two, then one.
 const FULL: f32 = 0.3;
 const HALF: f32 = 0.65;
 
-/// How far out a ring has to be before it curves over the rows beside its own.
+/// Distance at which a ring starts arcing over adjacent rows.
 const ARC_FROM: u16 = 2;
 
-/// One pulse: the last ring's start, and then its life.
+/// Last ring's start plus its life.
 pub const PULSE: Duration =
     Duration::from_millis(((RINGS - 1) as u64) * GAP.as_millis() as u64 + LIFE.as_millis() as u64);
 
-/// From the start of one pulse to the start of the next. Long enough that the
-/// rest is most of it — a ping, not a flicker going on beside the list — and
-/// short enough that a glance at the picker meets one before long.
+/// Pulse start to pulse start; mostly rest, so it reads as a ping.
 pub const PERIOD: Duration = Duration::from_millis(2500);
 
-/// A ring's edge on the row's own line, left of the row and right of it.
+/// Edge glyphs (left, right) by weight.
 const EDGES: [(char, char); 3] = [('⡇', '⢸'), ('⠆', '⠰'), ('⠂', '⠐')];
 
-/// A ring's arc on the row above, left and right: the bottom dot nearest the
-/// row.
+/// Arc on the row above (left, right): the bottom dot nearest the row.
 pub const ABOVE: (char, char) = ('⡀', '⢀');
 
-/// A ring's arc on the row below, left and right: the top dot nearest the row.
+/// Arc on the row below (left, right): the top dot nearest the row.
 pub const BELOW: (char, char) = ('⠁', '⠈');
 
-/// One ring now, for the renderer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ring {
-    /// Cells out from the row's ends, past the cell next to it: 0 is that
-    /// cell.
+    /// Cells out from the row's ends; 0 is the adjacent cell.
     pub out: u16,
-    /// Its edge on the row's own line, left and right.
     pub left: char,
     pub right: char,
-    /// How far through its life it is, `0..1`, for the renderer's fade.
+    /// Fraction of its life elapsed, `0..1`, for the fade.
     pub life: f32,
 }
 
 impl Ring {
-    /// How far out its arcs over the rows above and below are, on the same
-    /// measure as [`Ring::out`], once it has spread far enough to have them.
+    /// Distance of the arcs over adjacent rows (same measure as
+    /// [`Ring::out`]), once the ring is far enough out to have them.
     pub fn arc(&self) -> Option<u16> {
         (self.out >= ARC_FROM).then(|| self.out - 1)
     }
 }
 
-/// One sonar. See the module docs.
 #[derive(Debug, Clone, Default)]
 pub struct Sonar {
     age: Duration,
@@ -108,20 +79,17 @@ impl Sonar {
         self.age += elapsed;
     }
 
-    /// How far into the current period it is: in a pulse while this is under
-    /// [`PULSE`], resting after.
+    /// Time into the current period; pulsing while under [`PULSE`].
     fn phase(&self) -> Duration {
         let nanos = self.age.as_nanos() % PERIOD.as_nanos();
         Duration::from_nanos(u64::try_from(nanos).unwrap_or(0))
     }
 
-    /// Whether a pulse is going out now, rather than the sonar resting.
     pub fn pulsing(&self) -> bool {
         self.phase() < PULSE
     }
 
-    /// How long until the next pulse starts — nothing, while one is going.
-    /// What lets the caller sleep through a rest rather than draw it.
+    /// Time until the next pulse; zero while one is running.
     pub fn until_next(&self) -> Duration {
         let phase = self.phase();
         if phase < PULSE {
@@ -131,7 +99,7 @@ impl Sonar {
         }
     }
 
-    /// The rings out now, oldest — furthest out — first. None while resting.
+    /// Current rings, oldest (furthest out) first; empty while resting.
     pub fn rings(&self) -> Vec<Ring> {
         let phase = self.phase();
         (0..RINGS)
@@ -159,7 +127,7 @@ impl Sonar {
     }
 }
 
-/// Quick off the row and slowing, the way a ripple spreads.
+/// Quadratic ease-out.
 fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t) * (1.0 - t)
@@ -175,7 +143,6 @@ mod tests {
         s
     }
 
-    /// The rings leave a beat apart: one at first, then two, then three.
     #[test]
     fn the_rings_leave_one_after_another() {
         assert_eq!(at(0).rings().len(), 1);
@@ -183,8 +150,6 @@ mod tests {
         assert_eq!(at(310).rings().len(), 3);
     }
 
-    /// A ring only ever spreads, and thins as it does: the full column of dots
-    /// near the row, one dot by the end.
     #[test]
     fn a_ring_spreads_and_thins() {
         let near = at(10).rings()[0];
@@ -197,8 +162,6 @@ mod tests {
         assert!(dots(far.left) < dots(near.left));
     }
 
-    /// The arcs come only once a ring is clear of the row, and sit a cell
-    /// further in than its edge.
     #[test]
     fn arcs_follow_a_ring_once_it_is_clear() {
         let fresh = at(0).rings()[0];
@@ -207,7 +170,7 @@ mod tests {
         assert_eq!(out.arc(), Some(out.out - 1));
     }
 
-    /// Every glyph is braille, which is one column wide on every terminal.
+    /// Braille is one column wide on every terminal.
     #[test]
     fn every_glyph_is_braille() {
         let braille = |c: char| (0x2801..=0x28ff).contains(&(c as u32));
@@ -221,9 +184,6 @@ mod tests {
         }
     }
 
-    /// A pulse runs its course and the sonar rests — no rings, and the time
-    /// to the next one — and then the same pulse goes out again, on the
-    /// period.
     #[test]
     fn it_pulses_rests_and_pulses_again() {
         let pulse = PULSE.as_millis() as u64;

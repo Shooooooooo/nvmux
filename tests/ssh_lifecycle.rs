@@ -1,7 +1,7 @@
 //! End-to-end tests for the SSH transport, against a real `sshd`.
 //!
-//! The host comes from `$NVMUX_TEST_SSH_HOST`, defaulting to `selftest`; where
-//! no such host answers these **skip** rather than fail. Set one up with:
+//! The host is `$NVMUX_TEST_SSH_HOST` (default `selftest`). If it does not
+//! answer, tests skip; `$NVMUX_TEST_REQUIRE=ssh` makes that a failure. Setup:
 //!
 //! ```text
 //! Host selftest
@@ -10,10 +10,8 @@
 //!   IdentityFile ~/.ssh/id_ed25519
 //! ```
 //!
-//! Pointing that alias at localhost is not a cheat: it exercises the real ssh
-//! client, a real ControlMaster, real unix-socket forwarding and a real remote
-//! login shell — everything except latency. `$NVMUX_TEST_REQUIRE=ssh` turns
-//! the skip into a failure.
+//! Localhost still exercises the real ssh client, ControlMaster, unix-socket
+//! forwarding and remote login shell; only latency is missing.
 
 #[macro_use]
 mod common;
@@ -29,7 +27,7 @@ fn host() -> String {
     std::env::var("NVMUX_TEST_SSH_HOST").unwrap_or_else(|_| "selftest".to_string())
 }
 
-/// Is the test host usable? Skips are silent on purpose.
+/// Skips are silent on purpose.
 fn reachable() -> bool {
     std::process::Command::new("ssh")
         .args([
@@ -56,11 +54,8 @@ macro_rules! require_ssh {
     };
 }
 
-/// Removes every session this test file created, whatever happened.
-///
-/// The transport is built in `drop`, not held: one of these guards exists per
-/// test, and connecting up front cost a second full ssh connect and probe per
-/// test for a cleanup that usually has nothing to do.
+/// Kills the named sessions on drop. Connects only in `drop`, to spare each
+/// test an extra ssh connect and probe.
 struct Cleanup(Vec<String>);
 
 impl Cleanup {
@@ -114,9 +109,8 @@ fn a_session_created_over_ssh_is_reachable_through_the_forward() {
     let info = client.api_info().expect("api_info through the forward");
     assert!(info.is_supported(), "remote nvim {info} is too old");
 
-    // A deferred call too, which proves the session is actually serving rather
-    // than merely that ssh accepted the connection — `ssh -O forward` to a
-    // nonexistent remote socket also exits 0 and yields a working local socket.
+    // A deferred call proves nvim is serving: `ssh -O forward` to a missing
+    // remote socket also exits 0 and yields a connectable local socket.
     client
         .list_bufs()
         .expect("deferred call through the forward");
@@ -136,17 +130,14 @@ fn a_remote_session_outlives_the_transport_that_made_it() {
         s.id
     }; // transport dropped, ssh commands finished
 
-    // A completely fresh transport must find it, which is the whole point of
-    // keeping the metadata on the session host.
+    // Metadata lives on the session host, so a fresh transport finds it.
     let t2 = SshTransport::new(host()).expect("reconnect");
     let found = common::find_by_id(&t2, &id).expect("the session should have survived");
     assert_eq!(found.name, name);
 }
 
-/// Detach and re-attach is the flow this tool exists for, and the one that
-/// breaks without `StreamLocalBindUnlink=yes` on the master: `-O cancel` exits 0
-/// but leaves the local socket file, and the next `-O forward` onto that path
-/// fails with rc 255.
+/// Needs `StreamLocalBindUnlink=yes` on the master: `-O cancel` exits 0 but
+/// leaves the socket file, and the next `-O forward` there fails with rc 255.
 #[test]
 fn a_forward_can_be_torn_down_and_rebuilt() {
     require_ssh!();
@@ -162,8 +153,7 @@ fn a_forward_can_be_torn_down_and_rebuilt() {
 
     std::fs::remove_file(&first).ok();
 
-    // A fresh transport has no memory of the forward, so this exercises the
-    // rebuild rather than the cached path.
+    // A fresh transport, so the forward is rebuilt rather than cached.
     let t2 = SshTransport::new(host()).expect("reconnect");
     let again = t2.local_socket_for(&session).expect("re-forward");
     assert_eq!(first, again, "the local path should be stable");
@@ -174,8 +164,7 @@ fn a_forward_can_be_torn_down_and_rebuilt() {
     client.api_info().expect("usable after re-forward");
 }
 
-/// `count` sessions, made through the runtime directory's master, for a
-/// transport of a test's own to forward.
+/// `count` sessions made through the shared master.
 fn sessions(tag: &str, count: usize) -> (Vec<nvmux::session::Session>, Cleanup) {
     let names: Vec<String> = (0..count).map(|i| unique(&format!("{tag}{i}"))).collect();
     let guard = Cleanup::of(&names);
@@ -190,15 +179,13 @@ fn sessions(tag: &str, count: usize) -> (Vec<nvmux::session::Session>, Cleanup) 
     (made, guard)
 }
 
-/// Where a transport keeping its end of the link in `dir` forwards `s` to.
+/// The local socket a transport using `dir` forwards `s` to.
 fn forwarded_sock(dir: &Path, s: &nvmux::session::Session) -> PathBuf {
     nvmux::paths::forwarded_sock(dir, &nvmux::ids::host_token(&host()), &s.id).expect("path")
 }
 
-/// The sessions a picker opens on, and the clients started ahead of it, are
-/// forwarded by one `ssh -O forward` rather than one apiece, and each answers
-/// through its socket as one forwarded alone does. In a directory of the
-/// test's own, so that no forward another test made passes for one made here.
+/// One `ssh -O forward` for all, each usable. Uses a private directory so
+/// another test's forwards cannot pass for these.
 #[test]
 fn sessions_wanted_together_are_forwarded_together() {
     require_ssh!();
@@ -225,10 +212,8 @@ fn sessions_wanted_together_are_forwarded_together() {
     }
 }
 
-/// A forward the master still holds, with its socket gone from under it, is
-/// made again whether it is wanted with others or alone: the master answers
-/// `-O forward` of a pair it holds with a yes and makes nothing, so a yes is
-/// believed only where a socket shows for it.
+/// The master answers `-O forward` of a pair it already holds with success
+/// but creates nothing, so success is trusted only where the socket exists.
 #[test]
 fn a_forward_whose_socket_has_gone_is_made_again() {
     require_ssh!();
@@ -240,7 +225,7 @@ fn a_forward_whose_socket_has_gone_is_made_again() {
     assert!(socks.iter().all(|s| s.exists()), "forwarded together");
     std::fs::remove_file(&socks[0]).expect("take a socket away");
 
-    // A transport with no memory of either, over the master that holds both.
+    // A fresh transport over the master that holds both.
     let t2 = SshTransport::with_dir(host(), dir.0.clone()).expect("connect");
     t2.reach_all(&sessions);
     assert!(
@@ -255,10 +240,9 @@ fn a_forward_whose_socket_has_gone_is_made_again() {
     }
 }
 
-/// What one pair refused does to the forwards asked for with it: nothing. The
-/// command fails, every other pair is made, and nothing says which was
-/// refused — so after a batch that failed, a socket that is there may be the
-/// dead one that stood in the refused pair's way, and none is believed in.
+/// One refused pair fails the command but the others are still made, and
+/// nothing says which failed. So after a failed batch no socket is trusted:
+/// an existing one may be the stale file that blocked the refused pair.
 #[test]
 fn a_pair_refused_fails_the_batch_and_stops_none_of_the_rest() {
     require_ssh!();
@@ -312,8 +296,7 @@ fn killing_a_remote_session_removes_it_and_its_forward() {
     require_ssh!();
     let t = SshTransport::new(host()).expect("connect");
     let name = unique("kill");
-    // Even the kill test needs a guard: if the kill under test fails, the
-    // session would otherwise outlive the run on the remote host.
+    // In case the kill under test fails.
     let _guard = Cleanup::of([&name]);
 
     let session = t
@@ -341,8 +324,8 @@ fn killing_a_remote_session_removes_it_and_its_forward() {
 fn remote_names_with_shell_metacharacters_survive() {
     require_ssh!();
     let t = SshTransport::new(host()).expect("connect");
-    // Two layers of shell stand between here and the remote file: ssh joins its
-    // arguments and the remote login shell parses them again.
+    // Two shell layers: ssh joins its arguments and the remote login shell
+    // parses them again.
     let name = format!("{} $(id) 'q' \"d\"", unique("quote"));
     let _guard = Cleanup::of([unique("quote")]);
 
@@ -367,14 +350,9 @@ fn an_unreachable_host_fails_with_a_useful_message() {
     );
 }
 
-/// A live forward must survive a listing, and a dead one must not.
-///
-/// The sweep that removes orphaned forwards runs against the same runtime
-/// directory the remote listing scans — and when the "remote" host is this
-/// machine, which `nvmux localhost` makes an ordinary case, those are literally
-/// the same directory. A sweep that only asked "is anything serving this
-/// socket?" would find the local end of a live forward, see that no `--listen`
-/// process owns it, and delete the forward out from under an attached session.
+/// With `nvmux localhost` the orphan sweep and the remote listing scan the
+/// same directory. A sweep that only checked for a `--listen` owner would
+/// delete the local end of a live forward.
 #[test]
 fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     require_ssh!();
@@ -405,18 +383,13 @@ fn a_listing_keeps_live_forwards_and_removes_orphaned_ones() {
     client.api_info().expect("still usable after a listing");
 }
 
-/// A directory for this test's end of the connection, and every master that
-/// ever binds a socket in it retired when the test is done.
+/// A private runtime directory; every master bound in it exits on drop.
 ///
-/// Every other test here reaches the host through the one master nvmux keeps
-/// in the real runtime directory, and they run in parallel: a master pulled
-/// out from under one of their live forwards would fail *them*. The tests
-/// about a master dying, or its socket going, bring up their own here and
-/// leave that one alone.
+/// Other tests share the real runtime directory's master in parallel, so tests
+/// that kill a master or remove its socket use their own here.
 ///
-/// Under `/tmp`, as nvmux's own runtime directory is, and not `$TMPDIR`: on
-/// macOS that is long enough that a master's socket — with the seventeen
-/// bytes ssh adds to it while binding — would not fit in a socket path.
+/// Under `/tmp`, not `$TMPDIR`: macOS's is too long for a socket path once ssh
+/// adds 17 bytes while binding.
 struct PrivateDir(PathBuf);
 
 impl PrivateDir {
@@ -426,8 +399,7 @@ impl PrivateDir {
         Self(dir)
     }
 
-    /// The sockets masters bound here, each under a name of its own beside
-    /// the `ControlPath` they are linked to.
+    /// Each master's own socket, named after `control_path` plus a suffix.
     fn master_sockets(&self, control_path: &Path) -> Vec<PathBuf> {
         let prefix = format!("{}.", control_path.file_name().unwrap().to_string_lossy());
         let mut found: Vec<PathBuf> = std::fs::read_dir(&self.0)
@@ -441,8 +413,8 @@ impl PrivateDir {
         found
     }
 
-    /// How many master processes are bound somewhere in here — the ones still
-    /// linked to the `ControlPath` and the ones not.
+    /// Master processes using this directory, linked to the `ControlPath` or
+    /// not.
     fn masters_running(&self) -> usize {
         let needle = format!("ControlPath={}/", self.0.display());
         let out = std::process::Command::new("ps")
@@ -458,10 +430,8 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
-        // Telling every master in here to exit stops a test's masters
-        // outliving it by a minute of `ControlPersist`. By their names only:
-        // the local end of a forward is also a socket in here, and what
-        // answers on that is a session's Neovim.
+        // Otherwise masters outlive the test by `ControlPersist`. Match by
+        // name: forwarded sockets here are answered by Neovim, not ssh.
         for entry in std::fs::read_dir(&self.0).into_iter().flatten().flatten() {
             if entry.file_name().to_string_lossy().starts_with("cm") {
                 exit_master_at(&entry.path());
@@ -471,7 +441,7 @@ impl Drop for PrivateDir {
     }
 }
 
-/// `ssh -O exit`, through whichever of a master's names is given.
+/// `ssh -O exit` via any of a master's socket names.
 fn exit_master_at(socket: &Path) -> std::process::Output {
     std::process::Command::new("ssh")
         .arg("-o")
@@ -481,8 +451,7 @@ fn exit_master_at(socket: &Path) -> std::process::Output {
         .expect("run ssh -O exit")
 }
 
-/// A master on a `ControlPath` of this test's own, killable without
-/// disturbing anything — see [`PrivateDir`].
+/// A master in a [`PrivateDir`], safe to kill.
 struct PrivateMaster {
     ssh: Ssh,
     dir: PrivateDir,
@@ -492,15 +461,14 @@ impl PrivateMaster {
     fn up(tag: &str) -> Self {
         let dir = PrivateDir::new(tag);
         std::fs::create_dir_all(&dir.0).expect("scratch directory");
-        // Short, because a ControlPath is a socket path like any other.
+        // Short: a ControlPath is subject to the socket path limit.
         let ssh = Ssh::new(host(), dir.0.join("cm"));
         ssh.ensure_master().expect("bring up a master");
         assert!(ssh.is_master_alive(), "the master did not come up");
         Self { ssh, dir }
     }
 
-    /// What a sleeping laptop does, near enough: the master goes and every
-    /// forward on it goes too.
+    /// Like a laptop sleeping: the master and its forwards go.
     fn kill(&self) {
         let out = exit_master_at(self.ssh.control_path());
         assert!(
@@ -511,17 +479,10 @@ impl PrivateMaster {
     }
 }
 
-/// The fact every reconnection decision turns on, and the one that made the
-/// bug it guards against silent: `ssh` handed a `ControlPath` with no master
-/// on it does **not** fail. It opens a connection of its own, says nothing,
-/// and works — so a shell that is alive proves the host is reachable and
-/// nothing whatever about the master that every `-O forward` needs.
-///
-/// Which is why `run_script` asks ssh itself before replacing a dead shell,
-/// rather than inferring a master from the shell it is about to start. Get
-/// that wrong and the picker lists sessions perfectly over a direct connection
-/// while no session can be attached at all — "the connection to <host> dropped
-/// — press enter to retry", repeating for as long as the user presses enter.
+/// `ssh` with a `ControlPath` that has no master does **not** fail: it silently
+/// opens its own connection. A live shell proves nothing about the master that
+/// `-O forward` needs, so `run_script` asks ssh directly. Getting this wrong
+/// listed sessions fine but made every attach fail with "connection dropped".
 #[test]
 fn a_shell_started_without_a_master_quietly_makes_its_own_connection() {
     require_ssh!();
@@ -543,8 +504,7 @@ fn a_shell_started_without_a_master_quietly_makes_its_own_connection() {
         "starting a shell must not be mistaken for starting a master"
     );
 
-    // And this is what the working shell was hiding. Nothing can be attached
-    // until something brings the master back.
+    // What the working shell hides: no master to forward on.
     m.ssh
         .forward(
             &m.dir.0.join("l.sock"),
@@ -553,10 +513,8 @@ fn a_shell_started_without_a_master_quietly_makes_its_own_connection() {
         .expect_err("there is no master to forward on");
 }
 
-/// The other half of the same coin, and the premise behind asking the shell at
-/// all: a shell that *was* started over a master dies with it. That is what
-/// lets an attach check the link with a zero-timeout poll on a pipe instead of
-/// forking `ssh -O check` every time.
+/// A shell started over a master dies with it, so an attach can check the link
+/// with a zero-timeout poll on a pipe instead of forking `ssh -O check`.
 #[test]
 fn a_shell_started_over_a_master_dies_with_it() {
     require_ssh!();
@@ -567,28 +525,23 @@ fn a_shell_started_over_a_master_dies_with_it() {
 
     m.kill();
 
-    // The client is a separate process, so its death is not instantaneous.
+    // A separate process, so not instant.
     assert!(
         common::wait_until(std::time::Duration::from_secs(5), || !shell.is_alive()),
         "a shell over a master must not outlive it, or a live shell would \
          vouch for a master that has gone"
     );
 
-    // Brought back the way the transport brings it back, over the name the
-    // dead master was linked to — which it leaves behind.
+    // Reconnect as the transport does, over the name the dead master left.
     m.ssh.ensure_master().expect("reconnect");
     assert!(m.ssh.is_master_alive(), "the master did not come back");
     let mut again = m.ssh.start_shell().expect("shell");
     assert_eq!(again.run("printf back", &[]).expect("runs").stdout, "back");
 }
 
-/// What left the picker unable to attach anything: a master and its shell
-/// both still running — so everything that asks the shell hears the link is
-/// fine — and no socket at the `ControlPath` for `ssh -O forward` to reach
-/// the master by. Every attach failed with `Control socket connect(...): No
-/// such file or directory`, and pressing enter asked again in the same way.
-///
-/// However the socket went, the attach has to bring a master back.
+/// Regression: master and shell alive but the `ControlPath` socket gone, so
+/// every attach failed with `Control socket connect(...): No such file or
+/// directory`. The attach must bring a master back.
 #[test]
 fn an_attach_with_no_master_behind_the_control_path_brings_one_back() {
     require_ssh!();
@@ -614,7 +567,7 @@ fn an_attach_with_no_master_behind_the_control_path_brings_one_back() {
         .api_info()
         .expect("usable through the master it brought back");
 
-    // And the transport's scripts run over that master too, not the old one.
+    // Scripts run over the new master too.
     assert!(
         t.list_sessions()
             .expect("list")
@@ -624,11 +577,9 @@ fn an_attach_with_no_master_behind_the_control_path_brings_one_back() {
     );
 }
 
-/// ssh removes a master's `ControlPath` by name when the master exits, whoever
-/// holds that name by then. A master bound at the shared name that had lost it
-/// would, on its way out, take it from whichever master was linked there
-/// since — the master every later `-O forward` needs, with its shell still up.
-/// Bound at a name of its own, a master that leaves removes only that.
+/// ssh unlinks a master's socket path on exit, whoever holds it by then. Bound
+/// at the shared name, an old master would remove a newer one's
+/// `ControlPath`; bound at its own name, it removes only that.
 #[test]
 fn a_master_leaving_takes_only_its_own_name_with_it() {
     require_ssh!();
@@ -640,14 +591,12 @@ fn a_master_leaving_takes_only_its_own_name_with_it() {
         "one master, bound at a name of its own: {first:?}"
     );
 
-    // However a master comes to lose the shared name: another nvmux clearing
-    // it, a sweep of /tmp, a stray `rm`.
+    // E.g. another nvmux, a /tmp sweep, a stray `rm`.
     std::fs::remove_file(m.ssh.control_path()).expect("take the name");
     m.ssh.ensure_master().expect("a second master");
     assert!(m.ssh.is_master_alive(), "the second master is not linked");
 
-    // The first one leaves, as it would once its last client had — a separate
-    // process, so not instantly.
+    // The first exits, as after its last client; not instantly.
     exit_master_at(&first[0]);
     assert!(
         common::wait_until(std::time::Duration::from_secs(5), || !first[0].exists()),
@@ -659,11 +608,9 @@ fn a_master_leaving_takes_only_its_own_name_with_it() {
     );
 }
 
-/// Two nvmux bringing a master up at the same moment — both of them after one
-/// dropped link, say — must end with one master and not two. Bound at the
-/// shared name, the second found it taken, and ssh answers that by switching
-/// multiplexing off and staying up anyway: an idle connection nothing could
-/// reach, for as long as the network held.
+/// Two concurrent `ensure_master` calls (e.g. two nvmux after a dropped link)
+/// must leave one master. Otherwise ssh, finding the name taken, disables
+/// multiplexing and stays up as an unreachable idle connection.
 #[test]
 fn two_masters_brought_up_at_once_leave_one_running() {
     require_ssh!();
@@ -683,7 +630,7 @@ fn two_masters_brought_up_at_once_leave_one_running() {
     });
 
     assert!(a.is_master_alive(), "neither master is linked");
-    // The loser is told to exit, and takes a moment to.
+    // The loser is told to exit; it takes a moment.
     assert!(
         common::wait_until(std::time::Duration::from_secs(5), || {
             dir.masters_running() == 1
@@ -693,9 +640,6 @@ fn two_masters_brought_up_at_once_leave_one_running() {
     );
 }
 
-/// The chosen command runs on the host that owns the session, not on this one,
-/// and every word of it survives ssh's argument join and the remote login
-/// shell's second parse.
 #[test]
 fn a_chosen_command_runs_on_the_remote_host_with_its_arguments_intact() {
     require_ssh!();
@@ -708,7 +652,6 @@ fn a_chosen_command_runs_on_the_remote_host_with_its_arguments_intact() {
         .create_session(&name, &launch, common::anywhere())
         .expect("create");
 
-    // Asked of the remote host, since that is where the process is.
     let remote = std::process::Command::new("ssh")
         .args([
             "-o",
@@ -729,7 +672,6 @@ fn a_chosen_command_runs_on_the_remote_host_with_its_arguments_intact() {
         "the chosen argument never reached the remote nvim: {remote:?}"
     );
 
-    // Reachable through the forward like any other session, and recorded.
     let sock = t.local_socket_for(&session).expect("forward");
     let mut client =
         nvmux::rpc::Client::connect(&sock, nvmux::rpc::PROBE_TIMEOUT).expect("connect via forward");
