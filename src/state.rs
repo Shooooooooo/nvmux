@@ -9,9 +9,10 @@
 //! ```
 //!
 //! Unlike [`crate::config`], this file is best-effort and silent: any problem
-//! (absent, unreadable, malformed, unparsable command) is a debug log and a
-//! fallback to the default. No `deny_unknown_fields`, so a newer version's
-//! file loads; a rewrite drops keys this version does not know.
+//! (absent, unreadable, malformed, unparsable command) falls back to the
+//! default, with a debug log unless the file is absent. No
+//! `deny_unknown_fields`, so a newer version's file loads; a rewrite drops keys
+//! this version does not know.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;

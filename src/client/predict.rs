@@ -112,7 +112,7 @@ pub struct Shape {
     pub sidescrolloff: usize,
     pub sidescroll: usize,
     pub hor: i64,
-    /// Sent only with acks.
+    /// Sent only when acks are on.
     pub stepping: Option<Stepping>,
 }
 
@@ -139,14 +139,14 @@ pub struct Stepping {
     pub own_highlights: bool,
     /// The cursor line conceals differently (`'concealcursor'` without `n`).
     pub conceals: bool,
-    /// 0-based columns, `'textwidth'`-relative ones included.
+    /// 0-based display columns, `'textwidth'`-relative ones included.
     pub colorcolumn: Vec<usize>,
     /// Negative is a percentage of the window height.
     pub scrolljump: i64,
     /// `'conceallevel'` > 0: uncovered lines may conceal text the client shows.
     pub concealing: bool,
-    /// `'iskeyword'` class per byte below 256 (see `super::words::class`);
-    /// empty if not sent.
+    /// `'iskeyword'` class per character below 256 (see
+    /// `super::words::class`); empty if not sent.
     pub classes: Vec<u8>,
     /// `'iminsert'` is 1: `:lmap` applies to the character after `f` etc.
     pub lmap: bool,
@@ -178,7 +178,7 @@ impl Cursorline {
 }
 
 /// How `j`, `k`, `<Down>` or `<Up>` is mapped. `alone`: no longer mapping
-/// starts with it.
+/// starts with it, so Neovim does not wait for another key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Idiom {
     pub key: String,
@@ -203,11 +203,11 @@ impl Idiom {
         })
     }
 
-    /// Whether this is exactly LazyVim's `gj`/`gk`-without-count idiom,
-    /// non-recursive and with no longer mapping pending, which moves as the
-    /// bare key does over one-row lines. The edge cases where `gj` differs
-    /// from `j` (Neovim 0.12.6's `nv_screengo`) are handled in
-    /// `super::App::predict_move`.
+    /// Whether the key maps exactly to `gj`/`gk`, always or (as LazyVim does)
+    /// only without a count, non-recursive and with no longer mapping
+    /// pending: over one-row lines that moves as the bare key does. The edge
+    /// cases where `gj` differs from `j` (Neovim 0.12.6's `nv_screengo`) are
+    /// handled in `super::App::predict_move`.
     pub fn same(&self) -> bool {
         let (key, screen) = match self.key.as_str() {
             "j" | "<Down>" => ("j", "gj"),
@@ -226,7 +226,8 @@ impl Idiom {
 }
 
 impl Stepping {
-    /// No `'virtualedit'`, `'cursorcolumn'`, bound windows or `'langmap'`.
+    /// No `'virtualedit'` beyond `block`, `'cursorcolumn'`, bound windows or
+    /// `'langmap'`.
     pub fn plain(&self) -> bool {
         let virtual_edit = self
             .virtualedit
@@ -324,8 +325,9 @@ impl Shape {
         })
     }
 
-    /// Whether the cut-off part of `text` may change how `'listchars'` draws
-    /// its blanks (`trail` after trailing blanks, lead settings if all blank).
+    /// For a line sent cut short as `text`, whether the missing rest may
+    /// change how `'listchars'` draws its blanks (`trail` if `text` ends
+    /// blank, lead settings if it is all blank).
     fn unsure(&self, text: &str) -> bool {
         let l = &self.lcs;
         let blank = |c: char| matches!(c, ' ' | '\t');
@@ -529,7 +531,7 @@ impl Lines {
         self.line(buf, lnum).map(|l| l.text.as_str())
     }
 
-    /// Replace highlights from `first`; skipped if `tick` differs.
+    /// Replace highlights from `first`; skipped if the buffer or tick differs.
     fn recolour(&mut self, buf: i64, tick: i64, first: i64, spans: Vec<Vec<Span>>) {
         if buf != self.buf || tick != self.tick {
             return;
@@ -679,8 +681,8 @@ pub fn render(
                 cell.text = number.text;
             }
         } else {
-            // Fallback: right-aligned; wrong for the cursor line with both
-            // options set.
+            // Fallback: right-aligned; wrong for the cursor line with
+            // 'relativenumber' (Neovim left-aligns it, or shows 0).
             let n = if shape.relativenumber && lnum != cursor {
                 (lnum - cursor).abs()
             } else {
@@ -743,7 +745,7 @@ impl Gutter {
 const MOST_NUMBERWIDTH: usize = 20;
 
 /// Number column width as Neovim's `number_width`, trailing blank included;
-/// 0 without one, `None` if `'numberwidth'` is unknown (sent only with acks).
+/// 0 without one, `None` if `'numberwidth'` is unknown ([`Shape::stepping`]).
 pub fn number_width(shape: &Shape, rows: i64) -> Option<usize> {
     if !shape.number && !shape.relativenumber {
         return Some(0);
@@ -1017,15 +1019,16 @@ pub(super) fn line(
 }
 
 /// How `'list'` draws a line's blanks, as Neovim 0.12's `win_line`: `trail`
-/// after the last non-blank; before the first, `leadmultispace` (runs),
-/// `lead`, `space` or unchanged, always in `Whitespace`, and `leadtab` for
-/// tabs; elsewhere `multispace` (runs) or `space`; `nbsp`; nothing for a
-/// blank followed by a combining mark.
+/// after the last non-blank; before the first, with a lead setting,
+/// `leadmultispace` (runs), `lead`, `space` or unchanged, always in
+/// `Whitespace`, and `leadtab` for tabs; elsewhere `multispace` (runs) or
+/// `space`; `nbsp`; nothing for a blank followed by a combining mark.
 ///
-/// Neovim inspects blanks only if `'listchars'` sets more than `leadtab`, or
-/// it inspects every character anyway ([`Shape::checks`], or decorations such
-/// as tree-sitter). The client takes sent colours to mean decorations, which
-/// misses ones without colours, such as virtual text.
+/// Neovim inspects blanks only if `'listchars'` has a blank setting besides
+/// `leadtab`, or it inspects every character anyway ([`Shape::checks`], or
+/// decorations such as tree-sitter), so with only `leadtab` leading spaces
+/// are `Whitespace` on some lines only. The client takes sent colours to mean
+/// decorations, which misses ones without colours, such as virtual text.
 struct Blanks<'a> {
     text: &'a str,
     lcs: &'a Listchars,
@@ -1558,9 +1561,9 @@ fn end(cols: &[(usize, usize, char)]) -> usize {
 }
 
 /// The view's first column after Neovim draws the cursor at `vcol`, as
-/// `curs_columns`: `left` if the cursor is wholly within `'sidescrolloff'`
-/// of the edges, else moved at least `'sidescroll'`, or centred if that is 0
-/// or the cursor is half a view away.
+/// `curs_columns`: `left` if the cursor is wholly in view and at least
+/// `'sidescrolloff'` from both edges, else moved at least `'sidescroll'`, or
+/// centred if that is 0 or the cursor is half a view away.
 pub fn showing(text: &str, shape: &Shape, vcol: usize, left: usize, width: usize) -> usize {
     let tw = width.saturating_sub(shape.textoff) as i64;
     if shape.wrap || tw == 0 {
@@ -1875,8 +1878,8 @@ enum State {
 }
 
 impl Typed {
-    /// Read a typed key as Neovim will take it; returns the scroll, or with
-    /// acks the motion, if followable. `mapped(insert, key)` says if mapped.
+    /// Read a typed key as Neovim will take it; returns its [`Command`] if
+    /// followable. `mapped(insert, key)` says if mapped.
     pub fn key(&mut self, key: &str, mapped: impl Fn(bool, &str) -> bool) -> Option<Command> {
         self.seq += 1;
         let command = self.step(key, mapped);
@@ -2117,7 +2120,6 @@ impl Typed {
         self.seq
     }
 
-    /// Whether keys are being typed in Insert mode.
     pub fn inserting(&self) -> bool {
         matches!(self.state, State::Insert { .. })
     }
@@ -2191,7 +2193,8 @@ impl Typed {
         !self.blind && self.state != State::Lost
     }
 
-    /// Blindness is kept: scrolls never cause it nor depend on it.
+    /// Blindness is kept: scroll-only prediction never sets it nor reads it,
+    /// and a key whose effect was unknown stays unknown.
     pub fn set_predictions(&mut self, predictions: Predictions) {
         self.predictions = predictions;
     }
@@ -2211,7 +2214,7 @@ impl Typed {
         self.drawn == self.sent && self.state != State::Lost
     }
 
-    /// Whether to send a fence: inputs not known drawn, and none pending.
+    /// Whether to send a fence: inputs not known drawn, and no fence pending.
     pub fn wants_fence(&self) -> bool {
         self.fence.is_none() && self.drawn < self.sent
     }
@@ -2527,8 +2530,9 @@ pub struct Sync {
     recent: VecDeque<(u64, Option<Box<str>>)>,
     pastes: u64,
     /// The earliest fence whose answer can be trusted: after the last paste,
-    /// and after the next key if the paste is taken as keys or the last key
-    /// is not counted yet.
+    /// and after the next key if the paste is taken as keys (Neovim takes
+    /// them only after answering a fence sent with it) or the last key is
+    /// not counted yet.
     barrier: Option<Fenced>,
     /// The newest ack, judged or not.
     pub last: Option<Ack>,
@@ -2771,7 +2775,7 @@ const QUEUE: usize = 512;
 /// Outcomes of followed motions, judged at each ack (see [`Predictor::judge`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Shadow {
-    /// Whether Neovim put the cursor and view where the client would have.
+    /// Neovim put the cursor and view where the client would have, or not.
     pub agree: u64,
     pub disagree: u64,
     /// Keys the client could not follow, or had no state to follow from.
@@ -2796,7 +2800,7 @@ impl Shadow {
 const SHADOW_EVERY: u64 = 100;
 
 /// Consecutive confirmations before a kind drawn wrong in a buffer, or what
-/// plugin autocommands may change there ([`Unseen`]), is drawn again.
+/// plugin autocommands may change there ([`Unseen`]), is drawn.
 const PROOF: u32 = 8;
 
 /// Of the last `LOOKED_BACK` drawn predictions, at least `FLOOR` tenths must
@@ -2981,7 +2985,7 @@ impl Trust {
         self.proven.remove(&(buf, what));
     }
 
-    /// Motions dropped unjudged: see [`Tally::unjudged`].
+    /// Steps dropped unjudged: see [`Tally::unjudged`].
     pub fn unjudged(&mut self, n: u64) {
         if n > 0 {
             self.tally.count(|t| t.unjudged += n);
@@ -3089,8 +3093,8 @@ impl Predictor {
     }
 
     /// Window heights of lines the agent should keep either side of the view:
-    /// the pages a held key types in a round trip, plus two, within
-    /// 2..=[`MOST_REACH`].
+    /// the pages a held key types in a round trip, plus two for the page in
+    /// view and Neovim's own time, within 2..=[`MOST_REACH`].
     pub fn reach(&self) -> i64 {
         let rtt = self.srtt.unwrap_or_default().as_micros();
         let pages = (rtt * PAGES_A_SECOND).div_ceil(1_000_000);
@@ -3368,8 +3372,8 @@ impl Predictor {
         self.remade(seq);
     }
 
-    /// Replay inputs from Neovim's last word (see [`Typed::rebase`]); returns
-    /// whether there is one.
+    /// Reset [`Typed`] to Neovim's last word, for the caller to replay the
+    /// inputs since (see [`Typed::rebase`]); returns whether there is one.
     pub fn rebase(&mut self) -> bool {
         let Some(base) = self.base.as_ref() else {
             return false;
@@ -3695,7 +3699,7 @@ fn mapping<'a>(
     }
 }
 
-/// Whether `key` has an [`Idiom`] mapping.
+/// Whether `key`'s mapping moves as the bare key ([`Idiom::same`]).
 fn idiomatic(shape: Option<&Shape>, key: &str) -> bool {
     shape
         .and_then(|s| s.stepping.as_ref())
@@ -3883,7 +3887,6 @@ mod tests {
         }
     }
 
-    /// Gutter group ids for these tests.
     const IDS: Gutter = Gutter {
         line_nr: 10,
         above: 11,
@@ -4795,7 +4798,7 @@ mod tests {
     }
 
     /// Editor-drawn groups come from the editor if sent, else the text's
-    /// highlight.
+    /// highlight (0 for `EndOfBuffer`).
     #[test]
     fn the_colours_are_the_windows_own() {
         let cell = |hl| Cell {
@@ -6524,7 +6527,6 @@ mod tests {
         assert!(!t.refused(5, now), "shaped again");
     }
 
-    /// Exactly nine in ten keeps drawing on.
     #[test]
     fn too_many_drawn_wrong_and_none_are_drawn() {
         let now = Instant::now();

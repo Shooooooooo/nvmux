@@ -27,7 +27,8 @@ impl Motion {
         (self.row.nearest(), self.col.nearest())
     }
 
-    /// Advance `dt` seconds of a slide lasting `duration`; true while moving.
+    /// Advance `dt` seconds of a slide lasting `duration`; true while the
+    /// drawn offset is nonzero.
     pub fn step(&mut self, dt: f32, duration: f32) -> bool {
         self.row.step(dt, duration);
         self.col.step(dt, duration);

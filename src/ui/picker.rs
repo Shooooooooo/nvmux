@@ -354,10 +354,10 @@ impl Panel {
 }
 
 impl Floating for Panel {
-    /// Centred; as wide as the list plus [`ROOM`], at least [`MIN_WIDTH`]; as
-    /// tall as all sessions, not just filtered ones, so it holds still while a
-    /// filter is typed. Shrinks to keep the session margin; `None` if too
-    /// small.
+    /// Centred; as wide as the list plus [`ROOM`] each side, at least
+    /// [`MIN_WIDTH`]; as tall as all sessions, not just filtered ones, so it
+    /// holds still while a filter is typed. Shrinks to keep the session
+    /// margin; `None` if too small.
     fn area(&self, screen: Rect) -> Option<Rect> {
         let list = draw::list_width(&self.app);
         let rows = self.app.sessions().len().max(1) as u16;

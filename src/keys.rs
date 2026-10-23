@@ -9,7 +9,8 @@
 //! `[keys.bind]` can move keys ([`crate::config`]); a [`Keymap`] is the table
 //! as moved, read by [`Prefix::feed`], the help screen ([`crate::ui::help`])
 //! and the hint bar ([`crate::hint`]), so the help cannot miss a command. The
-//! README's "While attached" table is a hand-kept copy and can go stale.
+//! README's "While attached" table is a hand-kept copy; a test checks only its
+//! names and default keys.
 //!
 //! `Ctrl-z` (0x1a) is not special: it is forwarded to Neovim.
 //!
@@ -394,9 +395,9 @@ pub enum Wait {
     Sequence,
 }
 
-/// What the user has half-typed, for the hint bar ([`crate::hint`]). Unlike
-/// [`Wait`], which says what the caller must time (including unfinished
-/// escape sequences). A read-only view of the private [`State`].
+/// What the user has half-typed, for the hint bar ([`crate::hint`]). Not
+/// [`Wait`], which is what the caller must time and so also covers unfinished
+/// escape sequences. A read-only view of the private [`State`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pending {
     /// A lone `<prefix>`: the next key picks a command.
@@ -616,7 +617,6 @@ impl Prefix {
                     let wider = n.saturating_mul(10).saturating_add(u32::from(b - b'0'));
                     self.start_number(wider, steps, pending);
                 } else if b == ENTER {
-                    // Enter ends the number without waiting out the timeout.
                     self.state = State::Idle;
                     flush(steps, pending);
                     steps.push(Step::Act(Action::Switch(n)));
@@ -998,8 +998,8 @@ mod tests {
         assert!(!p.is_armed());
     }
 
-    /// Release reports (sent for every key, the prefix included) are forwarded
-    /// and change no state.
+    /// Release reports (sent for every key) change no state and are forwarded,
+    /// except the prefix's own while armed, which is held with its press.
     #[test]
     fn key_release_reports_are_transparent_in_every_state() {
         let release_prefix = b"\x1b[32;5:3u";
@@ -1803,7 +1803,6 @@ mod tests {
         );
     }
 
-    /// Once a number is begun, Enter still ends it.
     #[test]
     fn enter_after_the_prefix_alone_goes_where_the_card_is_about() {
         let mut p = Prefix::new(12);

@@ -19,7 +19,7 @@
 //! mode's shape (`super::Animator`).
 //!
 //! Cursor-line decorations (`'relativenumber'`, `'cursorline'`) are redrawn
-//! over Neovim's rows while the cursor is drawn on another line
+//! over Neovim's rows while the cursor is drawn on a line other than Neovim's
 //! (`crate::client::App::repaint`). Motions past `'scrolloff'` and scroll keys
 //! also scroll the view ahead (`super::scroll`); [`Chain::top`] is the result.
 //! All steps and scrolls are dropped when a Neovim frame moves the view any

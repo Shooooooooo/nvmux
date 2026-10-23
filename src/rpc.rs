@@ -32,8 +32,9 @@
 //! `blocking = true`). With `'cmdheight'` 0 (AstroNvim) any one-line error
 //! opens it; with 1, any message that scrolls. So [`probe`] and the attach
 //! probe (`pty::probe_on`) read the mode before anything deferred, and attach
-//! and resume in [`crate::pty`] send `<CR>` first. `nvim_get_mode` is queued
-//! too during `:!cmd` and CPU-bound Lua, so every call still has a budget.
+//! and resume in [`crate::pty`] end the prompt with `<CR>`. `nvim_get_mode` is
+//! queued too during `:!cmd` and CPU-bound Lua, so every call still has a
+//! budget.
 
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -119,8 +120,8 @@ impl Client<UnixStream> {
     /// until answered, and only an [`Interrupt`] from another thread ends it
     /// sooner: use it only for waits the user watches and can cancel.
     pub fn connect_with(path: &Path, read_timeout: Option<Duration>) -> Result<Self, RpcError> {
-        // std's error here is an `InvalidInput` with no OS error to match on;
-        // check first for a useful message.
+        // For an overlong path std's error is an `InvalidInput` with no OS
+        // error to match on; check first for a useful message.
         crate::paths::check_sock_path(path).map_err(|e| RpcError::Protocol(e.to_string()))?;
 
         let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
@@ -227,7 +228,7 @@ impl<S: Read + Write> Client<S> {
 
     /// Send a request without waiting, so two calls cost one round trip (over a
     /// 150 ms link, 151 ms instead of 302 ms). Replies are read with
-    /// [`Client::reply_to`] in any order. Only `pty::probe_on` uses it.
+    /// [`Client::reply_to`] in any order.
     pub fn ask(&mut self, method: &'static str, params: Vec<Value>) -> Result<Pending, RpcError> {
         if let Some(why) = &self.poisoned {
             return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
@@ -310,7 +311,7 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// `Some` if the frame answers `want`. Other replies we are owed are
-    /// parked; anything else is ignored.
+    /// parked; other well-formed frames are ignored.
     #[allow(clippy::type_complexity)]
     fn classify(
         &mut self,
@@ -461,8 +462,8 @@ impl<S: Read + Write> Client<S> {
         Ok(v.as_array().map(|a| a.len()).unwrap_or(0))
     }
 
-    /// `nvim_command`: used for the `:Detach` alias and for `:mode`, the one
-    /// command that clears and repaints the grid.
+    /// `nvim_command`: used for `:mode`, the one command that clears and
+    /// repaints the grid.
     pub fn command(&mut self, cmd: &str) -> Result<(), RpcError> {
         self.call("nvim_command", vec![Value::String(cmd.into())])?;
         Ok(())
@@ -895,7 +896,8 @@ mod tests {
         }
     }
 
-    /// Reset (gone), as a read would find it, not a protocol error.
+    /// A refused write is a reset, as a read would find it, not a protocol
+    /// error.
     #[test]
     fn a_request_to_a_session_that_hung_up_is_a_reset() {
         let e = Client::new(HungUp).get_mode().expect_err("refused");

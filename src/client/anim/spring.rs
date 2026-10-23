@@ -24,7 +24,8 @@ impl Spring {
     }
 
     /// Advance `dt` seconds towards settling in `duration`; returns whether
-    /// still moving. Exact solution, so a late frame loses no accuracy.
+    /// still moving (once stopped, it is exactly on target). Exact solution,
+    /// so a late frame loses no accuracy.
     pub fn step(&mut self, dt: f32, duration: f32) -> bool {
         if duration <= 0.0 || !duration.is_finite() {
             *self = Spring::default();
@@ -48,14 +49,14 @@ impl Spring {
         self.position != 0.0 || self.velocity != 0.0
     }
 
-    /// Whole cells to go, rounded towards the target, so a scroll shows its
-    /// first row at once. Used by [`super::scroll`].
+    /// Whole cells to go, rounded towards the target.
     pub fn cells(&self) -> i64 {
         self.position.trunc() as i64
     }
 
-    /// Whole cells to go, rounded to the nearest, so a distance added mid-way
-    /// does not shift what is drawn (see [`super::motion`]).
+    /// Whole cells to go, rounded to the nearest. Unlike [`Spring::cells`],
+    /// whole cells added mid-way, either way, do not shift what is drawn (see
+    /// [`super::motion`]).
     pub fn nearest(&self) -> i64 {
         self.position.round() as i64
     }

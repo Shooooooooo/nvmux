@@ -1,10 +1,10 @@
 //! The picker's transient effects, painted over a frame [`super::draw`] has
 //! drawn (like [`crate::fade::apply`], so drawing itself stays colourless):
-//! the afterglow on the row the cursor left (also used by [`super::swap`] and
-//! [`super::settings`]), rows a filter drops fading in place, a line struck
-//! through the name a `[y/N]` asks about, and the row in the gap `c` opens
-//! rising out of the background. Progress lives in [`App`]; positions come
-//! from [`draw::row_rect`].
+//! the afterglow on the row the cursor left (also on rows a session in flight
+//! crosses, [`super::swap`], and in [`super::settings`]), rows a filter drops
+//! fading in place, a line struck through the name a `[y/N]` asks about, and
+//! the row in the gap `c` opens rising out of the background. Progress lives
+//! in [`App`]; positions come from [`draw::row_rect`].
 //!
 //! With the terminal's palette ([`crate::palette::query`]) and no `NO_COLOR`
 //! they fade between real colours, the strike warming the bar toward the
@@ -38,7 +38,7 @@ use crate::palette::{Palette, Rgb};
 pub const SIFT: Duration = Duration::from_millis(120);
 
 /// Time for the gap row `c` opens to rise from the background (see
-/// [`App::make_room`]). Waited on before every prompt, so kept short.
+/// [`App::make_room`]). Waited on before every create prompt, so kept short.
 pub const ROOM: Duration = Duration::from_millis(130);
 
 /// How long the gap is shown before the prompt when fades are off (the row is
@@ -602,7 +602,6 @@ mod tests {
         assert!(a.glow().is_none());
     }
 
-    /// Nor does the picker request animation frames.
     #[test]
     fn with_the_effects_off_nothing_passes() {
         let mut a = picker(&["api-server", "dotfiles", "notes"]);

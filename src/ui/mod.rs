@@ -58,9 +58,9 @@ pub(crate) mod test_support;
 pub enum Outcome {
     Attach {
         session: Session,
-        /// The listing the picker showed (or, after a new session was moved to
-        /// the highlighted row, the one taken once its place was stored; see
-        /// `settle`). Passed on rather than relisted, as a listing costs
+        /// The listing the picker showed (or, after a new session was moved
+        /// below the highlighted row, the one taken once its place was stored;
+        /// see `settle`). Passed on rather than relisted, as a listing costs
         /// ~230 ms over SSH and 88-110 ms on hosts with slow forks. The
         /// session loop needs the highest number (to act on a digit without
         /// waiting) and the rows (to name `<prefix>` switch targets).
@@ -98,10 +98,10 @@ impl Outcome {
 /// What the picker opens on: the rows for its first frame, and whether a
 /// listing is still to come.
 ///
-/// Over SSH a listing is a round trip (a third of a second or more of blank
-/// screen after `<prefix> Space`). Returning from a session, the session loop
-/// already has the rows (see `main`), stale only for changes made outside this
-/// nvmux.
+/// Over SSH a listing is a round trip; a first frame waiting for it leaves the
+/// screen blank for a third of a second or more after `<prefix> Space`.
+/// Returning from a session, the session loop already has the rows (see
+/// `main`), stale only for changes made outside this nvmux.
 #[derive(Debug, Default)]
 pub enum Listing {
     /// No rows in hand: list, and wait for it before the first frame.
@@ -515,8 +515,8 @@ fn run_loop(
         };
         // Before a request blocks (e.g. a renumber over SSH), finish the
         // landing and draw, so the screen does not show the key's question
-        // through the I/O. Skipped for a key with no request: the loop draws
-        // next, and a second frame per key would let a held key fall behind.
+        // through the I/O. Skipped with neither: the loop draws next, and a
+        // second frame per key would let a held key fall behind.
         if app.landing().is_some() || request != Request::None {
             play_out(terminal, &mut app, colours, |app| app.landing().is_some())?;
         }
@@ -567,7 +567,8 @@ fn run_loop(
                         });
                     }
                     prompt::Outcome::Cancelled => {
-                        // The prompt faded out if it faded in; match it.
+                        // The prompt faded out if it faded in; fade the
+                        // picker back in to match.
                         if arrival != prompt::Arrival::Cut {
                             crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
                         }
@@ -887,7 +888,7 @@ fn settle(app: &App, transport: &dyn Transport, session: Session) -> (Session, V
 }
 
 /// Relist (keeping the selection by id) and drop any background listing: it
-/// predates the kill or rename and would undo it.
+/// predates the change just made and would undo it.
 fn refresh(app: &mut App, transport: &dyn Transport, behind: &mut Option<Behind>) -> Result<()> {
     *behind = None;
     app.set_sessions(transport.list_sessions()?);
@@ -1040,8 +1041,9 @@ mod tests {
         }
     }
 
-    /// The prefix (default Ctrl-Space) is such a chord, and `x`, `q`, `r`, `y`
-    /// are picker commands. Ctrl-Space must not reach the filter as a space.
+    /// The prefix (default Ctrl-Space) is a control chord, and `x`, `q`, `r`,
+    /// `y` are picker commands. Ctrl-Space must not reach the filter as a
+    /// space.
     #[test]
     fn other_control_chords_are_ignored_not_folded_to_letters() {
         for c in ['t', 'x', 'q', 'r', 'y', 'g', 'a', 'd', ' '] {
@@ -1276,9 +1278,10 @@ mod tests {
         assert_eq!(host.asked(), 1);
     }
 
-    /// The picker opens on the rows in hand minus that session, cursor on the
-    /// first row. If the listing still has it (client ended by `:detach`), the
-    /// cursor returns to it; if not, it stays. A key pressed meanwhile wins.
+    /// The picker opens on the rows in hand minus the exited session, cursor on
+    /// the first row. If the listing still has it (client ended by `:detach`),
+    /// the cursor returns to it; if not, it stays. A key pressed meanwhile
+    /// wins.
     #[test]
     fn the_cursor_goes_back_to_a_session_whose_client_exited_if_it_is_still_there() {
         let wait = Duration::from_millis(300);

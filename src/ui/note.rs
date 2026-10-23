@@ -1,8 +1,9 @@
 //! Glyphs and text for a session's note on the picker (layout is in
 //! [`super::draw`]).
 //!
-//! Every sign must be one column on every terminal, or the row shifts: hence
-//! braille, `∗` (U+2217), `✓` (U+2713, not the emoji U+2714) and `!`.
+//! Every sign must be one column on every terminal, or the row shifts, so
+//! none is emoji or ambiguous-width: braille, `∗` (U+2217), `✓` (U+2713, not
+//! the emoji U+2714) and `!`.
 
 use std::time::Duration;
 
@@ -43,14 +44,15 @@ pub fn turns(note: &Note) -> bool {
     note.kind == Kind::Busy(None)
 }
 
-/// Any progress shows at least one dot; only 100% fills the cell.
+/// `percent` to the nearest eighth, at least one dot; 94% and up fill the
+/// cell.
 pub fn gauge(percent: u8) -> char {
     let level = ((u32::from(percent.min(100)) * 8 + 50) / 100).clamp(1, 8);
     GAUGE[level as usize - 1]
 }
 
-/// The selected note's caption, e.g. `lua_ls: 42% indexing · 12s`, worded as
-/// Neovim prints progress.
+/// The selected note's caption, e.g. `lua_ls: 42% indexing · 12s`; progress
+/// reads as Neovim prints it, title first.
 pub fn caption(note: &Note) -> String {
     format!(
         "{} · {}",

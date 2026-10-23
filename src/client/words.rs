@@ -18,8 +18,9 @@ pub enum Way {
     BackEnd,
 }
 
-/// Neovim's `cls()`: 0 blank, 1 punctuation, 2 word; below 256 from `keyword`
-/// (`'iskeyword'`), above from [`CLASSES`]. With `big` every non-blank is 1.
+/// Neovim's `cls()`: 0 blank, 1 punctuation, 2 word, 3 emoji, or a script's
+/// own class. Below 256 from `keyword` (`'iskeyword'`), above from
+/// [`CLASSES`]. With `big` every non-blank is 1.
 pub fn class(c: char, keyword: &[u8], big: bool) -> u32 {
     let class = match u32::from(c) {
         0x20 | 0x09 => 0,
@@ -44,7 +45,8 @@ pub fn class(c: char, keyword: &[u8], big: bool) -> u32 {
 }
 
 /// `text` gives a 0-based line only where the client has it whole and it is
-/// [`predict::ordinary`]; `keyword` holds the [`class`] of each byte below 256.
+/// [`predict::ordinary`]; `keyword` holds the [`class`] of each character
+/// below 256.
 pub struct Lines<'a> {
     pub text: &'a dyn Fn(i64) -> Option<&'a str>,
     pub count: i64,

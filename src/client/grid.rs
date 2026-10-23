@@ -213,8 +213,8 @@ impl Grid {
             }
             for _ in 0..run.repeat {
                 if c >= self.width {
-                    // The first dropped cell is the right half of the last
-                    // one put.
+                    // A right half as the first dropped cell: the last one
+                    // put is cut in two.
                     if run.text == Text::Half {
                         self.cells[base + c - 1].text = Text::Char(' ');
                     }
@@ -273,7 +273,7 @@ impl Grid {
         }
     }
 
-    /// Copy of a region, for a scroll animation (see [`super::anim::scroll`]).
+    /// Copy of rows `top..bot`, columns `left..right`, clipped to the grid.
     pub fn lines(&self, top: usize, bot: usize, left: usize, right: usize) -> Vec<Vec<Cell>> {
         (top..bot.min(self.height))
             .map(|r| {
@@ -529,7 +529,7 @@ mod tests {
         }
     }
 
-    /// As for a line sent before the client narrowed the grid.
+    /// A line Neovim sent before the client narrowed the grid.
     #[test]
     fn a_line_cut_through_a_wide_character_leaves_a_blank() {
         let line = [
