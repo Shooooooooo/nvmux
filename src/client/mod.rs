@@ -347,14 +347,16 @@ return out";
 /// last of them, its mode, and the window, buffer, `b:changedtick`, line
 /// count, cursor, `curswant` and view they left, and how wide Neovim lays
 /// the cursor's line out: see [`predict::Ack`]), the edits they made sent
-/// first — and what would make a key typed in Insert mode in the buffer of
-/// the window that has the cursor do other than what typing it plainly
-/// does, as Insert mode is entered there, the buffer is, or an option that
-/// bears on it is set, where any of it changed (`insert`, see
-/// [`typing::Facts`]); and
+/// first and, in Normal, Visual and Insert mode, the frame that draws them
+/// flushed as the next key is taken, where Neovim takes it without waiting
+/// for it and so without flushing that frame itself — and what would make a
+/// key typed in Insert mode in the buffer of the window that has the cursor
+/// do other than what typing it plainly does, as Insert mode is entered
+/// there, the buffer is, or an option that bears on it is set, where any of
+/// it changed (`insert`, see [`typing::Facts`]); and
 /// each time Neovim moves a view while it is behind on the keys typed
-/// (`behind`), which it sends no frame for till it has caught up — what the
-/// client scrolled ahead of it waits for it meanwhile (see
+/// (`behind`), which it may send no frame for till it has caught up — what
+/// the client scrolled ahead of it waits for it meanwhile (see
 /// [`Predictor::deadline`]). The keys are counted in `_G.nvmux_taken`, by
 /// channel, for a fence to read (see [`predict::Sync`]).
 const AGENT_LUA: &str = "local chan, predict, keys, ikeys, reach, acks, typing = ...
@@ -408,6 +410,12 @@ if predict then
   -- that reads it before the first key is not taken for no agent at all;
   -- with the last few keys, for the client to check its count by.
   local taken, tail = 0, {}
+  -- Whether the frame for the keys last said to have been taken may not
+  -- have gone out yet (see the SafeState handler below), till the next key
+  -- typed is taken; and the modes the client judges by what is said of the
+  -- keys, which that frame is flushed in (see predict::Rest).
+  local unflushed = false
+  local judged = { n = true, v = true, V = true, ['\\22'] = true, i = true }
   -- Where <C-w> and <C-u> stop once in Insert mode, as Neovim has it, for
   -- the client to stop them there too: Neovim's Insstart_orig (orig),
   -- which goes back before each key to where Insert mode began, Insstart
@@ -490,6 +498,19 @@ if predict then
       end
       if typed == nil or typed == '' then
         return
+      end
+      -- Neovim drew what the keys said to have been taken made, and then
+      -- took this one: if it took it without waiting for it, it flushed
+      -- none of that, and the frame goes out now, before this key changes
+      -- anything. If it did wait, it flushed it then, and nothing is left.
+      -- With the cursor put back where Neovim draws it: it puts it there
+      -- before it flushes, and may have drawn elsewhere since, as in
+      -- Insert mode the mode's own message, before taking a key.
+      if unflushed then
+        unflushed = false
+        if judged[mode] then
+          pcall(api.nvim__redraw, { flush = true, cursor = true })
+        end
       end
       local t, i = vim.fn.keytrans(typed), 1
       while i <= #t do
@@ -1128,7 +1149,7 @@ if predict then
   -- before anything scheduled, so a push asked for at one scroll and not yet
   -- made at the next would wait for the last of them, and the pages typed
   -- ahead for their lines. Pushed with each scroll instead, till it has
-  -- caught up. Nor does it send a frame till then, and a frame is what
+  -- caught up. Nor need it send a frame till then, and a frame is what
   -- lands the scrolls the client made ahead of it: so the client is told,
   -- with each scroll, that Neovim is still at work on them.
   au('WinScrolled', {}, function()
@@ -1287,6 +1308,19 @@ if predict then
     end
     said = a
     send('ack', a[1], table.concat(tail), unpack(a, 2))
+    -- Said just ahead of the frame Neovim flushes as it waits for the next
+    -- key, which the client takes it with. But where that key has come in
+    -- already, Neovim goes on to it without waiting, and so without
+    -- flushing: the next frame the client would have is one for keys after
+    -- these. So the frame is flushed as the next key is taken, once Neovim
+    -- has drawn it all (see on_key above) — not here, before Neovim draws
+    -- its ruler and statusline, its folds and diffs; nor only where a key
+    -- is found to have come in, as looking for one takes in a <C-c> typed
+    -- ahead, which Neovim then never sees. In the modes the client judges
+    -- by the word (see predict::Rest).
+    if judged[mode] then
+      unflushed = true
+    end
   end)
   -- New colours for every group the client knows.
   au('ColorScheme', {}, function()
@@ -2469,7 +2503,7 @@ impl App {
                 }
             }
             Some("ack") => self.heard_ack(&params[1..], now),
-            // Neovim is still at work on keys typed ahead of it, and will
+            // Neovim is still at work on keys typed ahead of it, and may
             // send no frame till it has caught up: what it has yet to land
             // waits for it as long as a scroll made now would.
             Some("behind") => {
