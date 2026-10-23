@@ -5,11 +5,11 @@
 //!
 //! It is the picker: its [`App`], drawn by [`super::draw`] — rows, signs, the
 //! note under the list, the effects — into the panel rather than onto the
-//! terminal, on its own keys and the mouse. What changes is where it is drawn,
-//! and so how much of its hint row there is room for ([`HINTS`]); and where a
-//! key that leads off it goes — another session, the create prompt, the
-//! rename prompt, the help, the settings, out of nvmux — which is the relay's
-//! to follow ([`Leave`]). The help, the settings and the prompts come up in
+//! terminal, on its own keys and the mouse. What changes is where it is drawn
+//! — its hint row the full screen's, as much of it as the panel has room for
+//! ([`draw::hints`]) — and where a key that leads off it goes: another
+//! session, the create prompt, the rename prompt, the help, the settings, out
+//! of nvmux, which is the relay's to follow ([`Leave`]). The help, the settings and the prompts come up in
 //! its place, and go back to it, as they do full screen.
 //!
 //! # Rows in hand
@@ -49,29 +49,11 @@ use ratatui::Terminal;
 
 use super::app::{App, Request};
 use super::float::{self, Did, Floating, Leave};
-use super::{draw, effects, note, settings, Behind, Listing};
+use super::{draw, effects, note, Behind, Listing};
 use crate::ids::Id;
 use crate::notes::Poller;
 use crate::session::Session;
 use crate::transport::Shared;
-
-/// The picker's hints as the panel has room for them: the full screen's, in
-/// its order, and `esc back` after them, each ranked by how much it is needed
-/// — the panel keeps as many as its width takes, dropping the least needed
-/// whole (see [`settings::fit`]). At the panel's least width, the eight that
-/// rank under eight.
-const HINTS: [(&str, u8); 10] = [
-    ("↑↓ move", 0),
-    ("⏎ attach", 1),
-    ("c new", 3),
-    ("r rename", 8),
-    ("x kill", 5),
-    ("␣ order", 6),
-    ("/ find", 4),
-    (", settings", 7),
-    ("q quit", 9),
-    ("esc back", 2),
-];
 
 /// The least of the session the panel leaves showing round it: columns either
 /// side, and rows above and below. The help's.
@@ -82,17 +64,21 @@ const SESSION_ROWS: u16 = 1;
 /// signs left of the list, and for what flies off the ends of a row in flight.
 const ROOM: u16 = 8;
 
-/// The narrowest the panel is: room for the eight hints that matter most —
-/// `, settings` among them, the way to the settings that nothing else on the
-/// panel shows — and for most of what a session's note says under the list:
-/// Claude Code's asking for a permission, whole, and how long ago. A longer
-/// note is cut, as the picker's is on a terminal too narrow for it.
-const MIN_WIDTH: u16 = 75;
-
-// The panel at its least width, and the session round it, fit the eighty
-// columns a terminal opens at. On fewer the panel narrows, and its hint row
-// loses `, settings` first.
-const _: () = assert!(MIN_WIDTH + 2 * SESSION_COLS <= 80);
+/// The narrowest the panel is where the screen has room: the whole of the
+/// hint row the picker full screen has over a session ([`draw::widest_hints`]),
+/// a column off either side of the panel's inside — so that turning
+/// `[style] float` changes where the row is and nothing it says — and so room
+/// for what a session's note says under the list as well: Claude Code's asking
+/// for a permission, whole, and how long ago. A longer note is cut, as the
+/// picker's is on a terminal too narrow for it.
+///
+/// Narrower where the screen is, the panel's row gives up hints as the full
+/// screen's does on a narrower terminal, least needed first: on the eighty
+/// columns a terminal opens at, both keep the same eight, `, settings` among
+/// them — the way to the settings that nothing else on the panel shows.
+fn min_width() -> u16 {
+    draw::widest_hints() + 4
+}
 
 /// The panel's rows that are not the list's: one over it; one, and the note,
 /// under it; one more, the hint row and the panel's last.
@@ -395,17 +381,11 @@ impl Panel {
             || self.placing.is_some()
             || self.creating.is_some()
     }
-
-    /// The hint row's text at rest, as much of it as `width` takes.
-    fn hints(width: u16) -> String {
-        let entries = HINTS.map(|(text, rank)| (Some(text), rank));
-        settings::fit(&entries, usize::from(width.saturating_sub(2)))
-    }
 }
 
 impl Floating for Panel {
     /// In the middle: as wide as the list and room either side of it, or
-    /// [`MIN_WIDTH`]; as tall as every session and the rows round them —
+    /// [`min_width`]; as tall as every session and the rows round them —
     /// every session, not the ones a filter leaves, so the panel holds still
     /// as one is typed. Smaller where that leaves too little of the session
     /// round it, and nowhere where even that is too small.
@@ -413,7 +393,7 @@ impl Floating for Panel {
         let list = draw::list_width(&self.app);
         let rows = self.app.sessions().len().max(1) as u16;
         let width = (list + 2 * ROOM + 2)
-            .max(MIN_WIDTH)
+            .max(min_width())
             .min(screen.width.saturating_sub(2 * SESSION_COLS));
         let height = (rows + AROUND_LIST).min(screen.height.saturating_sub(2 * SESSION_ROWS));
         if width < list + 6 || height < AROUND_LIST + 1 {
@@ -568,14 +548,13 @@ impl Floating for Panel {
         if inside.width == 0 || inside.height == 0 {
             return buf;
         }
-        let hints = Self::hints(inside.width);
         // A terminal of the inside's size, in memory: the picker draws on a
         // frame, and this is the one it can have of a size of nvmux's choosing.
         let Ok(mut terminal) = Terminal::new(TestBackend::new(inside.width, inside.height));
         let app = &self.app;
         let colours = self.colours.as_ref();
         let Ok(_) = terminal.draw(|f| {
-            draw::draw_with(f, app, &hints);
+            draw::draw(f, app);
             crate::theme::paint(f.buffer_mut());
             effects::paint(f, app, colours);
         });
@@ -621,7 +600,6 @@ impl Floating for Panel {
 mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-    use unicode_width::UnicodeWidthStr;
 
     /// Sessions of these ids, numbered in order, as a listing has them.
     fn rows(ids: &[&str]) -> Vec<Session> {
@@ -778,18 +756,40 @@ mod tests {
         hand(&[], None);
     }
 
-    /// At its least width the panel keeps the eight hints that matter most, in
-    /// the full screen's order, and `esc back` after them; given the room, all
-    /// of them.
+    /// The panel's hint row is the one the picker full screen has over the
+    /// same session on the same terminal: on the eighty columns a terminal
+    /// opens at, the eight hints that matter most, `esc back` among them; given
+    /// the room, every one, `r rename` and `q quit` as well.
     #[test]
-    fn the_panels_hints_are_the_eight_that_matter_most() {
-        let inside = MIN_WIDTH - 2;
-        assert_eq!(
-            Panel::hints(inside),
-            "↑↓ move  ⏎ attach  c new  x kill  ␣ order  / find  , settings  esc back"
-        );
-        let all = HINTS.map(|(t, _)| t).join("  ");
-        assert_eq!(Panel::hints(all.width() as u16 + 2), all);
+    fn the_panels_hint_row_is_the_full_screens() {
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        let mut full = App::new(rows(&[other, behind]));
+        full.set_came_from(behind);
+        for (width, height) in [(80, 24), (120, 36), (200, 50)] {
+            let area = panel
+                .area(Rect::new(0, 0, width, height))
+                .expect("room to float");
+            let buf = panel.draw(area);
+            let floating: String = (area.x..area.x + area.width)
+                .map(|x| buf[(x, area.y + area.height - 2)].symbol())
+                .collect();
+            let screen = crate::ui::test_support::render(width, height, |f| draw::draw(f, &full));
+            let whole = &screen[usize::from(height) - 1];
+            assert_eq!(floating.trim(), whole.trim(), "{width}x{height}");
+            assert!(whole.contains("esc back"), "{width}x{height}: {whole:?}");
+            if width == 80 {
+                assert_eq!(
+                    whole.trim(),
+                    "↑↓ move  ⏎ attach  c new  x kill  ␣ order  / find  , settings  esc back"
+                );
+            } else {
+                assert!(whole.contains("r rename") && whole.contains("q quit"));
+            }
+        }
+        hand(&[], None);
     }
 
     /// Drawn where it floats, on the eighty columns a terminal opens at and on
