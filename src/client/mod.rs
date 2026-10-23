@@ -3427,13 +3427,7 @@ impl App {
         let Some(p) = self.predict.as_mut() else {
             return;
         };
-        // Blind from an input before it, as a key the client could not
-        // make leaves it till Neovim's word covers it: a turn drawn from
-        // where Neovim has the view and the cursor would leave out what
-        // that input did, as keys typed then are not drawn either — and
-        // like them it is made with Neovim's word on that input (see
-        // [`App::replay`]).
-        match command.filter(|_| !p.acks() || p.known()) {
+        match command {
             Some((command, by)) => {
                 let seq = p.typed.seq();
                 self.predict_command(grid, command, Cause { by, seq, at: now }, now);
@@ -3445,7 +3439,7 @@ impl App {
     /// What a turn of the wheel over grid `grid`, `way`, with modifiers
     /// `mods`, makes (see [`App::predict_wheel`]), and by what — in Insert
     /// mode where `insert` says: none where the scrolls are not predicted,
-    /// or something maps it.
+    /// or something maps it, or the client cannot say where Neovim is.
     fn wheel_command(
         &self,
         grid: u64,
@@ -3455,8 +3449,14 @@ impl App {
     ) -> Option<(Command, By)> {
         let p = self.predict.as_ref()?;
         // A turn of the wheel is a scroll, and left to Neovim with the rest
-        // where the scrolls are not predicted.
-        if !p.predictions.scrolls {
+        // where the scrolls are not predicted. And where the agent says what
+        // Neovim made of each key, left to it as a key that scrolls is where
+        // the counts are not tied, or the client is blind from an input
+        // before it — a key it could not make: a turn drawn from where
+        // Neovim has the view and the cursor would leave out what that
+        // input did. Like those keys, it is made with Neovim's word on the
+        // input (see [`App::replay`]).
+        if !p.predictions.scrolls || (p.acks() && !p.known()) {
             return None;
         }
         let shape = self.model.wins.get(&grid).and_then(|w| p.shape(*w));
@@ -5367,7 +5367,9 @@ impl App {
     /// the frame draws, whatever they did to the cursor; nor where the
     /// client could not make out what one of the keys does (see
     /// [`predict::Sent::lost`]), which may have changed what a window shows
-    /// and left its cursor and view as they were. The newest wins.
+    /// and left its cursor and view as they were; nor where a scroll it
+    /// covers was made ahead of Neovim in a window other than the one with
+    /// the cursor, whose view it does not say. The newest wins.
     fn heard_ack(&mut self, params: &[ValueRef<'_>], now: Instant) {
         let Some(ack) = predict::Ack::read(params) else {
             return;
@@ -5375,24 +5377,31 @@ impl App {
         let Some(p) = self.predict.as_mut().filter(|p| p.acks()) else {
             return;
         };
+        let edited = p
+            .base
+            .as_ref()
+            .is_some_and(|b| (b.ack.buf, b.ack.tick) != (ack.buf, ack.tick));
         let Some(k) = p.heard(&ack, now) else {
             // Past a key Neovim may count as two: the steps for the keys
             // before it are let go of with the frame that shows them taken,
-            // and at once where Neovim has drawn it already.
+            // and at once where Neovim has drawn it already, as an ack is.
             if let Some(upto) = p.sync.passed() {
-                self.passed = self.passed.max(Some(upto));
-                if self.shows(&ack) {
-                    self.take_acks(now);
+                if !edited && self.shows(&ack) {
+                    self.floor(upto, now);
+                } else {
+                    self.passed = self.passed.max(Some(upto));
                 }
             }
             self.forget_unsure(now);
             return;
         };
-        let edited = p
-            .base
-            .as_ref()
-            .is_some_and(|b| (b.ack.buf, b.ack.tick) != (ack.buf, ack.tick));
-        let shown = !edited && p.made_out(k) && self.shows(&ack);
+        let made_out = p.made_out(k);
+        let elsewhere = self
+            .anim
+            .unmade(k)
+            .iter()
+            .any(|grid| self.model.wins.get(grid) != Some(&ack.pos.win));
+        let shown = !edited && made_out && !elsewhere && self.shows(&ack);
         self.ack = Some((k, ack));
         if shown {
             self.take_acks(now);
@@ -9297,6 +9306,88 @@ mod tests {
         assert_eq!(top_row(&a), "line 6", "and the next at once");
     }
 
+    /// [`a_turn_of_the_wheel_after_a_key_left_to_neovim_lands_with_its_ack`],
+    /// the counts in doubt by the time the ack's frame comes — `<C-c>`,
+    /// which may throw the turn away: not made then, as a scroll typed
+    /// then would not be.
+    #[test]
+    fn a_turn_of_the_wheel_is_not_made_again_with_the_counts_in_doubt() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        a.keys(b"4j\x1b[<65;3;2M", t1);
+        ack(&mut a, 2, "4j", "n", (4, 0, 0, 0), t1);
+        a.keys(b"\x03", t1);
+        redraw(&mut a, cursor_to(4, 0), t1);
+        assert_eq!(a.anim.ahead(2), (0, 0), "not made");
+        assert_eq!(top_row(&a), "line 0");
+    }
+
+    /// The agent's word on a turn of the wheel over a window other than the
+    /// one with the cursor says nothing of that window's view: it waits for
+    /// the frame that draws the turn, rather than giving the scroll up at
+    /// once, which would take the window back a turn — and make the turns
+    /// after it again from a view without it.
+    #[test]
+    fn a_turn_over_a_window_without_the_cursor_waits_for_its_frame() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = acking(Duration::from_millis(200));
+        let n = Value::from;
+        let viewport = |top: i64, delta: i64| {
+            let bottom = top + 6;
+            (
+                "win_viewport",
+                vec![
+                    n(4),
+                    n(1001),
+                    n(top),
+                    n(bottom),
+                    n(top),
+                    n(0),
+                    n(50),
+                    n(delta),
+                ],
+            )
+        };
+        let rows: Vec<String> = (0..5).map(|r| format!("line {r}")).collect();
+        let mut events = vec![
+            resize(2, 10, 5),
+            place(2, 1000, 0, 0, 10, 5),
+            resize(4, 10, 5),
+            place(4, 1001, 0, 10, 10, 5),
+            viewport(0, 0),
+        ];
+        events.extend(whole(2, 10, 5, &rows));
+        events.extend(whole(4, 10, 5, &rows));
+        redraw(&mut a, events, t1);
+        let shape = shaped(0, (false, false, true), (false, 0), &[], Vec::new());
+        notify(
+            &mut a,
+            "nvmux_client",
+            vec!["shape".into(), n(1001), Value::Array(shape)],
+            t1,
+        );
+        let text: Vec<Value> = (0..20).map(|l| Value::from(format!("line {l}"))).collect();
+        let lines = vec![
+            "lines".into(),
+            n(1001),
+            n(1),
+            n(1),
+            n(0),
+            Value::Array(text),
+            true.into(),
+        ];
+        notify(&mut a, "nvmux_client", lines, t1);
+        // Over the window on the right, the cursor in the one on the left.
+        a.keys(b"\x1b[<65;16;2M", t1);
+        assert_eq!(a.anim.ahead(4).0, 3, "scrolled ahead");
+        ack(&mut a, 1, "<ScrollWheelDown>", "n", (0, 0, 0, 0), t1);
+        assert_eq!(a.anim.ahead(4).0, 3, "till its frame");
+        let mut events = vec![viewport(3, 3)];
+        events.extend((0..5).map(|r| line(4, r, &format!("line {}", r + 3))));
+        redraw(&mut a, events, t1);
+        assert_eq!(a.anim.ahead(4).0, 0, "made by it");
+    }
+
     /// A scroll typed after a key the client does not follow is made once
     /// the agent says where that key left the cursor — with the frame that
     /// draws it — not once Neovim has caught up with every key typed.
@@ -11191,6 +11282,42 @@ mod tests {
         redraw(&mut a, cursor_to(1, 1), t1);
         assert!(a.anim.chain(2).is_none(), "let go of with it");
         assert_eq!(drawn(&a), (1, 1));
+    }
+
+    /// [`a_count_past_a_key_with_alt_lets_go_of_the_steps_before_it_with_its_frame`],
+    /// where Neovim's last frame shows what the word says already: the step
+    /// is let go of at once, as an ack is — but not where the keys changed
+    /// the buffer, which the frame for them draws, and the step with them
+    /// till then.
+    #[test]
+    fn a_count_past_a_key_with_alt_lets_go_at_once_only_of_what_neovim_has_drawn() {
+        for (tick, at_once) in [(1, true), (2, false)] {
+            let t1 = Instant::now() + Duration::from_secs(1);
+            let mut a = stepping(Duration::from_millis(200));
+            a.keys(b"l", t1);
+            a.keys(b"\x1bh", t1);
+            let params: Vec<Value> = vec![
+                "ack".into(),
+                2.into(),
+                "l<Esc>h".into(),
+                "n".into(),
+                1000.into(),
+                1.into(),
+                tick.into(),
+                50.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                5.into(),
+            ];
+            notify(&mut a, "nvmux_client", params, t1);
+            assert_eq!(a.anim.chain(2).is_none(), at_once, "b:changedtick {tick}");
+            redraw(&mut a, cursor_to(0, 0), t1);
+            assert!(a.anim.chain(2).is_none(), "with the frame");
+            assert_eq!(drawn(&a), (0, 0));
+        }
     }
 
     /// [`a_count_past_a_key_with_alt_lets_go_of_the_steps_before_it_with_its_frame`],
