@@ -601,23 +601,31 @@ fn a_busy_session_is_never_reaped() {
 }
 
 /// Busy sessions use the whole probe budget, so they must be probed in
-/// parallel: two take about one budget, not two.
+/// parallel: eight take about one budget, not eight.
 #[test]
 fn busy_sessions_are_probed_together() {
     require_nvim!();
-    let scratch = Scratch::new("busytwo");
+    const BUSY: u32 = 8;
+    let budget = nvmux::rpc::QUICK_PROBE_TIMEOUT;
+    // One budget for the probes together, plus room for the rest of the
+    // listing on a loaded runner.
+    let bound = budget + Duration::from_secs(1);
+    assert!(
+        bound < budget * BUSY,
+        "{bound:?} is not under {BUSY} budgets: serial probing could pass"
+    );
+    let scratch = Scratch::new("busymany");
     let t = scratch.transport();
 
-    let socks: Vec<_> = ["building", "testing"]
-        .into_iter()
-        .map(|name| {
+    let socks: Vec<_> = (0..BUSY)
+        .map(|i| {
             let session = t
-                .create_session(name, &common::launch(), common::anywhere())
+                .create_session(&format!("busy{i}"), &common::launch(), common::anywhere())
                 .expect("create");
             t.local_socket_for(&session).expect("socket")
         })
         .collect();
-    // Longer than two budgets, so serial probes would each take a full one.
+    // Outlasts even a serial listing, so every probe uses its whole budget.
     for sock in &socks {
         common::block_editor(sock, "call system('sleep 10')", Duration::ZERO);
     }
@@ -627,7 +635,11 @@ fn busy_sessions_are_probed_together() {
     let listed = t.list_sessions().expect("list");
     let took = started.elapsed();
 
-    assert_eq!(listed.len(), 2, "both busy sessions must still be listed");
+    assert_eq!(
+        listed.len(),
+        socks.len(),
+        "every busy session must still be listed"
+    );
     assert!(
         listed.iter().all(|s| s.state.liveness == Liveness::Busy),
         "blocked-but-reachable must read as Busy: {listed:?}"
@@ -637,8 +649,8 @@ fn busy_sessions_are_probed_together() {
         "a busy session must never be reaped"
     );
     assert!(
-        took < nvmux::rpc::PROBE_TIMEOUT + Duration::from_secs(2),
-        "two busy sessions held the listing {took:?}: a budget each, one after another"
+        took < bound,
+        "{BUSY} busy sessions held the listing {took:?}: a budget each, one after another"
     );
 }
 
