@@ -4,7 +4,9 @@
 //!
 //! The screen draws into a panel (see [`crate::ui::float`]) while the session
 //! keeps running behind it, dimmed half way to the background, more near the
-//! panel by the cards' falloff ([`crate::falloff`]), and blank under it.
+//! panel by the cards' falloff ([`crate::falloff`]), and blank under it. The
+//! hint row does not float: it stays on the terminal's last row, full width
+//! ([`Floating::draw_hints`]), and the session is blank under it too.
 //!
 //! The relay draws it, not the client, so it also works with
 //! `[client] ui = "nvim"`: each frame paints the session from its copy of the
@@ -14,76 +16,22 @@
 //! [`crate::boundary::Boundary::relay_whole`]), so on a terminal with
 //! synchronized updates the session never shows through. Keys go to the panel
 //! via [`crate::input`]; terminal replies go to the client. Mouse reporting is
-//! on while it is up; a press outside closes it, like `Esc`.
+//! on while it is up; a press on the session (outside the panel and its hint
+//! row) closes it, like `Esc`.
 //!
 //! It comes and goes over nvmux's fade like a card: the session dims, then
-//! the panel rises. From the picker ([`Leave`]), a switch fades panel and
-//! session out together; the help, settings or a prompt replace the picker
-//! over the dimmed session and return to it when closed. Settings switched to
-//! float from full screen, and the picker back from a full-screen prompt
-//! ([`Attachment::float_the_picker`]), come up with the session out of the
-//! background.
+//! the panel and its hint row rise. From the picker ([`Leave`]), a switch
+//! fades panel and session out together; the help, settings or a prompt
+//! replace the picker over the dimmed session and return to it when closed.
+//! Settings switched to float from full screen, and the picker back from a
+//! full-screen prompt ([`Attachment::float_the_picker`]), come up with the
+//! session out of the background.
 //!
-//! Keys go to the panel, read by [`crate::input`]; what the terminal answers
-//! the client goes on to the client, as it came. The mouse is reported while
-//! the panel is up, and put back as the session had it as it goes; a press
-//! on the session — anywhere but the panel and its hint row — takes it down,
-//! as `Esc` does.
-//!
-//! # The hint row
-//!
-//! What floats is all of the screen but its hint row, which stays where it
-//! is full screen: the last row of the terminal, the whole width of it,
-//! saying what it says there ([`Floating::draw_hints`]), with the panel in
-//! the middle of the room above it. The session's last row is emptied under
-//! it, as the session is under the panel, so nothing of the editor's own last
-//! row shows either side of the hints; and it comes and goes with the panel.
-//!
-//! # Coming and going
-//!
-//! In nvmux's fade, the way a card comes: over the first half the session
-//! dims, and empties where the panel and its hint row will be; over the
-//! second the two come up out of the background. Going, the other way round.
-//! With the fade off it is at once. While it is up, whatever moves on it —
-//! the settings' bar, whose row it leaves fades back from it as the picker's
-//! does (see [`crate::ui::settings`]) — has frames at the fade's pace until
-//! it stops; and a key or the mouse has its frame at once, as it does full
-//! screen.
-//!
-//! The picker can go two other ways ([`Leave`]). To another session, or to a
-//! screen of its own, it goes out with the session, the two into the
-//! background together, and the relay has nothing left to dissolve. To the
-//! help, the settings or the prompt, it goes out alone, and the other comes
-//! up in its place over the session as it stands, dimmed — set aside rather
-//! than taken down, and back the same way, as it was left, when that one is
-//! taken down, as the picker full screen is back after them. The prompt goes
-//! out with the session where it has made one, to it.
-//!
-//! And the settings can come the other way: from their screen full screen,
-//! turned to float, they come up over the session as the relay brings it
-//! back — with it, the two out of the background together, as the picker
-//! goes out to a screen of its own the other way round. So does the picker,
-//! back from a prompt it went out to full screen, where the prompt could not
-//! float ([`Attachment::float_the_picker`]).
-//!
-//! # Where it does not float
-//!
-//! Without the terminal's colours — `NO_COLOR`, or a terminal that never
-//! said — nothing can be taken toward a background nvmux does not know. The
-//! session is drawn faint instead, which dims its text and not its
-//! backgrounds, and the panel stands on a margin of blank cells; and nothing
-//! fades. On a terminal too small for a panel and the session round it — each
-//! screen says how big a one it needs ([`Floating::area`]) — and for a
-//! session nvmux keeps no copy of, the screen takes the terminal as it always
-//! did ([`Outcome::ShowSettings`], [`Outcome::ShowHelp`],
-//! [`Outcome::ToPicker`], [`Outcome::CreateNew`], [`Outcome::CreateAfter`],
-//! [`Outcome::Rename`]). With `[style] float` off, none of them floats:
-//! each takes the terminal, wherever it could have floated. Turned off by the
-//! settings as they float, they go out with the session, as the picker goes
-//! to a screen of its own, and come up full screen in their place; and turned
-//! on by the settings full screen over a session, they come up floating over
-//! it as soon as the relay has it back ([`Attachment::float_the_settings`],
-//! and see above).
+//! Without the terminal's colours the session is drawn faint on a blank
+//! margin, with no fade. A terminal too small ([`Floating::area`]), no copy
+//! of the session, or `[style] float` off means full screen instead (its
+//! [`Outcome`]); toggling `float` from the settings moves them between the
+//! two ([`Attachment::float_the_settings`]).
 
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -139,13 +87,10 @@ impl Look {
         }
     }
 
-    /// What becomes of the session's cell at (`row`, `col`) with the panel
-    /// at `panel` and its hint row at `hints`, the dimming `dim` of the way
-    /// in — and the whole of it `away` of the rest of the way to the
-    /// background, under a panel going somewhere other than back to the
-    /// session. Under the hint row it is emptied as it is under the panel,
-    /// for the row to come up on; round the row, it is as far from the panel
-    /// as it is.
+    /// The shade of session cell (`row`, `col`) with the panel at `panel` and
+    /// its hint row at `hints`, `dim` of the way in, and the whole session
+    /// `away` of the way out. Under the hint row it is emptied as under the
+    /// panel, but the row has no falloff of its own.
     fn shade(self, row: u16, col: u16, panel: Rect, hints: Rect, dim: f32, away: f32) -> Shade {
         let under_hints = hints.contains(Position::new(col, row));
         match self {
@@ -336,7 +281,6 @@ pub(super) fn float(
     let Some(mut area) = panel.area(screen) else {
         return Ok(Some(what.full_screen()));
     };
-    // Where its hint row goes: along the bottom of the screen, not with it.
     let (_, mut hints) = float::split(screen);
     if !a.copy().is_some_and(|c| c.is_usable()) {
         return Ok(Some(what.full_screen()));
@@ -482,8 +426,6 @@ pub(super) fn float(
                     asked = true;
                     let on_session = on_the_session(area, hints, mouse.column, mouse.row);
                     let press = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
-                    // A press on the session takes the panel down, as `Esc`
-                    // does.
                     going = (on_session && press) || panel.on_mouse(mouse, now) == Did::Close;
                 }
             }
@@ -688,10 +630,9 @@ fn hold(a: &mut Attachment, chunk: &[u8], held: &mut Vec<u8>, boundary: &mut Bou
     held.extend(boundary.relay_whole(chunk));
 }
 
-/// A frame, `there` of the way in and `away` of the way out to the
-/// background, if one can go out now (see [`frame_bytes`]): the panel at
-/// `area`, and its hint row at `hints`, which comes and goes with it. Says
-/// whether it did.
+/// Write a frame (`there` of the way in, `away` of the way out) if one can
+/// go out now (see [`frame_bytes`]); returns whether it did. The hint row at
+/// `hints` fades with the panel.
 #[allow(clippy::too_many_arguments)]
 fn paint(
     a: &mut Attachment,
@@ -736,26 +677,16 @@ fn paint(
     Ok(true)
 }
 
-/// Whether a press at (`column`, `row`) is on the session, which takes the
-/// panel down as `Esc` does: anywhere but the panel at `area` and its hint
-/// row at `hints`, which are the screen's.
 fn on_the_session(area: Rect, hints: Rect, column: u16, row: u16) -> bool {
     let at = Position::new(column, row);
     !area.contains(at) && !hints.contains(at)
 }
 
-/// The bytes of a frame: what the client wrote since the last, its own frame
-/// closes taken out so that it is presented with this one and no sooner; the
-/// mouse as the panel wants it; and the session under the panel — `laid`,
-/// the panel at `area` and its hint row at `hints`, the session dimmed `dim`
-/// of the way in round them — painted over all of it, in one synchronized
-/// update that this frame ends.
-///
-/// `None` while the session is half way through a sequence, where nothing of
-/// nvmux's can be written: then nothing goes out at all, the session's bytes
-/// included, until the rest of the sequence comes and a frame can go out
-/// after it. The session's bytes never reach the terminal without a frame
-/// after them, which is what keeps them from showing through the panel.
+/// A frame's bytes in one synchronized update: client output since the last
+/// (its sync closes removed, so it shows with this frame), panel mouse
+/// reporting, then the session dimmed `dim` with `laid` (the panel and its
+/// hint row) over it. `None` mid-sequence, where nvmux cannot write: client
+/// bytes always get a frame after them, so they never show through.
 #[allow(clippy::too_many_arguments)]
 fn frame_bytes(
     copy: &mut Shadow,
@@ -871,13 +802,10 @@ mod tests {
         P.get_or_init(crate::test_support::palette)
     }
 
-    /// The hint row of a screen 120 by 42: under every cell the tests about
-    /// the panel look at.
+    /// The hint row of a 120 by 42 screen, below every cell the panel tests
+    /// check.
     const HINTS: Rect = Rect::new(0, 41, 120, 1);
 
-    /// Behind the panel the whole session is half way to the background,
-    /// further nearer the panel by the cards' falloff, and under it emptied;
-    /// and none of it before the dimming has come in.
     #[test]
     fn the_session_dims_round_the_panel_by_the_cards_falloff() {
         let panel = Rect::new(24, 6, 72, 23);
@@ -913,11 +841,6 @@ mod tests {
         assert_eq!(shade(4, 30), Shade::Faint);
     }
 
-    /// Under the hint row the session is emptied as it is under the panel,
-    /// the whole width of the screen, for the row to come up on — and none
-    /// of it before the dimming has come in. Over the row it is as far from
-    /// the panel as it is: the row has no falloff of its own. Without
-    /// colours, blank under the row and faint over it.
     #[test]
     fn the_session_empties_under_the_hint_row() {
         let panel = Rect::new(24, 6, 72, 23);
@@ -940,8 +863,6 @@ mod tests {
         );
     }
 
-    /// A press on the session takes the panel down; one on the panel, or on
-    /// its hint row along the bottom of the screen, is the screen's.
     #[test]
     fn a_press_on_the_hint_row_is_not_on_the_session() {
         let panel = Rect::new(24, 6, 72, 23);

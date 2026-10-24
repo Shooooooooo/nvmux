@@ -682,13 +682,11 @@ const PANEL_ROOM: u16 = 24;
 const PANEL_NARROWEST: u16 = 48;
 const PANEL_WIDEST: u16 = 72;
 
-/// How tall the floating prompt is: its body, and the panel's last row, where
-/// the prompt has its hint row full screen — blank here, the hint row being
-/// along the bottom of the screen (see [`float::inside`]). A create's form,
-/// three fields and a message, is centred in the body as full screen, with
-/// its menu hanging under it: the body is as tall as the form and twice the
-/// menu, less the row centring puts above rather than below. A rename's is
-/// its line and its message, with three rows round them.
+/// Panel heights: the body plus the last row, where the prompt has its hint
+/// row full screen, left blank ([`float::inside`]). A create's form (three
+/// fields and a message) is centred with the menu below it, so the body is
+/// the form plus twice the menu, less the one row centring puts above. A
+/// rename has its line and message plus three rows.
 const CREATE_ROWS: u16 = (3 + 1) + 2 * MENU_ROWS - 1 + 1;
 const RENAME_ROWS: u16 = (1 + 1) + 3 + 1;
 
@@ -869,10 +867,8 @@ impl Panel {
 }
 
 impl Floating for Panel {
-    /// In the middle of the room above the hint row: wide enough for its
-    /// opening lines and what is typed past them, and tall enough for the
-    /// form and a create's menu under it; nowhere where that leaves too
-    /// little of the session round it, which has the prompt full screen.
+    /// Centred above the hint row; `None` if too little session would show
+    /// around it, which means full screen.
     fn area(&self, screen: Rect) -> Option<Rect> {
         let (room, _) = float::split(screen);
         let opening = self
@@ -915,8 +911,7 @@ impl Floating for Panel {
         }
     }
 
-    /// Nothing on it to point at, as full screen. A press on the session
-    /// takes it down, which is the relay's to see.
+    /// Nothing clickable; the relay handles presses on the session.
     fn on_mouse(&mut self, _mouse: MouseEvent, _now: Instant) -> Did {
         Did::Stay
     }
@@ -947,9 +942,8 @@ impl Floating for Panel {
         false
     }
 
-    /// The prompt drawn into `area`: as it draws itself on a terminal of the
-    /// panel's inside, in the theme's colour, and laid into a buffer of
-    /// `area` — all but its hint row.
+    /// Draw on an in-memory terminal the size of the panel's inside, themed,
+    /// then copy all but the hint row into a buffer of `area`.
     fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         let inside = float::inside(area);
@@ -966,8 +960,6 @@ impl Floating for Panel {
         buf
     }
 
-    /// The prompt's hint row drawn into `row`, as full screen, in the
-    /// theme's colour.
     fn draw_hints(&self, row: Rect) -> Buffer {
         let mut buf = Buffer::empty(row);
         draw::hint_row_on(&mut buf, row, self.prompt.hints(), true);
@@ -3051,10 +3043,7 @@ mod tests {
         assert_eq!(last.prompt.fields[NAME].default, "session 4");
     }
 
-    /// It floats where there is room for it and a session round it — above
-    /// the hint row, a row of the session between them — smaller for a
-    /// rename than for a create, and nowhere on a terminal too small, where
-    /// the prompt takes the screen instead.
+    /// The panel ends at least a row of the session above the hint row.
     #[test]
     fn the_floating_prompt_fits_where_it_can() {
         let rows = hosted(&["one", "two"]);
@@ -3078,9 +3067,6 @@ mod tests {
         assert_eq!(create.area(Rect::new(0, 0, 80, 18)), None);
     }
 
-    /// Drawn where it floats, the create prompt has its three fields, as full
-    /// screen, and its last row clear; and its hint row is the full screen's,
-    /// cell for cell, on the screen's last row.
     #[test]
     fn the_floating_create_prompt_draws_its_form_and_its_hints() {
         let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);

@@ -1,18 +1,15 @@
 //! Screens drawn in a panel over a session (see `crate::pty::panel`): the
-//! settings ([`super::settings::Panel`]), the help ([`super::help::Panel`])
-//! and the picker ([`super::picker::Panel`]).
+//! settings ([`super::settings::Panel`]), the help ([`super::help::Panel`]),
+//! the picker ([`super::picker::Panel`]) and the naming prompt
+//! ([`super::prompt::Panel`]).
 //!
-//! The relay reads the terminal while one is up, the screen being drawn over a
-//! session that has it, and hands each its keys and the mouse; it asks where
-//! the screen goes, draws it into a buffer of that size, and lays the buffer
-//! over the session dimmed round it. What floats keeps its own rules, every
-//! one, as it has them full screen: what changes is where it is drawn.
+//! While one is up the relay reads the terminal, forwards keys and mouse to
+//! it, draws it into a buffer of the size it asks for, and lays that over the
+//! dimmed session. Each screen behaves as it does full screen.
 //!
-//! All but its hint row. That does not float: it is the last row of the
-//! screen, the whole width of it, as full screen ([`Floating::draw_hints`]),
-//! and the panel goes in the room above it ([`split`]). So turning
-//! `[style] float` moves the screen and leaves its hint row as it was, where
-//! it was, saying what it said.
+//! The hint row does not float: it stays on the terminal's last row, full
+//! width, as full screen ([`Floating::draw_hints`]), with the panel in the
+//! room above it ([`split`]).
 
 use std::time::Instant;
 
@@ -47,16 +44,15 @@ pub enum Leave {
 }
 
 pub trait Floating {
-    /// Where it floats on `screen`, or `None` where there is no room for it
-    /// and the session round it: the relay then shows it full screen. In the
-    /// room above the hint row ([`split`]).
+    /// Where it floats on `screen`, in the room above the hint row
+    /// ([`split`]), or `None` if there is no room around it; the relay then
+    /// shows it full screen.
     fn area(&self, screen: Rect) -> Option<Rect>;
 
     fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did;
 
-    /// A mouse report inside the screen or out of it; a press on the session
-    /// — anywhere but the panel and the hint row — is the relay's, which
-    /// takes the screen down.
+    /// Gets every event but a left press on the session (outside the panel
+    /// and hint row), which the relay handles by closing the screen.
     fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did;
 
     /// When it next changes on its own, if ever.
@@ -68,18 +64,14 @@ pub trait Floating {
     /// Whether it is animating, so frames run at the frame rate.
     fn moving(&self) -> bool;
 
-    /// The screen drawn into `area`, a buffer of that area: all of it but its
-    /// hint row (see [`inside`]).
+    /// Drawn into a buffer of `area`, all but its hint row (see [`inside`]).
     fn draw(&mut self, area: Rect) -> Buffer;
 
-    /// Its hint row drawn into `row`, a buffer of that row: the last row of
-    /// the screen, the whole width of it ([`split`]), saying what the screen
-    /// full screen says on its last row on a terminal as wide — and blank
-    /// either side of that, which clears the session's own last row from
-    /// under it.
+    /// The hint row drawn into `row` (the screen's last row, see [`split`])
+    /// as full screen on a terminal as wide, blank either side so none of the
+    /// session's last row shows.
     fn draw_hints(&self, row: Rect) -> Buffer;
 
-    /// Taken down.
     fn close(&self);
 
     /// Reshown after being set aside, e.g. the picker after help or settings.
@@ -96,11 +88,9 @@ pub trait Floating {
     }
 }
 
-/// The room on `screen` that a screen floating over a session has its panel
-/// in, and its hint row under that: the hint row on the last row, the whole
-/// width of the screen, as it is full screen (see
-/// [`super::draw::split_hint_row`]), and the room all of the screen above it.
-/// Both empty on a screen with no rows.
+/// The room for a floating panel, and the hint row under it: the last row,
+/// full width, as full screen ([`super::draw::split_hint_row`]). Both empty
+/// if `screen` has no rows.
 pub fn split(screen: Rect) -> (Rect, Rect) {
     if screen.height == 0 {
         return (screen, screen);
@@ -108,12 +98,9 @@ pub fn split(screen: Rect) -> (Rect, Rect) {
     super::draw::split_hint_row(screen)
 }
 
-/// Where a screen goes in the panel it floats in: all of it but a column
-/// either side, which keep its text off the session's, laid out as on a
-/// terminal of that size — but for the last row, where the screen has its
-/// hint row full screen. That goes along the bottom of the screen
-/// ([`Floating::draw_hints`]), and here the row is left blank, keeping the
-/// screen's text off the session's under the panel too ([`lay`]).
+/// The panel minus a column each side, which keep its text off the
+/// session's. The screen is drawn as on a terminal this size, with its last
+/// row, where the hint row would go, left blank as a margin ([`lay`]).
 pub(super) fn inside(panel: Rect) -> Rect {
     Rect::new(
         panel.x + 1,
@@ -123,10 +110,8 @@ pub(super) fn inside(panel: Rect) -> Rect {
     )
 }
 
-/// What a screen drew of itself on a terminal the size of the panel's inside
-/// ([`inside`]) — `drawn`, a buffer of that size — laid into the panel's
-/// `buf` there: all of it but its last row, the hint row's, which is left
-/// blank.
+/// Copies `drawn`, the screen drawn on a terminal the size of `inside`, into
+/// `buf` at `inside`: all but its last row, the hint row's.
 pub(super) fn lay(buf: &mut Buffer, inside: Rect, drawn: &Buffer) {
     let from = drawn.area;
     let height = inside.height.min(from.height).saturating_sub(1);
@@ -141,15 +126,12 @@ pub(super) fn lay(buf: &mut Buffer, inside: Rect, drawn: &Buffer) {
 mod tests {
     use super::*;
 
-    /// A column off either side, and every row: the last is the hint row's.
     #[test]
     fn the_inside_leaves_a_column_either_side() {
         assert_eq!(inside(Rect::new(8, 3, 64, 18)), Rect::new(9, 3, 62, 18));
         assert_eq!(inside(Rect::new(0, 0, 1, 1)), Rect::new(1, 0, 0, 1));
     }
 
-    /// The hint row is the screen's last row, the whole width of it, and the
-    /// room for the panel all of the screen above it.
     #[test]
     fn the_hint_row_is_the_last_row_and_the_room_the_rest() {
         assert_eq!(
@@ -164,8 +146,6 @@ mod tests {
         assert_eq!(split(none), (none, none));
     }
 
-    /// What a screen drew goes where the inside is, every row of it but the
-    /// last, which stays blank.
     #[test]
     fn a_screen_is_laid_in_but_for_its_hint_row() {
         let inside = inside(Rect::new(8, 3, 6, 3));
