@@ -59,7 +59,7 @@ struct Shown {
 
 pub(super) struct Completer {
     /// Dropping it ends the worker.
-    tx: Option<Sender<Request>>,
+    tx: Sender<Request>,
     rx: Receiver<Reply>,
     /// The current request; a reply with another `seq` is stale.
     seq: u64,
@@ -91,7 +91,7 @@ impl Completer {
             .ok();
 
         Self {
-            tx: Some(ask_tx),
+            tx: ask_tx,
             rx: reply_rx,
             seq: 0,
             awaiting: false,
@@ -138,10 +138,8 @@ impl Completer {
         };
         // Unbounded, so this never blocks. Closed means no worker, so no
         // completions.
-        if let Some(tx) = &self.tx {
-            if tx.send(request).is_err() {
-                self.awaiting = false;
-            }
+        if self.tx.send(request).is_err() {
+            self.awaiting = false;
         }
     }
 
@@ -307,7 +305,7 @@ mod tests {
         let (ask_tx, ask_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         let c = Completer {
-            tx: Some(ask_tx),
+            tx: ask_tx,
             rx: reply_rx,
             seq: 0,
             awaiting: false,
