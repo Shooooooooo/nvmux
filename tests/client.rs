@@ -964,9 +964,8 @@ fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Link) {
         std::thread::spawn(move || {
             for (at, bytes) in rx {
                 std::thread::sleep(at.saturating_duration_since(Instant::now()));
-                // Stamped as the write begins: the other end may have read
-                // it and acted on it before the write returns, and a busy
-                // machine may leave this thread waiting milliseconds after.
+                // Stamp before writing: on a busy machine the other end may act
+                // on the bytes milliseconds before `write_all` returns.
                 let written = Instant::now();
                 if to.write_all(&bytes).is_err() {
                     return;
@@ -1037,8 +1036,8 @@ struct Carried {
     conn: usize,
     /// Session to client.
     back: bool,
-    /// When it was read, and when the link began to write it on.
     read: Instant,
+    /// When the link began writing it.
     written: Instant,
     bytes: Vec<u8>,
 }
@@ -1125,12 +1124,11 @@ impl Trace {
             .collect()
     }
 
-    /// The agent's acks the frame that draws them did not follow, as Neovim
-    /// sent them: each with its count and the view's top it says, and the
-    /// top in the first frame after it — none where another ack came first.
-    /// An ack whose view the last frame already showed needs no frame of its
-    /// own: Neovim flushes none where nothing changed, and the client takes
-    /// such an ack at once (see `App::shows`).
+    /// Acks not followed by a frame with their top, as (count, the ack's top,
+    /// the next frame's top or `None` if another ack came first). An ack for
+    /// the top the last frame showed needs none: Neovim flushes nothing when
+    /// nothing changed, and the client takes such an ack at once (see
+    /// `App::shows`).
     fn acks_without_their_frames(&self) -> Vec<(u64, u64, Option<u64>)> {
         let (mut top, mut drawn) = (None, None);
         let mut waiting: Option<(u64, u64)> = None;
@@ -1172,12 +1170,10 @@ impl Trace {
         unframed
     }
 
-    /// The last word of the agent's that Neovim is still at work on the keys
-    /// typed (`behind`), by when the link began writing it on; and the round
-    /// trips the client had timed how long to wait on Neovim by when it came,
-    /// in order — its first request, and the ones it asks after the round
-    /// trip with since (see `App::start`, `App::tick`) — each from when the
-    /// link read the request to when it began writing the answer.
+    /// When the link began writing the agent's last `behind` (Neovim still at
+    /// work on typed keys), and the round trips the client had timed by then,
+    /// in order (its first request and pings: `App::start`, `App::tick`), each
+    /// from the link reading the request to starting to write the answer.
     fn last_behind(&self) -> Option<(Instant, Vec<Duration>)> {
         const TIMED: [&str; 2] = ["nvim_get_api_info", "nvim_parse_expression"];
         let asked: std::collections::HashMap<(usize, u64), Instant> = self
@@ -1210,8 +1206,8 @@ impl Trace {
         last
     }
 
-    /// How many keys the client has sent the session, as Neovim's notation
-    /// counts them: a character, or a name in `<…>`.
+    /// Keys the client sent, counted as Neovim's notation does: a character,
+    /// or a name in `<…>`.
     fn inputs(&self) -> usize {
         self.messages(false)
             .iter()
@@ -2158,20 +2154,17 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
         "not back by that page alone, Neovim at {w0:?} once caught up at {caught:?}: {when:?}"
     );
     assert_eq!(w0, Ok(Some(541)), "Neovim went elsewhere");
-    // No sooner than Neovim's frame, a way of the link after it caught up;
-    // and as long after it last said it was still at work on them as a page
-    // typed then would wait, by the round trips the client had timed by
-    // then — which on a busy machine are longer than the link's, Neovim
-    // answering late — give or take a quarter of that and a way of the
-    // link, for a client held up.
+    // After Neovim's frame (a link delay after it caught up), and within the
+    // wait of a page typed at the last `behind`, by the round trips the client
+    // timed (longer than the link's on a busy machine, Neovim answering late),
+    // plus a quarter of it and a link delay for a client held up.
     let at = seen.last().map(|&(_, at)| at).expect("seen");
     let (since, timed) = link
         .trace
         .last_behind()
         .expect("Neovim behind on the pages");
-    // The round trip asked after with the first page is the link's: Neovim
-    // answers what it is asked with as it reads it, still at work on the
-    // pages — not once it has taken them all, which would time those too.
+    // The ping sent with the first page is answered as Neovim reads it, while
+    // still at work on the pages, so it times the link alone.
     assert!(
         timed.len() >= 2,
         "the round trip asked after with the first page not answered before Neovim last said \
@@ -2188,10 +2181,9 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
     );
 }
 
-/// How long the client waits on Neovim for a scroll it made, not told the
-/// motions, by the round trips it timed (see `Predictor::deadline`): two,
-/// smoothed, a quarter of a second or four times how much they vary, if
-/// that is longer, and a segment lost on the way.
+/// How long the client, without acks, waits for Neovim to make a scroll it
+/// predicted (see `Predictor::deadline`): two smoothed round trips, plus the
+/// larger of 250 ms and 4× their variation, plus 200 ms for a lost segment.
 fn patience(round_trips: &[Duration]) -> Duration {
     let (srtt, rttvar) = round_trips
         .iter()
@@ -2205,10 +2197,8 @@ fn patience(round_trips: &[Duration]) -> Duration {
     srtt * 2 + Duration::from_millis(250).max(rttvar * 4) + Duration::from_millis(200)
 }
 
-/// Pages typed faster than a slow link answers, by a client told to work
-/// out the motions as well, which goes by what the agent says Neovim made
-/// of each key: each is still on the screen before Neovim could have heard
-/// of it.
+/// With motions predicted, the client goes by the agent's acks; pages must
+/// still be drawn before Neovim could have the keys.
 #[test]
 fn pages_typed_faster_than_the_link_answers_keep_up_told_the_motions() {
     require_nvim!();
@@ -2230,44 +2220,33 @@ fn pages_typed_faster_than_the_link_answers_keep_up_told_the_motions() {
     }
 }
 
-/// The page Neovim does not turn of [`a_page_neovim_does_not_turn_is_given_up_in_time`],
-/// typed to a client told to work out the motions as well: the agent says
-/// which keys Neovim has taken with the frame that draws them, and the
-/// page is given up on with the first frame that should have turned it and
-/// did not — not two round trips and more after — the view back by that
-/// page alone, and the pages after it made again from there, on to where
-/// Neovim ends.
-///
-/// Neovim taking each page in 30 ms, slower than they come: past the first
-/// page it takes them all before it goes to wait for a key again, and the
-/// first ack to cover the fifth is its last.
+/// [`a_page_neovim_does_not_turn_is_given_up_in_time`] with motions
+/// predicted: acks arrive with the frames, so the page is given up at the
+/// first frame that should have turned it (not 2+ round trips later), the
+/// view going back by that page alone and redoing the rest to where Neovim
+/// ends. At 30 ms a page, SafeState fires after the first page and then only
+/// after the last, so the first ack covering the fifth is the last.
 #[test]
 fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
     given_up_at_its_ack("client-unturn-ack", Duration::from_millis(30));
 }
 
-/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`], Neovim taking
-/// each page in 20 ms: at that pace the key it throws away, which costs it
-/// no scroll, is the last it has to hand, and it goes to wait for the next
-/// straight after — so the agent says what it made of the keys part way
-/// through, the first word on the fifth page, with the next key come in
-/// already. Neovim goes on to that without waiting, and so without
-/// flushing the frame that draws the keys the word is on: the agent
-/// flushes it. Without that, the word was taken with the next frame Neovim
-/// flushed, one for keys after it, in which the page Neovim did not turn
-/// looked turned — a later page made up its rows — and the page was given
-/// up on only once Neovim had caught up, as macOS runners saw at 30 ms.
-/// Where the pace or a slower machine has the first word on the fifth page
-/// be the last, each word still has to come with its frame.
+/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`] at 20 ms a page.
+/// The discarded key costs no scroll and empties the typeahead buffer, so
+/// SafeState, and the first ack covering it, come part way through, though
+/// the next key is already queued by `nvim_input`. Neovim takes that key
+/// without waiting, so without flushing the acked keys' frame: the agent
+/// flushes it. Without that, the ack was judged by a later frame in which a
+/// later page filled the unturned page's rows, and the page was given up only
+/// once Neovim caught up (seen on macOS at 30 ms).
 #[test]
 fn a_page_neovim_does_not_turn_is_given_up_at_an_ack_part_way_through() {
     given_up_at_its_ack("client-unturn-mid", Duration::from_millis(20));
 }
 
-/// Pages typed every 10 ms, the fifth of which Neovim throws away, to a
-/// session whose Neovim takes `scroll` over each: see
-/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`]. And every ack
-/// the agent said came with the frame that draws it.
+/// 28 pages typed every 10 ms, the fifth discarded, Neovim taking `scroll`
+/// over each (see [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`]).
+/// Also checks that every ack comes with its frame.
 fn given_up_at_its_ack(tag: &str, scroll: Duration) {
     require_nvim!();
     let scratch = Scratch::new(tag);
@@ -2324,9 +2303,8 @@ fn given_up_at_its_ack(tag: &str, scroll: Duration) {
         w0(&mut rpc)
     );
     watch(&mut term, Instant::now() + 6 * SLOW);
-    // Each ack followed by the frame that draws what it says, before any
-    // ack after it: where Neovim goes on to a key that has come in without
-    // waiting for it, and so without flushing, the agent flushes that frame.
+    // Where Neovim takes a queued key without waiting, and so without
+    // flushing, the agent flushes the ack's frame.
     let unframed = link.trace.acks_without_their_frames();
     assert!(
         unframed.is_empty(),

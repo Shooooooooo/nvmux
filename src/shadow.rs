@@ -18,72 +18,16 @@
 //!   be transparent.
 //! - [`Shadow::paint`]: the grid exactly as drawn, for a kept client
 //!   returning without a fade; the server's `:mode` repaint lands on top.
-//! - [`Shadow::frame_under`]: the floating settings over the shaded session
-//!   (see `crate::pty::panel`).
+//! - [`Shadow::frame_under`]: a floating screen and its hint row over the
+//!   shaded session (see `crate::pty::panel`).
 //!
-//! # What a composite paints
-//!
-//! That is what [`Shadow::under`] is for. Given a rectangle nvmux has drawn on
-//! and how far through its dissolve it is, it paints the two together: the
-//! overlay's own glyphs fading out, the session's cells fading back in, each
-//! cell showing whichever of the two is the more visible. The notice then
-//! melts into the editor instead of leaving a hole for a repaint to fill —
-//! and where that repaint never lands, the screen has already been put back.
-//!
-//! # What a frame paints
-//!
-//! [`Shadow::frame`] writes the grid back to the terminal with every cell's
-//! colours moved `t` of the way to the terminal's background — the colours
-//! resolved first, through [`Palette`], so that "the default foreground" is a
-//! real colour the interpolation can start from. A background the editor left
-//! as the terminal's default is left as the default (`49`), never painted
-//! explicitly: the terminal may be transparent, and an opaque slab of the
-//! background colour would pop where the real background did not.
-//!
-//! Frames are diffs. The screen does not change between them, only `t` does,
-//! so a cell whose interpolated colours came out the same as last frame is not
-//! written again — which is every blank cell on a default background, most of
-//! any screen. The whole fade then costs about one full repaint plus the cells
-//! that change colour, and nvmux already emits a full repaint on every resize.
-//!
-//! And a cell that shows nothing — blank, or a space with no background and
-//! no underline — is not written a space at a time where there are many of
-//! them together: a stretch of them is erased, to the row's end with `EL` and
-//! short of it with `ECH`, neither of which moves the cursor, and under a pen
-//! with no background, so that the cells come out the terminal's own
-//! background whether the terminal erases in the pen's or in its own. A few
-//! are written as spaces, and a few the cursor has to cross to reach the next
-//! cell are written over rather than jumped. A row of 200 blank columns was
-//! 200 spaces; it is an `EL`.
-//!
-//! What a frame must get right is the same list as the attach notice's
-//! ([`crate::announce`]): a synchronized-update span around the whole thing,
-//! an absolute cursor position for every run of cells and never a newline or
-//! carriage return (`OPOST` is off), and the cursor hidden while the cells are
-//! written, so it is not seen chasing them across the screen.
-//!
-//! # What a paint paints
-//!
-//! [`Shadow::paint`] is the one painter that is not a fade: the grid as the
-//! session drew it, every cell in the colours and attributes it was given —
-//! indexed colours as indices, the default as the default — with no palette
-//! and nothing interpolated. It is for a kept client coming back to the front
-//! with no fade to bring it (see `pty::Attachment::paint_kept_screen`): the
-//! screen is on the glass at once, and the server's own repaint — asked for
-//! with `:mode`, a few round trips away, or later if the server is busy —
-//! lands on top. The same rules as a frame: one synchronized
-//! update, an absolute placement per row and never a newline, the cursor put
-//! back where the session had it.
-//!
-//! # What a frame under the settings paints
-//!
-//! [`Shadow::frame_under`] is a frame of the session with the settings
-//! floating over it (see `crate::pty::panel`): the panel's own cells where it
-//! stands, as the settings screen drew them, and its hint row's along the
-//! bottom of the screen; and every other cell as the caller says — taken
-//! toward the background through the palette, each cell as far as the
-//! falloff round the panel takes it; drawn faint where there is no palette;
-//! or emptied. A diff, as a fade's frames are, and the same rules as theirs.
+//! Frames are diffs (only `t` changes), so a whole fade costs about one full
+//! repaint. Runs of empty cells are erased with `EL` or `ECH` under a pen
+//! with no background, so they show the terminal's own background whether it
+//! erases in the pen's or its own. Like the attach notice
+//! ([`crate::announce`]), every frame is one synchronized update, places runs
+//! absolutely, never writes a newline or CR (`OPOST` is off), and hides the
+//! cursor while writing.
 //!
 //! # The cursor
 //!
@@ -226,8 +170,7 @@ impl Kept {
     }
 }
 
-/// What a frame with the settings over the session does with a session cell
-/// (see [`Shadow::frame_under`]).
+/// What [`Shadow::frame_under`] does with a session cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Shade {
     /// Colours this far toward the terminal's background, through its
@@ -240,9 +183,9 @@ pub enum Shade {
     Blank,
 }
 
-/// A rectangle nvmux draws over the session in place of what is there: the
-/// settings floating over it, or their hint row along the bottom of it (see
-/// `crate::pty::panel`), as their screen drew them into a buffer.
+/// A rectangle nvmux draws over the session in place of its cells: a
+/// floating screen (settings, help, picker or naming prompt) or its hint row
+/// on the last row (see `crate::pty::panel`), from the buffer the screen drew.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Laid {
     top: u16,
@@ -485,14 +428,14 @@ impl Shadow {
 
     /// The terminal was written behind the shadow's back, so the next frame
     /// paints every cell. The fade diff is freed, not cleared (11 bytes a
-    /// cell while a kept client is parked); the settings' is kept for reuse
-    /// until [`Shadow::forget_under`].
+    /// cell while a kept client is parked); [`Shadow::frame_under`]'s is kept
+    /// for reuse until [`Shadow::forget_under`].
     pub fn invalidate(&mut self) {
         self.painted = Vec::new();
         self.under_valid = false;
     }
 
-    /// Free the settings' diff once they close.
+    /// Free [`Shadow::frame_under`]'s diff once the floating screen closes.
     pub fn forget_under(&mut self) {
         self.under = Vec::new();
         self.under_valid = false;
@@ -837,20 +780,17 @@ impl Shadow {
 }
 
 impl Shadow {
-    /// A frame of the session with each of `laid` over it — the settings
-    /// floating over a session, and their hint row along the bottom of it
-    /// (see `crate::pty::panel`) — and every other cell as `shade` says:
-    /// taken toward the background through `palette`, drawn faint, or
-    /// emptied. With none laid the session's cells under where they go are
-    /// shaded too, which is how they empty for them to come up on.
+    /// A frame of the session with each of `laid` (a floating screen and its
+    /// hint row) over it and every other cell as `shade` says. With none laid,
+    /// the cells where they go are shaded too, which is how they blank for the
+    /// screen to come up on.
     ///
     /// A diff like [`Shadow::frame`]'s, in full after a [`feed`], [`resize`]
     /// or [`invalidate`] (so after any session output). Always at least the
     /// sync span, cursor hide and trailing SGR reset.
     ///
-    /// A wide character either edge of a rectangle cuts is blanked rather
-    /// than written in half. `Shade::Toward` with no palette is drawn faint:
-    /// there is nothing to take it toward.
+    /// A wide character cut by either edge of a rectangle is blanked.
+    /// `Shade::Toward` without a palette is drawn faint.
     ///
     /// [`feed`]: Shadow::feed
     /// [`resize`]: Shadow::resize
@@ -953,9 +893,9 @@ impl Shadow {
     }
 }
 
-/// A session cell as a settings-over-session frame draws it (see
-/// [`Shadow::frame_under`]): its text (blank if `cut`, a wide character the
-/// rectangle's edge cuts) and its pen as `shade` says.
+/// A session cell as [`Shadow::frame_under`] draws it: its text (blank if
+/// `cut`, a wide character a rectangle's or the screen's edge cuts) and its
+/// pen as `shade` says.
 fn shaded<'a>(
     cell: Option<&'a vt100::Cell>,
     shade: Shade,
@@ -1122,9 +1062,9 @@ impl Pen {
     }
 }
 
-/// What a settings-over-session frame last painted in a cell (see
-/// [`Shadow::frame_under`]): its text inline, and its pen. Kept per cell
-/// across frames, so a frame allocates nothing per cell.
+/// What [`Shadow::frame_under`] last painted in a cell: its text inline, and
+/// its pen. Kept per cell across frames, so a frame allocates nothing per
+/// cell.
 #[derive(Debug, Clone, Copy)]
 struct Drawn {
     /// Bytes of `text` used; [`Drawn::NONE`] for nothing written,
@@ -1141,7 +1081,7 @@ const DRAWN_BYTES: usize = 22;
 impl Drawn {
     /// The second half of a wide character, which its first half wrote.
     const NONE: u8 = u8::MAX;
-    /// Text too long to keep (only a settings cluster could be); never
+    /// Text too long to keep (only a [`Laid`] cluster could be); never
     /// matches, so it is always written.
     const LONG: u8 = u8::MAX - 1;
     const NOTHING: Drawn = Drawn {
@@ -1268,8 +1208,8 @@ fn blank_sgr(out: &mut Vec<u8>, sgr: &mut Option<Painted>, palette: &Palette) {
     }
 }
 
-/// Set the pen to one blank cells under the settings can be written or
-/// erased in, unless it already shows nothing.
+/// Set the pen to one that blank cells in a [`Shadow::frame_under`] frame can
+/// be written or erased in, unless it already shows nothing.
 fn blank_pen(out: &mut Vec<u8>, pen: &mut Option<Pen>) {
     if !pen.is_some_and(|p| p.shows_nothing()) {
         Pen::BLANK.write(out);
@@ -2491,11 +2431,8 @@ mod tests {
         assert_eq!(cells[&(3, 12)].1, "l", "the session again past its edge");
     }
 
-    /// The settings' hint row stands along the bottom as the panel stands
-    /// where it is, the two in one frame, and the session between them as
-    /// far toward the background as it is told. Nothing of the session's
-    /// last row shows either side of the hints: the row is the hint row's
-    /// from end to end.
+    /// The hint row is laid the full width, so none of the session's last row
+    /// shows either side of the hints.
     #[test]
     fn the_settings_and_their_hint_row_stand_over_the_session_together() {
         let mut shadow = lettered();
@@ -2526,10 +2463,6 @@ mod tests {
         assert_eq!(between.len(), 20, "the session between them: {between:?}");
     }
 
-    /// Emptied cells are the terminal's own background; faint ones keep the
-    /// session's own colours, as indices where it gave indices, and dim only
-    /// their text; and taken toward a background nvmux does not know, a cell
-    /// is drawn faint.
     #[test]
     fn a_cell_is_emptied_or_drawn_faint() {
         let mut shadow = Shadow::new(2, 6);
