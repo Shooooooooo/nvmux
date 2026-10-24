@@ -1085,18 +1085,14 @@ impl Animator {
             || !self.switches.is_empty()
     }
 
-    /// Whether a frame is the editor's grids where the editor put them and
-    /// nothing more: nothing moving, nothing held where a scroll is going,
-    /// and nothing painted over it — but what is drawn over their rows (see
-    /// [`Animator::patch`]), which stays on its rows. What a frame put
-    /// together from only the rows that changed needs of itself and of the
-    /// frame before it (see `crate::client::App::frame`).
+    /// Whether a frame is just the editor's grids in place, as frames built
+    /// from changed rows only require (see `crate::client::App::frame`).
+    /// Patched rows ([`Animator::patch`]) are allowed: they stay on their rows.
     pub fn still(&self) -> bool {
         !self.moving() && self.scrolls.is_empty() && self.sides.is_empty() && !self.paints_over()
     }
 
-    /// The rows drawn over (see [`Animator::patch`]): each window grid's, by
-    /// row of its grid.
+    /// `(grid, grid row)` of each row drawn over ([`Animator::patch`]).
     pub fn patched_rows(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
         self.patches
             .iter()
