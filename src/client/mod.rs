@@ -1683,12 +1683,11 @@ impl Onward {
         stepping: &'a predict::Stepping,
     ) -> impl Fn(i64) -> Option<&'a str> + 'a {
         let echo = self.head.as_ref().and_then(|s| s.echo.as_ref());
-        move |l| {
-            match echo.filter(|e| e.line == l) {
-                Some(e) => Some(&*e.text),
-                None => (!p.cut(self.win, l)).then(|| p.text(self.win, l)).flatten(),
-            }
-            .filter(|t| predict::ordinary(t) && (!stepping.widths || t.is_ascii()))
+        let lines = p.ordinary_texts(self.win, stepping.widths);
+        move |l| match echo.filter(|e| e.line == l) {
+            Some(e) => Some(&*e.text)
+                .filter(|t| predict::ordinary(t) && (!stepping.widths || t.is_ascii())),
+            None => lines(l),
         }
     }
 }
