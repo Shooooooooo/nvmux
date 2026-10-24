@@ -1125,7 +1125,7 @@ if predict then
   end
   local queued, scrolled = false, false
   local function push_all()
-    if not pcall(api.nvim_get_autocmds, { group = group }) then
+    if not pcall(api.nvim_get_autocmds, { group = group, event = 'SafeState' }) then
       return
     end
     flush()
@@ -1151,6 +1151,19 @@ if predict then
       queued = true
       vim.schedule(function()
         queued, scrolled = false, false
+        -- Many rows to colour again, as where a parse of the rest of a file
+        -- an edit opened a comment or a string in found them changed: what
+        -- Neovim has to draw goes out first, not after them. In the modes
+        -- where the frame is flushed as a key is taken (see on_key above).
+        local n, m = 0, api.nvim_get_mode()
+        for _, runs in pairs(stale) do
+          for _, r in ipairs(runs) do
+            n = n + r[2] - r[1]
+          end
+        end
+        if n > 100 and judged[m.mode] and not m.blocking then
+          pcall(api.nvim__redraw, { flush = true, cursor = true })
+        end
         push_all()
       end)
     end
@@ -1242,7 +1255,7 @@ if predict then
     end
     local blanks = {}
     for i, l in ipairs(api.nvim_buf_get_lines(buf, view.topline - 1, vim.fn.line('w$'), false)) do
-      if #l <= cap and l:find('%s$') then
+      if #l <= cap and l:find('^%s', #l) then
         blanks[#blanks + 1] = { view.topline + i - 2, vim.fn.virtcol({ view.topline + i - 1, #l }) }
       end
     end
@@ -1409,10 +1422,22 @@ if predict then
       end
       return false
     end
+    -- Read as Neovim goes to wait for every key (see rehooked): an event at
+    -- a time, as Neovim makes a table of every autocommand it hands back,
+    -- and none past the first that answers.
+    local hookevents = { { 'InsertCharPre', 'TextChangedI', 'CursorMovedI' },
+      { 'InsertEnter', 'ModeChanged' }, { 'InsertLeavePre', 'InsertLeave', 'ModeChanged' } }
     local function hooks(buf)
-      return { unseen(buf, { 'InsertCharPre', 'TextChangedI', 'CursorMovedI' }),
-        unseen(buf, { 'InsertEnter', 'ModeChanged' }),
-        unseen(buf, { 'InsertLeavePre', 'InsertLeave', 'ModeChanged' }) }
+      local h = { false, false, false }
+      for k, events in ipairs(hookevents) do
+        for _, event in ipairs(events) do
+          if unseen(buf, event) then
+            h[k] = true
+            break
+          end
+        end
+      end
+      return h
     end
     local function facts()
       if gone then
@@ -1683,25 +1708,13 @@ impl Onward {
         stepping: &'a predict::Stepping,
     ) -> impl Fn(i64) -> Option<&'a str> + 'a {
         let echo = self.head.as_ref().and_then(|s| s.echo.as_ref());
-        move |l| {
-            match echo.filter(|e| e.line == l) {
-                Some(e) => Some(&*e.text),
-                None => (!p.cut(self.win, l)).then(|| p.text(self.win, l)).flatten(),
-            }
-            .filter(|t| predict::ordinary(t) && (!stepping.widths || t.is_ascii()))
+        let lines = p.ordinary_texts(self.win, stepping.widths);
+        move |l| match echo.filter(|e| e.line == l) {
+            Some(e) => Some(&*e.text)
+                .filter(|t| predict::ordinary(t) && (!stepping.widths || t.is_ascii())),
+            None => lines(l),
         }
     }
-}
-
-/// A row of a window's gutter, as [`App::gutters`] finds it: the row of
-/// the window's grid, the cells Neovim's frame has there, and those Neovim
-/// draws there with the cursor on another line — `None` where the client
-/// cannot say.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Regutter {
-    row: usize,
-    drawn: Vec<Cell>,
-    now: Option<Vec<Cell>>,
 }
 
 /// What the client has asked and not been answered.
@@ -1845,8 +1858,11 @@ pub struct App {
     /// A frame is wanted: something changed.
     dirty: bool,
     last_frame: Option<Instant>,
-    /// When the frame before the last was drawn.
-    frame_before: Option<Instant>,
+    /// When the last two frames that drew a flush of Neovim's were drawn,
+    /// the later first: what [`App::dirty_due`] paces Neovim's frames by.
+    flush_frames: (Option<Instant>, Option<Instant>),
+    /// A flush of Neovim's was taken in since the last frame.
+    flushed_since: bool,
     /// This attach has had its first flush: before it, nothing animates or
     /// is drawn.
     flushed: bool,
@@ -1933,6 +1949,10 @@ struct Partial {
     still: bool,
     /// The rows of this frame to put together.
     rows: Vec<bool>,
+    /// The rows of the last frame drawn over (see [`Animator::patch`]): put
+    /// together again, as Neovim drew them, should what was drawn over them
+    /// be gone.
+    patched: Vec<usize>,
     /// How many frames have been put together from only the rows that
     /// changed: for the tests to know it was done at all.
     #[cfg(test)]
@@ -1977,7 +1997,8 @@ impl App {
             mouse: (false, false),
             dirty: false,
             last_frame: None,
-            frame_before: None,
+            flush_frames: (None, None),
+            flushed_since: false,
             flushed: false,
             remaking: false,
             away: false,
@@ -3050,6 +3071,7 @@ impl App {
             })
             .collect();
         self.apply(batch, animate, &switched, now);
+        self.flushed_since = true;
         self.flushed = true;
         self.landed_sideways(now);
         self.take_tails();
@@ -4523,14 +4545,6 @@ impl App {
             .and_then(|s| s.echo.clone());
         let redrawn = self.redrawn_with(grid, (view.curline, to));
         let ids = predict::Gutter::of(|name| self.model.groups.get(name).copied());
-        // What the rows drawn afresh are drawn with, once for them all.
-        let afresh = self
-            .afresh(grid)
-            .then(|| {
-                let shape = self.predict.as_ref()?.shape(win)?;
-                self.look(grid, rect, &view, shape).zip(ids)
-            })
-            .flatten();
         let p = self.predict.as_ref()?;
         let shape = p.shape(win)?;
         let textoff = shape.textoff;
@@ -4539,6 +4553,12 @@ impl App {
         let bars = redrawn && cul.is_some_and(|c| c.line && !c.screenline);
         let decided = redrawn && (shape.relativenumber || cul.is_some_and(|c| c.number || c.line));
         let ahead = self.anim.rows_shown(grid);
+        // What the rows drawn afresh are drawn with, once for them all: where
+        // there can be any, rows shown ahead of Neovim's view, in a window
+        // where the cursor's line decides any of them.
+        let afresh = (decided && ahead != 0 && self.afresh(grid))
+            .then(|| self.look(grid, rect, &view, shape).zip(ids))
+            .flatten();
         let mut patches: BTreeMap<usize, Vec<compose::Patch>> = BTreeMap::new();
         for r in 0..h {
             let i = r as i64 + ahead;
@@ -4679,20 +4699,15 @@ impl App {
         if !shape.relativenumber && !stepping.cursorline.number {
             return shape.plain_gutter;
         }
-        shape.plain_gutter
-            && !stepping.number_signs
-            && self
-                .gutters(grid, to)
-                .is_some_and(|rows| rows.iter().all(|r| r.now.is_some()))
+        shape.plain_gutter && !stepping.number_signs && self.gutters(grid, to) == Some(true)
     }
 
-    /// Each row of window grid `grid`'s gutter that shows a line, as Neovim's
-    /// frame has it, and as Neovim draws it with the cursor on line `to`
-    /// instead (see [`predict::regutter`]), by row of its grid: `None` for
-    /// one the client cannot say of. `None` for a window whose gutter the
-    /// client has no shape or groups for, or that the `'statuscolumn'`
-    /// draws.
-    fn gutters(&self, grid: u64, to: i64) -> Option<Vec<Regutter>> {
+    /// Whether every row of window grid `grid`'s gutter that shows a line,
+    /// as Neovim's frame has it, can be drawn as Neovim draws it with the
+    /// cursor on line `to` instead (see [`predict::regutter`]). `None` for a
+    /// window whose gutter the client has no shape or groups for, or that
+    /// the `'statuscolumn'` draws.
+    fn gutters(&self, grid: u64, to: i64) -> Option<bool> {
         let (win, view) = (
             self.model.wins.get(&grid)?,
             self.model.viewports.get(&grid)?,
@@ -4706,20 +4721,17 @@ impl App {
         }
         let h = bot - top;
         let cursor = (view.curline, to);
-        let rows = (0..h)
+        let all = (0..h)
             .map(|r| (r, view.topline + r as i64))
             .take_while(|&(_, lnum)| lnum < view.line_count)
-            .filter_map(|(r, lnum)| {
-                let drawn = g.row(top + r).get(left..left + shape.textoff)?;
-                let now = predict::regutter(drawn, lnum, cursor, shape, h as i64, &ids);
-                Some(Regutter {
-                    row: top + r,
-                    drawn: drawn.to_vec(),
-                    now,
-                })
-            })
-            .collect();
-        Some(rows)
+            .all(|(r, lnum)| {
+                g.row(top + r)
+                    .get(left..left + shape.textoff)
+                    .is_none_or(|drawn| {
+                        predict::regutter(drawn, lnum, cursor, shape, h as i64, &ids).is_some()
+                    })
+            });
+        Some(all)
     }
 
     /// Whether Neovim draws line `line` of window grid `grid`, whose text the
@@ -5121,7 +5133,13 @@ impl App {
         shape: &predict::Shape,
     ) -> Option<predict::Look> {
         let (top, bot, left, right) = rect;
-        let rows = self.model.grids.get(&grid)?.lines(top, bot, left, right);
+        let g = self.model.grids.get(&grid)?;
+        let rows: Vec<&[Cell]> = (top..bot.min(g.height()))
+            .map(|r| {
+                let row = g.row(r);
+                &row[left.min(row.len())..right.min(row.len())]
+            })
+            .collect();
         let cursor_row = (self.model.cursor.grid == grid)
             .then(|| self.model.cursor.row.checked_sub(top))
             .flatten();
@@ -6106,14 +6124,18 @@ impl App {
     }
 
     /// When a frame for something that changed may be drawn, `now` or later:
-    /// [`MIN_FRAME_GAP`] after the last — but at once where the last came
-    /// after a quiet spell, a frame's time or more without one. A key in
-    /// normal mode has Neovim flush twice, a fraction of a millisecond apart
-    /// with `'showcmd'` on, as it is unless turned off: the key shown, and
-    /// what it did. Held apart by the gap, what it did would come those
-    /// milliseconds late, as most keys' would. A burst still comes no more
-    /// often than the gap allows, all but its first two frames. Away, no
-    /// sooner than [`AWAY_FRAME_GAP`] after the last, whatever came before.
+    /// at once for what the user typed, turned or pasted since the last
+    /// frame, which their hand paces — a key drawn ahead of Neovim most of
+    /// all. Otherwise [`MIN_FRAME_GAP`] after the last frame that drew a
+    /// flush of Neovim's — but at once where that one came after a quiet
+    /// spell, a frame's time or more without one. A key in normal mode has
+    /// Neovim flush twice, a fraction of a millisecond apart with
+    /// `'showcmd'` on, as it is unless turned off: the key shown, and what it
+    /// did. Held apart by the gap, what it did would come those milliseconds
+    /// late, as most keys' would; and so it would if the frames drawn for
+    /// keys ahead of Neovim counted. A burst still comes no more often than
+    /// the gap allows, all but its first two frames. Away, no sooner than
+    /// [`AWAY_FRAME_GAP`] after the last, whatever came before.
     fn dirty_due(&self, now: Instant) -> Instant {
         let Some(last) = self.last_frame else {
             return now;
@@ -6121,9 +6143,14 @@ impl App {
         if self.away {
             return (last + AWAY_FRAME_GAP).max(now);
         }
-        let quiet = self
-            .frame_before
-            .is_none_or(|before| last.saturating_duration_since(before) >= anim::FRAME);
+        if self.typed.is_some_and(|typed| typed > last) {
+            return now;
+        }
+        let (Some(last), before) = self.flush_frames else {
+            return now;
+        };
+        let quiet =
+            before.is_none_or(|before| last.saturating_duration_since(before) >= anim::FRAME);
         if quiet {
             return now;
         }
@@ -6208,7 +6235,10 @@ impl App {
             p.partly += 1;
         }
         self.dirty = false;
-        self.frame_before = self.last_frame.replace(now);
+        self.last_frame = Some(now);
+        if std::mem::take(&mut self.flushed_since) {
+            self.flush_frames = (Some(now), self.flush_frames.0);
+        }
         out
     }
 
@@ -6217,14 +6247,25 @@ impl App {
     /// the last are the editor's
     /// grids and nothing more — nothing moving, held or painted over either,
     /// no card over either — and nothing has changed since the last but the
-    /// cells of rows of grids on show. A row of the frame is changed where a
-    /// row of a grid drawn there is. Notes this frame for the next either
-    /// way.
+    /// cells of rows of grids on show, and what is drawn over rows. A row of
+    /// the frame is changed where a row of a grid drawn there is, or is drawn
+    /// over in this frame or was in the last. Notes this frame for the next
+    /// either way.
     fn changed_rows(&mut self, height: usize) -> bool {
         let Some(partial) = self.partial.as_mut() else {
             return false;
         };
         let since = std::mem::replace(&mut partial.at, grid::tick());
+        // The rows of the frame drawn over, where their grids are drawn as
+        // nothing moves; and those of the last frame.
+        let patched: Vec<usize> = self
+            .anim
+            .patched_rows()
+            .filter_map(|(grid, r)| {
+                usize::try_from(self.model.drawn_origin(grid).0 + r as i64).ok()
+            })
+            .collect();
+        let was_patched = std::mem::replace(&mut partial.patched, patched);
         let still = self.anim.still() && self.cards.is_empty();
         let was_still = std::mem::replace(&mut partial.still, still);
         if !(still && was_still && self.model.unchanged_since(since)) {
@@ -6233,6 +6274,11 @@ impl App {
         let rows = &mut partial.rows;
         rows.clear();
         rows.resize(height, false);
+        for &y in partial.patched.iter().chain(&was_patched) {
+            if let Some(row) = rows.get_mut(y) {
+                *row = true;
+            }
+        }
         let shown = self
             .model
             .layout
@@ -7682,6 +7728,53 @@ mod tests {
         redraw(&mut a, vec![line(1, 3, "again")], again);
         assert!(!a.due(again), "and the fourth");
         assert_eq!(a.wake_at(again), Some(third + MIN_FRAME_GAP));
+    }
+
+    /// A key drawn ahead of Neovim is drawn at once, though Neovim's two
+    /// flushes for the key before it came a moment ago; and Neovim's second
+    /// flush for a key is drawn at once after a quiet spell, though a key
+    /// was drawn ahead of Neovim a moment before its first. What the hand
+    /// types is paced by the hand, and Neovim's frames by its flushes alone.
+    #[test]
+    fn frames_drawn_ahead_do_not_pace_neovims_and_are_not_paced_by_them() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.frame(t1);
+        // Neovim's two flushes for a key, after a quiet spell: the key shown,
+        // and what it did, half a millisecond apart.
+        let shown = t1 + Duration::from_millis(100);
+        redraw(&mut a, vec![line(1, 5, "x")], shown);
+        assert!(a.due(shown), "the key shown, at once");
+        a.frame(shown);
+        let did = shown + Duration::from_micros(500);
+        redraw(&mut a, vec![line(1, 5, " ")], did);
+        assert!(a.due(did), "what it did, at once");
+        a.frame(did);
+        // A key a millisecond later, drawn ahead of Neovim: at once.
+        let key = did + Duration::from_millis(1);
+        a.keys(b"l", key);
+        assert_eq!(a.wake_at(key), Some(key), "the key's frame, at once");
+        assert!(a.due(key));
+        a.frame(key);
+        // Neovim's two flushes for it, 15.5 ms after the key's frame and
+        // 16.5 ms after Neovim's last: both at once.
+        let shown = key + Duration::from_micros(15_500);
+        redraw(&mut a, vec![line(1, 5, "l")], shown);
+        assert!(a.due(shown), "the key shown, at once");
+        a.frame(shown);
+        let did = shown + Duration::from_micros(500);
+        ack(&mut a, 1, "l", "n", (0, 1, 1, 0), did);
+        let mut events = cursor_to(0, 1);
+        events.push(line(1, 5, " "));
+        redraw(&mut a, events, did);
+        assert_eq!(a.wake_at(did), Some(did), "what it did, at once");
+        assert!(a.due(did));
+        a.frame(did);
+        // A burst of Neovim's from there is held to the gap, as ever.
+        let more = did + Duration::from_micros(500);
+        redraw(&mut a, vec![line(1, 5, "m")], more);
+        assert!(!a.due(more), "the third, held");
+        assert_eq!(a.wake_at(more), Some(did + MIN_FRAME_GAP));
     }
 
     /// A card is a frame when it comes, and another each time it looks
@@ -11737,6 +11830,42 @@ mod tests {
             ack_i(a, k as u64, &tail, col, k + 1, now);
             redraw(a, typed_frame(text, col), now);
         }
+    }
+
+    /// What a step draws over Neovim's rows — the line typed into ahead of
+    /// it — stays on those rows: a frame with it is put together from only
+    /// the rows that changed, its own among them, and so is the frame after
+    /// it is gone — Neovim's word come, or the step let go of as the client
+    /// is sent away — each writing what a frame put together whole writes.
+    #[test]
+    fn frames_drawn_over_are_put_together_in_part() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let ms = |n: u64| t1 + Duration::from_millis(n);
+        let mut whole = typing(Duration::from_millis(200)).with_partial_frames(false);
+        let mut part = typing(Duration::from_millis(200));
+        both(&mut whole, &mut part, vec![], b"", t1);
+        let before = both(&mut whole, &mut part, vec![], b"", t1);
+        assert_eq!(
+            both(&mut whole, &mut part, vec![], b"ab", ms(10)),
+            before + 1
+        );
+        assert!(
+            !part.anim.patched().is_empty(),
+            "the line typed into, drawn over"
+        );
+        assert_eq!(composed(&mut part)[0], "abline 0");
+        for a in [&mut whole, &mut part] {
+            neovim_typed(a, 0, &["a"], &["aline 0"], ms(20));
+        }
+        assert_eq!(both(&mut whole, &mut part, vec![], b"", ms(20)), before + 2);
+        // Sent away: the step let go of, and its row put back as Neovim drew it.
+        let away = crate::card::encode(&crate::card::Command::Away);
+        assert_eq!(
+            both(&mut whole, &mut part, vec![], &away, ms(30)),
+            before + 3
+        );
+        assert!(part.anim.patched().is_empty());
+        assert_eq!(composed(&mut part)[0], "aline 0");
     }
 
     /// Characters typed in Insert mode over a slow link go in at once, the

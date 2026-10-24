@@ -609,11 +609,32 @@ pub struct Span {
 }
 
 /// A line the agent sent: its text, and the colours the editor's own
-/// highlighting gives it, later spans over earlier ones.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// highlighting gives it, later spans over earlier ones; and, worked out
+/// once as it comes, whether Neovim steps over its characters as the client
+/// does ([`ordinary`]) and whether they are all ASCII.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Line {
     text: String,
     spans: Vec<Span>,
+    ordinary: bool,
+    ascii: bool,
+}
+
+impl Line {
+    fn new(text: String, spans: Vec<Span>) -> Self {
+        Line {
+            ordinary: ordinary(&text),
+            ascii: text.is_ascii(),
+            text,
+            spans,
+        }
+    }
+}
+
+impl Default for Line {
+    fn default() -> Self {
+        Line::new(String::new(), Vec::new())
+    }
 }
 
 /// The spans of a line as the agent sends them: start, end and group, flat,
@@ -708,10 +729,7 @@ impl Lines {
             let mut text = std::mem::take(&mut self.text);
             let tail = text.split_off(after);
             text.truncate(before);
-            text.extend(s.text.into_iter().map(|text| Line {
-                text,
-                spans: Vec::new(),
-            }));
+            text.extend(s.text.into_iter().map(|text| Line::new(text, Vec::new())));
             text.extend(tail);
             if text.len() > MAX_LINES {
                 *self = Lines::default();
@@ -829,25 +847,25 @@ impl Look {
     /// draws itself, `hl_group_set`'s, if it has said: `EndOfBuffer`, for a
     /// window that shows no row past the end, and `NonText`, `SpecialKey`
     /// and `Whitespace` for what is drawn in them.
-    pub fn of(
-        rows: &[Vec<Cell>],
+    pub fn of<R: AsRef<[Cell]>>(
+        rows: &[R],
         lines: usize,
         textoff: usize,
         skip: Option<usize>,
         group: impl Fn(&str) -> Option<u32>,
     ) -> Self {
-        let text_rows: Vec<&Vec<Cell>> = rows
+        let text_rows: Vec<&[Cell]> = rows
             .iter()
             .take(lines)
             .enumerate()
             .filter(|(r, _)| Some(*r) != skip)
-            .map(|(_, row)| row)
+            .map(|(_, row)| row.as_ref())
             .collect();
         let gutter = (0..textoff)
             .map(|c| most(text_rows.iter().filter_map(|row| row.get(c).map(|x| x.hl))))
             .collect();
         let text = most(text_rows.iter().filter_map(|row| row.last().map(|x| x.hl)));
-        let eob = rows.get(lines).cloned();
+        let eob = rows.get(lines).map(|row| row.as_ref().to_vec());
         let eob_hl = eob
             .as_ref()
             .and_then(|row| row.first())
@@ -1036,11 +1054,12 @@ pub fn numbers(
     let width = number_width(shape, rows)?.checked_sub(1)?;
     let rnu = shape.relativenumber;
     let away = (lnum - cursor).abs();
-    let text = match (rnu, shape.number) {
-        (true, _) if away > 0 => format!("{away:>width$} "),
-        (true, true) => format!("{:<width$} ", lnum + 1),
-        (true, false) => format!("{:>width$} ", 0),
-        (false, _) => format!("{:>width$} ", lnum + 1),
+    // The number, and whether it is left-aligned.
+    let (n, left) = match (rnu, shape.number) {
+        (true, _) if away > 0 => (away, false),
+        (true, true) => (lnum + 1, true),
+        (true, false) => (0, false),
+        (false, _) => (lnum + 1, false),
     };
     let numbered = shape.stepping.as_ref().is_some_and(|s| s.cursorline.number);
     let hl = match lnum.cmp(&cursor) {
@@ -1049,15 +1068,38 @@ pub fn numbers(
         std::cmp::Ordering::Equal if numbered => ids.cursor_nr,
         _ => ids.line_nr,
     };
-    Some(
-        text.chars()
+    // As `format!("{n:>width$} ")` — `<` for left — lays it out, cut to
+    // `width + 1` columns: without the `String`.
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut m = n.unsigned_abs();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    let sign: &[u8] = if n < 0 { b"-" } else { b"" };
+    let pad = width.saturating_sub(sign.len() + digits.len() - i);
+    let blanks = || std::iter::repeat_n(&b' ', pad);
+    let (before, after) = if left { (0, pad) } else { (pad, 0) };
+    let mut out = Vec::with_capacity(width + 1);
+    out.extend(
+        blanks()
+            .take(before)
+            .chain(sign)
+            .chain(&digits[i..])
+            .chain(blanks().take(after))
+            .chain(b" ")
             .take(width + 1)
-            .map(|c| Cell {
-                text: Text::Char(c),
+            .map(|&b| Cell {
+                text: Text::Char(char::from(b)),
                 hl,
-            })
-            .collect(),
-    )
+            }),
+    );
+    Some(out)
 }
 
 /// The gutter of a window of `shape`, `rows` rows of text tall, on buffer
@@ -1637,15 +1679,7 @@ pub fn chars(text: &str, shape: &Shape) -> Vec<Ch> {
         if joins(c) {
             continue;
         }
-        let width = match c {
-            '\t' if shape.list && shape.tab.is_empty() => 2,
-            '\t' => shape.tabstop - vcol % shape.tabstop,
-            '\0'..='\x1f' | '\x7f' => 2,
-            _ => match c.width() {
-                None => format!("<{:02x}>", c as u32).len(),
-                Some(w) => w,
-            },
-        };
+        let width = cells(c, vcol, shape);
         out.push(Ch {
             byte,
             vcol,
@@ -1655,6 +1689,21 @@ pub fn chars(text: &str, shape: &Shape) -> Vec<Ch> {
         vcol += width;
     }
     out
+}
+
+/// How many display columns character `c`, not one [`joins`] takes, takes
+/// at display column `vcol` of a line, as [`chars`] lays it out.
+#[inline(always)]
+fn cells(c: char, vcol: usize, shape: &Shape) -> usize {
+    match c {
+        '\t' if shape.list && shape.tab.is_empty() => 2,
+        '\t' => shape.tabstop - vcol % shape.tabstop,
+        '\0'..='\x1f' | '\x7f' => 2,
+        _ => match c.width() {
+            None => format!("<{:02x}>", c as u32).len(),
+            Some(w) => w,
+        },
+    }
 }
 
 /// Whether Neovim 0.12 steps over a line's characters as [`chars`] does, as
@@ -1745,7 +1794,17 @@ pub fn reach(text: &str, shape: &Shape) -> usize {
 /// characters out in: as the agent measures it Neovim's way (see
 /// [`Ack::width`]), where Neovim draws nothing between them.
 pub fn width(text: &str, shape: &Shape) -> usize {
-    end(&columns(text, shape))
+    // Printable ASCII, a column a byte: looked over whole, not stopping at
+    // the first byte that is not, which the compiler does many at a time.
+    if text
+        .bytes()
+        .fold(true, |all, b| all & matches!(b, b' '..=b'~'))
+    {
+        return text.len();
+    }
+    text.chars()
+        .filter(|&c| !joins(c))
+        .fold(0, |vcol, c| vcol + cells(c, vcol, shape))
 }
 
 /// Where in a line, in display columns, the cursor sits on a character: a
@@ -3862,9 +3921,8 @@ impl Predictor {
                     .map(|a| {
                         a.iter()
                             .enumerate()
-                            .map(|(i, t)| Line {
-                                text: lossy(t),
-                                spans: spans(colours.and_then(|c| c.get(i))),
+                            .map(|(i, t)| {
+                                Line::new(lossy(t), spans(colours.and_then(|c| c.get(i))))
                             })
                             .collect()
                     })
@@ -4286,12 +4344,8 @@ impl Predictor {
         let motions = moves::parse(keys.iter().copied(), |key| {
             shape.mapped.iter().any(|m| m == key)
         })?;
-        let text = |l: i64| {
-            (!self.cut(win, l))
-                .then(|| self.text(win, l))
-                .flatten()
-                .filter(|t| ordinary(t))
-        };
+        let texts = self.ordinary_texts(win, false);
+        let text = |l: i64| texts(l);
         let cx = moves::Ctx {
             shape,
             line_count: from.line_count,
@@ -4415,6 +4469,29 @@ impl Predictor {
     pub fn text(&self, win: i64, lnum: i64) -> Option<&str> {
         let shape = self.shapes.get(&win)?;
         self.lines.get(&win)?.get(shape.buf, lnum)
+    }
+
+    /// The lines of window `win` a motion may go over, by buffer line: the
+    /// text of those the agent sent whole ([`Predictor::cut`]) that Neovim
+    /// steps over as the client does ([`ordinary`]) — and, where `ascii`,
+    /// that are all ASCII. The window's lines are looked up once, and what
+    /// each line is worked out as it came.
+    pub fn ordinary_texts<'a>(
+        &'a self,
+        win: i64,
+        ascii: bool,
+    ) -> impl Fn(i64) -> Option<&'a str> + 'a {
+        let kept = self
+            .shapes
+            .get(&win)
+            .map(|s| s.buf)
+            .zip(self.lines.get(&win));
+        move |lnum| {
+            let (buf, lines) = kept?;
+            let line = lines.line(buf, lnum)?;
+            let whole = line.text.len() + 3 < lines.cap;
+            (whole && line.ordinary && (!ascii || line.ascii)).then_some(line.text.as_str())
+        }
     }
 
     /// Whether the agent may have sent buffer line `lnum` of window `win`
