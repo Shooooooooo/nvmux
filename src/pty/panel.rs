@@ -24,17 +24,72 @@
 //! ([`Attachment::float_the_picker`]), come up with the session out of the
 //! background.
 //!
-//! Without the terminal's colours the session is drawn faint on a blank
-//! margin, with no fade. A terminal too small ([`Floating::area`]), no copy
-//! of the session, or `[style] float` off means full screen instead (its
-//! [`Outcome`]); toggling `float` from the settings moves them between the
-//! two ([`Attachment::float_the_settings`]).
+//! Keys go to the panel, read by [`crate::input`]; what the terminal answers
+//! the client goes on to the client, as it came. The mouse is reported while
+//! the panel is up, and put back as the session had it as it goes; a press
+//! on the session — anywhere but the panel and its hint row — takes it down,
+//! as `Esc` does.
+//!
+//! # The hint row
+//!
+//! What floats is all of the screen but its hint row, which stays where it
+//! is full screen: the last row of the terminal, the whole width of it,
+//! saying what it says there ([`Floating::draw_hints`]), with the panel in
+//! the middle of the room above it. The session's last row is emptied under
+//! it, as the session is under the panel, so nothing of the editor's own last
+//! row shows either side of the hints; and it comes and goes with the panel.
+//!
+//! # Coming and going
+//!
+//! In nvmux's fade, the way a card comes: over the first half the session
+//! dims, and empties where the panel and its hint row will be; over the
+//! second the two come up out of the background. Going, the other way round.
+//! With the fade off it is at once. While it is up, whatever moves on it —
+//! the settings' bar, whose row it leaves fades back from it as the picker's
+//! does (see [`crate::ui::settings`]) — has frames at the fade's pace until
+//! it stops; and a key or the mouse has its frame at once, as it does full
+//! screen.
+//!
+//! The picker can go two other ways ([`Leave`]). To another session, or to a
+//! screen of its own, it goes out with the session, the two into the
+//! background together, and the relay has nothing left to dissolve. To the
+//! help, the settings or the prompt, it goes out alone, and the other comes
+//! up in its place over the session as it stands, dimmed — set aside rather
+//! than taken down, and back the same way, as it was left, when that one is
+//! taken down, as the picker full screen is back after them. The prompt goes
+//! out with the session where it has made one, to it.
+//!
+//! And the settings can come the other way: from their screen full screen,
+//! turned to float, they come up over the session as the relay brings it
+//! back — with it, the two out of the background together, as the picker
+//! goes out to a screen of its own the other way round. So does the picker,
+//! back from a prompt it went out to full screen, where the prompt could not
+//! float ([`Attachment::float_the_picker`]).
+//!
+//! # Where it does not float
+//!
+//! Without the terminal's colours — `NO_COLOR`, or a terminal that never
+//! said — nothing can be taken toward a background nvmux does not know. The
+//! session is drawn faint instead, which dims its text and not its
+//! backgrounds, and the panel stands on a margin of blank cells; and nothing
+//! fades. On a terminal too small for a panel and the session round it — each
+//! screen says how big a one it needs ([`Floating::area`]) — and for a
+//! session nvmux keeps no copy of, the screen takes the terminal as it always
+//! did ([`Outcome::ShowSettings`], [`Outcome::ShowHelp`],
+//! [`Outcome::ToPicker`], [`Outcome::CreateNew`], [`Outcome::CreateAfter`],
+//! [`Outcome::Rename`]). With `[style] float` off, none of them floats:
+//! each takes the terminal, wherever it could have floated. Turned off by the
+//! settings as they float, they go out with the session, as the picker goes
+//! to a screen of its own, and come up full screen in their place; and turned
+//! on by the settings full screen over a session, they come up floating over
+//! it as soon as the relay has it back ([`Attachment::float_the_settings`],
+//! and see above).
 
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{MouseButton, MouseEventKind};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use super::{
     pollfd, read_fd, ready, take_step, unsynced, Attachment, Outcome, Target, FRAME_WAIT,
@@ -47,7 +102,7 @@ use crate::keys::Step;
 use crate::palette::Palette;
 use crate::shadow::{Cursor, Laid, Shade, Shadow};
 use crate::term::{self, write_stdout, MouseReporting};
-use crate::ui::float::{Did, Floating, Leave};
+use crate::ui::float::{self, Did, Floating, Leave};
 use crate::ui::prompt::{self, Place};
 use crate::ui::{help, picker, settings};
 use crate::{card, config, fade, falloff, winch};
@@ -84,13 +139,19 @@ impl Look {
         }
     }
 
-    /// The shade of session cell (`row`, `col`) with the panel at `panel`,
-    /// `dim` of the way in, and the whole session `away` of the way out.
-    fn shade(self, row: u16, col: u16, panel: Rect, dim: f32, away: f32) -> Shade {
+    /// What becomes of the session's cell at (`row`, `col`) with the panel
+    /// at `panel` and its hint row at `hints`, the dimming `dim` of the way
+    /// in — and the whole of it `away` of the rest of the way to the
+    /// background, under a panel going somewhere other than back to the
+    /// session. Under the hint row it is emptied as it is under the panel,
+    /// for the row to come up on; round the row, it is as far from the panel
+    /// as it is.
+    fn shade(self, row: u16, col: u16, panel: Rect, hints: Rect, dim: f32, away: f32) -> Shade {
+        let under_hints = hints.contains(Position::new(col, row));
         match self {
             Look::Dimmed(_) => {
                 let d = falloff::distance(col, row, panel.x, panel.y, panel.width, panel.height);
-                let amount = if d == 0.0 {
+                let amount = if d == 0.0 || under_hints {
                     1.0
                 } else {
                     1.0 - (1.0 - BEHIND) * (1.0 - falloff::around(d, falloff::PEAK, falloff::REACH))
@@ -106,7 +167,7 @@ impl Look {
                     && col < panel.right() + MARGIN_COLS
                     && row >= top
                     && row < panel.bottom() + MARGIN_ROWS;
-                if inside {
+                if inside || under_hints {
                     Shade::Blank
                 } else {
                     Shade::Faint
@@ -275,6 +336,8 @@ pub(super) fn float(
     let Some(mut area) = panel.area(screen) else {
         return Ok(Some(what.full_screen()));
     };
+    // Where its hint row goes: along the bottom of the screen, not with it.
+    let (_, mut hints) = float::split(screen);
     if !a.copy().is_some_and(|c| c.is_usable()) {
         return Ok(Some(what.full_screen()));
     }
@@ -366,6 +429,7 @@ pub(super) fn float(
             let size = term::terminal_size();
             a.resize_to(size);
             screen = Rect::new(0, 0, size.cols, size.rows);
+            (_, hints) = float::split(screen);
             match panel.area(screen) {
                 Some(fits) => {
                     area = fits;
@@ -416,9 +480,11 @@ pub(super) fn float(
                 Input::Mouse(mouse) => {
                     owed = true;
                     asked = true;
-                    let outside = !area.contains((mouse.column, mouse.row).into());
+                    let on_session = on_the_session(area, hints, mouse.column, mouse.row);
                     let press = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
-                    going = (outside && press) || panel.on_mouse(mouse, now) == Did::Close;
+                    // A press on the session takes the panel down, as `Esc`
+                    // does.
+                    going = (on_session && press) || panel.on_mouse(mouse, now) == Did::Close;
                 }
             }
         }
@@ -496,6 +562,7 @@ pub(super) fn float(
                         look,
                         panel.as_mut(),
                         area,
+                        hints,
                         coming.to,
                         1.0,
                         &mut held,
@@ -534,6 +601,7 @@ pub(super) fn float(
                 look,
                 panel.as_mut(),
                 area,
+                hints,
                 there,
                 gone,
                 &mut held,
@@ -620,14 +688,17 @@ fn hold(a: &mut Attachment, chunk: &[u8], held: &mut Vec<u8>, boundary: &mut Bou
     held.extend(boundary.relay_whole(chunk));
 }
 
-/// Write a frame (`there` of the way in, `away` of the way out) if one can
-/// go out now (see [`frame_bytes`]); returns whether it did.
+/// A frame, `there` of the way in and `away` of the way out to the
+/// background, if one can go out now (see [`frame_bytes`]): the panel at
+/// `area`, and its hint row at `hints`, which comes and goes with it. Says
+/// whether it did.
 #[allow(clippy::too_many_arguments)]
 fn paint(
     a: &mut Attachment,
     look: Look,
     panel: &mut dyn Floating,
     area: Rect,
+    hints: Rect,
     there: f32,
     away: f32,
     held: &mut Vec<u8>,
@@ -643,17 +714,21 @@ fn paint(
         return Ok(false);
     }
     let (text, dim, away) = levels(there, away);
-    let laid = (text > 0.0).then(|| {
-        let mut buf = panel.draw(area);
-        if let (Some(palette), true) = (look.palette(), text < 1.0) {
-            fade::apply(&mut buf, palette, 1.0 - text);
-        }
-        Laid::from_buffer(&buf)
-    });
+    let laid: Vec<Laid> = (text > 0.0)
+        .then(|| [panel.draw(area), panel.draw_hints(hints)])
+        .into_iter()
+        .flatten()
+        .map(|mut buf| {
+            if let (Some(palette), true) = (look.palette(), text < 1.0) {
+                fade::apply(&mut buf, palette, 1.0 - text);
+            }
+            Laid::from_buffer(&buf)
+        })
+        .collect();
     let Some(copy) = a.copy() else {
         return Ok(false);
     };
-    let Some(out) = frame_bytes(copy, look, laid.as_ref(), area, dim, away, held, boundary) else {
+    let Some(out) = frame_bytes(copy, look, &laid, area, hints, dim, away, held, boundary) else {
         return Ok(false);
     };
     write_stdout(&out)?;
@@ -661,17 +736,33 @@ fn paint(
     Ok(true)
 }
 
-/// A frame's bytes in one synchronized update: client output since the last
-/// (its sync closes removed, so it shows with this frame), panel mouse
-/// reporting, then the session dimmed `dim` with `laid` over it. `None`
-/// mid-sequence, where nvmux cannot write: client bytes always get a frame
-/// after them, so they never show through.
+/// Whether a press at (`column`, `row`) is on the session, which takes the
+/// panel down as `Esc` does: anywhere but the panel at `area` and its hint
+/// row at `hints`, which are the screen's.
+fn on_the_session(area: Rect, hints: Rect, column: u16, row: u16) -> bool {
+    let at = Position::new(column, row);
+    !area.contains(at) && !hints.contains(at)
+}
+
+/// The bytes of a frame: what the client wrote since the last, its own frame
+/// closes taken out so that it is presented with this one and no sooner; the
+/// mouse as the panel wants it; and the session under the panel — `laid`,
+/// the panel at `area` and its hint row at `hints`, the session dimmed `dim`
+/// of the way in round them — painted over all of it, in one synchronized
+/// update that this frame ends.
+///
+/// `None` while the session is half way through a sequence, where nothing of
+/// nvmux's can be written: then nothing goes out at all, the session's bytes
+/// included, until the rest of the sequence comes and a frame can go out
+/// after it. The session's bytes never reach the terminal without a frame
+/// after them, which is what keeps them from showing through the panel.
 #[allow(clippy::too_many_arguments)]
 fn frame_bytes(
     copy: &mut Shadow,
     look: Look,
-    laid: Option<&Laid>,
+    laid: &[Laid],
     area: Rect,
+    hints: Rect,
     dim: f32,
     away: f32,
     held: &[u8],
@@ -680,7 +771,7 @@ fn frame_bytes(
     if boundary.mid_sequence() {
         return None;
     }
-    let shade = |row: u16, col: u16| look.shade(row, col, area, dim, away);
+    let shade = |row: u16, col: u16| look.shade(row, col, area, hints, dim, away);
     let frame = copy.frame_under(&shade, look.palette(), laid, Cursor::Hidden);
     let mut out = fade::SYNC_BEGIN.to_vec();
     out.extend_from_slice(&unsynced(held));
@@ -780,11 +871,18 @@ mod tests {
         P.get_or_init(crate::test_support::palette)
     }
 
+    /// The hint row of a screen 120 by 42: under every cell the tests about
+    /// the panel look at.
+    const HINTS: Rect = Rect::new(0, 41, 120, 1);
+
+    /// Behind the panel the whole session is half way to the background,
+    /// further nearer the panel by the cards' falloff, and under it emptied;
+    /// and none of it before the dimming has come in.
     #[test]
     fn the_session_dims_round_the_panel_by_the_cards_falloff() {
         let panel = Rect::new(24, 6, 72, 23);
         let look = Look::Dimmed(palette());
-        let amount = |row, col| match look.shade(row, col, panel, 1.0, 0.0) {
+        let amount = |row, col| match look.shade(row, col, panel, HINTS, 1.0, 0.0) {
             Shade::Toward(t) => t,
             other => panic!("{other:?}"),
         };
@@ -796,7 +894,7 @@ mod tests {
         let near = amount(10, 18);
         assert!(beside > near && near > far, "{beside} {near} {far}");
         assert_eq!(
-            look.shade(0, 0, panel, 0.0, 0.0),
+            look.shade(0, 0, panel, HINTS, 0.0, 0.0),
             Shade::Toward(0.0),
             "not yet"
         );
@@ -805,7 +903,7 @@ mod tests {
     #[test]
     fn without_colours_the_panel_stands_on_a_blank_margin() {
         let panel = Rect::new(24, 6, 72, 23);
-        let shade = |row, col| Look::Faint.shade(row, col, panel, 1.0, 0.0);
+        let shade = |row, col| Look::Faint.shade(row, col, panel, HINTS, 1.0, 0.0);
         assert_eq!(shade(10, 30), Shade::Blank);
         assert_eq!(shade(10, 22), Shade::Blank, "the margin, left");
         assert_eq!(shade(10, 97), Shade::Blank, "and right");
@@ -813,6 +911,46 @@ mod tests {
         assert_eq!(shade(29, 30), Shade::Blank, "and below");
         assert_eq!(shade(10, 21), Shade::Faint);
         assert_eq!(shade(4, 30), Shade::Faint);
+    }
+
+    /// Under the hint row the session is emptied as it is under the panel,
+    /// the whole width of the screen, for the row to come up on — and none
+    /// of it before the dimming has come in. Over the row it is as far from
+    /// the panel as it is: the row has no falloff of its own. Without
+    /// colours, blank under the row and faint over it.
+    #[test]
+    fn the_session_empties_under_the_hint_row() {
+        let panel = Rect::new(24, 6, 72, 23);
+        let look = Look::Dimmed(palette());
+        for col in [0, 60, 119] {
+            let shade = |dim| look.shade(41, col, panel, HINTS, dim, 0.0);
+            assert_eq!(shade(1.0), Shade::Toward(1.0), "column {col}");
+            assert_eq!(shade(0.0), Shade::Toward(0.0), "not yet, column {col}");
+            let faint = Look::Faint.shade(41, col, panel, HINTS, 1.0, 0.0);
+            assert_eq!(faint, Shade::Blank, "column {col}");
+        }
+        assert_eq!(
+            look.shade(40, 0, panel, HINTS, 1.0, 0.0),
+            Shade::Toward(BEHIND),
+            "the row over it, far from the panel"
+        );
+        assert_eq!(
+            Look::Faint.shade(40, 0, panel, HINTS, 1.0, 0.0),
+            Shade::Faint
+        );
+    }
+
+    /// A press on the session takes the panel down; one on the panel, or on
+    /// its hint row along the bottom of the screen, is the screen's.
+    #[test]
+    fn a_press_on_the_hint_row_is_not_on_the_session() {
+        let panel = Rect::new(24, 6, 72, 23);
+        assert!(on_the_session(panel, HINTS, 0, 0));
+        assert!(on_the_session(panel, HINTS, 30, 40), "the row over it");
+        assert!(!on_the_session(panel, HINTS, 30, 10), "the panel");
+        for col in [0, 60, 119] {
+            assert!(!on_the_session(panel, HINTS, col, 41), "column {col}");
+        }
     }
 
     fn count(haystack: &[u8], needle: &[u8]) -> usize {
@@ -826,15 +964,25 @@ mod tests {
     /// so a frame always follows client bytes.
     #[test]
     fn the_sessions_bytes_go_out_only_in_front_of_a_frame() {
-        let area = Rect::new(8, 3, 64, 18);
+        let (area, hints) = (Rect::new(8, 3, 64, 18), Rect::new(0, 23, 80, 1));
         let look = Look::Dimmed(palette());
         let mut copy = Shadow::new(24, 80);
         let mut boundary = Boundary::new();
         let chunk = b"\x1b[?2026h\x1b[5;10Hbusy\x1b[?2026l\x1b]2;tit";
         copy.feed(chunk);
         let held = boundary.relay_whole(chunk);
-        let out = frame_bytes(&mut copy, look, None, area, 1.0, 0.0, &held, &mut boundary)
-            .expect("a frame, between sequences");
+        let out = frame_bytes(
+            &mut copy,
+            look,
+            &[],
+            area,
+            hints,
+            1.0,
+            0.0,
+            &held,
+            &mut boundary,
+        )
+        .expect("a frame, between sequences");
         let front = [fade::SYNC_BEGIN, b"\x1b[?2026h\x1b[5;10Hbusy"].concat();
         assert!(
             out.starts_with(&front),
@@ -848,8 +996,18 @@ mod tests {
         let rest = b"le\x07";
         copy.feed(rest);
         let held = boundary.relay_whole(rest);
-        let out = frame_bytes(&mut copy, look, None, area, 1.0, 0.0, &held, &mut boundary)
-            .expect("the next frame");
+        let out = frame_bytes(
+            &mut copy,
+            look,
+            &[],
+            area,
+            hints,
+            1.0,
+            0.0,
+            &held,
+            &mut boundary,
+        )
+        .expect("the next frame");
         let front = [fade::SYNC_BEGIN, b"\x1b]2;title\x07"].concat();
         assert!(
             out.starts_with(&front),
@@ -862,7 +1020,7 @@ mod tests {
     /// out until it ends.
     #[test]
     fn nothing_goes_out_half_way_through_a_sequence() {
-        let area = Rect::new(8, 3, 64, 18);
+        let (area, hints) = (Rect::new(8, 3, 64, 18), Rect::new(0, 23, 80, 1));
         let mut copy = Shadow::new(24, 80);
         let mut boundary = Boundary::new();
         let mut held = boundary.relay_whole(b"\x1b[1;1Hbefore\x1b]52;c;");
@@ -871,8 +1029,9 @@ mod tests {
         let frame = frame_bytes(
             &mut copy,
             Look::Faint,
-            None,
+            &[],
             area,
+            hints,
             1.0,
             0.0,
             &held,
@@ -883,8 +1042,9 @@ mod tests {
         let out = frame_bytes(
             &mut copy,
             Look::Faint,
-            None,
+            &[],
             area,
+            hints,
             1.0,
             0.0,
             &held,
@@ -958,16 +1118,22 @@ mod tests {
         let panel = Rect::new(24, 6, 72, 23);
         let look = Look::Dimmed(palette());
         for (row, col) in [(0, 0), (10, 18), (10, 30), (40, 119)] {
-            assert_eq!(look.shade(row, col, panel, 1.0, 1.0), Shade::Toward(1.0));
-            let Shade::Toward(half) = look.shade(row, col, panel, 1.0, 0.5) else {
+            assert_eq!(
+                look.shade(row, col, panel, HINTS, 1.0, 1.0),
+                Shade::Toward(1.0)
+            );
+            let Shade::Toward(half) = look.shade(row, col, panel, HINTS, 1.0, 0.5) else {
                 panic!("not toward");
             };
-            let Shade::Toward(none) = look.shade(row, col, panel, 1.0, 0.0) else {
+            let Shade::Toward(none) = look.shade(row, col, panel, HINTS, 1.0, 0.0) else {
                 panic!("not toward");
             };
             assert!(half >= none, "({row}, {col}): {half} < {none}");
         }
-        assert_eq!(Look::Faint.shade(0, 0, panel, 1.0, 1.0), Shade::Blank);
+        assert_eq!(
+            Look::Faint.shade(0, 0, panel, HINTS, 1.0, 1.0),
+            Shade::Blank
+        );
     }
 
     /// The session is never undimmed in between: the first frame is all
@@ -985,7 +1151,7 @@ mod tests {
         assert_eq!(text, 0.0, "nothing of the panel yet");
         for (row, col) in [(0, 0), (10, 18), (10, 30), (40, 119)] {
             assert_eq!(
-                look.shade(row, col, panel, dim, away),
+                look.shade(row, col, panel, HINTS, dim, away),
                 Shade::Toward(1.0),
                 "({row}, {col}) is the background"
             );

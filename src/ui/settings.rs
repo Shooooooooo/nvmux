@@ -2,13 +2,26 @@
 //! tab per table and one row per [`crate::settings`] entry, so none can be
 //! left out.
 //!
-//! From the full-screen picker it takes the terminal, like [`super::help`].
-//! From a session (or the picker floating over one) it floats over the
-//! running session in a relay-drawn [`Panel`] (see `crate::pty::panel`),
-//! unless `[style] float` is off or the terminal is too small
-//! ([`panel_area`]); then it goes full screen and hands the same client back
-//! afterwards. Toggling `[style] float` here switches at once
-//! ([`Outcome::Float`]).
+//! From the picker full screen it takes the terminal the way the help screen
+//! does ([`super::help`]). From a session, or the picker floating over one,
+//! it floats over the session instead, in a panel the relay draws and gives
+//! its keys to ([`Panel`], and see `crate::pty::panel`), and the session goes
+//! on behind it, the hint row staying where it is full screen, along the
+//! bottom of the screen — unless `[style] float` is off, or the terminal is
+//! too small for a panel ([`panel_area`]), where it takes the terminal as from
+//! the picker and hands the same client back afterwards. And `[style] float`,
+//! flipped on the screen itself, moves it at once: off where it floats, it
+//! goes out with the session and comes up full screen in its place; on where
+//! it is full screen over a session — brought up from one, or from the picker
+//! brought up over one — it goes, and the session comes back with it
+//! floating over it ([`Outcome::Float`]).
+//! Either way the screen is the same: its rows are
+//! [`crate::settings`]' — one per setting, so the screen cannot leave one out
+//! — and every change it makes is applied as it is made ([`config::apply`]):
+//! the theme shows on the screen itself on the next frame, the picker's
+//! effects come back with the picker, and the rest reach what they govern as
+//! the table in [`crate::settings`] says. Until a save the file is untouched,
+//! and the tab row marks each tab with something unsaved on it.
 //!
 //! Changes apply immediately ([`config::apply`]); the file is untouched until
 //! `w`, and tabs with unsaved changes are marked. A dim row has no effect as
@@ -41,7 +54,7 @@ use unicode_width::UnicodeWidthStr;
 use super::app::Key;
 use super::draw;
 use super::effects::{self, AFTERGLOW};
-use super::float::{inside, Did, Floating};
+use super::float::{self, inside, Did, Floating};
 use super::prompt::Field;
 use super::setup;
 use crate::config::{self, Settings, ThemeColor};
@@ -980,10 +993,12 @@ fn follow(
     }
 }
 
-/// Largest floating panel: fits the longest section's rows and the longest
-/// help.
+/// The widest and the tallest the settings are when they float over a
+/// session: room for every row of the longest section, and for the longest
+/// help. Not for the hint row, which is the screen's last row, under the
+/// panel.
 const PANEL_WIDTH: u16 = 72;
-const PANEL_HEIGHT: u16 = 23;
+const PANEL_HEIGHT: u16 = 22;
 
 /// Minimum session left visible around the panel, both sides together: in
 /// columns, and in rows.
@@ -994,18 +1009,21 @@ const PANEL_ENDS: u16 = 6;
 const FLOAT_COLS: u16 = 72;
 const FLOAT_ROWS: u16 = 20;
 
-/// The centred floating panel on `screen`: up to [`PANEL_WIDTH`] by
-/// [`PANEL_HEIGHT`], keeping the session margins; `None` under
-/// [`FLOAT_COLS`] by [`FLOAT_ROWS`].
+/// Where the settings float over a session on `screen`: in the middle of the
+/// room above the hint row ([`float::split`]), [`PANEL_WIDTH`] by
+/// [`PANEL_HEIGHT`] where there is room for that and the session round it,
+/// and smaller where there is not; nowhere on a screen under [`FLOAT_COLS`]
+/// by [`FLOAT_ROWS`], which has them full screen.
 pub fn panel_area(screen: Rect) -> Option<Rect> {
     if screen.width < FLOAT_COLS || screen.height < FLOAT_ROWS {
         return None;
     }
-    let width = PANEL_WIDTH.min(screen.width - PANEL_SIDES);
-    let height = PANEL_HEIGHT.min(screen.height - PANEL_ENDS);
+    let (room, _) = float::split(screen);
+    let width = PANEL_WIDTH.min(room.width - PANEL_SIDES);
+    let height = PANEL_HEIGHT.min(room.height - PANEL_ENDS);
     Some(Rect::new(
-        screen.x + (screen.width - width) / 2,
-        screen.y + (screen.height - height) / 2,
+        room.x + (room.width - width) / 2,
+        room.y + (room.height - height) / 2,
         width,
         height,
     ))
@@ -1076,7 +1094,8 @@ impl Floating for Panel {
         self.after(step, now)
     }
 
-    /// By the screen's rules; a left press outside the panel is the relay's.
+    /// A mouse report, by the screen's rules; where it is was the relay's to
+    /// say, and a press on the session is the relay's too.
     fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did {
         let at = hit(&self.state, self.drawn, mouse.column, mouse.row);
         let Some(g) = gesture(mouse, at) else {
@@ -1108,10 +1127,24 @@ impl Floating for Panel {
         self.state.glowing()
     }
 
+    /// The settings drawn into `area`, a buffer of that area, in the theme's
+    /// colour where it has one, and the row the bar left fading back from it:
+    /// as on a terminal of the panel's inside, all but the hint row.
     fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         self.drawn = inside(area);
-        paint_on(&mut buf, self.drawn, &self.state);
+        let mut drawn = Buffer::empty(self.drawn);
+        paint_on(&mut drawn, self.drawn, &self.state);
+        float::lay(&mut buf, self.drawn, &drawn);
+        buf
+    }
+
+    /// The settings' hint row drawn into `row`, as full screen, in the
+    /// theme's colour where it has one.
+    fn draw_hints(&self, row: Rect) -> Buffer {
+        let mut buf = Buffer::empty(row);
+        hints_on(&mut buf, row, &self.state);
+        crate::theme::paint(&mut buf);
         buf
     }
 
@@ -1326,7 +1359,9 @@ fn afterglow(buf: &mut Buffer, area: Rect, state: &State, colours: Option<&effec
     }
 }
 
-/// Draw on `area`: the whole terminal, or the inside of the floating panel.
+/// The screen, drawn on `area` of `buf`: the whole of the terminal, or the
+/// inside of the panel floating over a session, which takes all of it but the
+/// hint row (see [`float::lay`]).
 fn draw_on(buf: &mut Buffer, area: Rect, state: &State) {
     let Some(l) = layout(area) else {
         return;
@@ -1354,8 +1389,18 @@ fn draw_on(buf: &mut Buffer, area: Rect, state: &State) {
             }
         }
     }
-    let (text, dim) = hints(state, current, usize::from(area.width.saturating_sub(2)));
-    hint_row(buf, l.hint, &text, dim);
+    hints_on(buf, l.hint, state);
+}
+
+/// The hint row drawn on `row` of `buf`: the screen's last row, full screen or
+/// under the panel floating over a session.
+fn hints_on(buf: &mut Buffer, row: Rect, state: &State) {
+    let (text, dim) = hints(
+        state,
+        state.current(),
+        usize::from(row.width.saturating_sub(2)),
+    );
+    hint_row(buf, row, &text, dim);
 }
 
 /// The hint row as every screen draws it (see [`draw::draw_hint_row`]); dim
@@ -2349,15 +2394,17 @@ mod tests {
         test_support::assert_no_colour(80, 24, |f| draw(f, &s));
     }
 
-    /// At most 72×23, leaving at least 8 columns each side and 3 rows above
-    /// and below; no float under 72×20.
+    /// The settings float in the middle of the room above the hint row, at
+    /// most 72 by 22 and leaving at least eight columns either side and three
+    /// rows above and below; on a screen under 72 by 20 they do not float at
+    /// all.
     #[test]
     fn the_panel_floats_in_the_middle_with_the_session_round_it() {
         let screen = |w, h| Rect::new(0, 0, w, h);
-        assert_eq!(panel_area(screen(120, 36)), Some(Rect::new(24, 6, 72, 23)));
-        assert_eq!(panel_area(screen(80, 24)), Some(Rect::new(8, 3, 64, 18)));
-        assert_eq!(panel_area(screen(200, 60)), Some(Rect::new(64, 18, 72, 23)));
-        assert_eq!(panel_area(screen(72, 20)), Some(Rect::new(8, 3, 56, 14)));
+        assert_eq!(panel_area(screen(120, 36)), Some(Rect::new(24, 6, 72, 22)));
+        assert_eq!(panel_area(screen(80, 24)), Some(Rect::new(8, 3, 64, 17)));
+        assert_eq!(panel_area(screen(200, 60)), Some(Rect::new(64, 18, 72, 22)));
+        assert_eq!(panel_area(screen(72, 20)), Some(Rect::new(8, 3, 56, 13)));
         assert_eq!(panel_area(screen(71, 40)), None, "too narrow");
         assert_eq!(panel_area(screen(120, 19)), None, "too short");
     }
@@ -2528,27 +2575,51 @@ mod tests {
             .collect()
     }
 
-    /// A clear column each side and a clear last row; tabs on the second row,
-    /// hints on the row above the last.
+    /// Drawn into its area, the panel is the screen with a column clear
+    /// either side and its last row — the hint row's, full screen — clear:
+    /// the sections on its second row, the selected setting's help on the
+    /// row above the last. The hint row is the full screen's, cell for cell,
+    /// on the screen's last row.
     #[test]
-    fn the_panel_is_the_screen_inside_a_margin() {
+    fn the_panel_is_the_screen_inside_a_margin_and_its_hints_the_screens() {
         let mut panel = Panel::open();
-        let area = Rect::new(8, 3, 64, 18);
+        let screen = Rect::new(0, 0, 80, 24);
+        let area = panel_area(screen).expect("floats on 80x24");
         let buf = panel.draw(area);
         assert_eq!(buf.area, area);
         let rows = rows_of(&buf);
-        assert_eq!(rows.len(), 18);
+        assert_eq!(rows.len(), 17);
         assert!(rows[0].is_empty(), "a clear row over the sections");
         assert!(
             rows[1].contains("keys") && rows[1].contains("effects"),
             "{rows:?}"
         );
-        assert!(rows[16].contains("esc"), "the hints: {rows:?}");
-        assert!(rows[17].is_empty(), "a clear row under them");
+        let help = panel.state.current().expect("a setting").help;
+        let width = usize::from(inside(area).width);
+        assert_eq!(rows[15].trim(), clip(help, width), "its help: {rows:?}");
+        assert!(rows[16].is_empty(), "a clear row under it");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("esc back") || r.contains("↑↓ move")),
+            "{rows:?}"
+        );
         for y in area.y..area.y + area.height {
             assert_eq!(buf[(area.x, y)].symbol(), " ", "the left margin");
             assert_eq!(buf[(area.x + area.width - 1, y)].symbol(), " ", "the right");
         }
+
+        let (_, row) = float::split(screen);
+        let hints = panel.draw_hints(row);
+        let whole = test_support::buffer(80, 24, |f| draw(f, &panel.state));
+        for x in 0..80 {
+            assert_eq!(hints[(x, 23)], whole[(x, 23)], "column {x}");
+        }
+        assert!(
+            rows_of(&hints)[0].contains("esc back"),
+            "{:?}",
+            rows_of(&hints)
+        );
     }
 
     /// Tab moves a section, a release is ignored, and Esc closes.

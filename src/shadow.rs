@@ -21,11 +21,69 @@
 //! - [`Shadow::frame_under`]: the floating settings over the shaded session
 //!   (see `crate::pty::panel`).
 //!
-//! Frames are diffs (only `t` changes), so a whole fade costs about one full
-//! repaint. Runs of empty cells are erased with `EL` or `ECH` under a pen
-//! with no background. Like the attach notice ([`crate::announce`]), every
-//! frame is one synchronized update, places runs absolutely, never writes a
-//! newline or CR (`OPOST` is off), and hides the cursor while writing.
+//! # What a composite paints
+//!
+//! That is what [`Shadow::under`] is for. Given a rectangle nvmux has drawn on
+//! and how far through its dissolve it is, it paints the two together: the
+//! overlay's own glyphs fading out, the session's cells fading back in, each
+//! cell showing whichever of the two is the more visible. The notice then
+//! melts into the editor instead of leaving a hole for a repaint to fill —
+//! and where that repaint never lands, the screen has already been put back.
+//!
+//! # What a frame paints
+//!
+//! [`Shadow::frame`] writes the grid back to the terminal with every cell's
+//! colours moved `t` of the way to the terminal's background — the colours
+//! resolved first, through [`Palette`], so that "the default foreground" is a
+//! real colour the interpolation can start from. A background the editor left
+//! as the terminal's default is left as the default (`49`), never painted
+//! explicitly: the terminal may be transparent, and an opaque slab of the
+//! background colour would pop where the real background did not.
+//!
+//! Frames are diffs. The screen does not change between them, only `t` does,
+//! so a cell whose interpolated colours came out the same as last frame is not
+//! written again — which is every blank cell on a default background, most of
+//! any screen. The whole fade then costs about one full repaint plus the cells
+//! that change colour, and nvmux already emits a full repaint on every resize.
+//!
+//! And a cell that shows nothing — blank, or a space with no background and
+//! no underline — is not written a space at a time where there are many of
+//! them together: a stretch of them is erased, to the row's end with `EL` and
+//! short of it with `ECH`, neither of which moves the cursor, and under a pen
+//! with no background, so that the cells come out the terminal's own
+//! background whether the terminal erases in the pen's or in its own. A few
+//! are written as spaces, and a few the cursor has to cross to reach the next
+//! cell are written over rather than jumped. A row of 200 blank columns was
+//! 200 spaces; it is an `EL`.
+//!
+//! What a frame must get right is the same list as the attach notice's
+//! ([`crate::announce`]): a synchronized-update span around the whole thing,
+//! an absolute cursor position for every run of cells and never a newline or
+//! carriage return (`OPOST` is off), and the cursor hidden while the cells are
+//! written, so it is not seen chasing them across the screen.
+//!
+//! # What a paint paints
+//!
+//! [`Shadow::paint`] is the one painter that is not a fade: the grid as the
+//! session drew it, every cell in the colours and attributes it was given —
+//! indexed colours as indices, the default as the default — with no palette
+//! and nothing interpolated. It is for a kept client coming back to the front
+//! with no fade to bring it (see `pty::Attachment::paint_kept_screen`): the
+//! screen is on the glass at once, and the server's own repaint — asked for
+//! with `:mode`, a few round trips away, or later if the server is busy —
+//! lands on top. The same rules as a frame: one synchronized
+//! update, an absolute placement per row and never a newline, the cursor put
+//! back where the session had it.
+//!
+//! # What a frame under the settings paints
+//!
+//! [`Shadow::frame_under`] is a frame of the session with the settings
+//! floating over it (see `crate::pty::panel`): the panel's own cells where it
+//! stands, as the settings screen drew them, and its hint row's along the
+//! bottom of the screen; and every other cell as the caller says — taken
+//! toward the background through the palette, each cell as far as the
+//! falloff round the panel takes it; drawn faint where there is no palette;
+//! or emptied. A diff, as a fade's frames are, and the same rules as theirs.
 //!
 //! # The cursor
 //!
@@ -182,9 +240,9 @@ pub enum Shade {
     Blank,
 }
 
-/// A rectangle nvmux draws over the session in place of its cells: the
-/// floating settings (see `crate::pty::panel`), from the buffer their screen
-/// drew.
+/// A rectangle nvmux draws over the session in place of what is there: the
+/// settings floating over it, or their hint row along the bottom of it (see
+/// `crate::pty::panel`), as their screen drew them into a buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Laid {
     top: u16,
@@ -779,16 +837,20 @@ impl Shadow {
 }
 
 impl Shadow {
-    /// A frame of the session with `laid` (the floating settings) over it and
-    /// every other cell as `shade` says. Without `laid`, the cells where it
-    /// goes are shaded too, which is how they blank for it to come up on.
+    /// A frame of the session with each of `laid` over it — the settings
+    /// floating over a session, and their hint row along the bottom of it
+    /// (see `crate::pty::panel`) — and every other cell as `shade` says:
+    /// taken toward the background through `palette`, drawn faint, or
+    /// emptied. With none laid the session's cells under where they go are
+    /// shaded too, which is how they empty for them to come up on.
     ///
     /// A diff like [`Shadow::frame`]'s, in full after a [`feed`], [`resize`]
     /// or [`invalidate`] (so after any session output). Always at least the
     /// sync span, cursor hide and trailing SGR reset.
     ///
-    /// A wide character cut by either edge of the rectangle is blanked.
-    /// `Shade::Toward` without a palette is drawn faint.
+    /// A wide character either edge of a rectangle cuts is blanked rather
+    /// than written in half. `Shade::Toward` with no palette is drawn faint:
+    /// there is nothing to take it toward.
     ///
     /// [`feed`]: Shadow::feed
     /// [`resize`]: Shadow::resize
@@ -797,7 +859,7 @@ impl Shadow {
         &mut self,
         shade: &dyn Fn(u16, u16) -> Shade,
         palette: Option<&Palette>,
-        laid: Option<&Laid>,
+        laid: &[Laid],
         cursor: Cursor,
     ) -> Vec<u8> {
         let screen = self.parser.screen();
@@ -822,7 +884,7 @@ impl Shadow {
             let mut wide_before = false;
             for col in 0..cols {
                 let cell = screen.cell(row, col);
-                let drawn = match laid.and_then(|l| l.at(row, col)) {
+                let drawn = match laid.iter().find_map(|l| l.at(row, col)) {
                     Some(inside) => {
                         wide_before = false;
                         inside
@@ -834,7 +896,7 @@ impl Shadow {
                     None => {
                         let wide = cell.is_some_and(vt100::Cell::is_wide);
                         let cut =
-                            wide && (col + 2 > cols || laid.is_some_and(|l| l.holds(row, col + 1)));
+                            wide && (col + 2 > cols || laid.iter().any(|l| l.holds(row, col + 1)));
                         wide_before = wide && !cut;
                         Some(shaded(cell, shade(row, col), palette, cut))
                     }
@@ -2401,7 +2463,12 @@ mod tests {
         let mut shadow = lettered();
         let panel = laid(5, 2, 6, 2, "panel");
         let shade = |row: u16, _col: u16| Shade::Toward(if row == 0 { 0.5 } else { 0.25 });
-        let frame = shadow.frame_under(&shade, Some(&palette()), Some(&panel), Cursor::Hidden);
+        let frame = shadow.frame_under(
+            &shade,
+            Some(&palette()),
+            std::slice::from_ref(&panel),
+            Cursor::Hidden,
+        );
         let cells = screen_of(&frame);
         let shown: String = (6..=11).map(|col| cells[&(3, col)].1.clone()).collect();
         assert_eq!(shown, "panel ");
@@ -2424,6 +2491,45 @@ mod tests {
         assert_eq!(cells[&(3, 12)].1, "l", "the session again past its edge");
     }
 
+    /// The settings' hint row stands along the bottom as the panel stands
+    /// where it is, the two in one frame, and the session between them as
+    /// far toward the background as it is told. Nothing of the session's
+    /// last row shows either side of the hints: the row is the hint row's
+    /// from end to end.
+    #[test]
+    fn the_settings_and_their_hint_row_stand_over_the_session_together() {
+        let mut shadow = lettered();
+        let laid = [laid(5, 1, 6, 2, "panel"), laid(0, 5, 20, 1, "    esc back")];
+        let shade = |_row: u16, _col: u16| Shade::Toward(0.5);
+        let frame = shadow.frame_under(&shade, Some(&palette()), &laid, Cursor::Hidden);
+        let terminal = over_marks(&frame, 6, 20);
+        let (shown, _) = shown_on(&terminal, 1);
+        let panel: String = shown
+            .iter()
+            .filter(|(col, _)| (5..11).contains(col))
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(panel, "panel");
+        let screen = terminal.screen();
+        let last: String = (0..20)
+            .map(|col| match screen.cell(5, col).map(vt100::Cell::contents) {
+                Some(text) if !text.is_empty() => text.to_string(),
+                _ => " ".to_string(),
+            })
+            .collect();
+        assert_eq!(last, "    esc back        ");
+        assert!(
+            shown_on(&terminal, 5).1,
+            "nothing of the session's row either side"
+        );
+        let (between, _) = shown_on(&terminal, 3);
+        assert_eq!(between.len(), 20, "the session between them: {between:?}");
+    }
+
+    /// Emptied cells are the terminal's own background; faint ones keep the
+    /// session's own colours, as indices where it gave indices, and dim only
+    /// their text; and taken toward a background nvmux does not know, a cell
+    /// is drawn faint.
     #[test]
     fn a_cell_is_emptied_or_drawn_faint() {
         let mut shadow = Shadow::new(2, 6);
@@ -2448,9 +2554,9 @@ mod tests {
                 })
             })
         };
-        let blank = shadow.frame_under(&|_, _| Shade::Blank, None, None, Cursor::Hidden);
+        let blank = shadow.frame_under(&|_, _| Shade::Blank, None, &[], Cursor::Hidden);
         assert!(emptied(&blank));
-        let faint = shadow.frame_under(&|_, _| Shade::Faint, None, None, Cursor::Hidden);
+        let faint = shadow.frame_under(&|_, _| Shade::Faint, None, &[], Cursor::Hidden);
         let cells = screen_of(&faint);
         assert_eq!(
             cells[&(1, 1)],
@@ -2464,7 +2570,7 @@ mod tests {
         );
         // The same frame as the last, so a diff would paint nothing.
         shadow.invalidate();
-        let toward = shadow.frame_under(&|_, _| Shade::Toward(0.5), None, None, Cursor::Hidden);
+        let toward = shadow.frame_under(&|_, _| Shade::Toward(0.5), None, &[], Cursor::Hidden);
         assert_eq!(
             screen_of(&toward)[&(1, 2)].0,
             "0;2;31;44",
@@ -2473,7 +2579,7 @@ mod tests {
         let gone = shadow.frame_under(
             &|_, _| Shade::Toward(falloff::EMPTIED),
             Some(&palette()),
-            None,
+            &[],
             Cursor::Hidden,
         );
         assert!(emptied(&gone), "emptied");
@@ -2522,7 +2628,7 @@ mod tests {
         let under = shadow.frame_under(
             &|_, _| Shade::Toward(0.5),
             Some(&palette()),
-            None,
+            &[],
             Cursor::Hidden,
         );
         for frame in [fade, under] {
@@ -2565,7 +2671,7 @@ mod tests {
         let under = shadow.frame_under(
             &|_, _| Shade::Toward(0.25),
             Some(&palette()),
-            Some(&panel),
+            std::slice::from_ref(&panel),
             Cursor::Hidden,
         );
         for frame in [fade, under] {
@@ -2594,11 +2700,11 @@ mod tests {
     fn what_the_settings_were_drawn_against_goes_with_them() {
         let mut shadow = lettered();
         let shade = |_: u16, _: u16| Shade::Toward(0.5);
-        shadow.frame_under(&shade, Some(&palette()), None, Cursor::Hidden);
+        shadow.frame_under(&shade, Some(&palette()), &[], Cursor::Hidden);
         assert!(shadow.under.capacity() > 0);
         shadow.forget_under();
         assert_eq!(shadow.under.capacity(), 0);
-        let again = shadow.frame_under(&shade, Some(&palette()), None, Cursor::Hidden);
+        let again = shadow.frame_under(&shade, Some(&palette()), &[], Cursor::Hidden);
         assert_eq!(screen_of(&again).len(), 6 * 20);
     }
 
@@ -2607,35 +2713,19 @@ mod tests {
         let mut shadow = lettered();
         let shade = |_: u16, _: u16| Shade::Toward(0.5);
         let p = palette();
-        let first = shadow.frame_under(
-            &shade,
-            Some(&p),
-            Some(&laid(5, 2, 6, 2, "one")),
-            Cursor::Hidden,
-        );
+        let first =
+            shadow.frame_under(&shade, Some(&p), &[laid(5, 2, 6, 2, "one")], Cursor::Hidden);
         assert_eq!(screen_of(&first).len(), 6 * 20);
-        let again = shadow.frame_under(
-            &shade,
-            Some(&p),
-            Some(&laid(5, 2, 6, 2, "one")),
-            Cursor::Hidden,
-        );
+        let again =
+            shadow.frame_under(&shade, Some(&p), &[laid(5, 2, 6, 2, "one")], Cursor::Hidden);
         assert!(wrapper_only(&again), "{:?}", text(&again));
-        let changed = shadow.frame_under(
-            &shade,
-            Some(&p),
-            Some(&laid(5, 2, 6, 2, "ono")),
-            Cursor::Hidden,
-        );
+        let changed =
+            shadow.frame_under(&shade, Some(&p), &[laid(5, 2, 6, 2, "ono")], Cursor::Hidden);
         let cells = screen_of(&changed);
         assert_eq!(cells.len(), 1, "the last letter: {cells:?}");
         shadow.feed(b"\x1b[1;1Hz");
-        let after = shadow.frame_under(
-            &shade,
-            Some(&p),
-            Some(&laid(5, 2, 6, 2, "ono")),
-            Cursor::Hidden,
-        );
+        let after =
+            shadow.frame_under(&shade, Some(&p), &[laid(5, 2, 6, 2, "ono")], Cursor::Hidden);
         assert_eq!(screen_of(&after).len(), 6 * 20, "all of it again");
     }
 
@@ -2648,7 +2738,7 @@ mod tests {
         let frame = shadow.frame_under(
             &|_, _| Shade::Toward(0.0),
             Some(&palette()),
-            Some(&panel),
+            std::slice::from_ref(&panel),
             Cursor::Hidden,
         );
         let cells = screen_of(&frame);
@@ -2665,12 +2755,12 @@ mod tests {
     fn a_frame_under_the_settings_can_put_the_cursor_back() {
         let mut shadow = lettered();
         shadow.feed(b"\x1b[4;7H");
-        let hidden = shadow.frame_under(&|_, _| Shade::Blank, None, None, Cursor::Hidden);
+        let hidden = shadow.frame_under(&|_, _| Shade::Blank, None, &[], Cursor::Hidden);
         assert!(!text(&hidden).contains("\x1b[?25h"));
         let back = shadow.frame_under(
             &|_, _| Shade::Toward(0.0),
             Some(&palette()),
-            None,
+            &[],
             Cursor::Restored,
         );
         assert!(
@@ -2703,7 +2793,7 @@ mod tests {
         let frame = shadow.frame_under(
             &|_, _| Shade::Blank,
             None,
-            Some(&Laid::from_buffer(&buf)),
+            &[Laid::from_buffer(&buf)],
             Cursor::Hidden,
         );
         let cells = screen_of(&frame);

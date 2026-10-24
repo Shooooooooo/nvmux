@@ -964,6 +964,10 @@ fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Link) {
         std::thread::spawn(move || {
             for (at, bytes) in rx {
                 std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                // Stamped as the write begins: the other end may have read
+                // it and acted on it before the write returns, and a busy
+                // machine may leave this thread waiting milliseconds after.
+                let written = Instant::now();
                 if to.write_all(&bytes).is_err() {
                     return;
                 }
@@ -971,7 +975,7 @@ fn counted_link(dir: &Path, to: &Path, delay: Duration) -> (PathBuf, Link) {
                     conn,
                     back,
                     read: at - delay,
-                    written: Instant::now(),
+                    written,
                     bytes,
                 });
             }
@@ -1033,6 +1037,7 @@ struct Carried {
     conn: usize,
     /// Session to client.
     back: bool,
+    /// When it was read, and when the link began to write it on.
     read: Instant,
     written: Instant,
     bytes: Vec<u8>,
@@ -1042,6 +1047,14 @@ impl Trace {
     /// Messages passed one way on every connection, in write order, each with
     /// when its last part was read and written.
     fn messages(&self, back: bool) -> Vec<(Instant, Instant, Value)> {
+        self.messages_on(back)
+            .into_iter()
+            .map(|(_, read, written, v)| (read, written, v))
+            .collect()
+    }
+
+    /// [`Trace::messages`], each with the connection that carried it.
+    fn messages_on(&self, back: bool) -> Vec<(usize, Instant, Instant, Value)> {
         let carried = self.carried.lock().expect("the trace");
         let mut pending: std::collections::HashMap<usize, Vec<u8>> = Default::default();
         let mut out = Vec::new();
@@ -1054,7 +1067,7 @@ impl Trace {
                 match rmpv::decode::read_value(&mut tried) {
                     Ok(value) => {
                         rest = tried;
-                        out.push((c.read, c.written, value));
+                        out.push((c.conn, c.read, c.written, value));
                     }
                     // Incomplete: wait for the next read.
                     Err(_) => break,
@@ -1112,8 +1125,93 @@ impl Trace {
             .collect()
     }
 
-    /// Keys the client sent, counted as Neovim's notation does: a character,
-    /// or a name in `<…>`.
+    /// The agent's acks the frame that draws them did not follow, as Neovim
+    /// sent them: each with its count and the view's top it says, and the
+    /// top in the first frame after it — none where another ack came first.
+    /// An ack whose view the last frame already showed needs no frame of its
+    /// own: Neovim flushes none where nothing changed, and the client takes
+    /// such an ack at once (see `App::shows`).
+    fn acks_without_their_frames(&self) -> Vec<(u64, u64, Option<u64>)> {
+        let (mut top, mut drawn) = (None, None);
+        let mut waiting: Option<(u64, u64)> = None;
+        let mut unframed = Vec::new();
+        for (_, _, v) in self.messages(true) {
+            match notification(&v) {
+                Some(("nvmux_client", [kind, rest @ ..])) if kind.as_str() == Some("ack") => {
+                    if let Some((count, said)) = waiting.take() {
+                        unframed.push((count, said, None));
+                    }
+                    let field = |i: usize| rest.get(i).and_then(Value::as_u64);
+                    waiting = field(0)
+                        .zip(field(10))
+                        .filter(|&(_, said)| drawn != Some(said));
+                }
+                Some(("redraw", events)) => {
+                    for event in events.iter().filter_map(Value::as_array) {
+                        match event.first().and_then(Value::as_str) {
+                            Some("win_viewport") => {
+                                for args in event[1..].iter().filter_map(Value::as_array) {
+                                    top = args.get(2).and_then(Value::as_u64).or(top);
+                                }
+                            }
+                            Some("flush") => {
+                                drawn = top;
+                                if let Some((count, said)) = waiting.take() {
+                                    if top != Some(said) {
+                                        unframed.push((count, said, top));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        unframed
+    }
+
+    /// The last word of the agent's that Neovim is still at work on the keys
+    /// typed (`behind`), by when the link began writing it on; and the round
+    /// trips the client had timed how long to wait on Neovim by when it came,
+    /// in order — its first request, and the ones it asks after the round
+    /// trip with since (see `App::start`, `App::tick`) — each from when the
+    /// link read the request to when it began writing the answer.
+    fn last_behind(&self) -> Option<(Instant, Vec<Duration>)> {
+        const TIMED: [&str; 2] = ["nvim_get_api_info", "nvim_parse_expression"];
+        let asked: std::collections::HashMap<(usize, u64), Instant> = self
+            .messages_on(false)
+            .into_iter()
+            .filter_map(|(conn, read, _, v)| match v.as_array()?.as_slice() {
+                [kind, id, method, ..]
+                    if kind.as_u64() == Some(0) && TIMED.contains(&method.as_str()?) =>
+                {
+                    Some(((conn, id.as_u64()?), read))
+                }
+                _ => None,
+            })
+            .collect();
+        let (mut timed, mut last) = (Vec::new(), None);
+        for (conn, _, written, v) in self.messages_on(true) {
+            if notification(&v).is_some_and(|(method, args)| {
+                method == "nvmux_client" && args.first().and_then(Value::as_str) == Some("behind")
+            }) {
+                last = Some((written, timed.clone()));
+            }
+            let answered = match v.as_array().map(Vec::as_slice) {
+                Some([kind, id, ..]) if kind.as_u64() == Some(1) => id.as_u64(),
+                _ => None,
+            };
+            if let Some(at) = answered.and_then(|id| asked.get(&(conn, id))) {
+                timed.push(written.saturating_duration_since(*at));
+            }
+        }
+        last
+    }
+
+    /// How many keys the client has sent the session, as Neovim's notation
+    /// counts them: a character, or a name in `<…>`.
     fn inputs(&self) -> usize {
         self.messages(false)
             .iter()
@@ -2060,20 +2158,57 @@ fn a_page_neovim_does_not_turn_is_given_up_in_time() {
         "not back by that page alone, Neovim at {w0:?} once caught up at {caught:?}: {when:?}"
     );
     assert_eq!(w0, Ok(Some(541)), "Neovim went elsewhere");
-    // After Neovim's frame (a link delay after it caught up), and within
-    // twice the wait of a page typed then (two round trips, 250 ms and a lost
-    // segment, roughly), for a busy machine.
+    // No sooner than Neovim's frame, a way of the link after it caught up;
+    // and as long after it last said it was still at work on them as a page
+    // typed then would wait, by the round trips the client had timed by
+    // then — which on a busy machine are longer than the link's, Neovim
+    // answering late — give or take a quarter of that and a way of the
+    // link, for a client held up.
     let at = seen.last().map(|&(_, at)| at).expect("seen");
-    let wait = 4 * SLOW + Duration::from_millis(450);
+    let (since, timed) = link
+        .trace
+        .last_behind()
+        .expect("Neovim behind on the pages");
+    // The round trip asked after with the first page is the link's: Neovim
+    // answers what it is asked with as it reads it, still at work on the
+    // pages — not once it has taken them all, which would time those too.
     assert!(
-        at > caught_up + SLOW && at < caught_up + SLOW + 2 * wait,
-        "given up on {:?} after Neovim caught up at {caught:?}: {when:?}",
-        at.saturating_duration_since(caught_up)
+        timed.len() >= 2,
+        "the round trip asked after with the first page not answered before Neovim last said \
+         it was behind: {timed:?}"
+    );
+    let wait = patience(&timed);
+    assert!(
+        at > caught_up + SLOW && at < since + wait * 5 / 4 + SLOW,
+        "given up on {:?} after Neovim caught up at {caught:?}, and {:?} after it last said \
+         it was behind, the client waiting {wait:?} by the round trips it timed, {timed:?}: \
+         {when:?}",
+        at.saturating_duration_since(caught_up),
+        at.saturating_duration_since(since)
     );
 }
 
-/// With motions predicted, the client goes by the agent's acks; pages must
-/// still be drawn before Neovim could have the keys.
+/// How long the client waits on Neovim for a scroll it made, not told the
+/// motions, by the round trips it timed (see `Predictor::deadline`): two,
+/// smoothed, a quarter of a second or four times how much they vary, if
+/// that is longer, and a segment lost on the way.
+fn patience(round_trips: &[Duration]) -> Duration {
+    let (srtt, rttvar) = round_trips
+        .iter()
+        .fold(None, |was: Option<(Duration, Duration)>, &r| {
+            Some(match was {
+                Some((s, v)) => ((s * 7 + r) / 8, (v * 3 + s.abs_diff(r)) / 4),
+                None => (r, r / 2),
+            })
+        })
+        .unwrap_or_default();
+    srtt * 2 + Duration::from_millis(250).max(rttvar * 4) + Duration::from_millis(200)
+}
+
+/// Pages typed faster than a slow link answers, by a client told to work
+/// out the motions as well, which goes by what the agent says Neovim made
+/// of each key: each is still on the screen before Neovim could have heard
+/// of it.
 #[test]
 fn pages_typed_faster_than_the_link_answers_keep_up_told_the_motions() {
     require_nvim!();
@@ -2095,23 +2230,54 @@ fn pages_typed_faster_than_the_link_answers_keep_up_told_the_motions() {
     }
 }
 
-/// [`a_page_neovim_does_not_turn_is_given_up_in_time`] with motions
-/// predicted: acks arrive with the frames, so the page is given up at the
-/// first frame that should have turned it (not 2+ round trips later), the
-/// view going back by that page alone and redoing the rest to where Neovim
-/// ends.
+/// The page Neovim does not turn of [`a_page_neovim_does_not_turn_is_given_up_in_time`],
+/// typed to a client told to work out the motions as well: the agent says
+/// which keys Neovim has taken with the frame that draws them, and the
+/// page is given up on with the first frame that should have turned it and
+/// did not — not two round trips and more after — the view back by that
+/// page alone, and the pages after it made again from there, on to where
+/// Neovim ends.
+///
+/// Neovim taking each page in 30 ms, slower than they come: past the first
+/// page it takes them all before it goes to wait for a key again, and the
+/// first ack to cover the fifth is its last.
 #[test]
 fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
+    given_up_at_its_ack("client-unturn-ack", Duration::from_millis(30));
+}
+
+/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`], Neovim taking
+/// each page in 20 ms: at that pace the key it throws away, which costs it
+/// no scroll, is the last it has to hand, and it goes to wait for the next
+/// straight after — so the agent says what it made of the keys part way
+/// through, the first word on the fifth page, with the next key come in
+/// already. Neovim goes on to that without waiting, and so without
+/// flushing the frame that draws the keys the word is on: the agent
+/// flushes it. Without that, the word was taken with the next frame Neovim
+/// flushed, one for keys after it, in which the page Neovim did not turn
+/// looked turned — a later page made up its rows — and the page was given
+/// up on only once Neovim had caught up, as macOS runners saw at 30 ms.
+/// Where the pace or a slower machine has the first word on the fifth page
+/// be the last, each word still has to come with its frame.
+#[test]
+fn a_page_neovim_does_not_turn_is_given_up_at_an_ack_part_way_through() {
+    given_up_at_its_ack("client-unturn-mid", Duration::from_millis(20));
+}
+
+/// Pages typed every 10 ms, the fifth of which Neovim throws away, to a
+/// session whose Neovim takes `scroll` over each: see
+/// [`a_page_neovim_does_not_turn_is_given_up_at_its_ack`]. And every ack
+/// the agent said came with the frame that draws it.
+fn given_up_at_its_ack(tag: &str, scroll: Duration) {
     require_nvim!();
-    let scratch = Scratch::new("client-unturn-ack");
-    const SCROLL: Duration = Duration::from_millis(30);
+    let scratch = Scratch::new(tag);
     let (mut rpc, mut term, link) = drawn_slowly_with(
         &scratch,
-        "client-unturn-ack",
+        tag,
         &format!(
             "call setline(1, map(range(1, 2000), '\"line \" . v:val')) | \
              autocmd WinScrolled * lua vim.uv.sleep({})",
-            SCROLL.as_millis()
+            scroll.as_millis()
         ),
         MOTIONS,
     );
@@ -2158,6 +2324,14 @@ fn a_page_neovim_does_not_turn_is_given_up_at_its_ack() {
         w0(&mut rpc)
     );
     watch(&mut term, Instant::now() + 6 * SLOW);
+    // Each ack followed by the frame that draws what it says, before any
+    // ack after it: where Neovim goes on to a key that has come in without
+    // waiting for it, and so without flushing, the agent flushes that frame.
+    let unframed = link.trace.acks_without_their_frames();
+    assert!(
+        unframed.is_empty(),
+        "acks not followed by their frames, as (count, top, the next frame's top): {unframed:?}"
+    );
     let when: Vec<(u32, Duration)> = seen.iter().map(|&(top, at)| (top, at - t0)).collect();
     let tops: Vec<u32> = seen.iter().map(|&(top, _)| top).collect();
     let back: Vec<usize> = (1..seen.len()).filter(|&i| tops[i] < tops[i - 1]).collect();

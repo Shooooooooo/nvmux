@@ -597,9 +597,18 @@ pub struct StyleSettings {
     /// Never applied to Neovim's screen or the first-run screen (shown before
     /// the config is read). `NO_COLOR` overrides it.
     pub color: ThemeColor,
-    /// Whether the picker (`<prefix> Space`), settings (`<prefix> ,`) and
-    /// help (`<prefix> ?`) float in a centred panel over the dimmed, live
-    /// session (see `crate::pty::panel`). Default on.
+    /// Whether the picker (`<prefix> Space`), the settings (`<prefix> ,`)
+    /// and the help (`<prefix> ?`) float over the session they are brought
+    /// up from, in a panel in the middle of it, the session going on behind
+    /// them dimmed (see `crate::pty::panel`) — all of each but its hint row,
+    /// which is along the bottom of the screen either way.
+    ///
+    /// On, the default. Off, each takes the whole terminal, the session
+    /// dissolving out under it and back in after, as the picker always did.
+    /// The picker's own `?` and `,` follow the picker: over the session in
+    /// its place where it floats, and on the terminal it has where it does
+    /// not. On a terminal too small for a panel and some of the session round
+    /// it, one that would float takes the terminal too.
     ///
     /// Off, each takes the whole terminal, the session dissolving out and
     /// back. The picker's `?` and `,` follow the picker. A terminal too small

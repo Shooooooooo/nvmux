@@ -1,8 +1,16 @@
 //! The key-binding help, shown by `?` on the picker and `<prefix> ?` in a
 //! session.
 //!
-//! Over a session it floats in a [`Panel`] (see `crate::pty::panel`) unless
-//! `[style] float` is off or there is no room ([`Floating::area`]).
+//! From the picker full screen it takes the terminal, as the settings do. From
+//! a session, or the picker floating over one, it floats over the session
+//! instead, as the settings do too: in a panel the relay draws and gives its
+//! keys to ([`Panel`], and see `crate::pty::panel`), the session going on
+//! behind it, dimmed. The panel is the table's size, the table being one that
+//! does not scroll, and the hint row stays where it is full screen, along the
+//! bottom of the screen. With `[style] float` off, or on a terminal with no
+//! room for the panel and some of the session round it ([`Floating::area`]),
+//! the help is full screen, as from the picker, handing the same client back
+//! afterwards.
 //!
 //! Command rows come from the [`Keymap`] [`keys::Prefix::feed`] runs on, so
 //! the screen cannot list a key that does nothing; a test pins the other
@@ -121,8 +129,11 @@ fn draw(frame: &mut Frame, rows: &[Row]) {
     draw_on(frame.buffer_mut(), area, rows);
 }
 
-/// Draw on `area` (the terminal, or the panel's inside) in the usual screen
-/// layout (see [`draw::screen`]).
+/// The help drawn on `area` of `buf`, as every screen is laid out (see
+/// [`draw::screen`]): the table in the middle of all but the last row, and
+/// the hint row on that. The whole terminal, or the inside of the panel
+/// floating over a session, which takes all of it but the hint row (see
+/// [`float::lay`]).
 fn draw_on(buf: &mut Buffer, area: Rect, rows: &[Row]) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -163,8 +174,11 @@ fn draw_table(buf: &mut Buffer, rows: &[Row], area: Rect) {
     Paragraph::new(lines).render(block, buf);
 }
 
-/// The help floating over a session, sized to the table plus padding, hint
-/// row and margin ([`float::inside`]).
+/// The help floating over a session (see `crate::pty::panel`): the same
+/// table and the same keys closing it, in a panel the table's size — with a
+/// column of room either side of it and a row over and under it, and the
+/// panel's own margins ([`float::inside`]) — rather than the whole terminal,
+/// and the same hint row along the bottom of the screen.
 #[derive(Debug)]
 pub struct Panel {
     rows: Vec<Row>,
@@ -180,21 +194,24 @@ impl Panel {
 
     fn size(&self) -> (u16, u16) {
         let (width, height) = table_size(&self.rows);
-        (width + 4, height + 4)
+        (width + 4, height + 3)
     }
 }
 
 impl Floating for Panel {
-    /// `None` (full screen) without [`SESSION_COLS`] and [`SESSION_ROWS`] of
-    /// session around it.
+    /// In the middle of the room above the hint row, the panel's size, where
+    /// that leaves [`SESSION_COLS`] either side and [`SESSION_ROWS`] above and
+    /// below; nowhere on a screen that does not, which has the help full
+    /// screen.
     fn area(&self, screen: Rect) -> Option<Rect> {
+        let (room, _) = float::split(screen);
         let (width, height) = self.size();
-        if screen.width < width + 2 * SESSION_COLS || screen.height < height + 2 * SESSION_ROWS {
+        if room.width < width + 2 * SESSION_COLS || room.height < height + 2 * SESSION_ROWS {
             return None;
         }
         Some(Rect::new(
-            screen.x + (screen.width - width) / 2,
-            screen.y + (screen.height - height) / 2,
+            room.x + (room.width - width) / 2,
+            room.y + (room.height - height) / 2,
             width,
             height,
         ))
@@ -209,7 +226,8 @@ impl Floating for Panel {
         }
     }
 
-    /// Nothing to click. A press outside closes it, which the relay handles.
+    /// Nothing on it to point at. A press on the session takes it down, which
+    /// is the relay's to see.
     fn on_mouse(&mut self, _mouse: MouseEvent, _now: Instant) -> Did {
         Did::Stay
     }
@@ -226,9 +244,22 @@ impl Floating for Panel {
         false
     }
 
+    /// The help drawn into `area`, in the theme's colour where it has one:
+    /// as on a terminal of the panel's inside, all but its hint row.
     fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
-        draw_on(&mut buf, float::inside(area), &self.rows);
+        let inside = float::inside(area);
+        let mut drawn = Buffer::empty(inside);
+        draw_on(&mut drawn, inside, &self.rows);
+        float::lay(&mut buf, inside, &drawn);
+        crate::theme::paint(&mut buf);
+        buf
+    }
+
+    /// The help's hint row drawn into `row`, as full screen.
+    fn draw_hints(&self, row: Rect) -> Buffer {
+        let mut buf = Buffer::empty(row);
+        draw::hint_row_on(&mut buf, row, HINTS, true);
         crate::theme::paint(&mut buf);
         buf
     }
@@ -539,30 +570,42 @@ mod tests {
             .collect()
     }
 
+    /// Floating, the help is the table's size and a little — a column of
+    /// room and the panel's margin either side, a row over and under the
+    /// table, and the panel's last — in the middle of the room above the
+    /// hint row, wherever that leaves some of the session round it; and
+    /// nowhere it does not.
     #[test]
     fn the_panel_is_the_tables_size_in_the_middle() {
         let panel = panel();
         let (w, h) = table_size(&panel.rows);
-        let (pw, ph) = (w + 4, h + 4);
+        let (pw, ph) = (w + 4, h + 3);
         let screen = |cols, rows| Rect::new(0, 0, cols, rows);
         assert_eq!(
             panel.area(screen(120, 36)),
-            Some(Rect::new((120 - pw) / 2, (36 - ph) / 2, pw, ph))
+            Some(Rect::new((120 - pw) / 2, (35 - ph) / 2, pw, ph))
         );
         let on_80 = panel.area(screen(80, 24)).expect("floats on 80x24");
         assert!(on_80.x >= SESSION_COLS && on_80.right() <= 80 - SESSION_COLS);
-        assert!(on_80.y >= SESSION_ROWS && on_80.bottom() <= 24 - SESSION_ROWS);
-        let fits = (pw + 2 * SESSION_COLS, ph + 2 * SESSION_ROWS);
+        assert!(
+            on_80.y >= SESSION_ROWS && on_80.bottom() <= 23 - SESSION_ROWS,
+            "a row of the session over the hint row: {on_80:?}"
+        );
+        let fits = (pw + 2 * SESSION_COLS, ph + 2 * SESSION_ROWS + 1);
         assert!(panel.area(screen(fits.0, fits.1)).is_some(), "just fits");
         assert_eq!(panel.area(screen(fits.0 - 1, 40)), None, "too narrow");
         assert_eq!(panel.area(screen(200, fits.1 - 1)), None, "too short");
     }
 
-    /// The help does not scroll, so no row may be cut.
+    /// Drawn into its area, every row is there whole — the help does not
+    /// scroll, so none may be cut — with a clear row over and under the
+    /// table, the last row clear, and a clear column either side; and the
+    /// hint row is the full screen's, cell for cell, on the screen's last row.
     #[test]
-    fn the_panel_draws_every_row_whole_and_its_hint() {
+    fn the_panel_draws_every_row_whole_and_its_hint_row_is_the_screens() {
         let mut panel = panel();
-        let area = panel.area(Rect::new(0, 0, 80, 24)).expect("floats");
+        let screen = Rect::new(0, 0, 80, 24);
+        let area = panel.area(screen).expect("floats");
         let buf = panel.draw(area);
         assert_eq!(buf.area, area);
         let lines = rows_of(&buf);
@@ -572,13 +615,22 @@ mod tests {
             let line = line_for(&lines, row);
             assert!(line.contains(&row.what), "{row:?} cut: {line:?}");
         }
-        assert!(lines[last - 2].trim().is_empty(), "a clear row under it");
-        assert_eq!(lines[last - 1].trim(), HINTS);
+        assert!(lines[last - 1].trim().is_empty(), "a clear row under it");
         assert!(lines[last].trim().is_empty(), "the last row clear");
+        assert!(!lines.iter().any(|l| l.contains(HINTS)), "{lines:#?}");
         for y in area.y..area.y + area.height {
             assert_eq!(buf[(area.x, y)].symbol(), " ", "the left margin");
             assert_eq!(buf[(area.right() - 1, y)].symbol(), " ", "the right");
         }
+
+        let (_, row) = float::split(screen);
+        let hints = panel.draw_hints(row);
+        let rows = rows(PREFIX_LABEL);
+        let whole = test_support::buffer(80, 24, |f| draw(f, &rows));
+        for x in 0..80 {
+            assert_eq!(hints[(x, 23)], whole[(x, 23)], "column {x}");
+        }
+        assert_eq!(rows_of(&hints)[0].trim(), HINTS);
     }
 
     #[test]
