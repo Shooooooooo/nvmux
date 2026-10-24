@@ -4511,14 +4511,6 @@ impl App {
             .and_then(|s| s.echo.clone());
         let redrawn = self.redrawn_with(grid, (view.curline, to));
         let ids = predict::Gutter::of(|name| self.model.groups.get(name).copied());
-        // What the rows drawn afresh are drawn with, once for them all.
-        let afresh = self
-            .afresh(grid)
-            .then(|| {
-                let shape = self.predict.as_ref()?.shape(win)?;
-                self.look(grid, rect, &view, shape).zip(ids)
-            })
-            .flatten();
         let p = self.predict.as_ref()?;
         let shape = p.shape(win)?;
         let textoff = shape.textoff;
@@ -4527,6 +4519,12 @@ impl App {
         let bars = redrawn && cul.is_some_and(|c| c.line && !c.screenline);
         let decided = redrawn && (shape.relativenumber || cul.is_some_and(|c| c.number || c.line));
         let ahead = self.anim.rows_shown(grid);
+        // What the rows drawn afresh are drawn with, once for them all: where
+        // there can be any, rows shown ahead of Neovim's view, in a window
+        // where the cursor's line decides any of them.
+        let afresh = (decided && ahead != 0 && self.afresh(grid))
+            .then(|| self.look(grid, rect, &view, shape).zip(ids))
+            .flatten();
         let mut patches: BTreeMap<usize, Vec<compose::Patch>> = BTreeMap::new();
         for r in 0..h {
             let i = r as i64 + ahead;
@@ -5101,7 +5099,13 @@ impl App {
         shape: &predict::Shape,
     ) -> Option<predict::Look> {
         let (top, bot, left, right) = rect;
-        let rows = self.model.grids.get(&grid)?.lines(top, bot, left, right);
+        let g = self.model.grids.get(&grid)?;
+        let rows: Vec<&[Cell]> = (top..bot.min(g.height()))
+            .map(|r| {
+                let row = g.row(r);
+                &row[left.min(row.len())..right.min(row.len())]
+            })
+            .collect();
         let cursor_row = (self.model.cursor.grid == grid)
             .then(|| self.model.cursor.row.checked_sub(top))
             .flatten();

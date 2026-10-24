@@ -847,25 +847,25 @@ impl Look {
     /// draws itself, `hl_group_set`'s, if it has said: `EndOfBuffer`, for a
     /// window that shows no row past the end, and `NonText`, `SpecialKey`
     /// and `Whitespace` for what is drawn in them.
-    pub fn of(
-        rows: &[Vec<Cell>],
+    pub fn of<R: AsRef<[Cell]>>(
+        rows: &[R],
         lines: usize,
         textoff: usize,
         skip: Option<usize>,
         group: impl Fn(&str) -> Option<u32>,
     ) -> Self {
-        let text_rows: Vec<&Vec<Cell>> = rows
+        let text_rows: Vec<&[Cell]> = rows
             .iter()
             .take(lines)
             .enumerate()
             .filter(|(r, _)| Some(*r) != skip)
-            .map(|(_, row)| row)
+            .map(|(_, row)| row.as_ref())
             .collect();
         let gutter = (0..textoff)
             .map(|c| most(text_rows.iter().filter_map(|row| row.get(c).map(|x| x.hl))))
             .collect();
         let text = most(text_rows.iter().filter_map(|row| row.last().map(|x| x.hl)));
-        let eob = rows.get(lines).cloned();
+        let eob = rows.get(lines).map(|row| row.as_ref().to_vec());
         let eob_hl = eob
             .as_ref()
             .and_then(|row| row.first())
