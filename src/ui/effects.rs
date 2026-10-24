@@ -1,60 +1,24 @@
-//! The picker's passing effects: the afterglow the cursor leaves behind (and a
-//! session in flight leaves on the rows it crosses, see [`super::swap`], and
-//! the settings' bar on the row it leaves, see [`super::settings`]), the
-//! rows a filter keystroke drops fading out where they stood, the line struck
-//! through a name a `[y/N]` is asking about, and the row `c` stands in the gap
-//! it opens, coming up out of the background.
+//! The picker's transient effects, painted over a frame [`super::draw`] has
+//! drawn (like [`crate::fade::apply`], so drawing itself stays colourless):
+//! the afterglow on the row the cursor left (also on rows a session in flight
+//! crosses, [`super::swap`], and in [`super::settings`]), rows a filter drops
+//! fading in place, a line struck through the name a `[y/N]` asks about, and
+//! the row in the gap `c` opens rising out of the background. Progress lives
+//! in [`App`]; positions come from [`draw::row_rect`].
 //!
-//! All four are a post-pass over a frame [`super::draw`] has already drawn,
-//! the way [`crate::fade::apply`] is, and for the same reason: the screen's own
-//! drawing stays colourless, and its tests keep saying so. What is passing —
-//! which rows, and how far through — is [`App`]'s, moved on by the caller's
-//! clock like the trail is; where those rows are on screen is the renderer's,
-//! asked through [`draw::row_rect`] so the pass lands on the row the eye sees.
+//! With the terminal's palette ([`crate::palette::query`]) and no `NO_COLOR`
+//! they fade between real colours, the strike warming the bar toward the
+//! terminal's red. Otherwise they fall back to modifiers: the glow is reversed
+//! and dim for its first third, a dropped row and the gap row are dim, and the
+//! strike is the crossed-out line alone.
 //!
-//! # Colour where the terminal said, modifiers where it did not
+//! Under a theme ([`crate::theme`]) the frame arrives coloured; effects fade
+//! each cell to the colour it is drawn in ([`crate::fade::drawn_in`]) and draw
+//! their own marks in the ink.
 //!
-//! A real fade needs real colours at both ends, so with the terminal's answer
-//! to [`crate::palette::query`] and no `NO_COLOR`, all four paint in colour:
-//!
-//! - the afterglow runs from the selection's look — the foreground as the
-//!   background, the background as the foreground — back to the plain row;
-//! - a dropped row's text runs from most of the way to all of the way into
-//!   the background, so it is plainly leaving from its first frame;
-//! - the bar of a row a `[y/N]` is asking about warms towards the terminal's
-//!   own red as the line goes through its name;
-//! - the row in the gap comes up out of the background to the dim it is
-//!   drawn in.
-//!
-//! Without them, each falls back to a modifier, which sets no colour: the
-//! afterglow holds the bar, reversed and dim, for the first third of its time
-//! and then lets it go; a dropped row is dim until it goes; the struck row is
-//! the line alone, which is a modifier to begin with; the row in the gap is
-//! there, dim, from the first frame.
-//! Coarser, and correct under `NO_COLOR` by construction, as everything else
-//! here is.
-//!
-//! Under a theme ([`crate::theme`]) the frame comes here with the theme's
-//! colour already on it, on everything drawn at full strength, and each effect
-//! takes a cell from the colour it is drawn in ([`crate::fade::drawn_in`]): a
-//! name back to the ink, a dim number back to the terminal's own foreground.
-//! What an effect draws of its own — the bar a row lets go of, a ring — is the
-//! ink, as the selection's bar is. The one colour that is not the ink is the
-//! warning: the struck row's bar warms from the ink towards the terminal's own
-//! red, as it warms from the terminal's foreground with no theme.
-//!
-//! The underline on a filter's matched letters is not here, and is not an
-//! effect: it is still, a modifier, and says why a row is still on screen, so
-//! [`super::draw`] draws it whatever `[effects]` says.
-//!
-//! # The rings, kept for later
-//!
-//! [`rings`] draws a [`super::sonar`] going out from a row, and nothing calls
-//! it at the moment. It marked the session you came back to the picker from
-//! until a still mark on that row took the job over (see [`super::draw`]),
-//! and is kept, tested, for another use. With a palette each
-//! ring fades into the background as it spreads; without one, a ring is dim
-//! once it is halfway out.
+//! The filter's match underline is static and drawn by [`super::draw`] even
+//! with `[effects]` off. [`rings`] ([`super::sonar`]) is unused but kept,
+//! tested, for later.
 
 use std::time::Duration;
 
@@ -69,88 +33,70 @@ use super::sonar::{self, Sonar};
 use crate::fade::drawn_in;
 use crate::palette::{Palette, Rgb};
 
-/// How long a row a filter keystroke dropped takes to fade before the list
-/// closes up. Short: the row has already been ruled out, and every
-/// millisecond of this is a millisecond the list is longer than the query
-/// says. Long enough to see which rows went, which is all it is for.
+/// Fade time for rows a filter keystroke drops, before the list closes up.
+/// Short: meanwhile the list is longer than the query says.
 pub const SIFT: Duration = Duration::from_millis(120);
 
-/// How long the row `c` stands in the gap it opens takes to come up out of the
-/// background (see [`App::make_room`]). Long enough to read the name and
-/// the number on it before the picker closes onto it; it is waited on before
-/// the prompt every time, so no longer than that.
+/// Time for the gap row `c` opens to rise from the background (see
+/// [`App::make_room`]). Waited on before every create prompt, so kept short.
 pub const ROOM: Duration = Duration::from_millis(130);
 
-/// How long the gap stays up, all told, when there is no fade to close the
-/// picker onto it: the row is there at once, dim, and this is how long it is
-/// shown before the prompt cuts in. A little longer than [`ROOM`], which the
-/// close would otherwise have followed.
+/// How long the gap is shown before the prompt when fades are off (the row is
+/// dim at once); a little longer than [`ROOM`].
 pub const ROOM_HELD: Duration = Duration::from_millis(200);
 
-/// How long the row the cursor leaves glows. Only that row glows: a quick
-/// `j j j`, or a held key, moves the glow along with the cursor rather than
-/// leaving a tail. Short enough that one key's glow is gone before the next is
-/// pressed at an ordinary pace. Fixed, where the fade's length is
-/// configurable: the fade is waited on at every switch, and this holds nothing
-/// up.
+/// Glow time for the row the cursor left. Only that row glows, so a held key
+/// moves the glow instead of leaving a tail. Fixed, unlike the fade's length,
+/// since nothing waits on it.
 pub const AFTERGLOW: Duration = Duration::from_millis(100);
 
-/// How long the line takes to go all the way through a name a `[y/N]` is
-/// asking about, and to come back off it when the answer is no. Quick: the
-/// question is already on the hint row, and this only says which row it
-/// means.
+/// Time for the strike line to cross a name, or to retract on a no.
 pub const STRIKE: Duration = Duration::from_millis(180);
 
-/// How much of the way towards the terminal's red the struck row's bar goes
-/// once the line is all the way across. Most of the way to the bar's own
-/// colour is kept, so the row still reads as the selection, warned about.
+/// Fraction of the way to red the struck bar goes, so the row still reads as
+/// the selection.
 const STRIKE_WARMTH: f32 = 0.55;
 
-/// The terminal's own red, among the sixteen [`Palette::ansi`].
+/// Red's index in [`Palette::ansi`].
 const RED: usize = 1;
 
-/// How far into the background a ring's colour has gone by the end of its
-/// life. Not all the way: by then it is a single dot, and fading that to
-/// nothing as well reads as it vanishing early.
+/// A ring's fade toward the background at the end of its life. Not 1: its
+/// final dot would seem to vanish early.
 const RING_FADE: f32 = 0.85;
 
-/// How much further into the background a ring's arcs are than its edge, so
-/// the ring is heaviest level with the row it leaves.
+/// Extra fade of a ring's arcs over its edge, so it is heaviest level with the
+/// row.
 const ARC_FAINTER: f32 = 0.25;
 
-/// Past this part of its life a ring is dim, without a palette.
+/// Life fraction past which a ring is dim, without a palette.
 const RING_FAR: f32 = 0.45;
 
-/// The part of the afterglow the modifier fallback holds the bar for.
+/// Fraction of the afterglow the modifier fallback holds the bar for.
 const FALLBACK_HOLD: f32 = 1.0 / 3.0;
 
-/// How far into the background a dropped row starts. Not zero: the row should
-/// read as leaving on the very frame the keystroke lands.
+/// A dropped row's starting fade; nonzero so it reads as leaving on the first
+/// frame.
 const SIFT_FROM: f32 = 0.3;
 
-/// What the effects paint with, when they paint in colour: the terminal's
-/// colours, and the theme's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Colours {
-    /// The terminal's own: the background every effect fades into, and the
-    /// foreground a cell with no colour of its own is drawn in — every cell
-    /// with no theme, and the dim ones with one.
+    /// The terminal's: the background effects fade into, and the foreground of
+    /// uncoloured cells (all cells with no theme, dim ones with one).
     pub palette: Palette,
     /// The theme's ink, or `None` for no theme (see [`crate::theme`]).
     pub theme: Option<Rgb>,
 }
 
 impl Colours {
-    /// What the screens' text at full strength is drawn in, and so the
-    /// selection's bar, and whatever an effect draws of its own: the theme's
-    /// ink, or the terminal's foreground.
+    /// Colour of full-strength text, the selection bar and effects' own marks:
+    /// the theme's ink, else the terminal's foreground.
     fn ink(&self) -> Rgb {
         self.theme.unwrap_or(self.palette.fg)
     }
 }
 
-/// What the effects paint with, or `None` to fall back to modifiers: none when
-/// `NO_COLOR` is set or the terminal did not say what its colours are.
+/// `None` (use modifiers) under `NO_COLOR` or when the terminal did not report
+/// its colours.
 pub fn colours() -> Option<Colours> {
     if std::env::var_os("NO_COLOR").is_some() {
         return None;
@@ -161,9 +107,8 @@ pub fn colours() -> Option<Colours> {
     })
 }
 
-/// Whether the config wants an effect that paints in colour, so the terminal
-/// should be asked what its colours are even with the fade switched off.
-/// `NO_COLOR` answers no for all of them, as it does for the fade.
+/// Whether an enabled effect paints in colour, so the palette must be queried
+/// even with the fade off. False under `NO_COLOR`.
 pub fn want_palette() -> bool {
     let effects = crate::config::get().effects;
     let wanted = effects.cursor_enabled()
@@ -174,8 +119,8 @@ pub fn want_palette() -> bool {
     wanted && std::env::var_os("NO_COLOR").is_none()
 }
 
-/// Paint whatever is passing over the frame `draw::draw` has just drawn — and,
-/// under a theme, [`crate::theme::paint`] has just coloured.
+/// Paint current effects over a frame from `draw::draw` (and, under a theme,
+/// [`crate::theme::paint`]).
 pub fn paint(frame: &mut Frame, app: &App, colours: Option<&Colours>) {
     let area = frame.area();
     let buf = frame.buffer_mut();
@@ -189,8 +134,7 @@ pub fn paint(frame: &mut Frame, app: &App, colours: Option<&Colours>) {
         }
     }
 
-    // The rows a session in flight crossed, letting its bar go: the same glow,
-    // left by a move rather than by the cursor.
+    // Rows a session in flight crossed get the same glow.
     for (id, progress) in app.swap().echoes() {
         if selected != Some(id) {
             if let Some(rect) = draw::row_rect(app, area, id) {
@@ -212,9 +156,8 @@ pub fn paint(frame: &mut Frame, app: &App, colours: Option<&Colours>) {
             draw::row_rect(app, area, id),
             draw::name_rect(app, area, id),
         ) {
-            // The warmth is the bar's, so only while the row is the selection:
-            // a line still being drawn back off a row the cursor has since
-            // left goes off a plain row.
+            // Warm only while the row is selected: a line retracting from a
+            // row the cursor left is drawn on a plain row.
             let warm = colours.filter(|_| selected == Some(id));
             strike(buf, bar, name, warm, drawn);
         }
@@ -227,10 +170,9 @@ pub fn paint(frame: &mut Frame, app: &App, colours: Option<&Colours>) {
     }
 }
 
-/// The row the cursor left, `progress` of the way back to plain: the bar it
-/// had sinking into the background, and each cell's text coming up out of it
-/// to the colour the plain row draws it in. The settings' bar leaves the same
-/// (see [`super::settings`]).
+/// The row the cursor left, `progress` of the way back to plain: the bar fades
+/// into the background and text rises to its plain colour. Also used by
+/// [`super::settings`].
 pub(super) fn glow(buf: &mut Buffer, rect: Rect, colours: Option<&Colours>, progress: f32) {
     match colours {
         Some(c) => {
@@ -252,12 +194,8 @@ pub(super) fn glow(buf: &mut Buffer, rect: Rect, colours: Option<&Colours>, prog
     }
 }
 
-/// The row a `[y/N]` is asking about: a line through its name, `drawn` of
-/// the way across, and — given a palette — its bar warmed towards the
-/// terminal's red by as much, from the colour the bar is drawn in: the
-/// terminal's foreground, or a theme's ink. The line is the crossed-out
-/// modifier, drawn in the text's own colour, so it is the same with a palette
-/// or without one.
+/// Cross out the name `drawn` of the way across (the same with or without a
+/// palette) and, with colours, warm the bar from the ink toward red by as much.
 fn strike(buf: &mut Buffer, bar: Rect, name: Rect, colours: Option<&Colours>, drawn: f32) {
     let k = ease_out(drawn);
     let across = ((k * f32::from(name.width)).ceil() as u16).min(name.width);
@@ -279,14 +217,9 @@ fn strike(buf: &mut Buffer, bar: Rect, name: Rect, colours: Option<&Colours>, dr
     }
 }
 
-/// The rings going out from the row at `rect` (see [`super::sonar`]): each
-/// ring's edge on the row's own line past both its ends, and once it is clear
-/// of the row, its arcs on the lines above and below. Laid only on the
-/// terminal's own background — never on a row, the hint row, or a glyph
-/// something else has put there — and not past the edge of the screen.
-///
-/// Called last by whatever calls it, so the rings find the screen as
-/// everything else left it. Nothing does at the moment: see the module docs.
+/// Draw [`super::sonar`] rings from the row at `rect`: edges on the row's line
+/// past both ends, arcs above and below once clear of the row, only on bare
+/// background ([`ground`]). Call it last. Currently unused.
 #[allow(dead_code)]
 fn rings(
     buf: &mut Buffer,
@@ -298,8 +231,7 @@ fn rings(
 ) {
     let left = |out: u16| rect.x.checked_sub(1 + out);
     let right = |out: u16| rect.x.checked_add(rect.width + out);
-    // Put `glyph` at a cell, if it is on the screen and is the terminal's own
-    // background.
+    // Only on bare background within the screen.
     let mut lay = |x: Option<u16>, y: Option<u16>, glyph: char, style: Style| {
         if let (Some(x), Some(y)) = (x, y) {
             if ground(buf, app, area, x, y) {
@@ -325,8 +257,7 @@ fn rings(
     }
 }
 
-/// How a ring's glyph is drawn: `fade` of the way into the background with a
-/// palette, and without one, dim if `dim` says so.
+/// `fade` of the way into the background with a palette; else dim if `dim`.
 fn ring_style(colours: Option<&Colours>, fade: f32, dim: bool) -> Style {
     match colours {
         Some(c) => Style::default().fg(rgb(c.ink().lerp(c.palette.bg, fade))),
@@ -335,10 +266,8 @@ fn ring_style(colours: Option<&Colours>, fade: f32, dim: bool) -> Style {
     }
 }
 
-/// Whether (`x`, `y`) is the terminal's own background around the list: on
-/// the screen above the hint row, blank, painted by nothing, and on no row as
-/// drawn — a blank inside a name like `session 3` is the row's, not the
-/// background's.
+/// Whether (`x`, `y`) is bare background: on screen above the hint row, blank,
+/// unpainted, and not on a row (a blank inside a name is the row's).
 fn ground(buf: &Buffer, app: &App, area: Rect, x: u16, y: u16) -> bool {
     let screen = buf.area.intersection(area);
     let above_hint = screen.y + screen.height.saturating_sub(1);
@@ -371,10 +300,8 @@ fn leave(buf: &mut Buffer, rect: Rect, colours: Option<&Colours>, progress: f32)
     }
 }
 
-/// The row in a gap made for a new session, `progress` of the way up out of
-/// the background. Only with a palette: without one the row is simply there,
-/// drawn dim, from the first frame. Once it is all the way up nothing is set,
-/// and the row is the plain dim one the renderer drew.
+/// The gap row, `progress` of the way up from the background. Palette only:
+/// without one the row is drawn dim from the start.
 fn arrive(buf: &mut Buffer, rect: Rect, colours: &Colours, progress: f32) {
     let k = ease_out(progress);
     let p = &colours.palette;
@@ -386,7 +313,7 @@ fn arrive(buf: &mut Buffer, rect: Rect, colours: &Colours, progress: f32) {
     });
 }
 
-/// Every cell of `rect` that is on the buffer.
+/// Apply `f` to each cell of `rect` within the buffer.
 fn each_cell(buf: &mut Buffer, rect: Rect, mut f: impl FnMut(&mut ratatui::buffer::Cell)) {
     let rect = rect.intersection(buf.area);
     for y in rect.y..rect.y + rect.height {
@@ -400,8 +327,7 @@ fn rgb(c: Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
-/// Quick at first and settling, so the change is seen on the first frames and
-/// the end is soft.
+/// Quadratic ease-out: visible change on the first frames, soft end.
 fn ease_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t) * (1.0 - t)
@@ -418,7 +344,6 @@ mod tests {
     const W: u16 = 40;
     const H: u16 = 8;
 
-    /// The terminal's colours as the effects take them, with no theme.
     fn plain(palette: Option<&Palette>) -> Option<Colours> {
         palette.map(|p| Colours {
             palette: *p,
@@ -426,7 +351,6 @@ mod tests {
         })
     }
 
-    /// Draw `app` and paint its effects, the way the picker does.
     fn frame(app: &App, palette: Option<&Palette>) -> Buffer {
         test_support::buffer(W, H, |f| {
             draw::draw(f, app);
@@ -434,8 +358,7 @@ mod tests {
         })
     }
 
-    /// [`frame`] under a theme of `ink`: the theme's pass first, as the picker
-    /// makes it, and then the effects.
+    /// [`frame`] with a theme pass of `ink` before the effects.
     fn themed(app: &App, palette: &Palette, ink: Rgb) -> Buffer {
         let colours = Colours {
             palette: *palette,
@@ -464,8 +387,6 @@ mod tests {
             .expect("something on the row")
     }
 
-    /// A move leaves the row it came from looking selected, in colour, and the
-    /// glow is gone once its time is up.
     #[test]
     fn the_row_the_cursor_left_glows_and_then_settles() {
         let p = test_palette();
@@ -494,10 +415,8 @@ mod tests {
         assert!(!a.animating(), "nothing left to animate");
     }
 
-    /// Under a theme the bar a row lets go of is the ink, as the selection's
-    /// is, and each cell's text comes back up to the colour the plain row
-    /// draws it in — the name to the ink, the dim number to the terminal's own
-    /// foreground — so nothing changes colour when the glow is done.
+    /// The name returns to the ink and the dim number to the terminal's
+    /// foreground, so nothing jumps when the glow ends.
     #[test]
     fn a_themed_row_lets_go_of_an_ink_bar_back_to_its_own_colours() {
         let ink = Rgb(0x7a, 0xa2, 0xf7);
@@ -525,8 +444,6 @@ mod tests {
         assert_eq!(buf[(column_of(&buf, y, "one"), y)].fg, rgb(ink), "the ink");
     }
 
-    /// The row now selected never glows, even if it was glowing a moment ago:
-    /// moving back onto a row takes its glow away.
     #[test]
     fn moving_back_onto_a_glowing_row_ends_its_glow() {
         let mut a = picker(&["one", "two"]);
@@ -536,8 +453,6 @@ mod tests {
         assert_ne!(Some(id), a.selected_row_id());
     }
 
-    /// Only the row the cursor last left glows: a run of moves, as a held key
-    /// makes, carries the glow along rather than leaving a tail behind it.
     #[test]
     fn only_the_row_last_left_glows() {
         let p = test_palette();
@@ -556,8 +471,7 @@ mod tests {
         }
     }
 
-    /// Without a palette the glow is a modifier: reversed and dim for its first
-    /// third, and nothing after — and no colour at any point.
+    /// Reversed and dim for its first third, then nothing; never a colour.
     #[test]
     fn without_a_palette_the_glow_is_a_held_bar() {
         let mut a = picker(&["one", "two", "three"]);
@@ -576,8 +490,6 @@ mod tests {
         assert!(!cell.modifier.contains(Modifier::REVERSED), "let go");
     }
 
-    /// A keystroke that drops rows leaves them on screen, fading, until their
-    /// time is up; then the list closes up.
     #[test]
     fn dropped_rows_fade_where_they_stood_and_then_go() {
         let p = test_palette();
@@ -600,7 +512,6 @@ mod tests {
         );
     }
 
-    /// Without a palette, a dropped row is dim instead.
     #[test]
     fn without_a_palette_a_dropped_row_is_dim() {
         let mut a = picker(&["api-server", "dotfiles", "notes"]);
@@ -612,8 +523,6 @@ mod tests {
         assert_eq!(cell.fg, Color::Reset);
     }
 
-    /// The next key ends the last key's fade at once: a fast typist never
-    /// waits on rows the query ruled out two letters ago.
     #[test]
     fn the_next_key_ends_the_last_keys_fade() {
         let mut a = picker(&["api-server", "dotfiles", "notes", "nvmux"]);
@@ -630,16 +539,12 @@ mod tests {
         assert_eq!(leaving, ["notes"], "only what this key dropped");
     }
 
-    /// The first cell of `name` where it is drawn: not the row's first glyph,
-    /// which can be a spark beside the list.
+    /// Not the row's first glyph, which can be a spark beside the list.
     fn name_cell<'a>(buf: &'a Buffer, name: &str) -> &'a ratatui::buffer::Cell {
         let y = row_of(buf, name);
         &buf[(column_of(buf, y, name), y)]
     }
 
-    /// The row a session in flight leaves keeps its bar for a moment, under the
-    /// session that moved into it, and lets it go: the cursor's afterglow, left
-    /// by the move. In colour, it runs from the bar back to plain.
     #[test]
     fn the_row_a_session_in_flight_left_lets_its_bar_go() {
         let p = test_palette();
@@ -667,8 +572,6 @@ mod tests {
         assert_eq!(cell.bg, Color::Reset, "let go: {cell:?}");
     }
 
-    /// Without a palette the row holds the bar, reversed and dim, for the first
-    /// third, as the afterglow does, and sets no colour.
     #[test]
     fn without_a_palette_the_row_left_holds_the_bar() {
         let mut a = picker(&["one", "two", "three"]);
@@ -689,8 +592,7 @@ mod tests {
         assert!(!cell.modifier.contains(Modifier::REVERSED), "let go");
     }
 
-    /// A session in flight carries the cursor with it, and that is the trail's
-    /// to show: moving it leaves no glow behind.
+    /// The cursor moves with the session; the trail shows that, not a glow.
     #[test]
     fn moving_a_session_in_flight_leaves_no_glow() {
         let mut a = picker(&["one", "two", "three"]);
@@ -700,8 +602,6 @@ mod tests {
         assert!(a.glow().is_none());
     }
 
-    /// With the picker's effects off, a move and a filter keystroke leave
-    /// nothing behind, and the picker never asks for a frame's pace.
     #[test]
     fn with_the_effects_off_nothing_passes() {
         let mut a = picker(&["api-server", "dotfiles", "notes"]);
@@ -721,8 +621,7 @@ mod tests {
 
     // --- the strike ---------------------------------------------------------
 
-    /// [`picker`] with the second row selected and `x` pressed on it, the line
-    /// `ms` milliseconds along.
+    /// Second row selected and `x` pressed, the line `ms` ms along.
     fn asking(ms: u64) -> App {
         let mut a = picker(&["api-server", "dotfiles", "notes"]);
         a.on_key(Key::Char('j'));
@@ -731,24 +630,21 @@ mod tests {
         a
     }
 
-    /// The column `needle` starts at on row `y`, in cells rather than bytes:
-    /// the marker before a name is three bytes and one cell.
+    /// In cells, not bytes: the marker before a name is three bytes, one cell.
     fn column_of(buf: &Buffer, y: u16, needle: &str) -> u16 {
         let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
         let at = line.find(needle).expect("drawn");
         line[..at].chars().count() as u16
     }
 
-    /// The cells of row `y` that are crossed out.
     fn crossed(buf: &Buffer, y: u16) -> Vec<u16> {
         (0..buf.area.width)
             .filter(|x| buf[(*x, y)].modifier.contains(Modifier::CROSSED_OUT))
             .collect()
     }
 
-    /// While the `[y/N]` is up a line goes through the name — the name only,
-    /// not the marker or the number — and, in colour, the bar warms towards
-    /// the terminal's red.
+    /// Only the name, not the marker or number; in colour the bar warms
+    /// toward red.
     #[test]
     fn a_name_asked_about_is_struck_through() {
         let p = test_palette();
@@ -765,9 +661,6 @@ mod tests {
         assert!(!marker.modifier.contains(Modifier::REVERSED));
     }
 
-    /// Under a theme a kill is still a warning: the line goes through the name
-    /// all the same, and the bar it is on warms from the ink towards the
-    /// terminal's red, as it warms from the foreground with no theme.
     #[test]
     fn a_themed_strike_warms_its_bar_from_the_ink() {
         let ink = Rgb(0x7a, 0xa2, 0xf7);
@@ -785,8 +678,6 @@ mod tests {
         assert!(!marker.modifier.contains(Modifier::REVERSED));
     }
 
-    /// The line is drawn across from the left: partway, only the start of the
-    /// name is crossed out.
     #[test]
     fn the_line_goes_through_from_the_left() {
         let a = asking(STRIKE.as_millis() as u64 / 4);
@@ -797,8 +688,7 @@ mod tests {
         assert_eq!(first[0], column_of(&buf, y, "dotfiles"));
     }
 
-    /// Without a palette the line is all there is: the bar stays reversed,
-    /// and no colour is set.
+    /// The bar stays reversed and no colour is set.
     #[test]
     fn without_a_palette_the_strike_is_the_line_alone() {
         let a = asking(STRIKE.as_millis() as u64);
@@ -812,8 +702,7 @@ mod tests {
         });
     }
 
-    /// Once the line is all the way across, the question waits without
-    /// asking for frames.
+    /// No frames are requested while the question waits.
     #[test]
     fn a_line_all_the_way_across_is_still() {
         let a = asking(STRIKE.as_millis() as u64);
@@ -821,8 +710,7 @@ mod tests {
         assert!(asking(10).animating());
     }
 
-    /// Any answer but `y` draws the line back off, from wherever it had got
-    /// to, and then it is gone.
+    /// Any answer but `y` retracts the line from wherever it reached.
     #[test]
     fn declining_draws_the_line_back_off() {
         let mut a = asking(STRIKE.as_millis() as u64);
@@ -839,8 +727,7 @@ mod tests {
         assert!(!a.animating());
     }
 
-    /// `y` hands the row over to the backspace: the line does not linger to
-    /// be drawn back.
+    /// `y` hands the row to the backspace effect; the line does not retract.
     #[test]
     fn confirming_ends_the_line_at_once() {
         let mut a = asking(STRIKE.as_millis() as u64);
@@ -857,15 +744,14 @@ mod tests {
             .is_some_and(|c| (0x2801..=0x28ff).contains(&(c as u32)))
     }
 
-    /// A sonar `ms` milliseconds old.
     fn sonar_at(ms: u64) -> Sonar {
         let mut sonar = Sonar::new();
         sonar.advance(Duration::from_millis(ms));
         sonar
     }
 
-    /// Draw `app`, paint its effects, and send `sonar` out from the row of
-    /// session `id` over the lot, last, the way a caller of [`rings`] would.
+    /// Draw, paint effects, then [`rings`] from session `id`'s row, last, as a
+    /// caller would.
     fn ping(f: &mut Frame, app: &App, id: &str, sonar: &Sonar, palette: Option<&Palette>) {
         let colours = plain(palette);
         draw::draw(f, app);
@@ -876,23 +762,20 @@ mod tests {
         }
     }
 
-    /// `names` in the picker with the cursor on the second row, the one the
-    /// tests below send a sonar out from.
+    /// Cursor on the second row, which the sonar tests ping from.
     fn on_second(names: &[&str]) -> App {
         let mut a = picker(names);
         a.select_session("id000001");
         a
     }
 
-    /// [`ping`] into a buffer, with a sonar `ms` milliseconds old going out
-    /// from the second row of `names`.
+    /// [`ping`] from the second row with a sonar `ms` ms old.
     fn pinged(names: &[&str], ms: u64, palette: Option<&Palette>) -> Buffer {
         let a = on_second(names);
         test_support::buffer(W, H, |f| ping(f, &a, "id000001", &sonar_at(ms), palette))
     }
 
-    /// Rings go out past both ends of the row, and once they are clear of it,
-    /// over the lines above and below as well.
+    /// Past both ends of the row, and above and below once clear of it.
     #[test]
     fn rings_go_out_from_a_row() {
         let p = test_palette();
@@ -923,8 +806,7 @@ mod tests {
         );
     }
 
-    /// A ring never lands on a row — not even in the blank inside a name — and
-    /// never on the hint row.
+    /// Not even in a blank inside a name, nor on the hint row.
     #[test]
     fn rings_never_land_on_a_row() {
         let a = on_second(&["session 3 is long", "x", "y"]);
@@ -943,8 +825,6 @@ mod tests {
         }
     }
 
-    /// Without a palette the rings are braille and the dim modifier, and no
-    /// colour is set at any point.
     #[test]
     fn without_a_palette_rings_are_dim_braille() {
         let a = on_second(&["api-server", "dotfiles", "notes"]);
@@ -961,8 +841,6 @@ mod tests {
         );
     }
 
-    /// Between pulses there are no rings to draw, and the picker is left as
-    /// it was.
     #[test]
     fn between_pulses_nothing_is_drawn() {
         let names = ["api-server", "dotfiles", "notes"];
@@ -972,8 +850,8 @@ mod tests {
         assert_eq!(resting, plain);
     }
 
-    /// The picker sends no rings out of its own: coming back from a session
-    /// marks its row, still, and asks for no frames.
+    /// Returning from a session gives its row a still mark and requests no
+    /// frames.
     #[test]
     fn coming_back_sends_no_rings() {
         let mut a = on_second(&["api-server", "dotfiles", "notes"]);
@@ -991,7 +869,7 @@ mod tests {
 
     // --- the gap a new session opens ---------------------------------------
 
-    /// [`picker`] with a gap made after the second row, `ms` milliseconds ago.
+    /// A gap made after the second row `ms` ms ago.
     fn room_after(ms: u64) -> App {
         let mut a = picker(&["api-server", "dotfiles", "notes"]);
         a.on_key(Key::Char('j'));
@@ -1000,9 +878,8 @@ mod tests {
         a
     }
 
-    /// In colour, the row in the gap comes up out of the background: nearly
-    /// the background on its first frame, brighter halfway, and once it is all
-    /// the way up, the plain dim row the renderer drew, with no colour set.
+    /// Near the background at first, brighter halfway, and at the end the
+    /// renderer's plain dim row with no colour set.
     #[test]
     fn the_row_in_the_gap_comes_up_out_of_the_background() {
         let p = test_palette();
@@ -1027,8 +904,6 @@ mod tests {
         assert_eq!(other.fg, Color::Reset, "no other row is touched");
     }
 
-    /// Without a palette, nothing is painted: the row is there, dim, from the
-    /// first frame.
     #[test]
     fn without_a_palette_the_row_in_the_gap_is_simply_there() {
         let a = room_after(0);

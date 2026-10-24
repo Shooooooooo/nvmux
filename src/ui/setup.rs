@@ -1,17 +1,12 @@
-//! The first-run screen — pick a prefix key once, when there is no config yet.
+//! First-run screen: pick a prefix key when there is no config yet.
 //!
-//! Shown by the binary only when no config file exists, `$NVMUX_CONFIG` is
-//! unset, and the terminal is interactive (see the guards there). It takes the
-//! whole screen the way [`crate::ui::help`] does, but reads keys *raw*: the user
-//! presses the actual `Ctrl` chord they want, so this is the one place that
-//! must **not** go through `translate`, which discards every chord it does not
-//! bind (see the note in [`crate::ui`]). The pressed chord is validated by the
-//! same [`crate::keys::parse_prefix`] the config file uses, so the rules and
-//! the messages are shared.
+//! Shown only when no config file exists, `$NVMUX_CONFIG` is unset and the
+//! terminal is interactive. Reads keys raw, not through `translate`, which
+//! drops every chord it does not bind. Chords are validated by
+//! [`crate::keys::parse_prefix`], as in the config file.
 //!
-//! `Enter` keeps whatever is shown (the default until a key is pressed); `Esc`
-//! and `Ctrl-c` skip. `Ctrl-c` is reserved for skipping, as everywhere else in
-//! nvmux — `C-c`/`C-z` are still selectable as prefixes by editing the config.
+//! `Enter` keeps what is shown; `Esc` and `Ctrl-c` skip, so `C-c` can be the
+//! prefix only by editing the config.
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
@@ -23,44 +18,36 @@ use ratatui::Frame;
 use super::draw;
 use crate::error::Result;
 
-/// What the first-run screen returned.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// A prefix was confirmed (the pressed key, or the default on a bare Enter).
+    /// The chosen prefix byte, or the default on a bare Enter.
     Chosen(u8),
-    /// The user skipped: run on defaults this time, ask again next time.
+    /// Run on defaults this time and ask again next time.
     Skipped,
 }
 
-/// What one keypress meant. Split out so the decision is testable without a
-/// terminal — and so the settings screen, which changes the prefix the same
-/// way, reads a chord as this screen does ([`super::settings`]).
+/// What one keypress meant. Also used by [`super::settings`] to read a prefix
+/// chord.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Step {
-    /// A valid prefix chord: this control byte.
+    /// A valid prefix chord, as its control byte.
     Choose(u8),
-    /// A chord that cannot be a prefix; carries the reason to show.
+    /// A chord that cannot be a prefix, with the reason to show.
     Reject(String),
-    /// Enter: confirm what is shown.
     Confirm,
     /// Esc / Ctrl-c: skip without writing.
     Skip,
-    /// Anything else: nudge the user toward a Ctrl-chord.
     Ignore,
 }
 
-/// Decide what a keypress means. `ctrl` is whether the CONTROL modifier was held
-/// on the raw event.
-///
-/// The chord is spelled the way the config file spells it and handed to the one
-/// validator, so the screen and the file agree — which is why the space bar is
-/// named rather than sent as itself: `Ctrl-Space` is the default prefix, and
-/// `"Ctrl- "` is not a spelling [`crate::keys::parse_prefix`] knows.
+/// `ctrl` is whether CONTROL was held on the raw event. The chord is spelled
+/// as in the config file for [`crate::keys::parse_prefix`], so space becomes
+/// `Space`: `"Ctrl- "` would not parse.
 pub(super) fn interpret(code: KeyCode, ctrl: bool) -> Step {
     match code {
         KeyCode::Enter => Step::Confirm,
         KeyCode::Esc => Step::Skip,
-        // Reserved for skipping, like Ctrl-c on every other nvmux screen.
+        // The way out, as on every other nvmux screen.
         KeyCode::Char('c') if ctrl => Step::Skip,
         KeyCode::Char(c) if ctrl => {
             let key = match c {
@@ -76,16 +63,14 @@ pub(super) fn interpret(code: KeyCode, ctrl: bool) -> Step {
     }
 }
 
-/// What the screen is showing between keystrokes.
 struct State {
     /// The chosen prefix, or `None` while the default is on offer.
     selected: Option<u8>,
-    /// A rejection reason or a nudge, shown under the prefix.
+    /// A rejection reason or hint, shown under the prefix.
     message: Option<String>,
 }
 
-/// Show the screen until the user confirms or skips. Owns the terminal, like
-/// [`crate::ui::help::run`].
+/// Show the screen until the user confirms or skips.
 pub fn run() -> Result<Outcome> {
     super::owning(run_loop)
 }
@@ -96,16 +81,13 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
         message: None,
     };
     loop {
-        // The one screen with no theme pass (see `crate::theme`): it is up
-        // before the config is read, and reading the theme would read the
-        // config — fixing the defaults in place of the file about to be loaded.
+        // No theme pass: reading the theme would read the config, fixing the
+        // defaults in place of the file about to be loaded.
         terminal.draw(|f| draw(f, &state))?;
 
         if !event::poll(super::TICK)? {
             continue;
         }
-        // Read the RAW event — `translate` discards every chord but the three
-        // it binds, and the whole point here is to see which chord was pressed.
         let (code, ctrl) = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 (k.code, k.modifiers.contains(KeyModifiers::CONTROL))
@@ -151,7 +133,7 @@ fn draw_body(frame: &mut Frame, state: &State, area: Rect) {
     let dim = Style::default().add_modifier(Modifier::DIM);
 
     let label = crate::keys::prefix_label(state.selected.unwrap_or(crate::keys::PREFIX));
-    // Bold once the user has actually pressed a key; dim while it is the default.
+    // Dim while the default is shown.
     let prefix_style = if state.selected.is_some() { bold } else { dim };
 
     let mut lines: Vec<Line> = vec![
@@ -187,16 +169,14 @@ mod tests {
         assert_eq!(interpret(KeyCode::Char('A'), true), Step::Choose(0x01));
     }
 
-    /// The default prefix has to be choosable by pressing it. crossterm reports
-    /// the chord as a space with CONTROL — from the byte `NUL` or from either
-    /// keyboard protocol — and it must not reach the parser as `"Ctrl- "`.
+    /// crossterm reports Ctrl-Space (from `NUL` or either keyboard protocol)
+    /// as a space with CONTROL; it must not reach the parser as `"Ctrl- "`.
     #[test]
     fn ctrl_space_is_chosen_as_the_default_prefix() {
         assert_eq!(
             interpret(KeyCode::Char(' '), true),
             Step::Choose(crate::keys::PREFIX)
         );
-        // Without Ctrl it is just the space bar, and nothing to choose.
         assert_eq!(interpret(KeyCode::Char(' '), false), Step::Ignore);
     }
 

@@ -1,32 +1,18 @@
-//! The key-binding help — a third screen, shown by `?` on the picker and by
-//! `<prefix> ?` in a session.
+//! The key-binding help, shown by `?` on the picker and `<prefix> ?` in a
+//! session.
 //!
-//! From the picker full screen it takes the terminal, as the settings do. From
-//! a session, or the picker floating over one, it floats over the session
-//! instead, as the settings do too: in a panel the relay draws and gives its
-//! keys to ([`Panel`], and see `crate::pty::panel`), the session going on
-//! behind it, dimmed. The panel is the table's size, the table being one that
-//! does not scroll, and the hint row stays where it is full screen, along the
-//! bottom of the screen. With `[style] float` off, or on a terminal with no
-//! room for the panel and some of the session round it ([`Floating::area`]),
-//! the help is full screen, as from the picker, handing the same client back
-//! afterwards.
+//! Over a session it floats in a [`Panel`] (see `crate::pty::panel`) unless
+//! `[style] float` is off or there is no room ([`Floating::area`]); its hint
+//! row stays on the screen's last row.
 //!
-//! Every command row comes from [`keys::BINDINGS`] as the user has it — the
-//! [`Keymap`] [`keys::Prefix::feed`] runs on — so this screen cannot claim
-//! something the machine does not do, nor name a key a command was moved off.
-//! The rows that are not commands — a digit selects a
-//! session, `<prefix> <prefix>` is a literal, anything else is replayed — are the
-//! machine's other branches, spelled here and pinned to it by a test.
+//! Command rows come from the [`Keymap`] [`keys::Prefix::feed`] runs on, so
+//! the screen cannot list a key that does nothing; a test pins the other
+//! rows to the machine.
 //!
-//! # Why only named keys close it
-//!
-//! `<prefix>` arrives here as `Key::Other`, because `translate` turns every
-//! control chord but `Ctrl-c`, `Ctrl-n` and `Ctrl-p` into nothing. If any key
-//! closed the help, someone who read "Ctrl-Space d" and typed it would close
-//! the screen on the `Ctrl-Space` and send a bare `d` into normal mode. So the
-//! space bar, `d`, `c` and `Other` do nothing, and only `Esc`, `q`, `Enter`,
-//! `?` and `Ctrl-c` close it. Nothing typed on this screen is ever forwarded.
+//! Only named keys close it. `<prefix>` arrives as `Key::Other` (`translate`
+//! maps every control chord but `Ctrl-c`, `Ctrl-n`, `Ctrl-p` to it), so if
+//! any key closed it, typing "Ctrl-Space d" would close on the prefix and
+//! send a bare `d` to the session. Nothing typed here is forwarded.
 
 use std::time::Instant;
 
@@ -44,34 +30,24 @@ use super::float::{self, Did, Floating};
 use crate::error::Result;
 use crate::keys::{self, Keymap};
 
-/// Key then action, the picker's hint grammar. `q`, `Enter`, `?` and `Ctrl-c`
-/// also close, unadvertised.
+/// `q`, `Enter`, `?` and `Ctrl-c` also close, unadvertised.
 const HINTS: &str = "esc back";
 
 /// Columns between the key column and the description.
 const GAP: usize = 3;
 
-/// The least of the session the help leaves showing round it when it floats:
-/// columns either side, and rows above and below. Less than the settings
-/// leave, the help being as wide as its widest row and no narrower.
+/// Minimum session left visible on each side of the floating help.
 const SESSION_COLS: u16 = 2;
 const SESSION_ROWS: u16 = 1;
 
-/// One line of the table.
 #[derive(Debug)]
 struct Row {
     keys: String,
     what: String,
 }
 
-/// The command rows from [`keys::BINDINGS`], each on the key `keymap` puts it
-/// on, then the rules that are not commands: digits select a session, a
-/// doubled prefix is a literal, and anything else is replayed.
-///
-/// `prefix` is the label to spell the prefix with — [`keys::PREFIX_LABEL`] by
-/// default, or whatever a remapped prefix reads as (see
-/// [`keys::prefix_label`]) — so every row, and the two descriptions that name
-/// the prefix, follow the key the user actually set.
+/// The command rows on `keymap`'s keys, then the fixed rules. `prefix` labels
+/// the prefix key (see [`keys::prefix_label`]).
 fn rows(prefix: &str, keymap: &Keymap) -> Vec<Row> {
     let mut rows: Vec<Row> = keymap
         .bindings()
@@ -81,8 +57,8 @@ fn rows(prefix: &str, keymap: &Keymap) -> Vec<Row> {
         })
         .collect();
     rows.push(Row {
-        // Not `1-9`: `Prefix::feed` reads a number, not a digit, so `12` reaches
-        // the twelfth session.
+        // Not `1-9`: `Prefix::feed` reads a number, so `12` reaches the
+        // twelfth session.
         keys: format!("{prefix} 1-n"),
         what: "attach to the session with that number".to_string(),
     });
@@ -97,13 +73,8 @@ fn rows(prefix: &str, keymap: &Keymap) -> Vec<Row> {
     rows
 }
 
-/// Named keys only. The space bar, `d` and `c` — and therefore the prefix,
-/// which arrives as `Key::Other` — are deliberately not here: a chord typed
-/// while the help is open must do nothing, not close the help and forward its
-/// second key.
-///
-/// `q` and `Ctrl-c` close like esc rather than quitting: quitting here would
-/// tear the user out of a live session they only meant to read a key list in.
+/// Named keys only (see the module docs). `q` and `Ctrl-c` close rather than
+/// quit, so reading the help never exits a live session.
 fn closes(key: Key) -> bool {
     matches!(
         key,
@@ -111,16 +82,14 @@ fn closes(key: Key) -> bool {
     )
 }
 
-/// Show the bindings until the user dismisses them, on its own terminal, handing
-/// the session back untouched afterwards.
+/// Show the help full screen until dismissed.
 pub fn run() -> Result<()> {
-    // Reached from a session that has just dissolved out, so dissolve in.
+    // Reached from a session that just dissolved out, so dissolve in.
     super::owning(|terminal| run_on(terminal, true))
 }
 
-/// Show the bindings on a terminal the caller already owns — how the picker
-/// answers `?`. `animate` is whether to dissolve in on the way in and out on
-/// the way out; from the picker the screen is already up, so it does not.
+/// Show the help on a terminal the caller owns (the picker's `?`), dissolving
+/// in and out if `animate`.
 pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> Result<()> {
     let settings = crate::config::get().keys;
     let rows = rows(&keys::prefix_label(settings.prefix), &settings.bind);
@@ -138,8 +107,8 @@ pub(super) fn run_on(terminal: &mut ratatui::DefaultTerminal, animate: bool) -> 
         };
 
         if closes(key) {
-            // Dissolve out, so the resumed session takes over from the
-            // background rather than from the key list.
+            // So the resumed session takes over from the background, not
+            // from the key list.
             if animate {
                 crate::fade::fade_out(terminal, |f| draw(f, &rows))?;
             }
@@ -153,11 +122,9 @@ fn draw(frame: &mut Frame, rows: &[Row]) {
     draw_on(frame.buffer_mut(), area, rows);
 }
 
-/// The help drawn on `area` of `buf`, as every screen is laid out (see
-/// [`draw::screen`]): the table in the middle of all but the last row, and
-/// the hint row on that. The whole terminal, or the inside of the panel
-/// floating over a session, which takes all of it but the hint row (see
-/// [`float::lay`]).
+/// Draw on `area` (the terminal, or the panel's inside) in the usual screen
+/// layout (see [`draw::screen`]). The panel keeps all but the hint row
+/// ([`float::lay`]).
 fn draw_on(buf: &mut Buffer, area: Rect, rows: &[Row]) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -167,19 +134,15 @@ fn draw_on(buf: &mut Buffer, area: Rect, rows: &[Row]) {
     draw::hint_row_on(buf, hint, HINTS, true);
 }
 
-/// How big the table is: its widest key, the gap and its widest line of
-/// help across, and a row a row.
+/// The table's (width, height).
 fn table_size(rows: &[Row]) -> (u16, u16) {
     let key_width = rows.iter().map(|r| r.keys.width()).max().unwrap_or(0);
     let what_width = rows.iter().map(|r| r.what.width()).max().unwrap_or(0);
     ((key_width + GAP + what_width) as u16, rows.len() as u16)
 }
 
-/// One left-aligned block, centred on both axes.
-///
-/// Keys are padded to the widest key by *display* width rather than `{:<w$}`,
-/// so a non-ASCII key label would still line up. Rows are truncated to the
-/// block and never wrapped, which is what keeps the hint row where it is.
+/// Keys are padded by display width (not `{:<w$}`) so non-ASCII labels align.
+/// Rows are truncated, never wrapped, to keep the hint row in place.
 fn draw_table(buf: &mut Buffer, rows: &[Row], area: Rect) {
     if area.height == 0 || area.width == 0 || rows.is_empty() {
         return;
@@ -202,18 +165,14 @@ fn draw_table(buf: &mut Buffer, rows: &[Row], area: Rect) {
     Paragraph::new(lines).render(block, buf);
 }
 
-/// The help floating over a session (see `crate::pty::panel`): the same
-/// table and the same keys closing it, in a panel the table's size — with a
-/// column of room either side of it and a row over and under it, and the
-/// panel's own margins ([`float::inside`]) — rather than the whole terminal,
-/// and the same hint row along the bottom of the screen.
+/// The help floating over a session, sized to the table plus padding and
+/// margins ([`float::inside`]).
 #[derive(Debug)]
 pub struct Panel {
     rows: Vec<Row>,
 }
 
 impl Panel {
-    /// The keys as nvmux has them now.
     pub fn open() -> Self {
         let settings = crate::config::get().keys;
         Self {
@@ -221,7 +180,6 @@ impl Panel {
         }
     }
 
-    /// How big the panel is.
     fn size(&self) -> (u16, u16) {
         let (width, height) = table_size(&self.rows);
         (width + 4, height + 3)
@@ -229,10 +187,8 @@ impl Panel {
 }
 
 impl Floating for Panel {
-    /// In the middle of the room above the hint row, the panel's size, where
-    /// that leaves [`SESSION_COLS`] either side and [`SESSION_ROWS`] above and
-    /// below; nowhere on a screen that does not, which has the help full
-    /// screen.
+    /// `None` (full screen) without [`SESSION_COLS`] and [`SESSION_ROWS`] of
+    /// session around it.
     fn area(&self, screen: Rect) -> Option<Rect> {
         let (room, _) = float::split(screen);
         let (width, height) = self.size();
@@ -247,8 +203,7 @@ impl Floating for Panel {
         ))
     }
 
-    /// The keys that close the help full screen close it here; releases are
-    /// no keys, and the rest do nothing (see [`closes`]).
+    /// See [`closes`]; releases are ignored.
     fn on_key(&mut self, key: KeyEvent, _now: Instant) -> Did {
         if key.kind != KeyEventKind::Release && closes(super::translate(key)) {
             Did::Close
@@ -257,8 +212,8 @@ impl Floating for Panel {
         }
     }
 
-    /// Nothing on it to point at. A press on the session takes it down, which
-    /// is the relay's to see.
+    /// Nothing to click. A press on the session closes it, which the relay
+    /// handles.
     fn on_mouse(&mut self, _mouse: MouseEvent, _now: Instant) -> Did {
         Did::Stay
     }
@@ -275,8 +230,6 @@ impl Floating for Panel {
         false
     }
 
-    /// The help drawn into `area`, in the theme's colour where it has one:
-    /// as on a terminal of the panel's inside, all but its hint row.
     fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         let inside = float::inside(area);
@@ -287,7 +240,6 @@ impl Floating for Panel {
         buf
     }
 
-    /// The help's hint row drawn into `row`, as full screen.
     fn draw_hints(&self, row: Rect) -> Buffer {
         let mut buf = Buffer::empty(row);
         draw::hint_row_on(&mut buf, row, HINTS, true);
@@ -305,12 +257,10 @@ mod tests {
     use crate::keys::{Prefix, PREFIX, PREFIX_LABEL};
     use ratatui::style::Modifier;
 
-    /// Wide enough that the whole table fits with slack on both sides, so the
-    /// centring is what is being measured rather than the clamp.
+    /// Wide enough that centring is measured, not clamping.
     const WIDE: u16 = 70;
 
-    /// [`super::rows`] with every command on the table's own key: what the
-    /// screen is about everywhere but the one test that moves them.
+    /// [`super::rows`] on the default keymap.
     fn rows(prefix: &str) -> Vec<Row> {
         super::rows(prefix, &Keymap::default())
     }
@@ -320,9 +270,8 @@ mod tests {
         test_support::render(w, h, |f| draw(f, &rows))
     }
 
-    /// The line a row was drawn on. Matched on the *start* of the line rather
-    /// than anywhere in it: "send a literal Ctrl-Space to Neovim" contains the
-    /// text `Ctrl-Space t`, so `contains` would find the picker row twice.
+    /// The line starting with a row's keys. Not `contains`: "send a literal
+    /// Ctrl-Space to Neovim" contains `Ctrl-Space t`.
     fn line_for<'a>(lines: &'a [String], row: &Row) -> &'a String {
         lines
             .iter()
@@ -343,9 +292,6 @@ mod tests {
         }
     }
 
-    /// `<prefix>` arrives here as `Key::Other`, and its command keys as
-    /// themselves; if any of them closed the help, a chord typed from this
-    /// screen would be half-forwarded.
     #[test]
     fn the_prefix_and_its_command_keys_do_nothing_here() {
         for key in [
@@ -362,13 +308,8 @@ mod tests {
         }
     }
 
-    /// The rendered rows are checked against what the machine actually does,
-    /// not against the table both of them read — on the table's own keys, and
-    /// on keys a config file has moved, where a key a command left must be
-    /// listed for nothing.
-    ///
-    /// `highest` is 0 so every digit resolves on the spot; what is being checked
-    /// is which bytes are commands at all, not how long one waits.
+    /// Against the prefix machine itself, not the table both read, on default
+    /// and remapped keys. `highest` is 0 so digits resolve at once.
     #[test]
     fn every_row_matches_what_the_prefix_machine_does() {
         let mut moved = Keymap::default();
@@ -382,9 +323,8 @@ mod tests {
                     .feed(&[PREFIX, b])
                     .iter()
                     .any(|s| matches!(s, keys::Step::Act(_)));
-                // Equality, not `starts_with`: `o` would otherwise match the
-                // `<prefix> other` row. Digits are the one range row, so they
-                // are looked up as the range rather than as themselves.
+                // Equality, not `starts_with`: `o` would match the
+                // `<prefix> other` row. Digits are looked up as the range row.
                 let listed = if b.is_ascii_digit() {
                     acts && rows.iter().any(|r| r.keys == format!("{PREFIX_LABEL} 1-n"))
                 } else {
@@ -399,7 +339,6 @@ mod tests {
         }
     }
 
-    /// The range row is a promise about nine specific bytes; check them.
     #[test]
     fn the_digit_row_covers_exactly_one_to_nine() {
         assert!(
@@ -413,7 +352,7 @@ mod tests {
                 .feed(&[PREFIX, b])
                 .iter()
                 .any(|s| matches!(s, keys::Step::Act(_)));
-            // Zero is excluded on purpose: no session number begins with one.
+            // No session number starts with 0.
             assert_eq!(acts, b != b'0', "byte {:?}", b as char);
         }
     }
@@ -457,9 +396,6 @@ mod tests {
         assert!(other.contains("that key"), "got {other:?}");
     }
 
-    /// A remapped prefix relabels every row *and* the two descriptions that name
-    /// the prefix — not just the key column — so the screen never claims a key the
-    /// user did not set.
     #[test]
     fn a_remapped_prefix_labels_every_row_and_the_literal_text() {
         let rows = rows("Ctrl-a");
@@ -501,8 +437,7 @@ mod tests {
 
     #[test]
     fn the_whole_screen_is_a_centred_table_and_one_hint_line() {
-        // Room for every row and two of slack: high enough that centring is
-        // what is being measured rather than the clamp.
+        // Two rows of slack, so centring is measured, not clamping.
         let rows = keys::BINDINGS.len() + 3;
         let height = rows as u16 + 3;
         let body = usize::from(height) - 1;
@@ -517,10 +452,7 @@ mod tests {
             .filter(|(_, l)| !l.is_empty())
             .map(|(i, _)| i)
             .collect();
-        // Derived rather than listed, so adding a binding does not turn a
-        // centring test into a counting one: the table is every row of
-        // `BINDINGS` plus the three fixed rules, and centring puts any odd row
-        // of slack at the bottom.
+        // Centring puts an odd row of slack at the bottom.
         let top = (body - rows) / 2;
         assert_eq!(
             occupied,
@@ -528,8 +460,8 @@ mod tests {
             "table is not vertically centred: {lines:#?}"
         );
 
-        // The widest row is the one that defines the block; a shorter one has
-        // slack on the right by construction.
+        // Only the widest row defines the block; shorter ones have slack on
+        // the right.
         let row = lines[..body]
             .iter()
             .max_by_key(|l| l.width())
@@ -597,22 +529,19 @@ mod tests {
         }
     }
 
-    /// No SGR colour, so the screen is correct under NO_COLOR by construction.
     #[test]
     fn nothing_sets_a_colour() {
         let rows = rows(PREFIX_LABEL);
         test_support::assert_no_colour(WIDE, 11, |f| draw(f, &rows));
     }
 
-    /// The help as it floats, on the table's own keys rather than whatever
-    /// the config of the moment has.
+    /// A panel on the default keymap, independent of the live config.
     fn panel() -> Panel {
         Panel {
             rows: rows(PREFIX_LABEL),
         }
     }
 
-    /// The text of a buffer's rows.
     fn rows_of(buf: &Buffer) -> Vec<String> {
         let area = buf.area;
         (area.y..area.y + area.height)
@@ -624,11 +553,7 @@ mod tests {
             .collect()
     }
 
-    /// Floating, the help is the table's size and a little — a column of
-    /// room and the panel's margin either side, a row over and under the
-    /// table, and the panel's last — in the middle of the room above the
-    /// hint row, wherever that leaves some of the session round it; and
-    /// nowhere it does not.
+    /// The panel goes in the room above the hint row: all but the last row.
     #[test]
     fn the_panel_is_the_tables_size_in_the_middle() {
         let panel = panel();
@@ -651,10 +576,7 @@ mod tests {
         assert_eq!(panel.area(screen(200, fits.1 - 1)), None, "too short");
     }
 
-    /// Drawn into its area, every row is there whole — the help does not
-    /// scroll, so none may be cut — with a clear row over and under the
-    /// table, the last row clear, and a clear column either side; and the
-    /// hint row is the full screen's, cell for cell, on the screen's last row.
+    /// The help does not scroll, so no row may be cut.
     #[test]
     fn the_panel_draws_every_row_whole_and_its_hint_row_is_the_screens() {
         let mut panel = panel();
@@ -687,9 +609,6 @@ mod tests {
         assert_eq!(rows_of(&hints)[0].trim(), HINTS);
     }
 
-    /// Floating, the keys that close the help full screen close it, and
-    /// nothing else does: not the prefix, not a command's key after it, not a
-    /// key coming up, and not the mouse.
     #[test]
     fn the_panel_closes_on_the_screens_keys_only() {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};

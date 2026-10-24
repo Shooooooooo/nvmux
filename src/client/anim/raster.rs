@@ -1,29 +1,18 @@
-//! Shapes finer than a cell, in the characters a terminal has for them.
+//! Sub-cell shapes drawn with block elements.
 //!
-//! A cell is sampled at eight by eight points, and the shape — the cursor's
-//! four corners, wherever its animation has put them — is reduced to which of
-//! those 64 points it covers. That is then matched against the block elements
-//! (`U+2580`–`U+259F`: the halves, the eighths, the quadrants), each one a
-//! pattern over the same 64 points, drawn either way round: a glyph in the
-//! shape's colour on the cell's background, or the background's colour on the
-//! shape's, which turns `▁` into a cell seven-eighths full. The nearest one
-//! wins. Block elements, because every monospace font has them and draws them
-//! edge to edge; the finer sextants and octants of Unicode's legacy computing
-//! block are not in enough fonts to be relied on.
-//!
-//! Sparks are drawn in braille instead (see [`super::vfx`]): eight dots to a
-//! cell, each one a spark, the way the picker's starfield draws its stars.
+//! A cell is sampled at 8×8 points and matched against each of [`BLOCKS`]
+//! (from `U+2580`–`U+259F`), normal or inverted; the nearest wins. Block
+//! elements are drawn edge to edge by every monospace font; legacy-computing
+//! sextants and octants are not in enough fonts.
 
-/// The point every 8×8 sample sits at within its eighth of the cell.
 const SAMPLES: usize = 8;
 
-/// A pattern of a cell's 64 sample points: bit `row * 8 + col`.
+/// A cell's 64 sample points: bit `row * 8 + col`.
 pub type Mask = u64;
 
 pub const EMPTY: Mask = 0;
 pub const FULL: Mask = u64::MAX;
 
-/// The rows `from..to` of a cell, every column.
 const fn rows(from: usize, to: usize) -> Mask {
     let mut m = 0u64;
     let mut r = from;
@@ -34,7 +23,6 @@ const fn rows(from: usize, to: usize) -> Mask {
     m
 }
 
-/// The columns `from..to` of a cell, every row.
 const fn cols(from: usize, to: usize) -> Mask {
     let mut row = 0u64;
     let mut c = from;
@@ -56,7 +44,7 @@ const UR: Mask = rows(0, 4) & cols(4, 8);
 const LL: Mask = rows(4, 8) & cols(0, 4);
 const LR: Mask = rows(4, 8) & cols(4, 8);
 
-/// Every block element, and the points it fills.
+/// `█` must stay first: [`fill`] skips it.
 pub const BLOCKS: [(char, Mask); 29] = [
     ('█', FULL),
     ('▀', rows(0, 4)),
@@ -89,19 +77,19 @@ pub const BLOCKS: [(char, Mask); 29] = [
     ('▟', UR | LL | LR),
 ];
 
-/// How a cell is to show the part of a shape that falls in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fill {
-    /// None of it: the cell is left as it is.
     Empty,
-    /// All of it: the cell takes the shape's colour, its text kept.
+    /// The shape's colour; the cell's text is kept.
     Full,
-    /// Some: this glyph, in the shape's colour if `inverted` is false, in the
-    /// cell's background on the shape's colour if it is true.
-    Glyph { glyph: char, inverted: bool },
+    /// `glyph` in the shape's colour or, if `inverted`, in the cell's
+    /// background on the shape's colour.
+    Glyph {
+        glyph: char,
+        inverted: bool,
+    },
 }
 
-/// The block element nearest to the points a shape covers in a cell.
 pub fn fill(covered: Mask) -> Fill {
     if covered == EMPTY {
         return Fill::Empty;
@@ -135,10 +123,9 @@ pub fn fill(covered: Mask) -> Fill {
     best.1
 }
 
-/// A point, in cells: `x` along, `y` down.
+/// In cells: `x` across, `y` down.
 pub type Point = (f32, f32);
 
-/// The sample points of the cell at `row`, `col` inside the polygon `poly`.
 pub fn coverage(poly: &[Point], row: i64, col: i64) -> Mask {
     let mut m = 0u64;
     for sy in 0..SAMPLES {
@@ -153,8 +140,7 @@ pub fn coverage(poly: &[Point], row: i64, col: i64) -> Mask {
     m
 }
 
-/// Whether `p` is inside `poly`, by its winding number: right for any
-/// polygon, convex or not, however its corners have been pulled about.
+/// Winding-number test: correct even for self-crossing polygons.
 pub fn inside(poly: &[Point], p: Point) -> bool {
     let mut winding = 0i32;
     for i in 0..poly.len() {
@@ -172,7 +158,6 @@ pub fn inside(poly: &[Point], p: Point) -> bool {
     winding != 0
 }
 
-/// The cells a polygon touches: rows and columns, each a half-open range.
 pub fn bounds(poly: &[Point]) -> (std::ops::Range<i64>, std::ops::Range<i64>) {
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for &(x, y) in poly {
@@ -187,9 +172,8 @@ pub fn bounds(poly: &[Point]) -> (std::ops::Range<i64>, std::ops::Range<i64>) {
     )
 }
 
-/// The braille dot for a point within a cell, `fx` and `fy` from 0 to 1.
-/// Braille numbers its dots down the left column, then the right, with the
-/// bottom pair last — which is why the bits are not in order.
+/// Braille numbers dots down the left column, then the right, with the bottom
+/// pair last, hence the bit order.
 pub fn braille_dot(fx: f32, fy: f32) -> u8 {
     const DOTS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
     let col = ((fx * 2.0) as usize).min(1);
@@ -197,7 +181,6 @@ pub fn braille_dot(fx: f32, fy: f32) -> u8 {
     DOTS[row][col]
 }
 
-/// The braille character with these dots.
 pub fn braille(dots: u8) -> char {
     char::from_u32(0x2800 + u32::from(dots)).unwrap_or(' ')
 }
@@ -218,7 +201,6 @@ mod tests {
         assert_eq!(fill(coverage(&r, 1, 3)), Fill::Empty);
     }
 
-    /// A bar cursor a quarter of a cell wide is a quarter block.
     #[test]
     fn a_bar_is_a_left_block() {
         let r = rect(5.0, 0.0, 5.25, 1.0);
@@ -231,7 +213,7 @@ mod tests {
         );
     }
 
-    /// An underline a fifth of a cell high is the nearest lower eighths.
+    /// A fifth of a cell rounds to two eighths.
     #[test]
     fn an_underline_is_a_lower_block() {
         let r = rect(0.0, 0.8, 1.0, 1.0);
@@ -244,8 +226,7 @@ mod tests {
         );
     }
 
-    /// Most of a cell is drawn as the little that is not, the other way
-    /// round: three quarters from the top is a lower quarter, inverted.
+    /// Three quarters from the top is a lower quarter, inverted.
     #[test]
     fn mostly_full_is_drawn_inverted() {
         let r = rect(0.0, 0.0, 1.0, 0.75);
@@ -258,7 +239,6 @@ mod tests {
         );
     }
 
-    /// A diagonal smear across a cell lands on a quadrant pattern.
     #[test]
     fn a_diagonal_is_a_quadrant() {
         let tri = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)];
@@ -270,12 +250,9 @@ mod tests {
         }
     }
 
-    /// The winding rule fills a quad however its corners are pulled, even
-    /// crossed over.
     #[test]
     fn a_crossed_quad_is_still_filled() {
-        // Crossed at (1, 1): its two lobes are left and right, and the two
-        // between them, above and below, are outside.
+        // Crossed at (1, 1): left and right lobes inside, above and below not.
         let bowtie = [(0.0, 0.0), (2.0, 2.0), (2.0, 0.0), (0.0, 2.0)];
         assert!(inside(&bowtie, (0.4, 1.0)));
         assert!(inside(&bowtie, (1.6, 1.0)));

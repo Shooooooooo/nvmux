@@ -1,23 +1,12 @@
-//! What flies off the cursor as it moves: Neovide's `vfx_mode`, in a
-//! terminal.
+//! Neovide's `vfx_mode` cursor effects, in a terminal.
 //!
-//! Three of its modes are trails of particles left along the way the cursor
-//! went: `railgun` coils them off the path in a spiral, `torpedo` sprays them
-//! out behind it, `pixiedust` lets them drift down like dust. A particle is a
-//! braille dot — eight to a cell, so they fly at a quarter of a cell's height
-//! — drawn in the cursor's colour and fading with its life. A dot is drawn
-//! only in a blank cell: over text, where a dot would take the character's
-//! place, the particle is a glow in the cell's background instead, and the
-//! text stays readable through it.
+//! Trail modes (`railgun`, `torpedo`, `pixiedust`) leave braille-dot particles
+//! along the cursor's path; mark modes (`sonicboom`, `ripple`, `wireframe`)
+//! draw a shape where it lands. Marks, and particles over text, tint the
+//! cell's background instead of drawing a glyph, so text is never hidden.
 //!
-//! The other three mark where the cursor landed: `sonicboom` a disc that
-//! grows and fades, `ripple` a ring, `wireframe` a square outline. They are
-//! drawn as glows too — a tint of the background in the cells they cover — so
-//! they never hide a character either.
-//!
-//! Positions are in cells, but a particle moves in a space where a row is as
-//! tall as two columns are wide ([`ASPECT`]), so that a spiral is round and a
-//! spray is even on a screen whose cells are not square.
+//! Particles move in a space where a row is [`ASPECT`] columns tall, so
+//! spirals stay round on non-square cells.
 
 use super::raster;
 use super::smear::ASPECT;
@@ -26,7 +15,6 @@ use crate::client::grid::Text;
 use crate::client::style::{mix, Color, Colors};
 use crate::palette::Rgb;
 
-/// Neovide's six modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Railgun,
@@ -38,7 +26,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The mode `[effects.particles] mode` names, spelt as Neovide spells it.
+    /// Parses `[effects.particles] mode`, spelt as Neovide spells it.
     pub fn named(name: &str) -> Option<Self> {
         Some(match name {
             "railgun" => Mode::Railgun,
@@ -51,7 +39,6 @@ impl Mode {
         })
     }
 
-    /// The modes' names, for a config error that has to say what it takes.
     pub const NAMES: &'static str = "railgun, torpedo, pixiedust, sonicboom, ripple or wireframe";
 
     fn is_trail(self) -> bool {
@@ -63,42 +50,38 @@ impl Mode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     pub mode: Mode,
-    /// How strongly a particle shows at its brightest, 0 to 1.
+    /// Peak opacity, 0 to 1.
     pub opacity: f32,
-    /// Seconds a particle lives.
+    /// Seconds.
     pub lifetime: f32,
-    /// Particles for every cell the cursor travels.
+    /// Particles per cell travelled.
     pub density: f32,
-    /// How fast a particle flies, in cells a second.
+    /// Cells per second.
     pub speed: f32,
 }
 
-/// How many turns a railgun's spiral takes over every row the cursor
-/// travels: Neovide's `vfx_particle_phase`.
+/// Railgun spiral turns, times the square root of the distance in rows:
+/// Neovide's `vfx_particle_phase`.
 const PHASE: f32 = 1.5;
 
-/// How fast a particle's path bends, in radians a second: Neovide's
-/// `vfx_particle_curl`.
+/// Path bend in radians per second: Neovide's `vfx_particle_curl`.
 const CURL: f32 = 1.0;
 
-/// The most particles in the air at once: a cursor thrown across a large
-/// screen should not cost a frame.
+/// Cap so a cursor jump across a large screen does not cost a frame.
 const MAX_PARTICLES: usize = 400;
 
-/// How long a mark where the cursor landed lasts, in seconds.
+/// Mark lifetime, in seconds.
 const MARK: f32 = 0.25;
 
-/// How wide a mark grows, in rows across.
+/// Mark's final diameter, in rows.
 const MARK_SIZE: f32 = 3.0;
 
-/// How far over text a particle's glow goes towards its colour, against the
-/// dot it would have been in a blank cell.
+/// Over text, a particle tints by this fraction of its alpha.
 const GLOW: f32 = 0.45;
 
 #[derive(Debug, Clone, Copy)]
 struct Particle {
-    /// Columns along, rows down — in the square space: `y` is rows times
-    /// [`ASPECT`].
+    /// In the square space: `y` is rows times [`ASPECT`].
     x: f32,
     y: f32,
     vx: f32,
@@ -107,7 +90,6 @@ struct Particle {
     lifetime: f32,
 }
 
-/// A mark where the cursor landed, `t` from 0 to 1 through its life.
 #[derive(Debug, Clone, Copy)]
 struct Mark {
     x: f32,
@@ -115,7 +97,6 @@ struct Mark {
     t: f32,
 }
 
-/// Everything flying off the cursor.
 #[derive(Debug)]
 pub struct Vfx {
     particles: Vec<Particle>,
@@ -134,8 +115,7 @@ impl Default for Vfx {
 }
 
 impl Vfx {
-    /// The cursor went from the middle of one cell to the middle of another
-    /// (`x` along and `y` down, in cells).
+    /// The cursor moved between cell centres (in cells).
     pub fn moved(&mut self, from: (f32, f32), to: (f32, f32), s: &Settings) {
         if !s.mode.is_trail() {
             self.mark = Some(Mark {
@@ -189,8 +169,7 @@ impl Vfx {
                     )
                 }
             };
-            // A little each way, so particles born together do not all die
-            // together.
+            // Jitter so particles born together do not die together.
             let lifetime = s.lifetime * (0.75 + 0.5 * self.rng.unit());
             self.particles.push(Particle {
                 x,
@@ -203,7 +182,7 @@ impl Vfx {
         }
     }
 
-    /// Move on `dt` seconds. Says whether anything is still flying.
+    /// Returns whether anything is still active.
     pub fn step(&mut self, dt: f32) -> bool {
         self.particles.retain_mut(|p| {
             p.life -= dt;
@@ -234,13 +213,10 @@ impl Vfx {
         self.mark = None;
     }
 
-    /// Draw everything flying over `frame`, in `color`.
     pub fn paint(&self, frame: &mut Frame, colors: &Colors, color: Rgb, s: &Settings) {
         if let Some(m) = self.mark {
             paint_mark(frame, colors, color, s, m);
         }
-        // Gather the particles by cell: the dots they light, and the
-        // strongest of them.
         let mut cells: std::collections::HashMap<(usize, usize), (u8, f32)> =
             std::collections::HashMap::new();
         for p in &self.particles {
@@ -276,7 +252,6 @@ impl Vfx {
     }
 }
 
-/// Tint a cell's background `amount` of the way to `color`, its text kept.
 fn glow(colors: &Colors, cell: &mut crate::client::compose::Out, color: Rgb, amount: f32) {
     let fg = colors.visual_fg(&cell.style);
     let bg = colors.visual_bg(&cell.style);
@@ -286,10 +261,8 @@ fn glow(colors: &Colors, cell: &mut crate::client::compose::Out, color: Rgb, amo
     cell.style.reverse = false;
 }
 
-/// A disc, a ring or a square around where the cursor landed, as a glow.
 fn paint_mark(frame: &mut Frame, colors: &Colors, color: Rgb, s: &Settings, m: Mark) {
-    // Grows from nothing to its full size, fading as it does — fast at
-    // first, as Neovide eases it.
+    // Grows to full size as it fades.
     let radius = m.t * MARK_SIZE * ASPECT / 2.0;
     let alpha = s.opacity * (1.0 - m.t * m.t);
     if radius <= 0.0 || alpha <= 0.0 {
@@ -304,7 +277,6 @@ fn paint_mark(frame: &mut Frame, colors: &Colors, color: Rgb, s: &Settings, m: M
             let (Ok(ru), Ok(cu)) = (usize::try_from(r), usize::try_from(c)) else {
                 continue;
             };
-            // Four by four samples: how much of the cell the shape covers.
             let mut hit = 0;
             for sy in 0..4 {
                 for sx in 0..4 {
@@ -333,7 +305,7 @@ fn paint_mark(frame: &mut Frame, colors: &Colors, color: Rgb, s: &Settings, m: M
     }
 }
 
-/// A small generator: nothing depends on it but the look of the particles.
+/// Only the particles' look depends on it.
 #[derive(Debug)]
 struct Rng(u64);
 
@@ -348,12 +320,10 @@ impl Rng {
         x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
-    /// Uniform in `0..1`.
     fn unit(&mut self) -> f32 {
         (self.next() >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// A direction, uniform around the circle.
     fn direction(&mut self) -> (f32, f32) {
         let a = self.unit() * std::f32::consts::TAU;
         (a.cos(), a.sin())
@@ -404,8 +374,6 @@ mod tests {
         assert_eq!(Mode::named("sparkles"), None);
     }
 
-    /// A trail is laid along the way the cursor went, more for further, and
-    /// it dies away.
     #[test]
     fn a_trail_is_laid_along_the_way_and_dies_away() {
         for mode in [Mode::Railgun, Mode::Torpedo, Mode::PixieDust] {
@@ -424,7 +392,6 @@ mod tests {
         }
     }
 
-    /// No particle more than the ceiling, however far the cursor is thrown.
     #[test]
     fn the_air_holds_only_so_many() {
         let mut v = Vfx::default();
@@ -434,8 +401,6 @@ mod tests {
         assert!(v.particles.len() <= MAX_PARTICLES);
     }
 
-    /// A particle over a blank is a dot; over text it is a glow, and the
-    /// text stays.
     #[test]
     fn a_dot_in_a_blank_a_glow_over_text() {
         let mut frame = Frame::new(4, 1, Style::default());
@@ -463,7 +428,6 @@ mod tests {
         assert_eq!(frame.cells[2].text, Text::Char(' '));
     }
 
-    /// A mark grows round where the cursor landed and goes; it hides no text.
     #[test]
     fn a_mark_grows_and_goes_and_hides_nothing() {
         for mode in [Mode::SonicBoom, Mode::Ripple, Mode::Wireframe] {

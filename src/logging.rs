@@ -1,7 +1,7 @@
 //! Tracing setup.
 //!
-//! **Never to stdout**, which belongs to the picker and then to the PTY relay:
-//! a stray log line would land in the middle of the user's editor.
+//! **Never to stdout**: it belongs to the picker and the PTY relay, so a stray
+//! log line would land in the user's editor.
 
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::prelude::*;
 
-/// Start logging to `<dir>/nvmux.log`, at the verbosity `$NVMUX_LOG` asks
-/// for (see [`filter`]).
+/// Log to `<dir>/nvmux.log` at the verbosity `$NVMUX_LOG` sets (see
+/// [`filter`]).
 pub fn init(dir: &Path) -> Result<()> {
     let path = crate::paths::client_log(dir);
     let file = OpenOptions::new()
@@ -25,8 +25,8 @@ pub fn init(dir: &Path) -> Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(Mutex::new(file))
-                // No colour: escape codes in a log you `cat` while debugging a
-                // terminal problem only make it harder to read.
+                // No colour: escape codes clutter a log read while debugging
+                // terminal problems.
                 .with_ansi(false)
                 .with_target(true),
         )
@@ -37,22 +37,19 @@ pub fn init(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What gets logged, from `$NVMUX_LOG`: a comma-separated list of
-/// `target=level`, or a bare level for every target, as `RUST_LOG` spells
-/// them — `nvmux=debug`, `nvmux::pty=trace,warn`. Warnings from nvmux only
-/// when it is not set or does not parse, and nothing at all when it is set
-/// but empty.
+/// Parse `$NVMUX_LOG`: comma-separated `target=level` or bare levels, as in
+/// `RUST_LOG` (`nvmux::pty=trace,warn`). Unset or unparsable: nvmux warnings
+/// only. Set but empty: nothing.
 ///
-/// `RUST_LOG`'s span and field filters (`target[span{field=value}]=level`)
-/// are not taken: nvmux makes no spans, and parsing them is what would bring
-/// in a regex engine.
+/// Span and field filters are not supported: nvmux makes no spans, and
+/// parsing them would need a regex engine.
 fn filter(spec: Option<&str>) -> Targets {
     let warnings = || Targets::new().with_target("nvmux", tracing::Level::WARN);
     let Some(spec) = spec else {
         return warnings();
     };
-    // Empty directives are skipped: `Targets` would read one as a target
-    // that every event's begins with, and log everything.
+    // Skip empty directives: `Targets` treats one as a prefix of every
+    // target and logs everything.
     let directives: Vec<&str> = spec.split(',').filter(|d| !d.is_empty()).collect();
     if directives.is_empty() {
         return Targets::new();
@@ -65,7 +62,6 @@ mod tests {
     use super::*;
     use tracing::Level;
 
-    /// Which of these targets `spec` logs at `level`.
     fn logs(spec: Option<&str>, level: Level, targets: &[&str]) -> Vec<bool> {
         let filter = filter(spec);
         targets
@@ -74,7 +70,6 @@ mod tests {
             .collect()
     }
 
-    /// Unset, nvmux warns and nothing else says a word.
     #[test]
     fn unset_is_nvmux_warnings_only() {
         assert_eq!(
@@ -84,8 +79,8 @@ mod tests {
         assert_eq!(logs(None, Level::INFO, &["nvmux"]), [false]);
     }
 
-    /// A target's level holds for the modules under it, the most specific
-    /// target wins, and a bare level is for every target else.
+    /// A target covers its submodules, the most specific target wins, and a
+    /// bare level covers all other targets.
     #[test]
     fn targets_and_levels_read_as_rust_log_spells_them() {
         let targets = ["nvmux", "nvmux::pty", "nvmux::shadow", "vte"];
@@ -102,9 +97,7 @@ mod tests {
         assert_eq!(logs(Some("DEBUG"), Level::DEBUG, &targets), [true; 4]);
     }
 
-    /// An empty directive — a trailing comma, or nothing at all — is no
-    /// directive, as `RUST_LOG` has it: never a target that matches every
-    /// event and logs it.
+    /// A trailing comma or empty spec must not match every target.
     #[test]
     fn an_empty_directive_logs_nothing_of_its_own() {
         assert_eq!(
@@ -120,7 +113,6 @@ mod tests {
         }
     }
 
-    /// What does not parse is as good as not set.
     #[test]
     fn what_does_not_parse_is_nvmux_warnings_only() {
         for spec in ["nvmux=verbose", "nvmux=debug=trace"] {

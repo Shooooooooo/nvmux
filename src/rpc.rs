@@ -1,59 +1,40 @@
 //! A minimal synchronous msgpack-RPC client for Neovim.
 //!
-//! There is **no `nvim_ui_attach` through this client**, and there must never be
-//! one — see [`Client::list_uis`]. The UI nvmux is itself, [`crate::client`],
-//! is the client on the pty, in a process of its own and on a channel of its
-//! own: one UI, as `nvim --remote-ui` is where `[client] ui = "nvim"` puts
-//! that on the pty instead.
+//! Never `nvim_ui_attach` through this client (see [`Client::list_uis`]): the
+//! UI is [`crate::client`] (or `nvim --remote-ui`) on the pty, in its own
+//! process and channel.
 //!
-//! Synchronous because Neovim never pushes unsolicited traffic on a bare RPC
-//! channel: only one that has attached a UI or registered for autocmds gets
-//! notifications, so there is nothing to demultiplex in the background. The
-//! one channel nvmux asks for any on is a listener's, which a session's
-//! watcher tells its news to, and which waits for nothing else: see
-//! [`Client::next_notification`].
+//! Synchronous because Neovim sends nothing unsolicited on a bare RPC channel;
+//! only UI or autocmd subscribers get notifications. The one listener channel
+//! is read by [`Client::next_notification`]. [`Client::ask`] pipelines
+//! requests so two calls cost one round trip (the whole delay over SSH); a
+//! reply arriving while another is awaited is parked for its own waiter.
 //!
-//! Synchronous is not the same as one call at a time. [`Client::ask`] sends a
-//! request without waiting for it, so two calls whose answers are both wanted
-//! cost one round trip rather than two — which over an SSH forward is the whole
-//! of the delay. The only frames that can arrive are replies to requests this
-//! client sent, by the paragraph above, so a reply that turns up while a
-//! different one is being waited for is kept for its own waiter rather than
-//! demultiplexed anywhere.
+//! # Reachable is not ready
 //!
-//! # Reachable is not the same as ready
+//! `nvim_get_api_info` is answered off the main loop: it replies in 3 ms while
+//! the editor is blocked in `call system('sleep 3')` and `nvim_list_bufs`
+//! times out. So:
 //!
-//! `nvim_get_api_info` is answered off the main loop. Measured, it still replies
-//! in 3ms while the editor is blocked inside `call system('sleep 3')`, at which
-//! point `nvim_list_bufs` on a separate connection times out completely. That
-//! asymmetry drives the whole liveness model:
+//! * `api_info` answering proves a real Neovim, not an SSH forward that
+//!   accepts and resets.
+//! * only a deferred call answering proves the session is serving.
+//! * a deferred call timing out is [`Liveness::Busy`] (e.g. `:!make`), never
+//!   death, or live sessions would be reaped.
 //!
-//! * `api_info` answering means a real Neovim is behind the socket, as distinct
-//!   from an SSH forward that accepts and then resets.
-//! * only a *deferred* call answering means the session is actually serving.
-//! * a deferred call timing out means [`Liveness::Busy`] — the user is running
-//!   a build — and must never be treated as death, or nvmux would reap live
-//!   sessions out from under anyone who typed `:!make`.
+//! # Fast calls and the hit-enter prompt
 //!
-//! # Fast calls, and a session waiting at a prompt
-//!
-//! Neovim runs a handful of API functions straight from the socket read
-//! callback (`FUNC_API_FAST`: `nvim_get_api_info`, `nvim_get_mode`,
-//! `nvim_input`) and queues every other one for its main loop. An editor
-//! parked at a hit-enter prompt (`Press ENTER or type command to continue`)
-//! waits for that key with the queue switched off, so a deferred call — any of
-//! `nvim_list_bufs`, `nvim_list_uis`, `nvim_command`, `nvim_eval` — gets no
-//! answer at all until the prompt ends, however long the budget. Measured
-//! against 0.12.5: `nvim_get_mode` answers in 0.1 ms with `blocking = true`,
-//! `nvim_list_bufs` never answers. With `'cmdheight'` at 0, which AstroNvim
-//! sets, every one-line error opens that prompt; with the default 1, any
-//! message that scrolls does. So [`probe`] asks the mode before it asks
-//! anything deferred, the attach probe reads the mode before it waits on
-//! anything deferred (`pty::probe_on`, which sends both at once), and the
-//! attach and resume paths in [`crate::pty`] end the prompt with the one key
-//! it consumes, `<CR>`, before they wait on the editor. `nvim_get_mode` is only immediate while the editor is blocked or
-//! idle: during `:!cmd` and CPU-bound Lua it is queued like everything else,
-//! which is why every call here still carries a budget.
+//! `FUNC_API_FAST` functions (`nvim_get_api_info`, `nvim_get_mode`,
+//! `nvim_input`) run from the socket read callback; the rest queue for the main
+//! loop. At a hit-enter prompt that queue is off, so deferred calls
+//! (`nvim_list_bufs`, `nvim_list_uis`, `nvim_command`, `nvim_eval`) get no
+//! answer until it ends (0.12.5: `nvim_get_mode` answers in 0.1 ms with
+//! `blocking = true`). With `'cmdheight'` 0 (AstroNvim) any one-line error
+//! opens it; with 1, any message that scrolls. So [`probe`] and the attach
+//! probe (`pty::probe_on`) read the mode before anything deferred, and attach
+//! and resume in [`crate::pty`] end the prompt with `<CR>`. `nvim_get_mode` is
+//! queued too during `:!cmd` and CPU-bound Lua, so every call still has a
+//! budget.
 
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -70,72 +51,50 @@ const REQUEST: u64 = 0;
 const RESPONSE: u64 = 1;
 const NOTIFICATION: u64 = 2;
 
-/// Long enough that an ordinary call never trips it, short enough that a dead
-/// forward does not stall the picker.
+/// Short enough that a dead forward does not stall the picker.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// The read timeout for probes that run behind the picker. Three seconds rather
-/// than one: a deferred call blocks for the whole of any `system()` call in the
-/// user's editor, so a shorter budget marks healthy sessions dead.
-///
-/// The attach probe is the exception: it has no budget at all. There the user
-/// is watching a spinner and can give up whenever they like (see
-/// [`crate::pty::Probe`] and `ui::attaching`), and a session in the middle of
-/// a long `:!make` is one to wait for, not to refuse. A listing's probes have
-/// a quarter of a second ([`QUICK_PROBE_TIMEOUT`]). This stays for the probes
-/// nobody is watching besides: the wait for a freshly created session to
-/// answer.
+/// Read timeout for probes nobody watches, e.g. waiting for a new session. 3 s
+/// because a deferred call blocks for any `system()` in the editor, and a
+/// shorter budget marks healthy sessions dead. The attach probe has none (the
+/// user can cancel; see [`crate::pty::Probe`]); listings use
+/// [`QUICK_PROBE_TIMEOUT`].
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The read timeout for a listing's probes, in place of [`PROBE_TIMEOUT`]: an
-/// idle editor answers in a millisecond or two, many times over in this, and
-/// one that cannot answer — in a `:!make`, or in CPU-bound Lua — is busy at
-/// the end of it, as at the end of the longer one, and is listed as one that
-/// answered is. Busy is never reaped, so the longer wait only ever decided
-/// whether a session that died during it was listed: one that dies in the
-/// three seconds is listed until the next listing.
+/// Read timeout for a listing's probes. An idle editor answers in 1-2 ms; one
+/// that cannot is Busy either way, and Busy is never reaped, so a longer wait
+/// would only catch a session dying meanwhile (listed until the next listing).
 pub const QUICK_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// A connected RPC channel, generic over the byte stream so the same code serves
-/// a local socket, the local end of an SSH forward, and a pipe in tests.
+/// An RPC channel over any byte stream: a local socket, an SSH forward's local
+/// end, or a pipe in tests.
 pub struct Client<S: Read + Write> {
     io: BufReader<S>,
     next_msgid: u32,
     /// Once set, every call fails fast. See [`Client::poison`].
     poisoned: Option<String>,
-    /// Tracked so a timeout error reports the budget that actually elapsed,
-    /// rather than misreporting a 250ms failure as a 3s one. `None` is a
-    /// connection with no budget: a call waits until it is answered, or until
-    /// the socket is shut down under it (see [`Interrupt`]).
+    /// So timeout errors report the real budget. `None`: no budget; a call
+    /// waits until answered or the socket is shut down (see [`Interrupt`]).
     read_timeout: Option<Duration>,
-    /// The msgids of requests sent and not yet read. A parking permit rather
-    /// than a ledger: its only job is to say which stray reply is worth
-    /// keeping, so an id left here by an abandoned [`Pending`] costs nothing.
+    /// Msgids sent and not yet read. Only decides which stray reply to park,
+    /// so an id left by an abandoned [`Pending`] is harmless.
     in_flight: Vec<u32>,
-    /// Replies that arrived while a different one was being waited for, for
-    /// the waiter they belong to. Bounded by the number of requests sent and
-    /// not yet read, since nothing else is ever parked.
+    /// Replies that arrived while another was awaited, kept for their waiters.
+    /// Bounded by `in_flight`.
     parked: Vec<(u32, Result<Value, String>)>,
 }
 
-/// A request that has been sent and whose reply has not been read.
+/// A sent request whose reply is unread, from [`Client::ask`] for
+/// [`Client::reply_to`]. Not `Clone`: a second read would take the next
+/// call's reply.
 ///
-/// Handed out by [`Client::ask`] and spent on [`Client::reply_to`], which is
-/// what makes two calls cost one round trip instead of two. Not `Clone`: two
-/// reads of one reply would take the next call's answer for the second.
-///
-/// Abandoning one is allowed and costs nothing here — the reply is dropped if
-/// it ever arrives. What it costs on the *far* side is the caller's to think
-/// about: the request has been sent, so the session will run it whenever its
-/// main loop next gets to. See `pty::probe_on`, which abandons a `nvim_list_uis`
-/// on the one path where the answer stops mattering.
+/// Dropping one is harmless here, but the request was sent, so Neovim still
+/// runs it. See `pty::probe_on`, which abandons a `nvim_list_uis`.
 #[derive(Debug)]
 #[must_use = "a request that is sent and never read leaves its reply on the socket"]
 pub struct Pending {
     msgid: u32,
-    /// What was asked, for the error a failed read reports. Every method name
-    /// in this crate is a literal, so this borrows rather than allocating on
-    /// a path that already costs a round trip.
+    /// For error messages. Method names are literals, so no allocation.
     method: &'static str,
 }
 
@@ -150,21 +109,19 @@ impl<S: Read + Write> std::fmt::Debug for Client<S> {
 }
 
 impl Client<UnixStream> {
-    /// Connect to a session socket. `read_timeout` bounds each *reply*, not the
-    /// connect — a unix socket connect either finds a listener or does not.
-    /// Passing a connect-sized value here classified live sessions as dead.
+    /// `read_timeout` bounds each reply, not the connect (a unix connect finds
+    /// a listener or fails at once); a connect-sized value marks live sessions
+    /// dead.
     pub fn connect(path: &Path, read_timeout: Duration) -> Result<Self, RpcError> {
         Self::connect_with(path, Some(read_timeout))
     }
 
-    /// [`Client::connect`], with the budget optional. `None` bounds nothing: a
-    /// call blocks until the server answers, however long that is, and the only
-    /// way to end it sooner is an [`Interrupt`] fired from another thread. For
-    /// a wait somebody is watching and can cancel, and nothing else — every
-    /// probe the picker runs on its own account keeps a budget.
+    /// [`Client::connect`] with an optional budget. With `None` a call blocks
+    /// until answered, and only an [`Interrupt`] from another thread ends it
+    /// sooner: use it only for waits the user watches and can cancel.
     pub fn connect_with(path: &Path, read_timeout: Option<Duration>) -> Result<Self, RpcError> {
-        // std's error here is `InvalidInput` with `raw_os_error() == None` —
-        // nothing a caller could match on. Check explicitly for a useful message.
+        // For an overlong path std's error is an `InvalidInput` with no OS
+        // error to match on; check first for a useful message.
         crate::paths::check_sock_path(path).map_err(|e| RpcError::Protocol(e.to_string()))?;
 
         let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
@@ -172,11 +129,9 @@ impl Client<UnixStream> {
                 RpcError::ConnectionRefused(path.to_path_buf())
             }
             std::io::ErrorKind::NotFound => RpcError::ConnectionRefused(path.to_path_buf()),
-            // A regular file (or directory) sitting at the path. Linux reports
-            // that as ECONNREFUSED; macOS and the BSDs say ENOTSOCK. Either
-            // way nothing can be listening on a non-socket inode, so it is as
-            // dead as a missing one. Whether the file may be *deleted* is a
-            // separate question the reaper answers with `lstat`.
+            // A non-socket at the path: ECONNREFUSED on Linux, ENOTSOCK on
+            // macOS/BSD. Nothing can listen there, so it is dead. Whether it
+            // may be deleted is the reaper's call (`lstat`).
             _ if e.raw_os_error() == Some(libc::ENOTSOCK) => {
                 RpcError::ConnectionRefused(path.to_path_buf())
             }
@@ -189,9 +144,8 @@ impl Client<UnixStream> {
         Ok(client)
     }
 
-    /// Bound each reply from here on by `read_timeout`, in place of the budget
-    /// the connection was made with: for a deferred call sent behind a fast
-    /// one, waited for no longer than it would be on a connection of its own.
+    /// Replace the budget, e.g. so a deferred call sent behind a fast one
+    /// waits no longer than on its own connection.
     pub fn set_read_timeout(&mut self, read_timeout: Duration) -> Result<(), RpcError> {
         let stream = self.io.get_ref();
         stream.set_read_timeout(Some(read_timeout))?;
@@ -200,15 +154,13 @@ impl Client<UnixStream> {
         Ok(())
     }
 
-    /// A second handle on this connection, for ending a call in progress from
-    /// another thread. See [`Interrupt`].
+    /// A handle for ending a call from another thread (see [`Interrupt`]).
     pub fn interrupt(&self) -> std::io::Result<Interrupt> {
         Ok(Interrupt(self.io.get_ref().try_clone()?))
     }
 
-    /// The budget from here on: `None` for none, as [`Client::connect_with`]
-    /// takes it. What a channel held open for what the server pushes needs
-    /// once the calls that set it up have had theirs (see
+    /// Like [`Client::set_read_timeout`], but `None` removes the budget: for a
+    /// channel kept open for notifications after its setup calls (see
     /// [`crate::notes::listen`]).
     pub fn set_budget(&mut self, budget: Option<Duration>) -> std::io::Result<()> {
         let stream = self.io.get_ref();
@@ -219,28 +171,17 @@ impl Client<UnixStream> {
     }
 }
 
-/// A way to end a call in progress on another thread.
+/// Ends a call in progress on another thread.
 ///
-/// A [`Client`] with no budget ([`Client::connect_with`] given `None`) blocks
-/// in `read` until the server answers, and a thread parked in a blocking read
-/// cannot be told to stop — the reason [`crate::pty`] gives for reading the
-/// terminal from one thread and one `poll`. What *can* be done is to take the
-/// socket away from under it: `shutdown` acts on the socket itself rather than
-/// on the handle it is called through, so a shutdown here makes the read on
-/// the other thread return end-of-file at once, and the call fails as
-/// [`RpcError::Reset`]. Dropping a second handle would not do it — that only
-/// closes a file descriptor, and the socket stays open for as long as the
-/// other one is held.
-///
-/// Unconditional: the connection is unusable afterwards, which is what the
-/// holder wanted.
+/// A blocking read cannot be cancelled, but `shutdown` acts on the socket, not
+/// the handle, so the other thread's read gets EOF at once and the call fails
+/// as [`RpcError::Reset`]. Dropping a cloned handle would only close an fd.
+/// The connection is unusable afterwards.
 #[derive(Debug)]
 pub struct Interrupt(UnixStream);
 
 impl Interrupt {
-    /// End whatever call the connection is in the middle of. Harmless when it
-    /// is in none, or already gone — an error here has nothing to tell the
-    /// caller, who is abandoning the connection either way.
+    /// Errors are ignored: the caller is abandoning the connection anyway.
     pub fn fire(&self) {
         let _ = self.0.shutdown(std::net::Shutdown::Both);
     }
@@ -258,47 +199,36 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    /// Mark this connection unusable. rmpv reads incrementally, so a call that
-    /// gives up partway leaves bytes in the socket and the next read would
-    /// decode a well-formed-looking value out of the previous frame's tail.
+    /// Mark the connection unusable: rmpv reads incrementally, so a call
+    /// abandoned partway leaves bytes the next read would misdecode as a
+    /// plausible value.
     fn poison(&mut self, why: impl Into<String>) -> RpcError {
         let why = why.into();
         self.poisoned = Some(why.clone());
         RpcError::Protocol(why)
     }
 
-    /// Condemn the connection when an error left unread bytes behind — a
-    /// timeout is the dangerous case and the easy one to miss. The error the
-    /// caller sees is preserved; only the connection is condemned.
+    /// Poison the connection if `e` may have left unread bytes (a timeout
+    /// especially); `e` is returned unchanged.
     fn poison_if_fatal(&mut self, e: RpcError, method: &str) -> RpcError {
         match &e {
             RpcError::Timeout(_) | RpcError::Protocol(_) => {
                 self.poisoned = Some(format!("{method}: {e}"));
             }
-            // Already unusable, and the caller distinguishes these for liveness.
+            // Already unusable; the caller tells these apart for liveness.
             _ => {}
         }
         e
     }
 
-    /// Issue a request and wait for its response.
     pub fn call(&mut self, method: &'static str, params: Vec<Value>) -> Result<Value, RpcError> {
         let pending = self.ask(method, params)?;
         self.reply_to(pending)
     }
 
-    /// Send a request without waiting for its reply.
-    ///
-    /// The half of [`Client::call`] that costs nothing to do twice. Two calls
-    /// asked in series cost two round trips, and over an SSH forward a round
-    /// trip is the whole of the delay: measured through a link with a 150 ms
-    /// round trip, `nvim_get_mode` then `nvim_list_uis` took 302 ms, and the
-    /// same pair sent before either was read took 151 ms. `pty::probe_on` is
-    /// the caller, and the only one — see it for what may and may not be asked
-    /// of a session before it has said what state it is in.
-    ///
-    /// The reply is read by [`Client::reply_to`], in any order: one that
-    /// arrives while another is being waited for is kept for its own waiter.
+    /// Send a request without waiting, so two calls cost one round trip (over a
+    /// 150 ms link, 151 ms instead of 302 ms). Replies are read with
+    /// [`Client::reply_to`] in any order.
     pub fn ask(&mut self, method: &'static str, params: Vec<Value>) -> Result<Pending, RpcError> {
         if let Some(why) = &self.poisoned {
             return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
@@ -316,12 +246,9 @@ impl<S: Read + Write> Client<S> {
             Value::Array(params),
         ]);
 
-        // Encoded whole, then written once. rmpv writes each marker and value
-        // on its own, and on a bare socket every one of those was a syscall,
-        // and a wake-up of the session reading it: seventeen for a read of a
-        // session's notes, every two seconds, for every session. A write the
-        // session refuses is told as the flush's error was, a reset where it
-        // has hung up, as a read would find it — not as a failure to encode.
+        // Encode, then write once: rmpv writes each marker separately, and on
+        // a socket each is a syscall and a session wake-up (17 per notes read).
+        // A refused write maps like a read error (a reset if hung up).
         let mut bytes = Vec::with_capacity(64);
         rmpv::encode::write_value(&mut bytes, &request)
             .map_err(|e| self.poison(format!("encoding {method}: {e}")))?;
@@ -334,27 +261,21 @@ impl<S: Read + Write> Client<S> {
         Ok(Pending { msgid, method })
     }
 
-    /// Wait for the reply to a request [`Client::ask`] sent.
-    ///
-    /// The budget is this wait's, not the request's: a reply already in hand
-    /// costs nothing, and one that is still coming gets the whole of it. That
-    /// is the same bound a [`Client::call`] has, since there the two halves
-    /// are one statement apart.
+    /// Wait for the reply to a request [`Client::ask`] sent. The budget covers
+    /// this wait, not the time since the request.
     pub fn reply_to(&mut self, pending: Pending) -> Result<Value, RpcError> {
         let Pending { msgid, method } = pending;
         if let Some(why) = &self.poisoned {
             return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
         }
-        // Already read, while a different reply was being waited for.
         if let Some(i) = self.parked.iter().position(|(id, _)| *id == msgid) {
             let (_, result) = self.parked.remove(i);
             self.forget(msgid);
             return result.map_err(RpcError::Nvim);
         }
 
-        // An overall deadline as well as a per-read one: a peer that keeps
-        // sending frames we skip restarts the per-read budget every time. No
-        // budget, no deadline: an unbounded call is unbounded here too.
+        // An overall deadline too: a peer sending frames we skip would restart
+        // the per-read timeout each time. No budget, no deadline.
         let budget = self.read_timeout;
         let started = std::time::Instant::now();
 
@@ -384,13 +305,13 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    /// This reply has been handed to its waiter: nothing is owed on it now,
-    /// and a late duplicate is a stray rather than something to park.
+    /// The reply was delivered; a late duplicate is now a stray, not parked.
     fn forget(&mut self, msgid: u32) {
         self.in_flight.retain(|id| *id != msgid);
     }
 
-    /// Sort one decoded frame into "the answer we wanted" or "ignore it".
+    /// `Some` if the frame answers `want`. Other replies we are owed are
+    /// parked; other well-formed frames are ignored.
     #[allow(clippy::type_complexity)]
     fn classify(
         &mut self,
@@ -418,12 +339,8 @@ impl<S: Read + Write> Client<S> {
                 if got == u64::from(want) {
                     return Ok(Some(result));
                 }
-                // Not the one being waited for. Kept if it answers something
-                // this client asked and has not read — [`Client::ask`] hands
-                // out those waiters, and dropping their replies here would
-                // lose them for good. Anything else is a stray: a duplicate,
-                // or a frame from a peer that is not answering our questions,
-                // and there is nobody to give it to.
+                // Park it if we are owed it; otherwise it is a stray (a
+                // duplicate, or a peer answering unasked questions).
                 let ours = u32::try_from(got).is_ok_and(|id| {
                     self.in_flight.contains(&id) && !self.parked.iter().any(|(p, _)| *p == id)
                 });
@@ -444,12 +361,10 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    /// Wait for the next notification the server sends on this channel —
-    /// one it was asked for, as a session's watcher sends its news (see
-    /// [`crate::notes::listen`]) — and hand back its method and arguments. A
-    /// reply that comes meanwhile is kept for its waiter, as
-    /// [`Client::reply_to`] keeps one, and a request is not answered. Bounded
-    /// by the connection's budget, where it has one.
+    /// Wait for the next notification (e.g. a session watcher's, see
+    /// [`crate::notes::listen`]) and return its method and args. Replies
+    /// meanwhile are parked; requests are not answered. Bounded by the
+    /// connection's budget, if any.
     pub fn next_notification(&mut self) -> Result<(String, Vec<Value>), RpcError> {
         if let Some(why) = &self.poisoned {
             return Err(RpcError::Protocol(format!("connection poisoned: {why}")));
@@ -473,23 +388,20 @@ impl<S: Read + Write> Client<S> {
                 let args = a.get(2).and_then(Value::as_array).cloned();
                 return Ok((method.to_string(), args.unwrap_or_default()));
             }
-            // A reply or a request, sorted as any other read sorts one: no
-            // reply is to 0, the ids starting at 1.
+            // Msgids start at 1, so `want = 0` matches no reply.
             self.classify(value, 0)?;
         }
     }
 
-    /// `nvim_get_api_info` — reachability and version. Answered off the main
-    /// loop, so this does **not** prove the session is usable; see the module
-    /// docs.
+    /// `nvim_get_api_info`: reachability and version. Answered off the main
+    /// loop, so it does not prove the session is usable (see module docs).
     pub fn api_info(&mut self) -> Result<crate::nvim::Version, RpcError> {
         let v = self.call("nvim_get_api_info", vec![])?;
         let arr = v
             .as_array()
             .ok_or_else(|| RpcError::Protocol("api_info was not an array".into()))?;
-        // Element 0 is our channel id, which nvmux never uses. Requiring it to be
-        // an integer anyway is what makes a non-nvim peer fail here, cleanly,
-        // rather than somewhere further downstream.
+        // Element 0 is our channel id (unused). Requiring an integer makes a
+        // non-nvim peer fail here, cleanly.
         if arr.first().and_then(Value::as_u64).is_none() {
             return Err(RpcError::Protocol("api_info had no channel id".into()));
         }
@@ -514,14 +426,13 @@ impl<S: Read + Write> Client<S> {
             major: field("major").unwrap_or(0),
             minor: field("minor").unwrap_or(0),
             patch: field("patch").unwrap_or(0),
-            // The map spells `prerelease` as a boolean and keeps the dev tag
-            // under `build`; nothing in nvmux reads either from this path, so
-            // it is left unset rather than invented.
+            // The map has `prerelease` as a bool and the dev tag under
+            // `build`; neither is needed here.
             prerelease: None,
         })
     }
 
-    /// `nvim_list_bufs` — a *deferred* call, and therefore the real readiness test.
+    /// `nvim_list_bufs`: a deferred call, so the real readiness test.
     pub fn list_bufs(&mut self) -> Result<Vec<Value>, RpcError> {
         let v = self.call("nvim_list_bufs", vec![])?;
         Ok(v.as_array()
@@ -529,62 +440,53 @@ impl<S: Read + Write> Client<S> {
             .to_vec())
     }
 
-    /// How many UIs are currently attached, checked before ever attaching.
-    /// Neovim's `ui_attach_impl` does `if (ui_count == MAX_UI_COUNT) { abort(); }`
-    /// with `MAX_UI_COUNT == 16` — an `abort()`, not an error return, so a
-    /// seventeenth attach SIGABRTs the server and destroys the session.
+    /// Number of attached UIs, checked before attaching: Neovim's
+    /// `ui_attach_impl` calls `abort()` at `MAX_UI_COUNT` (16), so a 17th
+    /// attach kills the server.
     ///
-    /// This is also why nvmux never attaches a second UI to preview a session:
-    /// Neovim sizes the global grid to the per-dimension minimum across every
-    /// attached UI, so a small preview would shrink the grid you are editing in.
+    /// Also why nvmux never attaches a preview UI: Neovim sizes the grid to the
+    /// smallest attached UI, shrinking the one being edited in.
     pub fn list_uis(&mut self) -> Result<usize, RpcError> {
         let pending = self.ask_uis()?;
         self.uis_reply(pending)
     }
 
-    /// [`Client::list_uis`], asked but not waited for. The attach probe asks
-    /// this alongside the mode and reads it only once the mode has said the
-    /// session is serving deferred calls at all — see `pty::probe_on`.
+    /// [`Client::list_uis`] without waiting. The attach probe reads it only
+    /// once the mode shows deferred calls are served (see `pty::probe_on`).
     pub fn ask_uis(&mut self) -> Result<Pending, RpcError> {
         self.ask("nvim_list_uis", vec![])
     }
 
-    /// The count from an [`Client::ask_uis`] this client sent.
     pub fn uis_reply(&mut self, pending: Pending) -> Result<usize, RpcError> {
         let v = self.reply_to(pending)?;
         Ok(v.as_array().map(|a| a.len()).unwrap_or(0))
     }
 
-    /// `nvim_command`. Used for injecting the `:Detach` alias, and for
-    /// `:mode`, the one command that clears the grid and repaints it.
+    /// `nvim_command`: used for `:mode`, the one command that clears and
+    /// repaints the grid.
     pub fn command(&mut self, cmd: &str) -> Result<(), RpcError> {
         self.call("nvim_command", vec![Value::String(cmd.into())])?;
         Ok(())
     }
 
-    /// `nvim_eval` — deferred, like [`Client::command`]. The resume asks it
-    /// what the client's mouse setting is, once the server is known to be
-    /// free to answer.
+    /// `nvim_eval`, deferred like [`Client::command`]. Used on resume for the
+    /// mouse setting.
     pub fn eval(&mut self, expr: &str) -> Result<Value, RpcError> {
         self.call("nvim_eval", vec![Value::String(expr.into())])
     }
 
-    /// `nvim_get_mode` — a *fast* call, answered even while the editor is
-    /// blocked at a prompt, which is exactly when it is worth asking. See the
-    /// module docs.
+    /// `nvim_get_mode`: fast, so answered even at a prompt.
     pub fn get_mode(&mut self) -> Result<Mode, RpcError> {
         let pending = self.ask_mode()?;
         self.mode_reply(pending)
     }
 
-    /// [`Client::get_mode`], asked but not waited for. Fast, so the reply is
-    /// on its way whatever the editor is doing — which is what lets the attach
-    /// probe send a deferred call behind it and still decide on this one.
+    /// [`Client::get_mode`] without waiting. Being fast, it is answered even
+    /// with a deferred call queued behind it, as the attach probe does.
     pub fn ask_mode(&mut self) -> Result<Pending, RpcError> {
         self.ask("nvim_get_mode", vec![])
     }
 
-    /// The mode from an [`Client::ask_mode`] this client sent.
     pub fn mode_reply(&mut self, pending: Pending) -> Result<Mode, RpcError> {
         let v = self.reply_to(pending)?;
         let map = v
@@ -599,61 +501,48 @@ impl<S: Read + Write> Client<S> {
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::Protocol("get_mode had no mode".into()))?
             .to_string();
-        // Absent means not blocking: the key has been there since 0.2, but a
-        // missing flag must read as "go ahead", never as "blocked".
+        // Missing reads as not blocking (the key exists since 0.2): erring
+        // that way costs a wait, the other way could end a prompt.
         let blocking = field("blocking").and_then(Value::as_bool).unwrap_or(false);
         Ok(Mode { mode, blocking })
     }
 
-    /// `nvim_input` — a *fast* call: the keys land in the editor's input
-    /// buffer at once, prompt or no prompt. nvmux itself only ever sends a
-    /// lone `<CR>` to a hit-enter prompt this way (see [`Mode::at_hit_enter`]);
-    /// the integration tests type more.
+    /// `nvim_input`: a fast call, so keys are queued at once even at a prompt.
+    /// nvmux only sends a lone `<CR>` to a hit-enter prompt (see
+    /// [`Mode::at_hit_enter`]); integration tests send more.
     pub fn input(&mut self, keys: &str) -> Result<(), RpcError> {
-        // The reply is how many bytes were queued, which says nothing useful.
+        // The reply (bytes queued) is not useful.
         self.call("nvim_input", vec![Value::String(keys.into())])?;
         Ok(())
     }
 }
 
-/// What `nvim_get_mode` reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mode {
-    /// As `mode(1)` spells it: `n`, `i`, `c`, `r` for the hit-enter prompt,
-    /// `rm` for the more-prompt, `r?` for a `:confirm` question, and so on.
+    /// As `mode(1)` spells it: `n`, `i`, `c`, `r` (hit-enter prompt), `rm`
+    /// (more-prompt), `r?` (`:confirm`), etc.
     pub mode: String,
-    /// The editor is waiting for a key with its event queue switched off, so
-    /// no deferred call is served until that key arrives: a hit-enter or
-    /// more-prompt, or the second key of a multi-key command.
+    /// Waiting for a key with the event queue off: deferred calls are not
+    /// served until it arrives.
     ///
-    /// Measured against 0.12.5, with a real UI attached, since which states
-    /// actually set this is not obvious and decides what the attach probe may
-    /// ask. A hit-enter prompt is `r` with this true; a more-prompt `rm` with
-    /// it true; a half-typed `g` is `n` with it true. But a pending *operator*
-    /// is not: `d` reports `no` with this false and answers deferred calls as
-    /// usual, and so do a `:confirm` question (`r?`) and a script parked in
-    /// `getchar()`. So this flag is narrower than "the editor is waiting for
-    /// something", and it is the reliable half — where it is set, a deferred
-    /// call will not be answered, whatever the mode string says.
+    /// Measured on 0.12.5 with a UI attached: true at a hit-enter prompt (`r`),
+    /// a more-prompt (`rm`) and after a half-typed `g` (`n`); false for a
+    /// pending operator (`no`), `:confirm` (`r?`) and `getchar()`, which all
+    /// serve deferred calls. Narrower than "waiting", but reliable when set.
     pub blocking: bool,
 }
 
 impl Mode {
-    /// The hit-enter prompt, and only that: mode `r` while blocking.
+    /// The hit-enter prompt only: mode `r` while blocking.
     ///
-    /// The distinction matters because this is the one prompt nvmux is willing
-    /// to end on the user's behalf. `wait_return()` consumes `<CR>` outright
-    /// (most other keys it pushes back to run as a Normal-mode command), and
-    /// what it was showing has been painted over by the time nvmux asks. The
-    /// more-prompt (`rm`) scrolls a line on `<CR>`; a `:confirm` question
-    /// (`r?`) takes `<CR>` as its default answer, which is never nvmux's call
-    /// to make — and it is the mode string alone that keeps it out, since
-    /// `blocking` is false there. A pending multi-key command is blocking in
-    /// mode `n` or `no`, and `<CR>` would complete it.
+    /// The one prompt nvmux ends for the user: `wait_return()` consumes `<CR>`
+    /// (other keys run as Normal-mode commands) and its message is already
+    /// painted over. Not the more-prompt (`<CR>` scrolls), `:confirm` (`<CR>`
+    /// answers it; only the mode string excludes it, as `blocking` is false),
+    /// or a pending multi-key command in `n`/`no` (`<CR>` completes it).
     ///
-    /// Advisory, not a lock: a key from another attached UI in the
-    /// microseconds after this answer ends the prompt first, and a `<CR>`
-    /// sent on the strength of it runs in whatever mode that key left.
+    /// Advisory: a key from another UI just after this answer can end the
+    /// prompt first, and the `<CR>` then runs in whatever mode follows.
     pub fn at_hit_enter(&self) -> bool {
         self.blocking && self.mode == "r"
     }
@@ -661,24 +550,20 @@ impl Mode {
 
 /// Decode a Neovim handle (buffer, window, tabpage) into its integer id.
 ///
-/// Neovim encodes these as msgpack **EXT** values whose payload is itself a
-/// msgpack-encoded integer, not a raw byte. Reading `data[0]` directly appears
-/// to work for every handle below 128 and then silently returns nonsense:
-/// buffer 128 decodes as 204, because 0xcc is the `uint8` marker byte.
+/// Handles are msgpack EXT values whose payload is a msgpack-encoded integer:
+/// reading `data[0]` breaks from 128 (buffer 128 decodes as 204, 0xcc being
+/// the `uint8` marker).
 ///
-/// Display and logging only. Pass a handle **back** to Neovim as the original
-/// [`Value::Ext`] verbatim — an integer that happens to be 0 means "the current
-/// buffer" and answers plausibly for the wrong one.
-///
-/// nvmux makes no handle-based calls today, so this lives with its test as the
-/// reference for whoever adds one.
+/// For display only: pass handles back as the original [`Value::Ext`], since a
+/// wrong integer such as 0 ("current buffer") answers plausibly. Unused outside
+/// tests; kept as the reference for future handle-based calls.
 #[cfg(test)]
 fn ext_to_handle(v: &Value) -> Option<i64> {
     match v {
         Value::Ext(_type_code, data) => rmpv::decode::read_value(&mut &data[..])
             .ok()
             .and_then(|v| v.as_i64()),
-        // Tolerated so tests and any future plain-integer API keep working.
+        // Plain integers too, for tests and any future plain-integer API.
         other => other.as_i64(),
     }
 }
@@ -695,9 +580,8 @@ fn describe_nvim_error(v: &Value) -> String {
 
 fn map_io(e: std::io::Error, timeout: Option<Duration>) -> RpcError {
     match e.kind() {
-        // A read timeout surfaces as one of these two depending on platform.
-        // Not without a budget, though — nothing sets the socket non-blocking
-        // — so the zero reported in its place is never seen.
+        // A read timeout is one of these, by platform. Never without a budget
+        // (the socket is never non-blocking), so the zero default is unseen.
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
             RpcError::Timeout(timeout.unwrap_or_default())
         }
@@ -707,28 +591,24 @@ fn map_io(e: std::io::Error, timeout: Option<Duration>) -> RpcError {
     }
 }
 
-/// Decide whether a session socket has a live, serving Neovim behind it.
+/// Whether a session socket has a live, serving Neovim behind it.
 ///
-/// **Only `Dead` causes files to be deleted, so `Dead` must mean "we proved
-/// nothing is listening" — never "we did not get an answer".** Everything else
-/// degrades to [`Liveness::Busy`], which is never reaped. An earlier version
-/// mapped any `api_info` error to `Dead` under a 250ms budget; `api_info` is
-/// *not* answered during CPU-bound Lua, measured at 3.7s, so a plain `nvmux`
-/// invocation unlinked the socket of a session that was merely busy.
+/// **Only `Dead` leads to files being deleted, so it must mean "proved nothing
+/// is listening", never "no answer".** Everything else is [`Liveness::Busy`],
+/// which is never reaped. Even `api_info` goes unanswered during CPU-bound Lua
+/// (measured 3.7 s).
 pub fn probe(path: &Path) -> Liveness {
     probe_within(path, PROBE_TIMEOUT)
 }
 
-/// [`probe`], each call given `budget` to be answered in, rather than
-/// [`PROBE_TIMEOUT`].
+/// [`probe`] with `budget` per call instead of [`PROBE_TIMEOUT`].
 pub fn probe_within(path: &Path, budget: Duration) -> Liveness {
     let mut client = match Client::connect(path, budget) {
         Ok(c) => c,
         Err(e) if e.is_definitely_dead() => return Liveness::Dead,
         Err(e) => {
-            // EACCES, too many open files, a path we cannot name: none of it
-            // says anything about the session. Under fd exhaustion the
-            // alternative would reap every session at once.
+            // EACCES, EMFILE, a bad path: nothing about the session. Treating
+            // fd exhaustion as death would reap every session at once.
             tracing::warn!(path = %path.display(), error = %e, "probe inconclusive");
             return Liveness::Busy;
         }
@@ -743,12 +623,9 @@ pub fn probe_within(path: &Path, budget: Duration) -> Liveness {
         }
     }
 
-    // Before anything deferred: a session waiting for a key with its event
-    // queue off — at a hit-enter prompt, most often — would hold the deferred
-    // call for the whole budget, and it is the picker that waits with it, on
-    // a cleared screen. The mode is a fast call and says so in a millisecond.
-    // Busy, not a state of its own: like a `:!make` it is reachable and must
-    // never be reaped.
+    // The fast mode call first: at a hit-enter prompt a deferred call would
+    // hold the picker for the whole budget. Blocking is Busy, like `:!make`:
+    // reachable, never reaped.
     match client.get_mode() {
         Ok(mode) if mode.blocking => {
             tracing::debug!(
@@ -770,8 +647,7 @@ pub fn probe_within(path: &Path, budget: Duration) -> Liveness {
     match client.list_bufs() {
         Ok(_) => Liveness::Alive,
         Err(e) if e.is_definitely_dead() => Liveness::Dead,
-        // Reachable but not answering: almost certainly inside a `:!make`, or
-        // still sourcing a slow init.lua. Never reap this.
+        // Reachable but not answering: likely `:!make` or a slow init.lua.
         Err(e) => {
             tracing::debug!(path = %path.display(), error = %e, "list_bufs did not answer");
             Liveness::Busy
@@ -785,9 +661,8 @@ mod tests {
 
     #[test]
     fn ext_handles_decode_past_the_one_byte_boundary() {
-        // The payload is a msgpack-encoded integer, so these are the encodings
-        // Neovim actually sends. Handle 1 fits in a fixint; 128 needs a uint8
-        // marker (0xcc), which is the case a naive `data[0]` gets wrong.
+        // Real encodings: 1 is a fixint; 128 needs the uint8 marker 0xcc,
+        // which a naive `data[0]` misreads.
         let cases: &[(i64, &[u8])] = &[
             (1, &[0x01]),
             (127, &[0x7f]),
@@ -808,7 +683,6 @@ mod tests {
 
     #[test]
     fn naive_first_byte_decoding_would_be_wrong() {
-        // Guards the comment on ext_to_handle: this is the bug it prevents.
         let v = Value::Ext(0, vec![0xcc, 0x80]);
         assert_eq!(ext_to_handle(&v), Some(128));
         assert_ne!(ext_to_handle(&v), Some(0xcc));
@@ -819,8 +693,8 @@ mod tests {
         assert_eq!(ext_to_handle(&Value::from(7)), Some(7));
     }
 
-    /// A peer that answers every request with one canned frame, and keeps
-    /// what was sent to it, and in how many writes.
+    /// Replays canned reply bytes; records what was sent and in how many
+    /// writes.
     struct Canned {
         reply: std::io::Cursor<Vec<u8>>,
         sent: Vec<u8>,
@@ -844,15 +718,13 @@ mod tests {
         }
     }
 
-    /// A client whose first call is answered with `result`. The msgid is 1
-    /// because that is what a fresh client sends first.
+    /// Answers msgid 1, a fresh client's first request, with `result`.
     fn answering(result: Value) -> Client<Canned> {
         answering_frames(&[(1, result)])
     }
 
-    /// A client handed these replies, in this order, whatever it asks. The
-    /// order is the point: a peer answers a fast call before a deferred one it
-    /// was asked first, and nothing about the protocol says otherwise.
+    /// Replies in exactly this order, whatever is asked: a peer may answer a
+    /// fast call before a deferred one asked first.
     fn answering_frames(replies: &[(u32, Value)]) -> Client<Canned> {
         let mut bytes = Vec::new();
         for (msgid, result) in replies {
@@ -879,8 +751,6 @@ mod tests {
         Value::Map(pairs)
     }
 
-    /// The shape Neovim answers with at a hit-enter prompt — and the one
-    /// answer that took 3 s to not get before the mode was asked first.
     #[test]
     fn get_mode_decodes_a_hit_enter_prompt() {
         let mut c = answering(mode_map("r", Some(true)));
@@ -897,8 +767,7 @@ mod tests {
         assert_eq!(sent[2].as_str(), Some("nvim_get_mode"));
     }
 
-    /// A missing flag must mean "not blocking": that way round a decoding
-    /// gap costs a 3 s wait, the other way round it would end prompts.
+    /// Erring this way costs a 3 s wait; the other way would end prompts.
     #[test]
     fn a_missing_blocking_flag_reads_as_not_blocking() {
         let mut c = answering(mode_map("n", None));
@@ -907,21 +776,14 @@ mod tests {
         assert!(!m.at_hit_enter());
     }
 
-    /// Two questions in flight, answered in the other order: each reply
-    /// reaches the waiter it belongs to.
-    ///
-    /// This is what the attach probe does, and the order here is the one it
-    /// meets — `nvim_get_mode` is a fast call and `nvim_list_uis` waits for the
-    /// main loop, so the second question is routinely answered first. A reply
-    /// read while a different one is being waited for used to be dropped, which
-    /// would lose one of these outright.
+    /// The attach probe's two questions, the second answered first.
     #[test]
     fn a_reply_that_arrives_out_of_order_is_kept_for_its_own_waiter() {
         let mut c = answering_frames(&[(2, Value::from("uis")), (1, Value::from("mode"))]);
         let mode = c.ask("nvim_get_mode", vec![]).expect("sent");
         let uis = c.ask("nvim_list_uis", vec![]).expect("sent");
 
-        // Reading the mode takes the UI count off the socket on the way.
+        // Reading the mode parks the UI count on the way.
         assert_eq!(c.reply_to(mode).expect("the mode").as_str(), Some("mode"));
         assert_eq!(c.reply_to(uis).expect("the count").as_str(), Some("uis"));
         assert!(
@@ -932,9 +794,8 @@ mod tests {
         );
     }
 
-    /// Only a reply this client is owed is kept. Anything else — a duplicate,
-    /// a frame from a peer answering questions nobody asked — is skipped as it
-    /// always was, which is what bounds the parking to the requests in flight.
+    /// Duplicates and unasked replies are dropped, bounding parking to the
+    /// requests in flight.
     #[test]
     fn a_reply_nobody_is_owed_is_skipped_rather_than_kept() {
         let mut c = answering_frames(&[(99, Value::from("stray")), (1, Value::from("mine"))]);
@@ -943,9 +804,8 @@ mod tests {
         assert!(c.parked.is_empty(), "kept a stray reply: {:?}", c.parked);
     }
 
-    /// A question whose answer stopped mattering: the attach probe abandons
-    /// its UI count when the mode says the session is waiting for a key. The
-    /// reply still arrives, and the calls after it must still get their own.
+    /// The attach probe abandons its UI count when the mode shows a key is
+    /// awaited; later calls must still get their own replies.
     #[test]
     fn a_pending_nobody_reads_does_not_confuse_the_calls_after_it() {
         let mut c = answering_frames(&[
@@ -957,9 +817,8 @@ mod tests {
         let _abandoned = c.ask("nvim_list_uis", vec![]).expect("sent");
         assert_eq!(c.reply_to(mode).expect("the mode").as_str(), Some("mode"));
 
-        // The abandoned reply is read past on the way to this one, and kept
-        // for a waiter that will never come back for it — which costs one
-        // entry on a connection that is about to be dropped.
+        // The abandoned reply stays parked: one entry, on a connection about
+        // to be dropped.
         let input = c.ask("nvim_input", vec![]).expect("sent");
         assert_eq!(c.reply_to(input).expect("the count").as_str(), Some("4"));
         assert_eq!(c.parked.len(), 1, "{:?}", c.parked);
@@ -971,7 +830,6 @@ mod tests {
         assert!(matches!(c.get_mode(), Err(RpcError::Protocol(_))));
     }
 
-    /// Only the hit-enter prompt may be ended by nvmux; see `Mode::at_hit_enter`.
     #[test]
     fn only_the_hit_enter_prompt_may_be_answered() {
         let mode = |mode: &str, blocking| Mode {
@@ -999,8 +857,6 @@ mod tests {
         assert!(!mode("c", false).at_hit_enter());
     }
 
-    /// The keys go out as the single `nvim_input` parameter, and the byte
-    /// count that comes back is dropped.
     #[test]
     fn input_sends_nvim_input_and_ignores_the_count() {
         let mut c = answering(Value::from(4));
@@ -1010,9 +866,7 @@ mod tests {
         assert_eq!(sent[3][0].as_str(), Some("<CR>"));
     }
 
-    /// A request goes to the session in one write, however many markers it
-    /// is made of: on a socket each write is a syscall, and the session wakes
-    /// for each. A read of a session's notes was seventeen of them.
+    /// Each write is a syscall and a session wake-up; a notes read was 17.
     #[test]
     fn a_request_is_written_once() {
         let mut c = answering(Value::Nil);
@@ -1042,9 +896,8 @@ mod tests {
         }
     }
 
-    /// A session that hung up before the request was written is reset, as a
-    /// read would have found it a moment later: gone, not speaking another
-    /// protocol.
+    /// A refused write is a reset, as a read would find it, not a protocol
+    /// error.
     #[test]
     fn a_request_to_a_session_that_hung_up_is_a_reset() {
         let e = Client::new(HungUp).get_mode().expect_err("refused");
@@ -1075,9 +928,8 @@ mod tests {
         assert_eq!(probe(Path::new("/tmp/nvmux-nope.sock")), Liveness::Dead);
     }
 
-    /// `connect()` on a regular file fails with ECONNREFUSED on Linux and
-    /// ENOTSOCK on macOS. Both mean "nothing is listening": reporting `Busy`
-    /// instead would list the file as a session.
+    /// ECONNREFUSED on Linux, ENOTSOCK on macOS; `Busy` would list the file as
+    /// a session.
     #[test]
     fn probing_a_regular_file_is_dead_not_busy() {
         let path = crate::test_support::scratch_sock("rpc-notasock");
@@ -1087,10 +939,8 @@ mod tests {
         assert_eq!(liveness, Liveness::Dead);
     }
 
-    /// A session that takes the connection and says nothing — busy in a
-    /// `:!make`, or in CPU-bound Lua — is busy at the end of whatever budget
-    /// its probe is given, and never dead: a quarter of a second's as much as
-    /// three seconds'.
+    /// A session that accepts and says nothing (`:!make`, CPU-bound Lua) is
+    /// Busy, never Dead, even on the short budget.
     #[test]
     fn a_silent_session_is_busy_at_the_end_of_a_short_budget() {
         let path = crate::test_support::scratch_sock("rpc-silent");
@@ -1107,9 +957,8 @@ mod tests {
         );
     }
 
-    /// The attach probe has no budget, so the only thing that can end a call
-    /// the server is not answering is the interrupt — which has to unpark a
-    /// read on another thread, and promptly.
+    /// With no budget (as for the attach probe), only the interrupt can end an
+    /// unanswered call, and it must do so promptly.
     #[test]
     fn an_interrupt_ends_an_unbounded_call_on_another_thread() {
         let path = crate::test_support::scratch_sock("rpc-interrupt");

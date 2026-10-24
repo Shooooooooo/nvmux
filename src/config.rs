@@ -1,43 +1,32 @@
 //! The user's configuration file.
 //!
-//! nvmux runs with no configuration at all; this module is how it *optionally*
-//! reads one. The governing idea is that a config file only ever *overrides*:
-//! an absent file, an empty file and an omitted field all reproduce the
-//! built-in behaviour byte for byte, because they all resolve through the
-//! per-table `Default` impls — which is where each default is written down,
-//! once.
+//! Optional and override-only: an absent file, an empty file and an omitted
+//! field all give the built-in behaviour, since each resolves through the
+//! per-table `Default` impls, where every default is written once.
 //!
-//! # Strict, and loud
+//! # Strict
 //!
-//! A config file is edited by hand, so a typo is likely and silence is the wrong
-//! response: [`deny_unknown_fields`] rejects an unknown key, a value that does
-//! not parse is a hard error, and [`load`] surfaces all of it with the offending
-//! path. The one asymmetry is *absence*: a file named explicitly by
-//! `$NVMUX_CONFIG` must exist (asking for a file that is not there is a
-//! mistake), while the default search paths may be absent and simply fall back
-//! to the defaults.
+//! [`deny_unknown_fields`] rejects unknown keys, unparsable values are hard
+//! errors, and [`load`] reports them with the path. A file named by
+//! `$NVMUX_CONFIG` must exist; the default paths may be absent.
 //!
 //! [`deny_unknown_fields`]: https://serde.rs/container-attrs.html#deny_unknown_fields
 //!
 //! # Loading
 //!
-//! [`load`] resolves the file (see `resolve_config_path`), reads and validates
-//! it, and returns a [`Settings`]. `main` calls it once and hands the result to
-//! [`init`]; everything else reads the process-global through [`get`]. `get`
-//! falls back to [`Settings::default`] when nothing has been initialised, so a
-//! unit test that never calls `init` reads the compiled defaults rather than a
-//! developer's real `~/.config/nvmux/config.toml`.
+//! `main` calls [`load`] once and passes the result to [`init`]; everything
+//! else reads the process global through [`get`]. Without `init`, `get`
+//! returns [`Settings::default`], so unit tests never read a developer's real
+//! config.
 //!
 //! # Live
 //!
-//! What `get` hands out is the settings nvmux is running on *now*: the
-//! settings screen ([`crate::ui::settings`]) changes them with [`apply`] while
-//! nvmux runs, and every change counts a [`generation`], which is how a reader
-//! that copied what it needed can tell its copy is stale. What the file holds
-//! is kept beside them ([`saved`]), so that what differs between the two is
-//! what is unsaved — and what a save writes. Each reader asks `get` when it
-//! needs a value rather than holding one, so most of nvmux follows a change
-//! with no more than that.
+//! `get` returns the current settings: the settings screen
+//! ([`crate::ui::settings`]) changes them with [`apply`], and each change
+//! bumps [`generation`] so a reader holding a copy can tell it is stale. The
+//! file's contents are kept alongside ([`saved`]); the difference is what is
+//! unsaved and what a save writes. Readers call `get` when they need a value
+//! rather than holding one.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -50,20 +39,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ConfigError, SaveError};
 use crate::palette::Rgb;
 
-/// The whole configuration. Each field is a table of its own, so the file reads
-/// as `[keys]`-style sections — `[keys.bind]` inside `[keys]` for the key after
-/// the prefix that runs each command, `[style]` for how nvmux's own screens
-/// look — the colour they are drawn in, and whether they float over a session
-/// — and `[effects]` with a table inside it for each
-/// effect: `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
-/// `[effects.attach]`, `[effects.kill]`,
-/// `[effects.filter]` and `[effects.create]` for nvmux's own screens, and
-/// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
-/// `[effects.windows]` and `[effects.blink]` for nvmux's own client
-/// (`[client] ui = "nvmux"`, see [`crate::client`]).
+/// The whole configuration, one TOML table per field. `[effects]` has a
+/// sub-table per effect: `fade`, `move`, `cursor`, `attach`, `kill`, `filter`
+/// and `create` for nvmux's own screens; `smear`, `particles`, `scroll`,
+/// `windows` and `blink` for nvmux's own client (`[client] ui = "nvmux"`, see
+/// [`crate::client`]).
 ///
-/// Not `Copy`: `[session] command` owns a `String`. Nothing reads it by value —
-/// [`get`] hands out an `Arc` of it — so this costs nothing.
+/// Not `Copy` (`[session] command` is a `String`); [`get`] hands out an `Arc`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -74,310 +56,208 @@ pub struct Settings {
     pub effects: EffectsSettings,
 }
 
-/// The prefix key, how long a half-typed sequence waits, and which key after
-/// the prefix runs which command (see [`crate::keys`]).
+/// The prefix, the sequence timeout and the bindings (see [`crate::keys`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KeySettings {
-    /// The prefix, written as `"C-Space"` / `"Ctrl-a"` in the file and parsed
-    /// to its control byte by [`crate::keys::parse_prefix`].
+    /// Written as `"C-Space"` / `"Ctrl-a"`, parsed to its control byte by
+    /// [`crate::keys::parse_prefix`].
     #[serde(deserialize_with = "de_prefix")]
     pub prefix: u8,
-    /// How long to wait for the second byte of a prefix sequence before
-    /// deciding the user meant a literal `<prefix>`, and how long a half-typed
-    /// session number waits for another digit.
+    /// How long to wait for the byte after the prefix before taking it as a
+    /// literal `<prefix>`, and for another digit of a half-typed session
+    /// number.
     pub timeout_ms: u64,
-    /// `[keys.bind]`: the key after the prefix that runs each command, by the
-    /// command's name on the hint bar — `detach = "x"`. A command left out
-    /// stays on its own key (see [`crate::keys::Keymap`]); a key is read by
-    /// [`crate::keys::parse_key`], and two commands on one key are refused at
-    /// startup.
+    /// `[keys.bind]`: command name (as on the hint bar) to key, e.g.
+    /// `detach = "x"`. Omitted commands keep their default
+    /// ([`crate::keys::Keymap`]); keys parse with [`crate::keys::parse_key`].
+    /// Two commands on one key are refused at startup.
     pub bind: crate::keys::Keymap,
 }
 
-/// What a new session launches, when the user has not said otherwise in the
-/// prompt and nothing has been remembered from a previous one.
+/// What a new session launches when neither the prompt nor history says
+/// otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionSettings {
-    /// The command line, with `{sock}` standing in for the session's socket.
-    /// Parsed by [`crate::launch::Launch`], which is also what rejects a bad one.
+    /// `{sock}` stands for the session's socket. Parsed and validated by
+    /// [`crate::launch::Launch`].
     pub command: String,
-    /// Once a switch of its own, whether a listing waits a quarter of a
-    /// second on a session that cannot answer, rather than three: always so
-    /// now (see [`crate::rpc::QUICK_PROBE_TIMEOUT`]). Still read, so that a
-    /// file that sets it loads, and never looked at.
+    /// Retired: listings now always wait 0.25 s, not 3 s, on a session that
+    /// cannot answer (see [`crate::rpc::QUICK_PROBE_TIMEOUT`]). Parsed so old
+    /// files load; ignored.
     pub quick_list: Retired,
-    /// Once a switch of its own, whether the sessions say when they have news
-    /// rather than are asked for it every two seconds: always so now (see
-    /// [`crate::tell`]). Still read, so that a file that sets it loads, and
-    /// never looked at.
+    /// Retired: sessions now always push news instead of being polled every
+    /// 2 s (see [`crate::tell`]). Parsed so old files load; ignored.
     pub push_news: Retired,
 }
 
-/// The client that draws a session, on the pty nvmux relays (see
-/// [`crate::pty`]): nvmux's own, `nvmux --client`, unless `ui` says
-/// Neovim's.
+/// The client that draws a session on the relayed pty (see [`crate::pty`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientSettings {
-    /// Which client draws a session.
-    ///
-    /// `"nvmux"`, the default, is nvmux's own client ([`crate::client`]),
-    /// which draws the editor itself and so can animate it — the scroll,
-    /// windows moving, and if they are turned on the cursor travelling, its
-    /// particles and its blink — under `[effects.smear]`,
-    /// `[effects.particles]`, `[effects.scroll]`, `[effects.windows]` and
-    /// `[effects.blink]`. `"nvim"` is Neovim's own TUI: everything the
-    /// terminal can do reaches the editor exactly as Neovim negotiated it,
-    /// because Neovim did the negotiating.
+    /// `"nvmux"` (default) is nvmux's own client (`nvmux --client`, see
+    /// [`crate::client`]), which draws the editor itself and so can animate it
+    /// (`[effects.smear]`, `particles`, `scroll`, `windows`, `blink`).
+    /// `"nvim"` is Neovim's TUI, which negotiates terminal features itself.
     pub ui: Ui,
-    /// Keep one client per session rather than one in all.
+    /// Keep one client per session instead of one in all. Default on.
     ///
-    /// Off, the client in front is the only one there is: a switch retires it
-    /// and starts another for the session switched to — a fork, a probe, and
-    /// a first paint the new client waits for its server to send. On, a client
-    /// that leaves the front is parked instead — read on a thread of its own,
-    /// still attached to its server — and a switch back to its session puts
-    /// the screen it last had straight back on the terminal and asks the
-    /// server for its own on top: no fork, no probe, and nothing to wait for
-    /// (see [`crate::pty::Parked`]).
+    /// Off, a switch retires the front client and starts another (fork,
+    /// probe, wait for first paint). On, a client leaving the front is parked,
+    /// still attached and read on its own thread; switching back redraws its
+    /// last screen at once and asks the server to repaint (see
+    /// [`crate::pty::Parked`]).
     ///
-    /// On by default. What it costs, each for as long as nvmux runs, and so
-    /// the reasons to turn it off:
+    /// Costs, for as long as nvmux runs:
     ///
-    /// - A parked client is still a UI of its session's server. Another UI on
-    ///   the same session — another nvmux, another machine — shares its grid
-    ///   with it, at the smaller of the two sizes; a second nvmux of your own
+    /// - A parked client is still a UI of its server: other UIs on the session
+    ///   share its grid at the smaller size, and a second nvmux of your own
     ///   holds each session at the size its terminal had when it last left.
-    /// - A switch no longer fires `UILeave` in the session it leaves, nor
-    ///   `UIEnter` in the one it comes back to.
-    /// - Every session visited keeps an idle `nvim` client (about 1.5 MB of
-    ///   its own), a thread and a copy of its screen in nvmux, and its ssh
-    ///   forward. A session that keeps redrawing — a `:terminal` running
-    ///   something — keeps sending that client frames, over the link for a
-    ///   remote one.
-    /// - Nothing limits how many are kept: one per session visited.
-    /// - The screen a switch back puts up is nvmux's copy, which has no
-    ///   undercurl, underline colour, strikethrough, blink, conceal or
-    ///   overline (see [`crate::shadow`]) until the server's own repaint
-    ///   lands, a round trip or two later.
+    /// - Switches no longer fire `UILeave`/`UIEnter`.
+    /// - Each visited session keeps an idle `nvim` client (~1.5 MB), a thread,
+    ///   a screen copy and its ssh forward; one that keeps redrawing keeps
+    ///   sending it frames, over the link if remote.
+    /// - No limit: one per session visited.
+    /// - The restored screen lacks undercurl, underline colour, strikethrough,
+    ///   blink, conceal and overline (see [`crate::shadow`]) until the
+    ///   server's repaint lands, a round trip or two later.
     pub per_session: bool,
-    /// Start a session's client on its first visit, rather than every
-    /// session's at once as nvmux starts.
+    /// Start a session's client on its first visit instead of all at startup.
     ///
-    /// Off, the default, nvmux starts one for every session there is before
-    /// the picker goes up, and holds each out of sight until its session is
-    /// first visited (see [`crate::pty::Attachment::start_ahead`]). That
-    /// visit then waits for nothing: what the client drew meanwhile goes onto
-    /// the terminal as it was written, its questions to the terminal with it,
-    /// and the terminal's answers come back to it then. On, a session has no
-    /// client until it is first attached to — a fork, a probe, and a first
-    /// paint to wait for, as on a switch to it with `per_session` off. A
-    /// session created after nvmux started is started on its first visit
-    /// either way, unless a change of `ui` comes first.
+    /// Off (default), a client is started for every session before the picker
+    /// appears and held hidden until its first visit (see
+    /// [`crate::pty::Attachment::start_ahead`]), which then waits for nothing:
+    /// its output, terminal queries included, is replayed and the answers go
+    /// back to it. On, the first attach pays a fork, a probe and a first
+    /// paint. A session created after startup starts on its first visit either
+    /// way, unless a `ui` change comes first.
     ///
-    /// Clients are started again the same way. Each client kept for a session
-    /// not in front, parked or started ahead, rides the link to its session,
-    /// and leaves when the link does: over SSH, where there is a link to
-    /// drop, the session in front is attached again as the link comes back.
-    /// Off, the clients the link took are then started ahead again on a
-    /// thread of their own, once the session in front has painted, and the
-    /// next visit to each finds its client waiting. On, each is attached
-    /// afresh on its next visit: a fork, a forward, a probe and a first
-    /// paint, the last two each a round trip or more over the link that has
-    /// only just come back. A change of `ui` on the settings screen retires
-    /// every client there is, for the next attach to start the new kind. Off,
-    /// the client of every other session in the listing is then started as
-    /// the new kind, behind that one once it has painted; on, each is started
-    /// on its next visit.
+    /// Background clients drop with their SSH link; the front session
+    /// reattaches when it returns. Off, the others are then restarted ahead on
+    /// a thread once the front has painted; on, each reattaches on its next
+    /// visit (fork, forward, probe, first paint). A `ui` change retires every
+    /// client; off, the other sessions' clients are then restarted as the new
+    /// kind behind the front one.
     ///
-    /// What off costs, and so the reasons to turn it on:
+    /// Costs of off:
     ///
-    /// - Every session has a client — a UI of its server, with all that
-    ///   `per_session` says that costs — from the moment nvmux starts, not
-    ///   from its first visit.
-    /// - nvmux's start pays a listing and, per session, a fork and an ssh
-    ///   forward, before the picker is drawn.
-    /// - Every session is probed as nvmux starts, and again after a change of
-    ///   `ui`, which ends a hit-enter prompt in each, as a visit would (see
+    /// - Every session has a client (with `per_session`'s costs) from startup.
+    /// - Startup pays a listing and, per session, a fork and an ssh forward
+    ///   before the picker is drawn.
+    /// - Every session is probed at startup and after a `ui` change, which
+    ///   ends a hit-enter prompt in each, as a visit would (see
     ///   `pty::probe_on`).
     /// - A client that writes more than [`crate::pty::AHEAD_MAX`] before its
-    ///   first visit — a `:terminal` running something — is let go, and its
-    ///   session is started on its first visit after all.
-    /// - In the moments after a dropped link comes back, a fork and an ssh
-    ///   forward per session it took a client of, and each one's screen sent
-    ///   over the link once more, while the session in front is in use. On a
-    ///   slow link its next frames share the link with those.
+    ///   first visit is dropped and started on that visit instead.
+    /// - Right after a dropped link returns, a fork, forward and screen resend
+    ///   per session, sharing a slow link with the front session's frames.
     ///
-    /// With `per_session` off as well, a client started ahead is retired when
-    /// it first leaves the front, like every other.
+    /// With `per_session` off too, a client started ahead is retired when it
+    /// first leaves the front.
     pub lazy: bool,
-    /// Once a switch of its own, whether the clients a dropped link took are
-    /// started again as it comes back: `lazy` says now. Still read, so that a
-    /// file that sets it loads, and never looked at.
+    /// Retired: now governed by `lazy`. Parsed so old files load; ignored.
     #[serde(skip_serializing)]
     pub revive: Retired,
-    /// Once a switch of its own, whether a session nobody sees is drawn at
-    /// most once a second: always so now (see
-    /// [`crate::card::Command::Away`]). Still read, so that a file that sets
-    /// it loads, and never looked at.
+    /// Retired: unseen sessions are now always drawn at most once a second
+    /// (see [`crate::card::Command::Away`]). Parsed so old files load; ignored.
     #[serde(skip_serializing)]
     pub throttle: Retired,
-    /// Scroll ahead of a slow link: a key that scrolls — `<C-e>`, `<C-d>`,
-    /// `<C-f>`, `zz`, `zl` and their kind, in Normal mode or Insert — or a turn
-    /// of the mouse wheel, either way, scrolls the window at once, before
-    /// Neovim has heard of it. nvmux's own client only (see
-    /// [`crate::client::predict`]).
+    /// Scroll ahead of a slow link: scrolling keys (`<C-e>`, `<C-d>`, `<C-f>`,
+    /// `zz`, `zl` and similar, in Normal or Insert mode) and the mouse wheel
+    /// scroll the window before Neovim hears of it. nvmux's own client only
+    /// (see [`crate::client::predict`]).
     ///
-    /// `"auto"` by default, as `predict_motions` and `predict_typing` have it
-    /// too: on for a session on another machine, over ssh, and off for one on
-    /// this machine. `"on"` is on for this machine's as well; `"off"`, every
-    /// scroll waits for Neovim, whatever `predict_motions` and `predict_typing`
-    /// say of the rest.
+    /// `"auto"` (default for all three `predict_*`): on for sessions over ssh,
+    /// off locally. `"on"` includes local sessions; `"off"` waits for Neovim.
+    /// Even a 20-30 ms round trip is felt with keys held or typed fast; a local
+    /// one is a fraction of a millisecond, so Neovim's frame beats any
+    /// prediction.
     ///
-    /// On, a scroll is drawn ahead whatever the round trip: even one of 20 or
-    /// 30 ms is felt, a key held down or typed fast. This machine's is a
-    /// fraction of a millisecond, Neovim's own frame coming before a prediction
-    /// could be seen, which is why `"auto"` leaves its sessions out: their
-    /// clients leave the editor nothing to predict with, and time none of its
-    /// answers.
-    ///
-    /// What it costs: the rows a scroll uncovers are drawn without their
-    /// signs or virtual text until Neovim's own arrive, a round trip later,
-    /// and in the colours tree-sitter and highlights on the buffer give them
-    /// but not `:syntax`'s; and the agent the client leaves in the editor
-    /// sends the text of the lines around each window's view over the link,
-    /// and those colours, as the view moves — more of them the slower the
-    /// link.
+    /// Costs: uncovered rows lack signs and virtual text until Neovim's frame,
+    /// a round trip later, and get tree-sitter and buffer highlights but not
+    /// `:syntax` colours; the client's in-editor agent sends the lines around
+    /// each view, with colours, as it moves (more the slower the link).
     pub predict_scrolls: Predict,
-    /// Move the cursor ahead of a slow link, as `predict_scrolls` scrolls the
-    /// window: the keys that move it in Normal mode are drawn as Neovim will
-    /// move it. Each is drawn only where the client can work out exactly what
-    /// Neovim will make of it, and judged against what Neovim says it did (see
-    /// [`crate::client::predict::Sync`]): one Neovim made otherwise goes back
-    /// to Neovim's at once.
+    /// Move the cursor ahead of a slow link: Normal-mode motions are drawn
+    /// where Neovim will put the cursor, only when the client can work that
+    /// out exactly, and checked against what Neovim reports (see
+    /// [`crate::client::predict::Sync`]); a mismatch snaps back at once.
     ///
-    /// `"auto"` by default, as `predict_scrolls` has it: on for a session over
-    /// ssh, and with `"on"` for one on this machine as well; `"off"`, each key
-    /// waits for Neovim. The motions along a line — `h`, `l`, `0`, `^`, `$`,
-    /// `g_`, `|` and their kind — and to another line — `j`, `k`, `+`, `-`,
-    /// `_`, `<CR>` and theirs, and `j` and `k` mapped as LazyVim maps them —
-    /// and by words, along a line or to another — `w`, `b`, `e` and `ge`, and
-    /// `W`, `B`, `E` and `gE`, as `'iskeyword'` makes words — to the character
-    /// typed after `f`, `t`, `F` and `T`, unless something maps them, or
-    /// `'iminsert'` has `:lmap` mappings take that character for another — by
-    /// paragraphs, `}` and `{` — to the view's top, middle and bottom, `H`,
-    /// `M` and `L` — and to a line, `gg` and `G` — are drawn, with counts,
-    /// and with them the numbers of `'relativenumber'` and the bar of
-    /// `'cursorline'`: in view, or past `'scrolloff'`, the view scrolled as
-    /// Neovim scrolls it, just far enough or, further, to centre the cursor,
-    /// as far as the lines the agent keeps about the view go — but not to
-    /// bring into view a line Neovim draws with virtual text or a sign, which
-    /// the client would draw without them. With `predict_scrolls` as
-    /// well, a key that scrolls, or a turn of the wheel, goes on from where the
-    /// motions before it left the cursor, and they from it; and a scroll that
-    /// takes the cursor to another line, the wheel's among them, has the
-    /// numbers and the bar moved with it where the client can draw them as
-    /// Neovim does, and leaves them as Neovim drew them till its next frame
-    /// where not, as it always did. But not those to another line in a window
-    /// whose gutter a `'statuscolumn'` draws, as LazyVim's is, which are left
-    /// to Neovim. The client follows the rest by what Neovim says of each key
-    /// rather than waiting for it to catch up with them all.
+    /// Predicted, with counts: `h`, `l`, `0`, `^`, `$`, `g_`, `|`; `j`, `k`,
+    /// `+`, `-`, `_`, `<CR>` (and LazyVim's `j`/`k` mappings); `w`, `b`, `e`,
+    /// `ge`, `W`, `B`, `E`, `gE` (per `'iskeyword'`); `f`, `t`, `F`, `T` unless
+    /// mapped or remapped by `'iminsert'` `:lmap`s; `}`, `{`; `H`, `M`, `L`;
+    /// `gg`, `G`. They update `'relativenumber'` and `'cursorline'`, and past
+    /// `'scrolloff'` scroll the view as Neovim would, within the lines the
+    /// agent keeps, but never to reveal a line with virtual text or a sign.
+    /// With `predict_scrolls`, scrolls and motions chain from each other.
+    /// Line-changing motions in a window with a `'statuscolumn'` (as LazyVim
+    /// has) are left to Neovim.
     ///
-    /// What it costs, as `predict_typing` does too: the agent says where
-    /// each key left the cursor, about 40 bytes a key back over the link,
-    /// and as the view moves, which lines about it have virtual text or
-    /// signs, a few bytes a run of them, having looked them over as Neovim
-    /// went to wait for the key — as far either side of the view as it keeps
-    /// lines, which the slower the link the further: a millisecond and a half
-    /// at most, where they are thick on every line, and a fraction of one
-    /// where they are not; and each fence the client asks after its keys
-    /// reads the agent's count, about 40 bytes more.
+    /// Costs (shared with `predict_typing`): ~40 bytes back per key for the
+    /// cursor position; as the view moves, a few bytes per run of lines with
+    /// virtual text or signs, scanned while Neovim waits for a key (at most
+    /// 1.5 ms); and ~40 bytes per fence the client sends after its keys.
     pub predict_motions: Predict,
-    /// Type ahead of a slow link: what is typed in Insert mode — a character
-    /// put in, or taken out with `<BS>`, a word with `<C-w>` and what was typed
-    /// on the line with `<C-u>`, stopping where Insert mode began as Neovim
-    /// stops them — and `i`, `a`, `A`, `I` and the `<Esc>` after them are drawn
-    /// as Neovim will draw them, the cursor taking the shape of the mode it
-    /// goes into — judged, as `predict_motions`'s are, against what Neovim says
-    /// it did.
+    /// Type ahead of a slow link: in Insert mode, inserted characters, `<BS>`,
+    /// `<C-w>` and `<C-u>` (stopping where Insert began, as Neovim does), plus
+    /// `i`, `a`, `A`, `I` and the `<Esc>` after them, are drawn as Neovim will,
+    /// with the mode's cursor shape, and checked as `predict_motions` are.
     ///
-    /// `"auto"` by default, as `predict_scrolls` has it: on for a session over
-    /// ssh, and with `"on"` for one on this machine as well; `"off"`, each key
-    /// waits for Neovim. Not a key a mapping or an abbreviation may make more
-    /// of, one past `'textwidth'`, or one that indents the line again; nor, in
-    /// a buffer whose plugins act on what is typed there, till enough of it has
-    /// been found to go in as typed — or, whose plugins act as Insert mode is
-    /// entered or left there, the keys that do that, till enough of them have
-    /// been found to do no more than the key does: one that does more after
-    /// that — a trimmer of the blanks lines end in finding some on another
-    /// line — is drawn as the key alone does it, put right a round trip later,
-    /// and has its kind prove itself again.
+    /// Not predicted: keys a mapping or abbreviation may expand, keys past
+    /// `'textwidth'`, or keys that reindent. In buffers whose plugins react to
+    /// typing (or to entering and leaving Insert mode), keys are predicted
+    /// only once enough have been seen to do nothing extra; one that later does
+    /// more (e.g. a trailing-blank trimmer) is drawn as the plain key,
+    /// corrected a round trip later, and its kind must prove itself again.
     ///
-    /// What it costs: what `predict_motions` does, and the agent sends an
-    /// edit with each key typed in Insert mode rather than at a pause, and
-    /// the edit is the cursor's whole line: about a hundred bytes a key on a
-    /// short line, and as much as four times the window's width on a long
-    /// one — 800 bytes on a line of 800 characters, some 25 ms a key over a
-    /// link of 256 kbit/s; and as a buffer is entered, or Insert mode in it,
-    /// a few hundred bytes of what bears on typing there.
+    /// Costs: those of `predict_motions`, plus an edit per Insert-mode key
+    /// (not per pause) carrying the cursor's whole line: ~100 bytes on a short
+    /// line, up to four times the window width on a long one (800 bytes for
+    /// 800 characters, ~25 ms a key at 256 kbit/s); and a few hundred bytes on
+    /// entering a buffer or Insert mode.
     pub predict_typing: Predict,
-    /// Once which sessions' clients predicted, as each of `predict_scrolls`,
-    /// `predict_motions` and `predict_typing` now says for itself: `"auto"`,
-    /// those over ssh; `"on"`, this machine's as well; `"off"`, none. `"auto"`
-    /// and `"on"` are still read, so that a file that sets them loads, and
-    /// never looked at — `"on"` was no more than `"auto"` for any session whose
-    /// round trip was long enough to predict over; `"off"` is refused in words
-    /// that say which settings would do (see [`Superseded`]).
+    /// Superseded by the three `predict_*` settings. `"auto"` and `"on"` are
+    /// parsed and ignored (`"on"` acted as `"auto"` wherever the round trip was
+    /// long enough to matter); `"off"` is refused with a message naming the
+    /// replacements (see [`Superseded`]).
     #[serde(skip_serializing)]
     pub predict: Superseded,
-    /// On a terminal wider than a window's text needs, draw the text in the
-    /// middle of the window: a window wider than its text wants has it that
-    /// wide, its lines wrapping there and its status line's words standing
-    /// over it. nvmux's own client only (see `crate::client::wide`).
+    /// On a terminal wider than a window's text needs, centre the text in the
+    /// window: lines wrap at the text width and the status line sits over it.
+    /// nvmux's own client only (see `crate::client::wide`).
     ///
-    /// `"off"`, the default, has every window's text as wide as the window,
-    /// as Neovim's own client draws it. `"smart"` judges how wide each
-    /// window's text is to be by what it shows: its buffer's `'textwidth'`
-    /// where it has one, and room for its long lines where they are not
-    /// wrapped — all of them with `'wrap'` off, and with it on those of a
-    /// Markdown table or code block. `"fixed"` gives every window's text
-    /// `window_width`.
+    /// `"off"` (default) uses the full window width, like Neovim's TUI.
+    /// `"smart"` takes each window's text width from its buffer's
+    /// `'textwidth'`, widened for unwrapped long lines (all of them with
+    /// `'wrap'` off; with it on, those in Markdown tables or code blocks).
+    /// `"fixed"` uses `window_width`.
     ///
-    /// Either way, a window showing a terminal keeps its whole width: the
-    /// program in it is told its window's width. So does a window whose
-    /// text is in its middle already, as a start screen lays itself out.
-    /// What Neovim draws after the end of a line — a language server's
-    /// diagnostic, a blame — runs on into the window's margin, as far as
-    /// the window goes, rather than stopping where the text does.
+    /// Terminal windows keep their full width (the program is told it), as do
+    /// windows already centred, like start screens. Text past a line's end (a
+    /// diagnostic, a blame) runs on into the margin.
     pub centre: Centre,
-    /// How many columns a window's text gets with `centre` on: every
-    /// window's with `"fixed"`, and with `"smart"` one whose buffer has no
-    /// `'textwidth'`, unless its long lines want more. 0 for no limit, which
-    /// is `centre = "off"` whatever that says.
+    /// Text width with `centre` on: every window's with `"fixed"`; with
+    /// `"smart"`, for buffers without `'textwidth'` unless long lines need
+    /// more. 0 means no limit, i.e. `centre = "off"`.
     pub window_width: u16,
-    /// Once a switch of its own, whether each frame is written in as few
-    /// bytes as it takes: always so now (see [`crate::client::screen`]).
-    /// Still read, so that a file that sets it loads, and never looked at.
+    /// Retired: frames are now always written minimally (see
+    /// [`crate::client::screen`]). Parsed so old files load; ignored.
     #[serde(skip_serializing)]
     pub lean_output: Retired,
-    /// Once a switch of its own, whether the terminal moves the rows a frame
-    /// moved: always so now (see [`crate::client::region`]). Still read, so
-    /// that a file that sets it loads, and never looked at.
+    /// Retired: the terminal now always moves scrolled rows (see
+    /// [`crate::client::region`]). Parsed so old files load; ignored.
     #[serde(skip_serializing)]
     pub scroll_regions: Retired,
-    /// Once a switch of its own, whether a frame is put together from only
-    /// the rows that changed, where it can be: always so now (see
-    /// [`crate::client::App::frame`]). Still read, so that a file that sets
-    /// it loads, and never looked at.
+    /// Retired: frames are now always built from changed rows where possible
+    /// (see [`crate::client::App::frame`]). Parsed so old files load; ignored.
     #[serde(skip_serializing)]
     pub partial_frames: Retired,
 }
 
-/// A switch nvmux had once and has no more. A file that still sets it loads
-/// as one that does not, rather than failing on a key nvmux does not know:
-/// it is read as the switch it was, and never looked at again.
+/// A removed boolean switch: still parsed so files that set it load, then
+/// ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Retired;
 
@@ -409,9 +289,7 @@ impl Default for ClientSettings {
 }
 
 impl ClientSettings {
-    /// What a client predicts, for a session on another machine if `remote`
-    /// and on this one if not, as `predict_scrolls`, `predict_motions` and
-    /// `predict_typing` say: each `"auto"` for the one and not the other.
+    /// What a client predicts for a remote or local session.
     pub fn predictions(&self, remote: bool) -> Predictions {
         Predictions {
             scrolls: self.predict_scrolls.predicts(remote),
@@ -420,31 +298,27 @@ impl ClientSettings {
         }
     }
 
-    /// Whether a client predicts anything at all, for a session on another
-    /// machine if `remote`, and on this one if not.
     pub fn predicts(&self, remote: bool) -> bool {
         self.predictions(remote).any()
     }
 }
 
-/// What a client predicting draws ahead of Neovim, whatever the round trip:
-/// as `[client]`'s `predict_scrolls`, `predict_motions` and `predict_typing`
-/// say, each on its own, for the session it draws (see
+/// What a client draws ahead of Neovim for its session (see
 /// [`ClientSettings::predictions`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Predictions {
-    /// The keys that scroll, and the turns of the wheel.
+    /// Scrolling keys and the mouse wheel.
     pub scrolls: bool,
-    /// The keys that move the cursor in Normal mode.
+    /// Normal-mode cursor motions.
     pub motions: bool,
-    /// What is typed in Insert mode, and the keys that go in and out of it.
+    /// Insert-mode typing and the keys that enter and leave it.
     pub typing: bool,
 }
 
 impl Default for Predictions {
-    /// The scrolls alone: what a client predicts till it is told what its
-    /// settings say (see `crate::client::App::with_predictions`), the agent
-    /// left to say no more than the scrolls need.
+    /// Scrolls only, until the client learns its settings (see
+    /// `crate::client::App::with_predictions`), so the agent sends only what
+    /// scrolls need.
     fn default() -> Self {
         Self {
             scrolls: true,
@@ -455,39 +329,35 @@ impl Default for Predictions {
 }
 
 impl Predictions {
-    /// Whether any is drawn ahead of Neovim.
     pub fn any(self) -> bool {
         self.scrolls || self.motions || self.typing
     }
 
-    /// Whether the client goes by what the agent says Neovim made of each
-    /// key (see [`crate::client::predict::Sync`]): for the motions and the
-    /// typing, each of which goes on from where the one before it left the
-    /// cursor. The scrolls alone wait for Neovim to catch up instead.
+    /// Whether the client follows the agent's per-key reports of what Neovim
+    /// did (see [`crate::client::predict::Sync`]), since motions and typing
+    /// chain from the previous key's cursor. Scrolls alone wait for Neovim.
     pub fn acks(self) -> bool {
         self.motions || self.typing
     }
 }
 
-/// `[client] predict_scrolls`, `predict_motions` and `predict_typing`: for
-/// which sessions a client draws its kind ahead of Neovim.
+/// `[client] predict_*`: which sessions a client predicts for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Predict {
-    /// For a session on another machine, over ssh, and not for one on this.
+    /// Sessions over ssh only.
     #[default]
     Auto,
-    /// For every session, this machine's too.
+    /// Every session, local too.
     On,
-    /// For none: each key waits for Neovim.
+    /// None: each key waits for Neovim.
     Off,
 }
 
 impl Predict {
-    /// Every way, in the order the settings screen steps through them.
+    /// In the settings screen's order.
     pub const ALL: [Predict; 3] = [Predict::Auto, Predict::On, Predict::Off];
 
-    /// The way as the file spells it.
     pub fn name(self) -> &'static str {
         match self {
             Predict::Auto => "auto",
@@ -496,8 +366,6 @@ impl Predict {
         }
     }
 
-    /// Whether it is for a session on another machine if `remote`, and on
-    /// this one if not.
     pub fn predicts(self, remote: bool) -> bool {
         match self {
             Predict::Auto => remote,
@@ -507,9 +375,8 @@ impl Predict {
     }
 }
 
-// Read as the words the file spells them with (see `de_way`): `true` and
-// `false`, as each was before it said which sessions, refused with the words
-// that would do.
+// Parsed from its words (see `de_way`); the old `true`/`false` form is
+// refused with a message naming them.
 
 impl<'de> Deserialize<'de> for Predict {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -520,13 +387,11 @@ impl<'de> Deserialize<'de> for Predict {
     }
 }
 
-/// `[client] predict`, which said once which sessions' clients predicted, as
-/// the file may still set it: see [`ClientSettings::predict`]. `"auto"` and
-/// `"on"` are read as nothing, and `"off"` is refused with the settings that
-/// would turn every prediction off — rather than read as nothing as well, which
-/// would turn them all back on, or read as turning them all off, which a file
-/// that sets one of them too could not say again: the settings screen, saving
-/// one put back to its default, leaves it out.
+/// `[client] predict`, still parsed (see [`ClientSettings::predict`]).
+/// `"auto"` and `"on"` are ignored. `"off"` is refused, naming the settings
+/// that turn every prediction off: ignoring it would turn predictions back
+/// on, and mapping it onto all three could not round-trip, since the settings
+/// screen omits a setting saved at its default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Superseded;
 
@@ -561,25 +426,23 @@ impl<'de> Deserialize<'de> for Superseded {
     }
 }
 
-/// `[client] centre`: each window's text in the middle of a window wider
-/// than it needs, or not, and how wide it is there.
+/// `[client] centre`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Centre {
-    /// As wide as the window, as Neovim's own client draws it.
+    /// Full window width, as in Neovim's TUI.
     #[default]
     Off,
-    /// In the middle, as wide as what the window shows wants.
+    /// Centred, as wide as the content wants.
     Smart,
-    /// In the middle, `window_width` wide.
+    /// Centred, `window_width` wide.
     Fixed,
 }
 
 impl Centre {
-    /// Every way, in the order the settings screen steps through them.
+    /// In the settings screen's order.
     pub const ALL: [Centre; 3] = [Centre::Off, Centre::Smart, Centre::Fixed];
 
-    /// The way as the file spells it.
     pub fn name(self) -> &'static str {
         match self {
             Centre::Off => "off",
@@ -589,9 +452,8 @@ impl Centre {
     }
 }
 
-// Read as the words the file spells them with (see `de_way`): anything else,
-// the switch each of them once was among it, is refused with the words that
-// would do.
+// Parsed from its words (see `de_way`); anything else, the old boolean
+// included, is refused with a message naming them.
 
 impl<'de> Deserialize<'de> for Centre {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -602,10 +464,9 @@ impl<'de> Deserialize<'de> for Centre {
     }
 }
 
-/// One of `all`, read from the word `name` spells it with. Anything else is
-/// refused in words that say which words would do — `expected "off",
-/// "smart" or "fixed"` — where TOML's own for a setting that is no word at
-/// all, `true` say, is "wanted string or table".
+/// Parse one of `all` by its `name`. Anything else is refused listing the
+/// valid words (`expected "off", "smart" or "fixed"`), instead of TOML's
+/// "wanted string or table" for a non-string like `true`.
 fn de_way<'de, D, T>(
     deserializer: D,
     all: &'static [T],
@@ -647,37 +508,34 @@ where
     deserializer.deserialize_str(Way { all, name })
 }
 
-/// What nvmux's own client draws with: `[client]` and `[effects]`, of the
-/// settings nvmux is running on, and whether the sessions are another
-/// machine's, which every prediction goes by: a client predicts only for a
-/// session over ssh (see [`ClientSettings::predicts`]).
+/// What nvmux's own client draws with: `[client]`, `[effects]`, and whether
+/// the sessions are remote, which predictions depend on (see
+/// [`ClientSettings::predicts`]).
 ///
-/// Handed to a client as it starts, in its environment ([`Drawing::to_env`]),
-/// and told again whenever they change (`card::Command::Settings`), rather
-/// than read from the file by the client itself: the file does not have
-/// what the settings screen has changed and not saved, nor where the
-/// sessions are, which is the command line's to say.
+/// Passed in the client's environment at start ([`Drawing::to_env`]) and
+/// resent on change (`card::Command::Settings`), not read from the file: the
+/// file lacks unsaved settings-screen changes and where the sessions are
+/// (the command line says that).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Drawing {
     pub client: ClientSettings,
     pub effects: EffectsSettings,
-    /// The sessions are on another machine, over ssh: see [`remote`].
+    /// Sessions are on another machine, over ssh (see [`remote`]).
     pub remote: bool,
 }
 
 impl Drawing {
-    /// As a client's environment carries it: JSON, on one line.
+    /// One-line JSON, for the client's environment.
     pub fn to_env(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
 
-    /// [`Drawing::to_env`] read back; `None` for anything else.
+    /// Inverse of [`Drawing::to_env`].
     pub fn from_env(text: &str) -> Option<Drawing> {
         serde_json::from_str(text).ok()
     }
 
-    /// The settings a client runs on: these, and the defaults for what it
-    /// has no use for.
+    /// These, with defaults for everything else.
     pub fn settings(&self) -> Settings {
         Settings {
             client: self.client,
@@ -688,8 +546,6 @@ impl Drawing {
 }
 
 impl Settings {
-    /// What nvmux's own client draws with, of these settings, for the
-    /// sessions this nvmux runs.
     pub fn drawing(&self) -> Drawing {
         Drawing {
             client: self.client,
@@ -699,7 +555,7 @@ impl Settings {
     }
 }
 
-/// `[client] ui`: whose client draws a session.
+/// `[client] ui`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ui {
@@ -711,10 +567,9 @@ pub enum Ui {
 }
 
 impl Ui {
-    /// Every client, in the order the settings screen steps through them.
+    /// In the settings screen's order.
     pub const ALL: [Ui; 2] = [Ui::Nvmux, Ui::Nvim];
 
-    /// The client as the file spells it.
     pub fn name(self) -> &'static str {
         match self {
             Ui::Nvim => "nvim",
@@ -723,48 +578,34 @@ impl Ui {
     }
 }
 
-/// How nvmux's own screens look: the colour they are drawn in (see
-/// [`crate::theme`]), and whether the ones a key brings up over a session
-/// float over it.
+/// How nvmux's own screens look: their colour (see [`crate::theme`]) and
+/// whether they float over the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StyleSettings {
-    /// What nvmux draws its own screens in: the picker, the prompt, the help
-    /// and the wait for a session, and over a session the name an attach
-    /// hands across.
+    /// Colour of nvmux's own screens: picker, prompt, help, the wait for a
+    /// session, and the name an attach shows over a session.
     ///
-    /// `"terminal"`, the default, sets no colour at all, so the screens are in
-    /// the terminal's own foreground on its own background, shaded with dim,
-    /// bold and reverse. A colour, `"#rrggbb"` or `"#rgb"`, draws what they
-    /// draw at full strength in that one instead: the names and what is
-    /// typed, and the selection's bar, with the name standing out of it in the
-    /// background's colour — every fade and effect over them taking it from
-    /// that colour. What they draw dim — the session numbers, the notes, the
-    /// key hints, the hint bar a prefix puts up — stays the terminal's own,
-    /// dimmed, as it was. The background is left the terminal's own either
-    /// way.
+    /// `"terminal"` (default) sets no colour: terminal foreground and
+    /// background, shaded with dim, bold and reverse. A colour (`"#rrggbb"` or
+    /// `"#rgb"`) is used for the full-strength parts (names, typed text, the
+    /// selection bar with its name in the background colour), and effects
+    /// derive from it. Dim parts (session numbers, notes, key hints, the
+    /// prefix hint bar) stay the terminal's, dimmed. The background is always
+    /// the terminal's.
     ///
-    /// Neovim's own screen is the editor's, and is never drawn in it. Nor is
-    /// the first-run screen, which is up before there is a config to read
-    /// this from. And `NO_COLOR` keeps every screen in the terminal's own
-    /// colours, whatever this says.
+    /// Never applied to Neovim's screen or the first-run screen (shown before
+    /// the config is read). `NO_COLOR` overrides it.
     pub color: ThemeColor,
-    /// Whether the picker (`<prefix> Space`), the settings (`<prefix> ,`)
-    /// and the help (`<prefix> ?`) float over the session they are brought
-    /// up from, in a panel in the middle of it, the session going on behind
-    /// them dimmed (see `crate::pty::panel`) — all of each but its hint row,
-    /// which is along the bottom of the screen either way.
+    /// Whether the picker (`<prefix> Space`), settings (`<prefix> ,`) and
+    /// help (`<prefix> ?`) float in a centred panel over the dimmed, live
+    /// session (see `crate::pty::panel`). Default on. Their hint row stays on
+    /// the screen's last row either way.
     ///
-    /// On, the default. Off, each takes the whole terminal, the session
-    /// dissolving out under it and back in after, as the picker always did.
-    /// The picker's own `?` and `,` follow the picker: over the session in
-    /// its place where it floats, and on the terminal it has where it does
-    /// not. On a terminal too small for a panel and some of the session round
-    /// it, one that would float takes the terminal too.
-    ///
-    /// Flipped in the settings, it moves them at once: floating, they come up
-    /// full screen; full screen over a session, they come up floating over
-    /// it.
+    /// Off, each takes the whole terminal, the session dissolving out and
+    /// back. The picker's `?` and `,` follow the picker. A terminal too small
+    /// for a panel with session around it falls back to full screen. Changing
+    /// it in the settings moves an open screen at once.
     pub float: bool,
 }
 
@@ -777,19 +618,18 @@ impl Default for StyleSettings {
     }
 }
 
-/// `[style] color`: whose colour nvmux's own screens are drawn in.
+/// `[style] color`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeColor {
-    /// The terminal's own: no colour set, as nvmux has always drawn.
+    /// No colour set: the terminal's own.
     #[default]
     Terminal,
-    /// Shades of this one colour.
+    /// Shades of this colour.
     Mono(Rgb),
 }
 
 impl ThemeColor {
-    /// The value as the file spells it: `terminal`, or the colour as
-    /// `#rrggbb`.
+    /// `terminal` or `#rrggbb`.
     pub fn name(self) -> String {
         match self {
             ThemeColor::Terminal => "terminal".to_string(),
@@ -797,14 +637,11 @@ impl ThemeColor {
         }
     }
 
-    /// Read a value as the file spells it: `terminal`, or a colour as
-    /// `#rrggbb` or `#rgb`, the digits in either case.
+    /// Parse `terminal`, `#rrggbb` or `#rgb` (either case).
     ///
-    /// Those two are the spellings of a colour a terminal can answer in that
-    /// a person also writes, so they are read by the parser that reads the
-    /// terminal's answers ([`crate::palette`]), and `#f80` means `#ff8800`
-    /// there as it does here. Its other spellings — `rgb:ff/88/00`, and
-    /// twelve digits — are a terminal's, and are refused here.
+    /// Uses the terminal-reply parser ([`crate::palette`]), so `#f80` means
+    /// `#ff8800` in both; its terminal-only forms (`rgb:ff/88/00`, twelve
+    /// digits) are refused here.
     pub fn parse(s: &str) -> Result<ThemeColor, String> {
         if s == "terminal" {
             return Ok(ThemeColor::Terminal);
@@ -817,9 +654,8 @@ impl ThemeColor {
     }
 }
 
-/// The colour comes in as a human string; [`ThemeColor::parse`] reads it, and
-/// its message is folded into serde's error, which TOML then reports with the
-/// offending span — the shape `de_prefix` gives the prefix.
+/// Parsed by [`ThemeColor::parse`], its message folded into serde's error so
+/// TOML reports it with the span, as `de_prefix` does.
 impl<'de> Deserialize<'de> for ThemeColor {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -830,18 +666,13 @@ impl<'de> Deserialize<'de> for ThemeColor {
     }
 }
 
-/// The animated effects: a master switch over them all, and a table of its own
-/// for each — `[effects.fade]`, `[effects.move]`, `[effects.cursor]`,
-/// `[effects.attach]`, `[effects.kill]`,
-/// `[effects.filter]` and `[effects.create]`, and for nvmux's own client
-/// `[effects.smear]`, `[effects.particles]`, `[effects.scroll]`,
-/// `[effects.windows]` and `[effects.blink]` — with its own `enabled`. An effect runs only when both are on, which is what the
-/// `*_enabled` methods answer, so nothing reads one switch without the other.
+/// Animated effects: a master `enabled` plus a table per effect with its own
+/// `enabled`. An effect runs only when both are on; the `*_enabled` methods
+/// check both, so nothing reads one switch alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectsSettings {
-    /// Master switch. Off, nothing animates, whatever the effects' own
-    /// switches say.
+    /// Master switch.
     pub enabled: bool,
     pub fade: FadeSettings,
     #[serde(rename = "move")]
@@ -859,114 +690,87 @@ pub struct EffectsSettings {
 }
 
 impl EffectsSettings {
-    /// Whether the fade is switched on: its own switch and the master one.
-    /// `NO_COLOR` and the terminal have their say after this (see
+    /// `NO_COLOR` and the terminal are checked after this (see
     /// [`crate::fade::enabled`]).
     pub fn fade_enabled(&self) -> bool {
         self.enabled && self.fade.enabled
     }
 
-    /// Whether a session being moved streams stars off its name, the rows it
-    /// trades places with step aside, and it lands: its own switch and the
-    /// master one.
     pub fn move_enabled(&self) -> bool {
         self.enabled && self.moving.enabled
     }
 
-    /// Whether the row the cursor leaves glows as it lets the bar go: its own
-    /// switch and the master one. Whether it is drawn in colour or with a
-    /// modifier is the terminal's say after this (see [`crate::ui::effects`]).
+    /// Colour or modifier is then up to the terminal (see
+    /// [`crate::ui::effects`]).
     pub fn cursor_enabled(&self) -> bool {
         self.enabled && self.cursor.enabled
     }
 
-    /// Whether an attach from the picker hands the session's name across to
-    /// the session: its own switch and the master one. It rides the fade's
-    /// frames, so the fade decides the rest (see [`crate::handoff`]).
+    /// Rides the fade's frames, so the fade decides the rest (see
+    /// [`crate::handoff`]).
     pub fn attach_enabled(&self) -> bool {
         self.enabled && self.attach.enabled
     }
 
-    /// Whether a kill is drawn — the name struck through while the `[y/N]`
-    /// asks, and the row erased from its end once it is confirmed: its own
-    /// switch and the master one.
     pub fn kill_enabled(&self) -> bool {
         self.enabled && self.kill.enabled
     }
 
-    /// Whether rows a filter keystroke drops fade out rather than vanish: the
-    /// filter's own switch and the master one.
     pub fn filter_enabled(&self) -> bool {
         self.enabled && self.filter.enabled
     }
 
-    /// Whether `c` on the picker opens a gap where the new session will go
-    /// before the prompt comes up: its own switch and the master one. Whether
-    /// the picker then closes onto the gap or cuts away from it is the fade's
-    /// say (see [`crate::ui::app::App::make_room`]).
+    /// Whether the picker closes onto the gap `c` opens or cuts away is up to
+    /// the fade (see [`crate::ui::app::App::make_room`]).
     pub fn create_enabled(&self) -> bool {
         self.enabled && self.create.enabled
     }
 
-    /// Whether nvmux's own client animates its cursor between cells: its own
-    /// switch and the master one.
     pub fn smear_enabled(&self) -> bool {
         self.enabled && self.smear.enabled
     }
 
-    /// Whether particles fly off the cursor as it moves: its own switch and
-    /// the master one.
     pub fn particles_enabled(&self) -> bool {
         self.enabled && self.particles.enabled
     }
 
-    /// Whether a scroll slides the text through the window: its own switch
-    /// and the master one.
     pub fn scroll_enabled(&self) -> bool {
         self.enabled && self.scroll.enabled
     }
 
-    /// Whether windows and floats move rather than jump: its own switch and
-    /// the master one.
     pub fn windows_enabled(&self) -> bool {
         self.enabled && self.windows.enabled
     }
 
-    /// Whether a blinking cursor fades in and out: its own switch and the
-    /// master one.
     pub fn blink_enabled(&self) -> bool {
         self.enabled && self.blink.enabled
     }
 }
 
-// The client's effects are switches, and the particles' one choice of what
-// they are: how each looks and how long it takes is the client's own (see
-// `crate::client::anim`).
+// The client's effects are only switches (plus the particle mode); their
+// look and timing live in `crate::client::anim`.
 
-/// nvmux's own client: the cursor travelling between cells rather than
-/// jumping, its leading edge ahead and its trailing edge behind, so that a
-/// long move smears across the screen — Neovide's animated cursor (see
+/// nvmux's own client: the cursor travels between cells with its leading
+/// edge ahead, so long moves smear; Neovide's animated cursor (see
 /// [`crate::client::anim::smear`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SmearSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off unless turned
-    /// on; off, the cursor jumps, as the terminal's does.
+    /// Under `[effects] enabled`. Default off: the cursor jumps.
     pub enabled: bool,
 }
 
-/// nvmux's own client: what flies off the cursor as it moves — Neovide's
+/// nvmux's own client: particles off the moving cursor; Neovide's
 /// `cursor_vfx_mode` (see [`crate::client::anim::vfx`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ParticleSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off by default,
-    /// as Neovide's is.
+    /// Under `[effects] enabled`. Default off, as in Neovide.
     pub enabled: bool,
     pub mode: ParticleMode,
 }
 
-/// `[effects.particles] mode`, spelt as Neovide spells `cursor_vfx_mode`.
+/// `[effects.particles] mode`, spelt as Neovide's `cursor_vfx_mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParticleMode {
@@ -986,7 +790,7 @@ pub enum ParticleMode {
 }
 
 impl ParticleMode {
-    /// Every mode, in the order the settings screen steps through them.
+    /// In the settings screen's order.
     pub const ALL: [ParticleMode; 6] = [
         ParticleMode::Railgun,
         ParticleMode::Torpedo,
@@ -996,7 +800,6 @@ impl ParticleMode {
         ParticleMode::Wireframe,
     ];
 
-    /// The mode as the file spells it.
     pub fn name(self) -> &'static str {
         match self {
             ParticleMode::Railgun => "railgun",
@@ -1009,184 +812,146 @@ impl ParticleMode {
     }
 }
 
-/// nvmux's own client: a scroll sliding the text through the window a row at
-/// a time — Neovide's smooth scrolling (see
-/// [`crate::client::anim::scroll`]).
+/// nvmux's own client: scrolls slide the text a row at a time; Neovide's
+/// smooth scrolling (see [`crate::client::anim::scroll`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScrollSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off, the text
-    /// jumps to where it scrolled to.
+    /// Under `[effects] enabled`. Off, the text jumps.
     pub enabled: bool,
 }
 
-/// nvmux's own client: windows moving rather than jumping. A split window
-/// opening, closing or changing size moves the way animate.nvim's window
-/// module moves it, and one showing another buffer fades from one to the
-/// other (see [`crate::client::anim::layout`] and
-/// [`crate::client::anim::switch`]); a float, the message area or windows
-/// rearranged slide to their new place as Neovide's do — its
-/// `position_animation_length` (see [`crate::client::anim::motion`]).
+/// nvmux's own client: windows move instead of jumping. Splits opening,
+/// closing or resizing move like animate.nvim's window module; a window
+/// changing buffer cross-fades (see [`crate::client::anim::layout`] and
+/// [`crate::client::anim::switch`]); floats, the message area and rearranged
+/// windows slide like Neovide's `position_animation_length` (see
+/// [`crate::client::anim::motion`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowsSettings {
-    /// This effect's own switch, under `[effects] enabled`.
+    /// Under `[effects] enabled`.
     pub enabled: bool,
 }
 
-/// nvmux's own client: a blinking cursor fading out and back in rather than
-/// flashing — Neovide's `cursor_smooth_blink` (see
-/// [`crate::client::anim::blink`]). Only a block cursor fades; a bar or an
-/// underline keeps the terminal's own blink.
+/// nvmux's own client: a blinking block cursor fades out and in; Neovide's
+/// `cursor_smooth_blink` (see [`crate::client::anim::blink`]). Bars and
+/// underlines keep the terminal's blink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BlinkSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off by default,
-    /// as Neovide's is; and it does nothing for a cursor `'guicursor'` does
-    /// not make blink, nor for a session out of sight, whose cursor holds
-    /// still until it is back in front.
+    /// Under `[effects] enabled`. Default off, as in Neovide. No effect when
+    /// `'guicursor'` does not blink, or for a session out of sight, whose
+    /// cursor holds still.
     pub enabled: bool,
 }
 
-/// The fade between screens (see [`crate::fade`]): each one dissolves into the
-/// terminal's own background colour and the next dissolves up out of it.
+/// The fade between screens (see [`crate::fade`]): each dissolves into the
+/// terminal background and the next dissolves out of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FadeSettings {
-    /// This effect's own switch, under `[effects] enabled`. Two things force
-    /// the fade off whatever either says: `NO_COLOR`, because the effect paints
-    /// explicit colours, and a terminal that does not answer the startup colour
-    /// query, because there is then nothing to fade *to* — see
-    /// [`crate::fade::enabled`].
+    /// Under `[effects] enabled`. Forced off by `NO_COLOR` (it paints explicit
+    /// colours) and by a terminal that does not answer the startup colour
+    /// query (nothing to fade *to*); see [`crate::fade::enabled`].
     pub enabled: bool,
-    /// How long a dissolve takes, **both directions together**: a screen going
-    /// out and the next one coming up divide this between them, half each (see
-    /// [`FadeSettings::one_way`]). So a switch pays it once, for the screens:
-    /// the card that says where it landed comes in with the session's screen
-    /// (see [`crate::card`]), and the box that once said it, dissolving in and
-    /// out around the second it was up, is not drawn (see
-    /// [`crate::announce`]).
-    ///
-    /// Both directions rather than one because a transition is the thing
-    /// anybody watching is timing: what the number names is how long the screen
-    /// takes to change, not how long half of that takes. Must be at least 1 and
-    /// at most `MAX_FADE_MS`.
+    /// Duration of a dissolve **out and in together**, split half each (see
+    /// [`FadeSettings::one_way`]), since the whole change is what people
+    /// time. A switch pays it once: its landing card comes with the session's
+    /// screen (see [`crate::card`]) and the old announcement box is not drawn
+    /// (see [`crate::announce`]). Must be 1..=`MAX_FADE_MS`.
     pub duration_ms: u64,
-    /// Whether a Neovim screen dissolves too — in, once its first paint has
-    /// settled, and out — rather than only nvmux's own screens. Costs a
-    /// running parse of the session's output while it is attached (see
-    /// [`crate::shadow`]); off, a session hard-cuts both ways. A kept client
-    /// (`[client] per_session`, the default) parses the same output into its
-    /// own copy of its screen either way, so off saves the parse only with
-    /// `per_session = false` too.
+    /// Whether Neovim's screen dissolves too (in once its first paint
+    /// settles, and out), not only nvmux's. Costs a running parse of the
+    /// session's output while attached (see [`crate::shadow`]); off, sessions
+    /// hard-cut. Kept clients (`[client] per_session`) parse anyway, so off
+    /// saves the parse only with `per_session = false`.
     ///
-    /// That parse is also what the hint bar puts back the row it covered from,
-    /// so off, the bar blanks the row and waits for a repaint to fill it (see
-    /// [`crate::hint`]).
+    /// The hint bar restores the row it covered from that parse; off, it
+    /// blanks the row until a repaint (see [`crate::hint`]).
     pub session: bool,
 }
 
-/// The stars a session's name streams while it is picked up to be moved, off
-/// both ends of its row (see [`crate::ui::starfield`]); the rows it trades
-/// places with on each move stepping aside, letting its bar go and throwing
-/// sparks (see [`crate::ui::swap`]); and the impact when it is put down (see
+/// Moving a session in the picker: stars stream off its row while carried
+/// (see [`crate::ui::starfield`]), rows it swaps with step aside, release the
+/// bar and spark (see [`crate::ui::swap`]), and it lands with an impact (see
 /// [`crate::ui::landing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoveSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off, a session in
-    /// flight is drawn still, trades places with no more than a jump, and is
-    /// put down without a landing, and the picker redraws on a key and nothing
-    /// else, as it does the rest of the time.
+    /// Under `[effects] enabled`; one switch for the whole carry. Off, the
+    /// carried session is still, swaps are jumps, there is no landing, and
+    /// the picker redraws only on keys.
     ///
-    /// One switch for the flight, its moves and the landing: they are the one
-    /// carry, from picking the session up to putting it down.
-    ///
-    /// Unlike the fade, `NO_COLOR` leaves this alone. The trail, the sparks and
-    /// the landing are braille and modifiers, and the sidestep moves whole
-    /// cells; the one part in colour is a row letting the bar go, which
-    /// without colour holds it as a modifier instead, as the cursor's
-    /// afterglow does.
+    /// `NO_COLOR` does not disable it: trail, sparks and landing are braille
+    /// and modifiers, the sidestep moves whole cells, and a row releasing the
+    /// bar uses a modifier instead of colour, as the cursor afterglow does.
     pub enabled: bool,
 }
 
-/// The row the cursor leaves, fading from the selection's reversed bar back
-/// to a plain row (see [`crate::ui::effects`]).
+/// The row the cursor leaves fades from the reversed selection bar to plain
+/// (see [`crate::ui::effects`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CursorSettings {
-    /// This effect's own switch, under `[effects] enabled`.
-    ///
-    /// It is in colour, so it wants what the fade wants: the terminal's
-    /// answer to the colour query, and no `NO_COLOR`. Without them it falls
-    /// back to the bar standing a moment longer, reversed and dim, before it
-    /// goes — a modifier, like the rest of the picker. How long it lasts is
-    /// [`crate::ui::effects::AFTERGLOW`].
+    /// Under `[effects] enabled`. Needs colour, as the fade does (a colour
+    /// query answer and no `NO_COLOR`); otherwise the bar lingers reversed and
+    /// dim before going. Duration: [`crate::ui::effects::AFTERGLOW`].
     pub enabled: bool,
 }
 
-/// An attach from the picker: the picker closing in from the top and the
-/// bottom onto the chosen row with the session's name kept on the screen,
-/// through the client's start, and the session opening out of that line as
-/// the name dissolves into it (see [`crate::handoff`] and
+/// Attach from the picker: the picker closes from top and bottom onto the
+/// chosen row, the name stays up through the client's start, and the session
+/// opens out of that line as the name dissolves (see [`crate::handoff`] and
 /// [`crate::fade::Iris`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttachSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off, the picker
-    /// dissolves whole, as it did.
+    /// Under `[effects] enabled`. Off, the picker dissolves whole.
     ///
-    /// It adds no frame of its own, only changes what the fade's frames show,
-    /// so it needs the fade on and `[effects.fade] session` with it; with
-    /// either off, or under `NO_COLOR`, an attach is what it would have been
-    /// without this.
+    /// Adds no frames, only changes the fade's, so it needs the fade and
+    /// `[effects.fade] session` on; with either off, or under `NO_COLOR`, it
+    /// does nothing.
     pub enabled: bool,
 }
 
-/// A kill, in its two halves: while the `[y/N]` asks, a line struck through
-/// the session's name ([`crate::ui::effects`]); once it is confirmed, the row
-/// erased from its end behind a cursor before the kill runs
-/// ([`crate::ui::backspace`]). One switch for both, being the one kill.
+/// A kill: while `[y/N]` asks, the name is struck through
+/// ([`crate::ui::effects`]); once confirmed, the row is erased from its end
+/// behind a cursor before the kill runs ([`crate::ui::backspace`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KillSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off, the question
-    /// leaves the row as it is, and the row stays as it was until the listing
-    /// after the kill takes it away.
+    /// Under `[effects] enabled`. Off, the row is unchanged until the listing
+    /// after the kill removes it.
     ///
-    /// `NO_COLOR` leaves this alone: the line is the crossed-out modifier and
-    /// the backspace is characters. Only the warmth the struck row's bar takes
-    /// on is colour, and that is left out without one.
+    /// `NO_COLOR` does not disable it (strikethrough and characters); only the
+    /// struck bar's warm tint is colour, and is dropped.
     pub enabled: bool,
 }
 
-/// The rows a filter keystroke drops, fading out where they stood (see
+/// Rows a filter keystroke drops fade out in place (see
 /// [`crate::ui::effects`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilterSettings {
-    /// This effect's own switch, under `[effects] enabled`. On, the rows a
-    /// keystroke drops fade out where they stand before the list closes up —
-    /// in colour where the terminal said what its colours are, dim where it
-    /// did not. Off, they vanish on the keystroke.
+    /// Under `[effects] enabled`. In colour if the terminal reported its
+    /// colours, dim otherwise. Off, they vanish at once.
     pub enabled: bool,
 }
 
-/// `c` on the picker: the rows under the cursor step down a line, and the
-/// session about to be made fades into the gap, dim, under the name the prompt
-/// will offer and the number it will have — then the picker closes onto that
-/// row and the prompt opens out of its name field (see
-/// [`crate::ui::app::App::make_room`]).
+/// `c` on the picker: rows below the cursor step down, the new session fades
+/// into the gap, dim, with the name and number the prompt will offer, then
+/// the picker closes onto that row and the prompt opens from its name field
+/// (see [`crate::ui::app::App::make_room`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CreateSettings {
-    /// This effect's own switch, under `[effects] enabled`. Off, the prompt
-    /// replaces the picker on the next frame, as it did.
+    /// Under `[effects] enabled`. Off, the prompt replaces the picker on the
+    /// next frame.
     ///
-    /// The gap and the row in it are layout and the dim modifier, so
-    /// `NO_COLOR` leaves them alone. The row fading in, and the close and the
-    /// opening either side of the prompt, are the fade's: without it the gap
-    /// is held a moment, dim, and then the prompt cuts in.
+    /// The gap and its row are layout and dim, so `NO_COLOR` does not affect
+    /// them. The fade-in and the close and open around the prompt need the
+    /// fade; without it the gap is held a moment, then the prompt cuts in.
     pub enabled: bool,
 }
 
@@ -1210,8 +975,8 @@ impl Default for EffectsSettings {
     }
 }
 
-// On or off as Neovide has them, where it has the same effect — but for the
-// cursor's travel, off unless turned on (`SmearSettings` derives its off).
+// Defaults match Neovide where it has the same effect, except the smear,
+// which is off (`SmearSettings` derives it).
 
 impl Default for ParticleSettings {
     fn default() -> Self {
@@ -1270,35 +1035,21 @@ impl Default for CreateSettings {
     }
 }
 
-// These are the built-in behaviour. `#[serde(default)]` on the containers means
-// an absent file, an empty file and an omitted field all land here, so this is
-// the one place a default is written down.
+// The built-in defaults. With `#[serde(default)]` on the containers, an
+// absent file, an empty file and an omitted field all land here.
 
 impl Default for KeySettings {
     fn default() -> Self {
         Self {
-            // Not a literal: `keys::PREFIX` is read directly by the first-run
-            // screen and by `--help`, which are printed before any config is
-            // loaded, so it has to exist on its own.
+            // `keys::PREFIX` is also read directly by the first-run screen and
+            // `--help`, which run before any config loads.
             prefix: crate::keys::PREFIX,
-            // A second, where this was half of one. What made the shorter wait
-            // right was that a lone `<prefix>` showed nothing: the screen sat
-            // unchanged, so every millisecond of the wait was a millisecond the
-            // editor looked like it had dropped a keystroke, and the sooner the
-            // byte went through as a literal the better. The hint bar
-            // ([`crate::hint`]) ended that — the wait is now on screen, saying
-            // what it is waiting for — so the number can be what it should have
-            // been all along: long enough to read the row and choose from it,
-            // rather than short enough to hide that anything was pending.
-            //
-            // It is not only the prefix's wait. The same value is how long a
-            // half-typed session number waits for another digit, in the relay
-            // and in the picker ([`crate::ui`]), and both of those show the
-            // digits so far while they wait. Every use of it is now visible,
-            // which is what makes one number right for all three.
+            // Also how long a half-typed session number waits for another
+            // digit (relay and picker). Every such wait is shown on screen (the
+            // hint bar, the digits so far), so it can be long enough to read
+            // the row and choose.
             timeout_ms: 1000,
-            // Every command on the key `keys::BINDINGS` gives it, which is
-            // where each of those is written down, once.
+            // Defaults from `keys::BINDINGS`.
             bind: crate::keys::Keymap::default(),
         }
     }
@@ -1307,8 +1058,7 @@ impl Default for KeySettings {
 impl Default for SessionSettings {
     fn default() -> Self {
         Self {
-            // Not a literal, for the same reason as the prefix above: the
-            // prompt shows this before any config has necessarily been read.
+            // A constant: the prompt may show it before any config is read.
             command: crate::launch::DEFAULT.to_string(),
             quick_list: Retired,
             push_news: Retired,
@@ -1317,18 +1067,10 @@ impl Default for SessionSettings {
 }
 
 impl FadeSettings {
-    /// One direction of a dissolve: half of [`FadeSettings::duration_ms`],
-    /// which measures both.
-    ///
-    /// Halved here rather than at the two schedules that start a fade, so
-    /// there is one place where the config's units become the code's and
-    /// nowhere that can read the key as a single direction by mistake.
-    ///
-    /// Exact, and never zero: `Duration` divides at nanosecond resolution, so
-    /// the smallest legal setting — 1 ms — halves to 500 µs rather than to
-    /// nothing. A fade that short is one frame either way (see
-    /// [`crate::fade::Schedule::next`]), which is what any value at or under
-    /// a frame has always been.
+    /// Half of [`FadeSettings::duration_ms`], which covers both directions.
+    /// Halved only here, so nothing reads the key as one direction by mistake.
+    /// Never zero: `Duration` divides in nanoseconds, so 1 ms gives 500 µs,
+    /// which is one frame (see [`crate::fade::Schedule::next`]).
     pub fn one_way(&self) -> Duration {
         Duration::from_millis(self.duration_ms) / 2
     }
@@ -1338,17 +1080,16 @@ impl Default for FadeSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Long enough to read as a dissolve rather than a flicker, short
-            // enough to be one movement: 100 ms out and 100 ms back.
+            // 100 ms out, 100 ms back: a dissolve, not a flicker, yet one
+            // movement.
             duration_ms: 200,
             session: true,
         }
     }
 }
 
-/// The prefix comes in as a human string; delegate to the one parser so the file
-/// and any other caller agree, and fold its message into serde's error (which
-/// TOML then reports with the offending span).
+/// Parsed by [`crate::keys::parse_prefix`], its message folded into serde's
+/// error so TOML reports it with the span.
 fn de_prefix<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1357,10 +1098,8 @@ where
     crate::keys::parse_prefix(&s).map_err(serde::de::Error::custom)
 }
 
-/// `[keys.bind]` comes in as a table of command names and human key strings,
-/// and goes onto the defaults: a command it leaves out stays on its own key.
-/// Which two commands share a key is a question about the whole table, so it is
-/// [`Settings::validate`]'s.
+/// `[keys.bind]`: command names to key strings, applied over the defaults.
+/// Clashes are checked by [`Settings::validate`].
 impl<'de> Deserialize<'de> for crate::keys::Keymap {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1370,18 +1109,15 @@ impl<'de> Deserialize<'de> for crate::keys::Keymap {
             std::collections::BTreeMap::<CommandName, CommandKey>::deserialize(deserializer)?;
         let mut keymap = crate::keys::Keymap::default();
         for (CommandName(name), CommandKey(key)) in moved {
-            // A name the table has, or it would not have been read, so this
-            // always lands.
+            // `CommandName` accepts only known names, so this always applies.
             keymap.bind(&name, key);
         }
         Ok(keymap)
     }
 }
 
-/// A command's name in `[keys.bind]`: one of the table's own
-/// ([`crate::keys::NAMES`]), so a command cannot be added without being one a
-/// file can move. Any other is refused in the words `deny_unknown_fields` uses
-/// for every other typo in the file, and TOML points at the name.
+/// A `[keys.bind]` name, one of [`crate::keys::NAMES`]. Others are refused as
+/// `deny_unknown_fields` refuses any typo, with TOML pointing at the name.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct CommandName(String);
 
@@ -1399,10 +1135,8 @@ impl<'de> Deserialize<'de> for CommandName {
     }
 }
 
-/// The key a command is put on, read by the one parser
-/// ([`crate::keys::parse_key`]) and its message folded into serde's error,
-/// which TOML then reports with the offending span — the shape `de_prefix`
-/// gives the prefix.
+/// Parsed by [`crate::keys::parse_key`], with errors reported as in
+/// `de_prefix`.
 struct CommandKey(u8);
 
 impl<'de> Deserialize<'de> for CommandKey {
@@ -1417,18 +1151,16 @@ impl<'de> Deserialize<'de> for CommandKey {
     }
 }
 
-/// Ceiling for `keys.timeout_ms`. Generous but finite: the value goes into a
-/// `poll` timeout as a `c_int`, and an absurd one is a hang, not a long wait.
+/// Ceiling for `keys.timeout_ms`: it becomes a `c_int` `poll` timeout, and an
+/// absurd value is a hang.
 pub(crate) const MAX_TIMEOUT_MS: u64 = 60_000;
 
-/// Ceiling for `effects.fade.duration_ms`. Two seconds is already a transition nobody
-/// wants to sit through, and a switch sits through one at every change of
-/// session; past it the value is a hang with a name.
+/// Ceiling for `effects.fade.duration_ms`; every switch sits through it.
 pub(crate) const MAX_FADE_MS: u64 = 2_000;
 
 impl Settings {
-    /// Rules that the deserializer cannot express. Kept minimal: only values that
-    /// would misbehave at runtime, not taste.
+    /// Rules serde cannot express; only values that would misbehave at
+    /// runtime.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.keys.timeout_ms == 0 {
             // A zero poll timeout spins the relay at full speed while a prefix
@@ -1436,25 +1168,20 @@ impl Settings {
             return Err("keys.timeout_ms must be at least 1".into());
         }
         if self.keys.timeout_ms > MAX_TIMEOUT_MS {
-            // Beyond `c_int` this would wrap negative and `poll` would block
-            // forever; well before that it is a prefix that never resolves.
+            // Past `c_int` it wraps negative and `poll` blocks forever.
             return Err(format!("keys.timeout_ms must be at most {MAX_TIMEOUT_MS}"));
         }
         if let Some((first, second, key)) = self.keys.bind.clash() {
-            // The second could never be reached, and the help and the hint bar
-            // would offer it all the same. Both are named, since moving either
-            // is the fix — and one may be a command the file never mentions,
-            // still on its own key when another was moved onto it.
+            // The second would be unreachable. Name both: either may be moved,
+            // and one may be a default the file never mentions.
             return Err(format!(
                 "keys.bind.{first} and keys.bind.{second} are both {:?}",
                 crate::keys::key_label(key)
             ));
         }
         if self.effects.fade.duration_ms == 0 {
-            // `enabled = false` is how the fade is turned off; a zero-length
-            // fade would be the same thing spelled as a schedule with no frames.
-            // One millisecond still halves to something rather than to nothing,
-            // which is what [`FadeSettings::one_way`] is careful about.
+            // `enabled = false` turns the fade off; zero would be a schedule
+            // with no frames.
             return Err("effects.fade.duration_ms must be at least 1".into());
         }
         if self.effects.fade.duration_ms > MAX_FADE_MS {
@@ -1463,12 +1190,8 @@ impl Settings {
                 "effects.fade.duration_ms must be at most {MAX_FADE_MS}"
             ));
         }
-        // Refused at startup rather than at the prompt: a command that can never
-        // spawn a session is a broken config, and the file is where it is fixed.
-        //
-        // The reason alone, not the whole error: every one of them is phrased as
-        // a predicate, so it reads as one sentence about the key — the same
-        // shape the timeout's messages above have.
+        // Refused at startup, not at the prompt: the file is where it is fixed.
+        // Each reason is a predicate, so it reads as a sentence after the key.
         if let Err(crate::error::SessionError::InvalidCommand { reason, .. }) =
             crate::launch::Launch::parse(&self.session.command)
         {
@@ -1485,20 +1208,17 @@ enum ConfigSource {
     Explicit(PathBuf),
     /// A default search path; may be absent.
     Default(PathBuf),
-    /// No path could be formed (no `$HOME`); use the defaults.
+    /// Neither `$XDG_CONFIG_HOME` nor `$HOME` is set; use the defaults.
     None,
 }
 
-/// An empty value is treated as unset, matching how a shell exports a variable
-/// that was never really set. Shared with [`crate::state`], which takes the
-/// same view of the same kind of variable.
+/// An empty value counts as unset. Also used by [`crate::state`].
 pub(crate) fn nonempty(value: Option<&OsStr>) -> Option<&OsStr> {
     value.filter(|s| !s.is_empty())
 }
 
-/// Resolve the config path from the relevant environment, purely.
-///
-/// Precedence: `$NVMUX_CONFIG` (an exact path) > `$XDG_CONFIG_HOME/nvmux/` >
+/// Resolve the config path from the given environment (pure). Precedence:
+/// `$NVMUX_CONFIG` (an exact path) > `$XDG_CONFIG_HOME/nvmux/` >
 /// `$HOME/.config/nvmux/`.
 fn resolve_config_path(
     nvmux_config: Option<&OsStr>,
@@ -1522,11 +1242,9 @@ fn resolve_config_path(
     ConfigSource::None
 }
 
-/// Load the configuration, or the defaults when there is no file to load.
-///
-/// A missing *default* file is not an error; a missing *explicit* file
-/// (`$NVMUX_CONFIG`) is. Any file that exists is read and validated, and every
-/// failure carries its path.
+/// Load the configuration, or the defaults if there is no file. A missing
+/// *default* file is fine; a missing `$NVMUX_CONFIG` file is an error. Every
+/// failure carries the path.
 pub fn load() -> Result<Settings, ConfigError> {
     let nvmux_config = std::env::var_os("NVMUX_CONFIG");
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
@@ -1566,10 +1284,9 @@ fn parse(path: &Path, contents: &str) -> Result<Settings, ConfigError> {
 
 // --- first run ------------------------------------------------------------
 
-/// The path a first-run config should be written to, or `None` when nvmux must
-/// not offer to create one: `$NVMUX_CONFIG` is set (the user owns that file), no
-/// default path can be formed (no `$HOME`/`$XDG_CONFIG_HOME`), or a config
-/// already exists at the default path.
+/// Where to write a first-run config, or `None` if nvmux must not offer one:
+/// `$NVMUX_CONFIG` is set (the user owns it), no default path can be formed
+/// (no `$HOME`/`$XDG_CONFIG_HOME`), or a config already exists.
 pub fn first_run_target() -> Option<PathBuf> {
     let nvmux_config = std::env::var_os("NVMUX_CONFIG");
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
@@ -1580,8 +1297,7 @@ pub fn first_run_target() -> Option<PathBuf> {
     }
 }
 
-/// The settings for a session started from the first-run prompt: the chosen
-/// prefix over the built-in defaults.
+/// The first-run choice of prefix over the built-in defaults.
 pub fn with_prefix(prefix: u8) -> Settings {
     Settings {
         keys: KeySettings {
@@ -1592,13 +1308,10 @@ pub fn with_prefix(prefix: u8) -> Settings {
     }
 }
 
-/// The first-run config file body: a commented template that documents every
-/// option but activates only `[keys] prefix`. Recording just the choice means
-/// the file does not pin the other defaults — they keep tracking the code. The
-/// commented values are the current defaults, so the template stays accurate.
-///
-/// A line each, as the README's list of every setting has them: the long
-/// account of an option, what it costs included, is on its field here.
+/// The first-run config: a commented template listing every option at its
+/// current default and setting only `[keys] prefix`, so other defaults keep
+/// tracking the code. One line per option, as in the README; the full
+/// description is on each field.
 pub(crate) fn render_default_config(prefix: u8) -> String {
     let k = KeySettings::default();
     let s = SessionSettings::default();
@@ -1606,15 +1319,11 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
     let t = StyleSettings::default();
     let e = EffectsSettings::default();
     let f = e.fade;
-    // A string as the file spells it. Quoted here rather than with `{:?}` in
-    // the template, which would ignore the widths that line up a table's
-    // notes: each setting is padded to the widest in its table, and the
-    // prefix to the widest it can be, "Ctrl-Space".
+    // Quoted here, not with `{:?}` in the template, which would ignore the
+    // padding widths that align each table's notes.
     let quoted = |s: &str| format!("{s:?}");
-    // A line a command, made from the table rather than written out here, so a
-    // command cannot be added without one: its name, its key as `key_label`
-    // spells it — which `parse_key` reads back — and what the help screen says
-    // it does.
+    // One line per command, generated from the table so none is missed: name,
+    // key (as `key_label` spells it, which `parse_key` reads back) and help.
     let bind: String = crate::keys::BINDINGS
         .iter()
         .map(|b| {
@@ -1732,8 +1441,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
     )
 }
 
-/// How wide the template pads a command's name under `[keys.bind]`: as wide
-/// as the longest, so their keys line up.
+/// Pad width for `[keys.bind]` names, so the keys line up.
 fn command_width() -> usize {
     crate::keys::BINDINGS
         .iter()
@@ -1742,12 +1450,10 @@ fn command_width() -> usize {
         .unwrap_or(0)
 }
 
-/// Write the first-run config to `path`, creating its parent directory.
-///
-/// Atomic (temp file plus `rename` within the directory, see
-/// [`crate::paths::write_atomic`]), under a parent made the gentle way rather
-/// than the `/tmp`-hardened one — see [`crate::paths::create_private_parent`]
-/// for why a pre-existing `~/.config` must not be refused.
+/// Write the first-run config to `path` atomically
+/// ([`crate::paths::write_atomic`]). The parent is made with
+/// [`crate::paths::create_private_parent`], not the `/tmp`-hardened path,
+/// since an existing `~/.config` must be accepted.
 pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
     let err = |error| ConfigError::Write {
         path: path.to_path_buf(),
@@ -1759,9 +1465,8 @@ pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
 
 // --- saving ---------------------------------------------------------------
 
-/// The file a save writes: the one [`load`] reads, or would read — so
-/// `$NVMUX_CONFIG` when it is set. The first run never writes there, but a
-/// save is something the user asked for.
+/// The file a save writes: the one [`load`] reads, so `$NVMUX_CONFIG` if set
+/// (the first run never writes there, but a save is user-requested).
 fn config_path() -> Option<PathBuf> {
     let nvmux_config = std::env::var_os("NVMUX_CONFIG");
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
@@ -1772,8 +1477,7 @@ fn config_path() -> Option<PathBuf> {
     }
 }
 
-/// A path the way the user would type it: under their home, `~/` and the
-/// rest.
+/// `path` as the user would type it, with `~/` for home.
 pub(crate) fn shown(path: &Path) -> String {
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
     match home.and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
@@ -1785,10 +1489,8 @@ pub(crate) fn shown(path: &Path) -> String {
 /// What a save wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Saved {
-    /// The config file.
     pub path: PathBuf,
-    /// How many settings it changed in it: none when it already said what
-    /// was being saved.
+    /// Settings changed; 0 if the file already matched.
     pub count: usize,
 }
 
@@ -1802,21 +1504,17 @@ impl std::fmt::Display for Saved {
     }
 }
 
-/// Write what `live` has changed from `saved` — what the file was last known
-/// to hold — into the config file, and nothing else.
+/// Write what `live` changed from `saved` (the file's last known contents)
+/// into the config file, and nothing else.
 ///
-/// The file is read again first, since it may have been edited by hand while
-/// nvmux ran: one that no longer reads is not written over, and a setting
-/// being saved that the file has changed too is not overwritten unless
-/// `overwrite` says so. Each setting is written where the file has it,
-/// comments and all: in place if it is set, by uncommenting the template's
-/// line for it if it is not, and otherwise at the end of its table. One set
-/// back to its default is commented back out, so the file follows the default
-/// again. With no file yet, the first-run template is written with the
-/// changes in it.
-///
-/// Through a symlink to the file it names, keeping that file's mode (see
-/// [`crate::paths::write_through`]).
+/// The file is re-read first, as it may have been hand-edited: one that no
+/// longer parses is not overwritten, and a setting also changed in the file
+/// is not overwritten unless `overwrite`. Each setting is written where the
+/// file has it, comments kept: in place if set, by uncommenting the
+/// template's line if not, else at the end of its table. One reset to its
+/// default is commented back out. With no file, the first-run template is
+/// written with the changes. Symlinks are followed and the target's mode kept
+/// (see [`crate::paths::write_through`]).
 pub fn save(live: &Settings, saved: &Settings, overwrite: bool) -> Result<Saved, SaveError> {
     let path = config_path().ok_or(SaveError::Nowhere)?;
     let text = match std::fs::read_to_string(&path) {
@@ -1846,17 +1544,16 @@ pub fn save(live: &Settings, saved: &Settings, overwrite: bool) -> Result<Saved,
 /// Why [`saved_text`] edited nothing.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
-    /// The text no longer reads as a config: where, and why, in a line.
+    /// The text no longer parses: where and why, in one line.
     Unreadable(String),
-    /// Settings being saved, by path, that the text has changed too.
+    /// Paths of settings being saved that the text also changed.
     Changed(Vec<String>),
-    /// No edit came out holding what was to be saved.
+    /// No edit produced the intended settings.
     Unedited,
 }
 
-/// The config file's `text` — `None` when there is none — with what `live`
-/// has changed from `saved` written into it, and how many settings that
-/// changed in it. See [`save`].
+/// `text` (`None` if there is no file) with `live`'s changes from `saved`
+/// written in, and how many settings changed. See [`save`].
 fn saved_text(
     text: Option<&str>,
     live: &Settings,
@@ -1868,8 +1565,8 @@ fn saved_text(
         None => Settings::default(),
     };
     let changed = crate::settings::changed(live, saved);
-    // Changed in the file as well, to something other than what is being
-    // saved: somebody's edit, which a save would quietly undo.
+    // Also changed in the file, to something else: a save would silently undo
+    // that edit.
     let clashing: Vec<String> = changed
         .iter()
         .filter(|s| {
@@ -1882,7 +1579,7 @@ fn saved_text(
         return Err(Refusal::Changed(clashing));
     }
 
-    // What the file is to hold: what it holds now, with each change made.
+    // The file's current settings plus each change.
     let mut target = on_disk.clone();
     let mut edits = Vec::new();
     for setting in changed {
@@ -1939,16 +1636,14 @@ struct Edit {
     default: bool,
 }
 
-/// [`Edit`]s made to the text where they belong and nowhere else: every byte
-/// not part of a change kept as it was.
+/// Apply `edits` in place, keeping every other byte.
 ///
-/// A setting the file sets has its value replaced where it stands, its note
-/// kept in its column — or, put back to its default, its line commented out.
-/// One it does not set is uncommented where its table has it as a comment, as
-/// the template does every setting, and otherwise added after its table's
-/// last setting, or in a table of its own at the end. `None` where the file
-/// is laid out in a way this does not edit — a table only spelt inline or in
-/// dotted keys — which [`edit_structure`] is for.
+/// A set setting has its value replaced, its note kept in its column, or its
+/// line commented out if back at its default. An unset one is uncommented
+/// where its table has it commented (as the template has every setting),
+/// else added after its table's last setting, or in a new table at the end.
+/// `None` for layouts this cannot edit (tables only inline or in dotted
+/// keys), which [`edit_structure`] handles.
 fn edit_in_place(text: &str, edits: &[Edit]) -> Option<String> {
     let doc = toml_edit::Document::parse(text).ok()?;
     let headers = headers(doc.as_table());
@@ -2006,8 +1701,7 @@ fn edit_in_place(text: &str, edits: &[Edit]) -> Option<String> {
                     }
                 }
             },
-            // A table the file spells some other way than a header of its
-            // own: not one to add a header for.
+            // The table exists without its own header; do not add one.
             None if defined(doc.as_item(), &path) => return None,
             None => match tables.iter_mut().find(|(table, _)| *table == edit.table) {
                 Some((_, lines)) => lines.push(line),
@@ -2045,9 +1739,8 @@ fn edit_in_place(text: &str, edits: &[Edit]) -> Option<String> {
     Some(out)
 }
 
-/// Where the value of `key` in the table at `path` is in the original text,
-/// and whether it is in an inline table — where a line cannot be commented
-/// out — or `None` when the file does not set it.
+/// The span of `key`'s value in the table at `path`, and whether it is in an
+/// inline table (where it cannot be commented out); `None` if unset.
 fn active(
     root: &toml_edit::Item,
     path: &[&str],
@@ -2064,10 +1757,9 @@ fn active(
     Some((value.span()?, inline))
 }
 
-/// Whether the table at `path` is in the file spelt some other way than a
-/// header of its own: inline, or in dotted keys. A table that is only there
-/// because a table under it is — `[effects]` with only `[effects.fade]` in
-/// the file — is not: TOML lets its header be added after.
+/// Whether the table at `path` is defined other than by its own header
+/// (inline or dotted keys). An implicit table (`[effects]` existing only via
+/// `[effects.fade]`) is not, since TOML allows adding its header later.
 fn defined(root: &toml_edit::Item, path: &[&str]) -> bool {
     let mut at = root;
     for part in path {
@@ -2079,8 +1771,7 @@ fn defined(root: &toml_edit::Item, path: &[&str]) -> bool {
     !at.as_table().is_some_and(toml_edit::Table::is_implicit)
 }
 
-/// Every table header in the file — `[effects.fade]` — by its path, with
-/// where it starts.
+/// Every explicit table header (`[effects.fade]`) by path, with its start.
 fn headers(root: &toml_edit::Table) -> Vec<(String, usize)> {
     fn walk(table: &toml_edit::Table, at: &str, out: &mut Vec<(String, usize)>) {
         for (key, item) in table.iter() {
@@ -2109,8 +1800,8 @@ fn headers(root: &toml_edit::Table) -> Vec<(String, usize)> {
     out
 }
 
-/// The table `table`'s header line, where it ends, and the lines under it
-/// and over the next header — or `None` when the file has no header for it.
+/// Where `table`'s header line ends, and its body up to the next header;
+/// `None` if it has no header.
 fn region(text: &str, headers: &[(String, usize)], table: &str) -> Option<Region> {
     let start = headers.iter().find(|(path, _)| path == table)?.1;
     let header_end = line_around(text, start, start).1;
@@ -2166,7 +1857,7 @@ fn commented(text: &str, region: std::ops::Range<usize>, key: &str) -> Option<(u
 fn uncommented(line: &str, value: &str) -> String {
     let indent = &line[..line.len() - line.trim_start().len()];
     let rest = line.trim_start().trim_start_matches('#').trim_start();
-    // [`commented`] found the key with an `=` after it, so there is one.
+    // `commented` matched `key =`, so there is an `=`.
     let eq = rest.find('=').unwrap_or(rest.len().saturating_sub(1));
     let after = &rest[eq + 1..];
     let value_at = after.len() - after.trim_start().len();
@@ -2205,9 +1896,8 @@ fn old_value(text: &str) -> &str {
     }
 }
 
-/// What follows a value on its line, when it is a note — blanks then a `#`
-/// comment — with the blanks made up for the new value's length, so the note
-/// keeps its column. `None` when it is not a note.
+/// If what follows a value is a note (blanks then `#`), re-pad it so the
+/// note keeps its column after the new value; `None` otherwise.
 fn realigned(rest: &str, old: &str, new: &str) -> Option<String> {
     let note = rest.trim_start_matches([' ', '\t']);
     if !note.starts_with('#') {
@@ -2220,9 +1910,8 @@ fn realigned(rest: &str, old: &str, new: &str) -> Option<String> {
     Some(format!("{}{note}", " ".repeat(width)))
 }
 
-/// Where a line added to a table goes: after its last setting, or straight
-/// under its header when it has none — before any comments that lead into the
-/// next table.
+/// Where a line added to a table goes: after its last setting, or under its
+/// header if it has none, before any comments leading into the next table.
 fn last_setting_end(text: &str, region: Region) -> usize {
     let mut end = region.header_end;
     let mut at = region.body.start;
@@ -2236,10 +1925,9 @@ fn last_setting_end(text: &str, region: Region) -> usize {
     end
 }
 
-/// The edits made through `toml_edit`'s model of the file rather than its
-/// text: for a table spelt inline or in dotted keys, which [`edit_in_place`]
-/// leaves alone. Comments survive this too, though a value set back to its
-/// default is removed rather than commented out.
+/// Edits through `toml_edit`'s document model, for tables inline or in
+/// dotted keys, which [`edit_in_place`] skips. Comments survive, but a value
+/// reset to its default is removed, not commented out.
 fn edit_structure(text: &str, edits: &[Edit]) -> Option<String> {
     let mut doc: toml_edit::DocumentMut = text.parse().ok()?;
     for edit in edits {
@@ -2250,8 +1938,7 @@ fn edit_structure(text: &str, edits: &[Edit]) -> Option<String> {
                 .entry(part)
                 .or_insert(toml_edit::table());
         }
-        // A table only there for one under it gets a header now it has a
-        // setting of its own.
+        // An implicit table gets a header now it has a setting of its own.
         if let Some(table) = item.as_table_mut() {
             table.set_implicit(false);
         }
@@ -2279,20 +1966,17 @@ fn edit_structure(text: &str, edits: &[Edit]) -> Option<String> {
     Some(doc.to_string())
 }
 
-/// The settings a process runs on, and what its file is known to hold.
-///
-/// One of these is the process-global behind [`get`]; tests make their own,
-/// so that a change one of them applies is never what another reads.
+/// The live settings and what the file is known to hold. [`get`] uses a
+/// process-global one; tests make their own so changes do not leak between
+/// them.
 struct Store {
-    /// What [`get`] hands out: the file's settings as loaded, and whatever has
-    /// been changed since.
+    /// What [`get`] returns: as loaded, plus any changes since.
     live: RwLock<Arc<Settings>>,
-    /// What the file holds, as far as this process knows: as loaded, and then
-    /// as last saved. What differs from `live` is unsaved.
+    /// What the file holds as far as this process knows (as loaded, or as
+    /// last saved). Differences from `live` are unsaved.
     saved: RwLock<Arc<Settings>>,
-    /// How many changes `live` has seen. See [`generation`].
+    /// Changes `live` has seen; see [`generation`].
     generation: AtomicU64,
-    /// Whether [`Store::init`] has run.
     initialised: AtomicBool,
 }
 
@@ -2340,8 +2024,8 @@ impl Store {
     }
 }
 
-/// A lock that a panic elsewhere left poisoned still holds whole settings: a
-/// value is only ever swapped in whole, never edited in place.
+/// Ignores poisoning: values are only ever swapped in whole, so a poisoned
+/// lock still holds valid settings.
 fn read(lock: &RwLock<Arc<Settings>>) -> std::sync::RwLockReadGuard<'_, Arc<Settings>> {
     lock.read().unwrap_or_else(|e| e.into_inner())
 }
@@ -2352,66 +2036,55 @@ fn write(lock: &RwLock<Arc<Settings>>) -> std::sync::RwLockWriteGuard<'_, Arc<Se
 
 static STORE: LazyLock<Store> = LazyLock::new(Store::new);
 
-/// Install the loaded settings, once, before anything reads them. `main` calls
-/// this at startup, and the relay tests' child process does the same; a second
-/// call in one process is a bug, so it warns and keeps the first.
-///
-/// They are what the file holds, too, as far as nvmux knows: see [`saved`].
+/// Install the loaded settings once, before anything reads them (`main`, and
+/// the relay tests' child process). A second call warns and keeps the first.
+/// They also become [`saved`].
 pub fn init(settings: Settings) {
     STORE.init(settings);
 }
 
-/// The settings nvmux is running on: those loaded, as the settings screen has
-/// changed them since. The defaults when [`init`] has not run — which is what
-/// keeps unit tests reading the compiled defaults, never a real user's file.
-///
-/// Asked for each time a value is needed rather than kept, so that a change
-/// reaches its reader: the `Arc` is a snapshot, as current as the moment it
-/// was taken.
+/// The current settings: as loaded, plus settings-screen changes. Defaults if
+/// [`init`] has not run, so unit tests never read a real file. Call it each
+/// time a value is needed; the `Arc` is a snapshot.
 pub fn get() -> Arc<Settings> {
     STORE.get()
 }
 
-/// Run on `settings` from now on, if they are valid — the rules [`load`]
-/// holds a file to — and count the change (see [`generation`]). Applying the
-/// settings already running changes nothing and counts nothing.
+/// Switch to `settings` if they pass [`load`]'s validation, bumping
+/// [`generation`]. Applying the current settings is a no-op.
 pub fn apply(settings: Settings) -> Result<(), String> {
     STORE.apply(settings)
 }
 
-/// How many changes [`apply`] has made since nvmux started. A reader that
-/// copied what it needed — a client told its settings, the picker its
-/// effects — notes the generation it copied at, and knows its copy is stale
-/// when this has moved on.
+/// Number of changes [`apply`] has made. A reader holding a copy (a client's
+/// settings, the picker's effects) compares it to detect a stale copy.
 pub fn generation() -> u64 {
     STORE.generation.load(Ordering::SeqCst)
 }
 
-/// What the file holds, as far as nvmux knows: what [`init`] was given, until
-/// a save says otherwise ([`set_saved`]). Whatever [`get`] differs from it in
-/// is unsaved.
+/// What the file holds as far as nvmux knows: what [`init`] got, until
+/// [`set_saved`]. Where [`get`] differs, it is unsaved.
 pub fn saved() -> Arc<Settings> {
     STORE.saved()
 }
 
-/// Record that the file now holds `settings`, once a save has written them.
+/// Record that a save wrote `settings`.
 pub fn set_saved(settings: Settings) {
     STORE.set_saved(settings);
 }
 
-/// Whether the sessions this nvmux runs are on another machine, over ssh.
 static REMOTE: AtomicBool = AtomicBool::new(false);
 
-/// Say whether the sessions are on another machine, over ssh, as `main`
-/// does once, before it starts a client: what each client is told with its
-/// settings, which `"auto"` predicts only for (see [`Drawing`]), and what
-/// the settings screen checks a change of `[client] ui` against.
+/// Record whether the sessions are on another machine, over ssh. Called once
+/// by `main` before starting a client. Clients receive it with their settings
+/// (`"auto"` predicts only when remote, see [`Drawing`]), and the settings
+/// screen checks `[client] ui` changes against it.
 pub fn set_remote(remote: bool) {
     REMOTE.store(remote, Ordering::Relaxed);
 }
 
-/// Whether the sessions are on another machine, as [`set_remote`] said: not
-/// until it has, which is a unit test's case, and a client's own.
+/// As [`set_remote`] said; `false` until then (unit tests, and clients
+/// themselves).
 pub fn remote() -> bool {
     REMOTE.load(Ordering::Relaxed)
 }
@@ -2423,13 +2096,9 @@ mod tests {
 
     // --- defaults / parsing (pure) -----------------------------------------
 
-    /// The one default that is not written here: `keys::PREFIX` exists on its
-    /// own because `--help` and the first-run screen are printed before any
-    /// config is read. The two must agree.
-    ///
-    /// Every other default is pinned by
-    /// `a_full_document_at_the_defaults_round_trips`, which spells each value
-    /// out in TOML and asserts the result equals `Settings::default()`.
+    /// `keys::PREFIX` is the one default defined elsewhere (`--help` and the
+    /// first-run screen print it before any config loads). The others are
+    /// pinned by `a_full_document_at_the_defaults_round_trips`.
     #[test]
     fn the_default_prefix_is_the_one_the_key_machine_uses() {
         assert_eq!(KeySettings::default().prefix, crate::keys::PREFIX);
@@ -2453,9 +2122,8 @@ mod tests {
         &block[open..close]
     }
 
-    /// The README's "Every setting, at its default" is a copy of these
-    /// defaults that nothing else keeps in step: it must parse, and to them,
-    /// with every table in it that the code has.
+    /// That README block is a hand-kept copy of the defaults: it must parse to
+    /// them and include every table.
     #[test]
     fn the_readmes_settings_are_the_defaults() {
         let doc = readme_settings();
@@ -2553,12 +2221,8 @@ mod tests {
         assert_eq!(s.keys, KeySettings::default());
     }
 
-    /// The key measures a whole dissolve, so one direction is half of it.
-    ///
-    /// The floor is the case worth pinning: `duration_ms = 1` is legal, and
-    /// halving it in whole milliseconds would be zero — a schedule with no
-    /// length, which is the very thing `validate` refuses to let the key
-    /// express.
+    /// `duration_ms = 1` is legal, and halving it in whole milliseconds would
+    /// give a zero-length schedule, which `validate` exists to forbid.
     #[test]
     fn one_direction_is_half_the_configured_dissolve() {
         let at = |ms| {
@@ -2588,8 +2252,7 @@ mod tests {
         assert!(s.effects.move_enabled(), "the other effect is untouched");
     }
 
-    /// One switch over all of them: off, no effect runs, and each one's own
-    /// switch is left as it was for when the master is turned back on.
+    /// Each effect's own switch is kept for when the master is turned back on.
     #[test]
     fn the_master_switch_turns_every_effect_off() {
         let s: Settings = toml::from_str("[effects]\nenabled = false\n").expect("valid");
@@ -2616,7 +2279,6 @@ mod tests {
         assert!(on.create_enabled());
     }
 
-    /// The picker's effects each turn off on their own.
     #[test]
     fn each_picker_effect_turns_off_on_its_own() {
         let s: Settings = toml::from_str("[effects.cursor]\nenabled = false\n").expect("valid");
@@ -2645,8 +2307,6 @@ mod tests {
         assert!(s.effects.fade_enabled(), "the fade itself is untouched");
     }
 
-    /// Each effect has a switch of its own, and turning one off leaves the
-    /// others running.
     #[test]
     fn the_move_effect_is_on_unless_turned_off() {
         assert!(Settings::default().effects.moving.enabled);
@@ -2655,9 +2315,6 @@ mod tests {
         assert!(s.effects.fade_enabled(), "and the fade is untouched");
     }
 
-    /// On unless turned off, and `false` turns it off: a parked client is a
-    /// UI its session's other users share a grid with, and `false` is how
-    /// whoever runs this nvmux spares them that.
     #[test]
     fn one_client_per_session_is_on_unless_turned_off() {
         assert!(Settings::default().client.per_session);
@@ -2667,9 +2324,7 @@ mod tests {
         assert_eq!(s.session, SessionSettings::default());
     }
 
-    /// Started at launch unless made lazy, and making them lazy leaves
-    /// `per_session` as it was: the two are independent, and either can be
-    /// set alone.
+    /// `lazy` and `per_session` are independent.
     #[test]
     fn clients_start_at_launch_unless_made_lazy() {
         assert!(!Settings::default().client.lazy);
@@ -2681,13 +2336,9 @@ mod tests {
         assert!(s.client.lazy && !s.client.per_session);
     }
 
-    /// The scrolls, the motions and the typing are each `"auto"` unless told
-    /// otherwise: predicted for a session over ssh, and not for one on this
-    /// machine. `"on"` predicts a kind for both, and `"off"` for neither, each
-    /// on its own or with any other. What a client is told comes back from its
-    /// environment as it went; and a switch, as each was before it said which
-    /// sessions, or any other word, is refused in words that say which would
-    /// do.
+    /// Each `predict_*` is independent. Values survive the client's
+    /// environment; old booleans and other words are refused, naming the
+    /// valid ones.
     #[test]
     fn auto_predicts_over_ssh_and_not_here_unless_told() {
         let (auto, t, f) = (Predict::Auto, true, false);
@@ -2700,8 +2351,7 @@ mod tests {
         assert_eq!((there.scrolls, there.motions, there.typing), (t, t, t));
         assert!(!c.predictions(false).any(), "a session on this machine");
         assert!(c.predicts(true) && !c.predicts(false));
-        // What each says, over ssh and on this machine: the scrolls, the
-        // motions and the typing.
+        // (scrolls, motions, typing) over ssh and locally.
         for (doc, there, here) in [
             ("predict_typing = \"off\"", (t, t, f), (f, f, f)),
             ("predict_motions = \"on\"", (t, t, t), (f, t, f)),
@@ -2754,13 +2404,9 @@ mod tests {
         }
     }
 
-    /// A file that still sets `predict`, which once said which sessions'
-    /// clients predicted, loads as one that does not where it said those
-    /// over ssh, or this machine's too — the round trip of neither ever
-    /// long enough — and is refused where it said none, in words that name
-    /// the settings that say so now: read as nothing, it would turn every
-    /// prediction back on. Its switches of before are as wrong as any other
-    /// word, and a client is not told it.
+    /// `"auto"` and `"on"` load as if unset; `"off"` is refused naming the
+    /// replacements, since ignoring it would re-enable predictions. Old
+    /// booleans are refused too, and clients are not sent it.
     #[test]
     fn a_file_that_still_sets_predict_says_what_it_says_now() {
         for was in ["auto", "on"] {
@@ -2790,10 +2436,7 @@ mod tests {
         assert!(!env.contains("\"predict\""), "{env}");
     }
 
-    /// A wide terminal is left alone unless told otherwise, and each window's
-    /// text centred when it is, up to 120 columns or as wide as it wants:
-    /// each way a word away, spelt as the template spells it. The switches
-    /// they were, `centre` itself and `smart_width`, are errors.
+    /// The old boolean `centre` and `smart_width` are errors.
     #[test]
     fn nothing_is_centred_unless_told() {
         let c = Settings::default().client;
@@ -2824,10 +2467,8 @@ mod tests {
         }
     }
 
-    /// A file that still sets a switch nvmux has retired — what each said is
-    /// what nvmux does now, or `lazy` says — loads as one that does not,
-    /// whatever it says; one that sets it to anything but a switch is as
-    /// wrong as ever. A client is not told them.
+    /// Any boolean loads and is ignored; a non-boolean is still an error.
+    /// Clients are not sent them.
     #[test]
     fn a_file_that_still_sets_a_retired_switch_loads_as_one_that_does_not() {
         let retired = [
@@ -2856,7 +2497,6 @@ mod tests {
         }
     }
 
-    /// nvmux's own client unless told otherwise; Neovim's is a line away.
     #[test]
     fn a_session_is_drawn_by_nvmuxs_client_unless_told() {
         assert_eq!(Settings::default().client.ui, Ui::Nvmux);
@@ -2865,9 +2505,7 @@ mod tests {
         assert!(s.client.per_session && !s.client.lazy, "the rest as it was");
     }
 
-    /// The terminal's own colours unless told otherwise; a colour is a line
-    /// away, in either of the two spellings a person writes one in, and is
-    /// spelt back the long way.
+    /// Both `#rgb` and `#rrggbb` parse; `name` gives the long form.
     #[test]
     fn the_screens_are_in_the_terminals_colours_unless_told() {
         assert_eq!(Settings::default().style.color, ThemeColor::Terminal);
@@ -2893,9 +2531,6 @@ mod tests {
         assert_eq!(s, Settings::default(), "the default, said out loud");
     }
 
-    /// The picker, the settings, the help and the prompts float over the
-    /// session unless told otherwise; full screen is a line away, and leaves
-    /// the colour as it was.
     #[test]
     fn the_screens_float_over_the_session_unless_told() {
         assert!(Settings::default().style.float);
@@ -2910,8 +2545,6 @@ mod tests {
         );
     }
 
-    /// A colour that is not one is refused with the key it was in and the
-    /// spellings that would have done.
     #[test]
     fn a_colour_that_is_not_one_says_what_would_be() {
         for bad in [
@@ -2935,9 +2568,6 @@ mod tests {
         }
     }
 
-    /// On and off as Neovide's are: the scroll and the windows on, the
-    /// particles and the smooth blink off — but for the cursor's travel, off
-    /// unless turned on.
     #[test]
     fn the_clients_effects_start_as_neovides() {
         let e = Settings::default().effects;
@@ -2946,7 +2576,6 @@ mod tests {
         assert_eq!(e.particles.mode, ParticleMode::Railgun);
     }
 
-    /// A particle mode is spelt as Neovide spells it.
     #[test]
     fn a_particle_mode_is_spelt_as_neovides() {
         let s: Settings =
@@ -2955,8 +2584,8 @@ mod tests {
         assert_eq!(ParticleMode::Pixiedust.name(), "pixiedust");
     }
 
-    /// The one default that lives elsewhere, like the prefix: the prompt shows
-    /// it before a config has necessarily been read.
+    /// Defined elsewhere, like the prefix: the prompt may show it before a
+    /// config is read.
     #[test]
     fn the_default_command_is_the_one_the_launcher_uses() {
         assert_eq!(SessionSettings::default().command, crate::launch::DEFAULT);
@@ -2983,9 +2612,7 @@ mod tests {
         assert_eq!(s.keys.prefix, 0x01);
     }
 
-    /// `[keys.bind]` moves what it names and nothing else: every other command
-    /// stays on its own key, and the rest of `[keys]` at its default — in the
-    /// table's own form and in TOML's inline one.
+    /// As a table and inline.
     #[test]
     fn a_partial_bind_table_moves_only_what_it_names() {
         let s: Settings = toml::from_str("[keys.bind]\ndetach = \"x\"\n").expect("valid");
@@ -3000,9 +2627,8 @@ mod tests {
         assert_eq!(inline, s);
     }
 
-    /// Two commands on one key would leave one of them unreachable, so the file
-    /// is refused, naming both — the one moved, and the one it was moved onto
-    /// that the file never mentions. Trading two keys is no clash.
+    /// Both are named, including a default the file never mentions. Swapping
+    /// two keys is fine.
     #[test]
     fn two_commands_on_one_key_are_refused_with_both_named() {
         for (doc, first, second) in [
@@ -3041,9 +2667,7 @@ mod tests {
         );
     }
 
-    /// A name that is no command is refused in the words every other unknown
-    /// key is, offering the names there are; a key that cannot be one says
-    /// what would do. Each points at its own line.
+    /// Each error points at its own line.
     #[test]
     fn a_bad_binding_says_what_would_do() {
         let doc = "[keys.bind]\nnext = \"j\"\ndetatch = \"x\"\n";
@@ -3060,9 +2684,6 @@ mod tests {
         assert!(msg.contains("line 3"), "not at the key: {msg}");
     }
 
-    /// A config file is edited by hand, so a typo is likely and silence is the
-    /// wrong response — an unknown table, an unknown key in any table, and an
-    /// unparseable value all have to be refused rather than ignored.
     #[test]
     fn a_typo_is_never_silently_ignored() {
         for (what, doc) in [
@@ -3164,9 +2785,8 @@ mod tests {
         }
     }
 
-    /// The timeout feeds a `poll` call and the fade's duration a `sleep`, so
-    /// each has a floor and a ceiling; the extreme values that pass are also
-    /// pinned so the bounds stay generous.
+    /// The timeout feeds `poll` and the fade a `sleep`, so both are bounded;
+    /// the extremes that pass are pinned to keep the bounds generous.
     #[test]
     fn out_of_range_values_are_rejected_with_their_key_named() {
         let cases = [
@@ -3202,8 +2822,6 @@ mod tests {
         }
     }
 
-    /// A command that could never spawn a session is a broken config, not a
-    /// surprise at the prompt — and the message has to name the key it is in.
     #[test]
     fn an_unusable_command_is_rejected_with_its_key_named() {
         for doc in [
@@ -3224,9 +2842,8 @@ mod tests {
         }
     }
 
-    /// `main` prints a failed load through anyhow's `{:#}`, which follows the
-    /// message with every `source()`. The TOML error is in the message, so it
-    /// must not be one of those as well, or it is printed twice.
+    /// `main` prints with anyhow's `{:#}`, which appends every `source()`; the
+    /// TOML error is already in the message.
     #[test]
     fn a_parse_error_is_printed_once() {
         let doc = "[keys]\nprefx = \"C-a\"\n";
@@ -3266,8 +2883,7 @@ mod tests {
         // The timeout, the command and the fade are documentation, not active
         // settings.
         assert!(rendered.contains("# timeout_ms = 1000"));
-        // As is every command's key, under a table of their own: a line each,
-        // in the table's order.
+        // So is every command's key, one line each in table order.
         assert!(rendered.contains("\n[keys.bind]   # "), "{rendered:?}");
         let mut rest = rendered.as_str();
         for b in crate::keys::BINDINGS {
@@ -3341,10 +2957,8 @@ mod tests {
         }
     }
 
-    /// The file is edited by uncommenting a line, its note and all, so each
-    /// commented setting must parse once uncommented, and to its default; and
-    /// between them they must be every setting the README lists, spelt as it
-    /// spells them — which is what keeps a line from going missing.
+    /// Each commented line, uncommented with its note, must parse to its
+    /// default, and together they must be exactly the README's settings.
     #[test]
     fn the_default_config_uncommented_is_every_setting_at_its_default() {
         let rendered = render_default_config(crate::keys::PREFIX);
@@ -3368,9 +2982,8 @@ mod tests {
         assert_eq!(ours, readme, "not the README's settings: {uncommented}");
     }
 
-    /// What a client draws with goes to it in its environment and comes back
-    /// as it went, where its sessions are included, the rest of its settings
-    /// the defaults.
+    /// `remote` included; settings other than `[client]` and `[effects]` come
+    /// back as defaults.
     #[test]
     fn what_a_client_draws_with_survives_its_environment() {
         let mut settings = Settings::default();
@@ -3404,8 +3017,7 @@ mod tests {
         store.generation.load(Ordering::SeqCst)
     }
 
-    /// A change is what `get` hands out from then on, and counts one
-    /// generation; the file is as it was until a save says otherwise.
+    /// `saved` is unchanged until a save.
     #[test]
     fn a_change_is_what_get_hands_out_and_counts_a_generation() {
         let store = Store::new();
@@ -3431,8 +3043,7 @@ mod tests {
         assert_eq!(generation_of(&store), 1, "a save changes nothing that runs");
     }
 
-    /// What a file would be refused for, a change is refused for, with the
-    /// same words, and nothing changes.
+    /// Same message as a file would get, and nothing changes.
     #[test]
     fn a_change_a_file_would_be_refused_for_is_refused() {
         let store = Store::new();
@@ -3451,8 +3062,7 @@ mod tests {
         assert_eq!(generation_of(&store), 0);
     }
 
-    /// The settings loaded are both what runs and what the file holds, and a
-    /// second load in one process is a mistake that changes neither.
+    /// `init` sets both live and saved settings; a second call changes neither.
     #[test]
     fn a_second_init_keeps_the_first() {
         let store = Store::new();
@@ -3466,7 +3076,7 @@ mod tests {
 
     // --- saving (pure) ------------------------------------------------------
 
-    /// The first-run template, as a first run with the default prefix wrote it.
+    /// The first-run template with the default prefix.
     fn template() -> String {
         render_default_config(crate::keys::PREFIX)
     }
@@ -3485,8 +3095,7 @@ mod tests {
         saved_text(text, live, saved, false).expect("saved")
     }
 
-    /// The lines of `after` that are not lines of `before`, and the other way
-    /// round: what a save changed.
+    /// Lines added and removed by a save.
     fn diff(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
         let was: Vec<&str> = before.lines().collect();
         let now: Vec<&str> = after.lines().collect();
@@ -3504,8 +3113,6 @@ mod tests {
 
     use crate::settings::Value;
 
-    /// A setting the template has as a comment is uncommented where it is,
-    /// its note after it, and not a byte else changes.
     #[test]
     fn a_setting_the_template_comments_is_uncommented_in_place() {
         let before = template();
@@ -3513,8 +3120,7 @@ mod tests {
         let (after, count) = save_over(Some(&before), &Settings::default(), &live);
         assert_eq!(count, 1);
         let (added, removed) = diff(&before, &after);
-        // The note where it was, against the setting: the template pads the
-        // number to six.
+        // The note keeps its column; the template pads the number to six.
         assert_eq!(
             added,
             vec!["timeout_ms = 1500     # how long a lone prefix or half-typed number waits"]
@@ -3527,8 +3133,6 @@ mod tests {
         assert_eq!(read_back(&after), Ok(live));
     }
 
-    /// Set back to its default, a setting is commented back out, so the file
-    /// stops pinning it and follows the default again.
     #[test]
     fn a_setting_back_at_its_default_is_commented_back_out() {
         let saved = with(
@@ -3547,8 +3151,6 @@ mod tests {
         assert_eq!(after, template(), "back to the template, byte for byte");
     }
 
-    /// A setting the file sets is changed where it is, its note kept in its
-    /// column.
     #[test]
     fn a_setting_the_file_sets_is_changed_where_it_is() {
         let before = "[keys]\nprefix = \"Ctrl-Space\"   # mine\n\n[client]\nlazy = true\n";
@@ -3563,7 +3165,6 @@ mod tests {
         );
     }
 
-    /// With no file, the template is written with the change in it.
     #[test]
     fn with_no_file_the_template_is_written_with_the_change() {
         let live = with(
@@ -3588,8 +3189,7 @@ mod tests {
         );
     }
 
-    /// A setting with no line anywhere goes after its table's last setting —
-    /// and a table the file does not have goes at the end.
+    /// A missing table is added at the end.
     #[test]
     fn a_setting_with_no_line_is_added_to_its_table() {
         let before =
@@ -3608,8 +3208,7 @@ mod tests {
         assert_eq!(read_back(&after), Ok(live));
     }
 
-    /// A file written by hand, with comments, an inline table and dotted keys,
-    /// keeps everything the save did not change.
+    /// With comments, an inline table and dotted keys.
     #[test]
     fn a_hand_written_file_keeps_everything_a_save_did_not_change() {
         let before = "\
@@ -3649,7 +3248,6 @@ fade.enabled = false   # too slow over ssh
         }
     }
 
-    /// A table there only for one under it gets a header of its own.
     #[test]
     fn a_table_there_only_for_one_under_it_gets_a_header() {
         let before = "[effects.fade]\nenabled = false\n";
@@ -3663,9 +3261,7 @@ fade.enabled = false   # too slow over ssh
         assert_eq!(read_back(&after), Ok(live));
     }
 
-    /// A setting being saved that the file changed too, since nvmux read it,
-    /// is not overwritten unless asked again; one changed to the very value
-    /// being saved is no clash at all.
+    /// A file change to the very value being saved is no clash.
     #[test]
     fn a_setting_the_file_changed_too_is_overwritten_only_when_asked() {
         let saved = Settings::default();
@@ -3691,8 +3287,7 @@ fade.enabled = false   # too slow over ssh
         );
     }
 
-    /// A file that no longer reads is not written over, and the refusal says
-    /// where it stopped reading.
+    /// The refusal says where parsing stopped.
     #[test]
     fn a_file_that_no_longer_reads_is_not_written_over() {
         let live = with(&Settings::default(), "client.lazy", Value::Switch(true));
@@ -3716,8 +3311,6 @@ fade.enabled = false   # too slow over ssh
         }
     }
 
-    /// Every setting, changed from the template and back, comes out of the
-    /// file as nvmux would load it — and back at the template.
     #[test]
     fn every_setting_saves_and_saves_back_to_the_template() {
         for setting in crate::settings::all() {
@@ -3752,8 +3345,8 @@ fade.enabled = false   # too slow over ssh
                 "{}",
                 setting.path()
             );
-            // The prefix is the one line the template has set rather than
-            // commented: back at its default, it is commented out as any is.
+            // The prefix is the template's one active line; back at its
+            // default it is commented out like any other.
             let want = match setting.path().as_str() {
                 "keys.prefix" => template().replace("\nprefix = ", "\n# prefix = "),
                 _ => template(),
@@ -3762,8 +3355,7 @@ fade.enabled = false   # too slow over ssh
         }
     }
 
-    /// A command with quotes in it is written as TOML can spell it — a
-    /// literal string, which needs no escapes — and reads back as typed.
+    /// Written as a TOML literal string, which needs no escapes.
     #[test]
     fn a_command_with_quotes_reads_back_as_typed() {
         let typed = "nvim -u \"my init.lua\" --listen {sock}";
@@ -3785,7 +3377,6 @@ fade.enabled = false   # too slow over ssh
         );
     }
 
-    /// The edit keeps a file's line endings, notes and all.
     #[test]
     fn a_file_with_crlf_line_endings_keeps_them() {
         let before = "[client]\r\nlazy = true    # mine\r\n";
@@ -3831,12 +3422,12 @@ fade.enabled = false   # too slow over ssh
     // --- load() (touches process-global env; guarded) ----------------------
 
     /// `load` reads `HOME`/`XDG_CONFIG_HOME`/`NVMUX_CONFIG`, which are
-    /// process-global. No other test in the crate touches them, so this guard
-    /// only serialises these tests against each other.
+    /// process-global. No other test touches them, so this only serialises
+    /// these tests.
     static ENV_GUARD: Mutex<()> = Mutex::new(());
 
-    /// Unset the three vars for the duration of a test, restoring them on drop
-    /// so nothing leaks between tests even on a panic.
+    /// Unsets the three vars for a test and restores them on drop, even on
+    /// panic.
     struct ScrubbedEnv {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
@@ -3983,8 +3574,7 @@ fade.enabled = false   # too slow over ssh
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// A save writes the file a load reads: `$NVMUX_CONFIG` when it is set,
-    /// which the first run never writes but a save, being asked for, does.
+    /// Including `$NVMUX_CONFIG`, which the first run never writes.
     #[test]
     fn a_save_writes_the_file_a_load_reads() {
         let _lock = guard();

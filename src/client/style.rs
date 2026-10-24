@@ -1,35 +1,21 @@
-//! Highlights, and the colours a cell is finally drawn in.
+//! Highlights and the colours a cell is drawn in.
 //!
-//! Neovim defines every highlight once (`hl_attr_define`) in two forms — its
-//! GUI colours and its cterm ones — and from then on a cell names it by id.
-//! Which form the client draws is `'termguicolors'`, exactly as Neovim's own
-//! TUI decides it, so a session looks the same in this client as in that one:
-//! RGB with it set, the terminal's 256 colours without. A colour neither the
-//! highlight nor `default_colors_set` gives is the terminal's own, drawn as
-//! the terminal's default rather than as a guess at it — which is what keeps
-//! a transparent background transparent.
+//! Neovim defines each highlight once (`hl_attr_define`) in GUI and cterm
+//! forms. As in Neovim's TUI, `'termguicolors'` picks RGB or the terminal's
+//! 256 colours. A colour set by neither the highlight nor
+//! `default_colors_set` is drawn as the terminal default, not a guess, so a
+//! transparent background stays transparent.
 //!
-//! # Colours as they look
+//! Animations mix colours, so a [`Style`] can also be resolved to the RGB it
+//! looks like ([`Colors::visual_fg`], [`Colors::visual_bg`]) using the
+//! terminal's palette (see [`crate::palette`]).
 //!
-//! An animation mixes colours, and mixing needs real ones at both ends. So a
-//! [`Style`] can also be read as it *looks* ([`Colors::visual_fg`],
-//! [`Colors::visual_bg`]): its reverse applied, an index looked up, and a
-//! default made into the terminal's own colour from the palette nvmux asked
-//! the terminal for (see [`crate::palette`]). A cell an animation has touched
-//! is drawn in those, which is the one place this client draws a colour
-//! Neovim did not name.
-//!
-//! # Blending
-//!
-//! With `ext_multigrid` a float's `'winblend'` is the client's to draw: the
-//! float's cells mixed with what is under them. [`blend_over`] and
-//! [`blend_through`] are Neovim's own rules for it (`hl_blend_attrs` in
-//! `highlight.c`), ratios and all, so a blended float looks as it would in
-//! the TUI.
+//! With `ext_multigrid` the client draws `'winblend'` itself;
+//! [`blend_over`] and [`blend_through`] follow Neovim's `hl_blend_attrs`
+//! (`highlight.c`) exactly.
 
 use crate::palette::{Palette, Rgb};
 
-/// How a highlight underlines, if it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Underline {
     #[default]
@@ -44,7 +30,7 @@ pub enum Underline {
 /// One of a highlight's two forms, as `hl_attr_define` sends it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Attrs {
-    /// `0xRRGGBB` in the GUI form, a 256-colour index in the cterm one.
+    /// `0xRRGGBB` in the GUI form, a 256-colour index in the cterm form.
     pub fg: Option<u32>,
     pub bg: Option<u32>,
     pub sp: Option<u32>,
@@ -60,32 +46,31 @@ pub struct Attrs {
     pub underline: Underline,
     /// `'winblend'` / `'pumblend'`, 0 to 100.
     pub blend: u8,
-    /// A hyperlink's target, which Neovim sends with the GUI form only.
+    /// Hyperlink target; Neovim sends it with the GUI form only.
     pub url: Option<Box<str>>,
 }
 
-/// The editor's default colours: `Normal`'s, where it has them.
+/// The editor's default colours (`Normal`'s, where set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DefaultColors {
     pub rgb_fg: Option<u32>,
     pub rgb_bg: Option<u32>,
     pub rgb_sp: Option<u32>,
-    /// Zero-based, already turned from the protocol's one-based form.
+    /// Zero-based; the protocol sends them one-based.
     pub cterm_fg: Option<u8>,
     pub cterm_bg: Option<u8>,
 }
 
-/// A colour as the client draws it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Color {
-    /// The terminal's own.
+    /// The terminal's default.
     #[default]
     Default,
     Rgb(Rgb),
     Index(u8),
 }
 
-/// Everything a cell is drawn with but its text.
+/// Everything a cell is drawn with except its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
     pub fg: Color,
@@ -101,15 +86,13 @@ pub struct Style {
     pub conceal: bool,
     pub overline: bool,
     pub underline: Underline,
-    /// The hyperlink the cell is part of, by its number in the model's table
-    /// of them (see `super::model::Model::links`): 0 for none. A number, so
-    /// that a style stays `Copy` and is compared as cheaply as the rest.
+    /// Hyperlink index into `super::model::Model::links`, 0 for none. An index
+    /// keeps `Style` `Copy` and cheap to compare.
     pub link: u32,
 }
 
 impl Style {
-    /// The style with its colours swapped in, reverse spent: what a reversed
-    /// cell looks like, written down so it can be mixed.
+    /// The style with reverse applied and colours resolved to RGB, for mixing.
     fn unreversed(self, colors: &Colors) -> Style {
         Style {
             fg: Color::Rgb(colors.visual_fg(&self)),
@@ -127,23 +110,22 @@ pub fn mix(ratio: u8, a: Rgb, b: Rgb) -> Rgb {
     Rgb(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
 }
 
-/// `0xRRGGBB` as a colour.
 pub fn rgb(n: u32) -> Rgb {
     Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8)
 }
 
-/// What resolves a style's colours to the ones it shows: whether RGB is in
-/// force, the editor's defaults, and the terminal's own palette.
+/// Everything needed to resolve a style's colours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Colors {
+    /// `'termguicolors'`.
     pub rgb: bool,
     pub defaults: DefaultColors,
     pub term: Palette,
 }
 
 impl Colors {
-    /// A highlight resolved for drawing: its own colours, then the editor's
-    /// defaults, then the terminal's — in the form `'termguicolors'` says.
+    /// Resolve a highlight in the form `'termguicolors'` selects: its own
+    /// colours, else the editor's defaults, else the terminal's.
     pub fn style(&self, rgb: &Attrs, cterm: &Attrs) -> Style {
         let d = &self.defaults;
         let (a, fg, bg, sp) = if self.rgb {
@@ -188,12 +170,12 @@ impl Colors {
         }
     }
 
-    /// The style a cell with no highlight is drawn in.
     pub fn default_style(&self) -> Style {
         self.style(&Attrs::default(), &Attrs::default())
     }
 
-    /// A colour as it shows, `fg` saying which default stands in for none.
+    /// The RGB a colour shows as; `fg` selects which terminal default
+    /// `Color::Default` means.
     pub fn resolve(&self, c: Color, fg: bool) -> Rgb {
         match c {
             Color::Rgb(rgb) => rgb,
@@ -203,7 +185,7 @@ impl Colors {
         }
     }
 
-    /// The colour a cell's text shows in, reverse and all.
+    /// Text colour as shown, reverse applied.
     pub fn visual_fg(&self, s: &Style) -> Rgb {
         if s.reverse {
             self.resolve(s.bg, false)
@@ -212,7 +194,7 @@ impl Colors {
         }
     }
 
-    /// The colour a cell's background shows in, reverse and all.
+    /// Background colour as shown, reverse applied.
     pub fn visual_bg(&self, s: &Style) -> Rgb {
         if s.reverse {
             self.resolve(s.fg, true)
@@ -221,7 +203,7 @@ impl Colors {
         }
     }
 
-    /// The colour an underline shows in: its own, or the text's.
+    /// Underline colour: its own, else the text's.
     pub fn visual_sp(&self, s: &Style) -> Rgb {
         match s.sp {
             Color::Default => self.visual_fg(s),
@@ -230,10 +212,9 @@ impl Colors {
     }
 }
 
-/// A blended float's cell over what is under it, where the float's cell has
-/// text of its own: the float's style, its text colour moved half the blend's
-/// way towards the text under it and its background the whole way.
-/// `hl_blend_attrs` without `through`.
+/// A blended float cell that has text: the float's style, with fg mixed at
+/// `blend / 2` and bg at `blend` towards what is under it. `hl_blend_attrs`
+/// without `through`.
 pub fn blend_over(colors: &Colors, back: &Style, front: &Style, blend: u8) -> Style {
     let b = back.unreversed(colors);
     let f = front.unreversed(colors);
@@ -260,9 +241,9 @@ pub fn blend_over(colors: &Colors, back: &Style, front: &Style, blend: u8) -> St
     out
 }
 
-/// A blended float's blank cell over what is under it: the text under it shows
-/// through, in its own style, its colours moved the blend's way towards the
-/// float's background. `hl_blend_attrs` with `through`.
+/// A blank blended float cell: the text under it shows through in its own
+/// style, mixed towards the float's background. `hl_blend_attrs` with
+/// `through`.
 pub fn blend_through(colors: &Colors, back: &Style, front: &Style, blend: u8) -> Style {
     let float_bg = colors.visual_bg(front);
     let b = back.unreversed(colors);
@@ -281,8 +262,7 @@ pub fn blend_through(colors: &Colors, back: &Style, front: &Style, blend: u8) ->
     out
 }
 
-/// Both backgrounds the terminal's own stays the terminal's own; otherwise
-/// they mix the blend's way.
+/// Two terminal-default backgrounds stay default; otherwise they mix.
 fn mixed_bg(colors: &Colors, back: &Style, front: &Style, blend: u8) -> Color {
     let plain = |s: &Style| !s.reverse && s.bg == Color::Default;
     if plain(back) && plain(front) {
@@ -324,9 +304,6 @@ mod tests {
         assert_eq!(mix(30, Rgb(100, 0, 0), Rgb(0, 0, 100)), Rgb(30, 0, 70));
     }
 
-    /// With `'termguicolors'` a highlight's own GUI colour wins, then the
-    /// editor's default, then the terminal's: the last left as the terminal's
-    /// default, never a guess at it.
     #[test]
     fn rgb_colours_fall_back_to_the_defaults_and_then_the_terminal() {
         let c = colors(true);
@@ -342,7 +319,6 @@ mod tests {
         assert_eq!(c.default_style().fg, Color::Rgb(Rgb(0xe0, 0xe2, 0xea)));
     }
 
-    /// Without it, the cterm form is drawn, attributes and all.
     #[test]
     fn without_termguicolors_the_cterm_form_is_drawn() {
         let c = colors(false);
@@ -367,8 +343,6 @@ mod tests {
         assert_eq!(s.underline, Underline::Line);
     }
 
-    /// As it looks: reversed, indexed and defaulted colours all come out as
-    /// real ones.
     #[test]
     fn a_style_reads_as_it_looks() {
         let c = colors(true);
@@ -385,8 +359,7 @@ mod tests {
         assert_eq!(c.visual_bg(&plain), palette().bg);
     }
 
-    /// Neovim's numbers, for a float at `'winblend'` 30: a blank lets the text
-    /// under it through, tinted 70% of the way to the float's background.
+    /// Expected values are Neovim's for `'winblend'` 30.
     #[test]
     fn a_blank_in_a_blended_float_lets_the_text_through() {
         let c = colors(true);
@@ -407,8 +380,7 @@ mod tests {
         assert!(out.bold, "the text under keeps its own look");
     }
 
-    /// Text of the float's own keeps the float's style, its colour moved half
-    /// the blend towards what is under it, and attributes merge from 50 up.
+    /// Attributes from below merge only at blend 50 and up.
     #[test]
     fn text_in_a_blended_float_keeps_its_own_style() {
         let c = colors(true);
@@ -430,8 +402,6 @@ mod tests {
         assert!(blend_over(&c, &back, &front, 60).italic);
     }
 
-    /// Where neither side has a background of its own, the terminal's shows
-    /// through still — transparent stays transparent.
     #[test]
     fn two_default_backgrounds_stay_default() {
         let c = colors(true);

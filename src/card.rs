@@ -1,43 +1,34 @@
-//! The cards nvmux shows in the margin of the session in front: which session
-//! you have just landed in, and what the others report while you are in one —
-//! a command that finished (`✓`) or failed (`!`) in one of their terminals, a
-//! notification a program there asked for (`∗`) — and of the session in front,
-//! what a terminal of its own off the screen says. A card with news says it
-//! and goes, and leaves its sign behind as the session's mark, which stays
-//! until the session is opened.
+//! Cards nvmux shows in the margin of the session in front: which session you
+//! landed in, and news from the others (a command in one of their terminals
+//! finished `✓` or failed `!`, or a program asked for a notification `∗`),
+//! plus news from the front session's own off-screen terminals. A news card
+//! shows its text, then leaves its sign as the session's mark until the
+//! session is opened.
 //!
 //! # Drawn by the client
 //!
-//! A card is nvmux's, and drawn on this side of the link: nothing about it
-//! goes to the session's server, so it is up as soon as nvmux knows what it
-//! says, over a slow link as over none. nvmux's own client draws it
-//! ([`crate::client::cards`]) — over the frame it composes from the editor's
-//! grids, so that the editor redrawing its screen, a `:mode` included, draws
-//! the card again with it rather than over it. Neovim's own client
-//! (`[client] ui = "nvim"`) draws no card: it has no way to be asked.
+//! Nothing goes to the session's server, so a card is up as soon as nvmux
+//! knows it, whatever the link. nvmux's client draws it
+//! ([`crate::client::cards`]) over the frame it composes from the editor's
+//! grids, so editor redraws (`:mode` included) redraw it too. Neovim's own
+//! client (`[client] ui = "nvim"`) cannot be asked and draws none.
 //!
 //! # On the client's input
 //!
-//! The relay tells its client what to show the way it tells it its size when
-//! that changed while it was parked: in the client's input, as a sequence no
-//! terminal sends — an APC opened by [`OPEN`] — which the client keeps for
-//! itself rather than typing (see [`crate::client::input`]). One write, and
-//! never inside a paste or a sequence of the terminal's own the relay is
-//! passing on (see [`Forwarded`]). Never echoed back out, either: the client's
-//! pty passes its input on untouched from before the client starts on it, so
-//! a card that goes in before the client is reading waits there until it is
-//! (see `pty::take_input_as_written`). What it carries is a [`Command`] as
-//! JSON, hex-encoded: plain ASCII, so that nothing in a name or a
-//! notification — an `ESC`, a `BEL`, a UTF-8 byte that is a C1 control on its
-//! own — can end the sequence early or reach the terminal.
+//! The relay sends commands in the client's input, as it does a size change
+//! made while parked: an APC opened by [`OPEN`], which no terminal sends and
+//! the client keeps for itself (see [`crate::client::input`]). One write,
+//! never inside a paste or a terminal sequence being passed on (see
+//! [`Forwarded`]). The pty holds input untouched until the client reads it,
+//! so an early card waits (see `pty::take_input_as_written`). The payload is
+//! a [`Command`] as hex-encoded JSON, so nothing in it (`ESC`, `BEL`, a lone
+//! C1 byte) can end the sequence or reach the terminal.
 //!
 //! # From the notifier
 //!
-//! What the other sessions report is read on a thread of its own
-//! ([`crate::tell::Notifier`]), which posts its cards on the [`board`] for the
-//! relay in front to take: the relay's loop wakes on the board's pipe, and
-//! takes what was posted for its own session, the one the card was written
-//! for, and drops anything left over from one before it.
+//! Other sessions' news is read on its own thread ([`crate::tell::Notifier`]),
+//! which posts cards on the [`board`]. The relay in front wakes on the board's
+//! pipe, takes the posts for its own session and drops the rest.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -49,31 +40,27 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// What opens the sequence a command goes to the client in: an APC, `ESC _`,
-/// and a byte no terminal's APC starts with — kitty's graphics replies, the
-/// only APCs a terminal sends, start with `G`.
+/// Opens a command's sequence: an APC (`ESC _`) and a byte no terminal's APC
+/// starts with (kitty's graphics replies, the only APCs terminals send, start
+/// with `G`).
 pub const OPEN: &[u8] = b"\x1b_~";
 
 /// The byte after `ESC _` that says the APC is nvmux's.
 pub const OPENER: u8 = b'~';
 
-/// What ends it: the string terminator.
+/// The string terminator.
 pub const CLOSE: &[u8] = b"\x1b\\";
 
-/// How long the card that says where a switch landed stays at full strength.
-///
-/// Long enough to catch a name out of the corner of the eye, which is where it
-/// is, in the margin: unlike the box that said it before
-/// ([`crate::announce`]), it is not over the text you have just switched to,
-/// so a little longer than that box's second costs nothing.
+/// How long the arrival card stays at full strength. It sits in the margin,
+/// not over the text, so it can outlast [`crate::announce`]'s one second.
 pub const ARRIVAL_LIFE: Duration = Duration::from_millis(1500);
 
 /// How long a card with news stays at full strength: long enough to read two
 /// lines and decide whether to go.
 pub const NEWS_LIFE: Duration = Duration::from_secs(6);
 
-/// What an arrival says under the name of a session waiting for a key, which
-/// nothing else on its blank screen would say.
+/// An arrival's body for a session waiting for a key, which its blank screen
+/// would not say.
 pub const WAITING: &str = "waiting for a key";
 
 /// The most characters of a title or a line that are kept: more than any card
@@ -95,8 +82,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The picker's sign for it (see [`crate::ui::note`]); none for an arrival,
-    /// which is a name and nothing else.
+    /// The picker's sign for it (see [`crate::ui::note`]); none for an arrival.
     pub fn sign(self) -> Option<char> {
         match self {
             Kind::Arrival => None,
@@ -113,87 +99,77 @@ pub struct Card {
     /// Unique among the cards one relay sends: what [`Command::Drop`] names.
     pub id: u64,
     pub kind: Kind,
-    /// The session's name; for the session in front, `here`, and where its
+    /// The session's name; for the session in front, `here` and where its
     /// terminal is.
     pub title: String,
-    /// What happened, for news; for an arrival, that the session is waiting
-    /// for a key ([`WAITING`]), which nothing else on the screen would say.
+    /// What happened, for news; for an arrival, [`WAITING`] or nothing.
     pub body: Option<String>,
-    /// The key that acts on the card and what it does, or nothing for one that
-    /// goes nowhere. The client draws it while the prefix is held
-    /// ([`Command::Keys`]), on the newest card up that has one, which is the
-    /// one the key acts on ([`Desk::go`]), and on no other.
+    /// The key that acts on the card and what it does, if any. Drawn while the
+    /// prefix is held ([`Command::Keys`]), only on the newest card up that has
+    /// one, which is the one the key acts on ([`Desk::go`]).
     pub footer: Option<String>,
     /// How old the news was when the card was sent, in seconds; the client
     /// counts on from there. `None` for an arrival.
     pub age: Option<u64>,
     /// How long its words stay at full strength, in milliseconds.
     pub life_ms: u64,
-    /// nvmux's own fade one way, in milliseconds (see [`crate::fade`]), and 0
-    /// where that is off: what the card's comings and goings are timed in.
+    /// nvmux's fade one way in milliseconds (see [`crate::fade`]), 0 if off;
+    /// times the card's entry and exit.
     pub fade_ms: u64,
-    /// `[style] color` (see [`crate::theme`]): the colour of its sign and its
-    /// session's name, in place of the editor's; `None` for the editor's own.
+    /// `[style] color` (see [`crate::theme`]) for its sign and session name;
+    /// `None` for the editor's colours.
     pub ink: Option<(u8, u8, u8)>,
-    /// No colour of nvmux's own, under `NO_COLOR`: its sign in the editor's
-    /// text colour rather than the colour the editor has for its kind.
+    /// `NO_COLOR`: the sign in the editor's text colour, not its colour for
+    /// the kind.
     #[serde(default)]
     pub plain: bool,
-    /// The session the news is about, by its id, where it is another's — and
-    /// for a terminal of the session in front, which one: a newer card about
-    /// the same takes this one's place, as its news has. `None` for an
-    /// arrival.
+    /// The session the news is about, by id, if another's; for a terminal of
+    /// the session in front, which one. A newer card about the same replaces
+    /// this one. `None` for an arrival.
     #[serde(default)]
     pub about: Option<String>,
-    /// The sign the news leaves once its words have gone, which stays until
-    /// the card is let go of: the session's mark. The one the picker has
-    /// beside the session, which is a notification's or a failure's over a
-    /// command's that finished since; `None` for a card that leaves none.
+    /// The sign left once the words have gone, kept until the card is
+    /// dropped: the session's mark, as the picker shows it (a notification or
+    /// failure outranks a later finish). `None` leaves none.
     #[serde(default)]
     pub mark: Option<Kind>,
-    /// Whether it is the mark alone, its words never said: for news that came
-    /// before the screen it is on, and was told on another. The prefix held
-    /// says them, on the one the key acts on.
+    /// Only the mark, words unsaid: for news older than this screen, already
+    /// shown on another. Holding the prefix shows them on the card the key
+    /// acts on.
     #[serde(default)]
     pub only_mark: bool,
-    /// For an arrival: where the session is among the ones `<prefix> n` and
+    /// For an arrival: its place among the sessions `<prefix> n` and
     /// `<prefix> p` step through. Boxed, as only an arrival has one.
     #[serde(default)]
     pub row: Option<Box<Row>>,
-    /// How long it has been up already, in milliseconds, where it was up on
-    /// another screen first: the card a switch lands with, which the client
-    /// of the session it leaves draws from the key on (see
-    /// [`crate::pty::relay`]). The client of the session it lands in takes it
-    /// up from there, its row as far along as it has come, rather than from
-    /// the start. 0 for a card on its first screen, which is timed from when
-    /// it is first drawn there.
+    /// How long it has already been up on another screen, in milliseconds.
+    /// The card a switch lands with is first drawn by the departing session's
+    /// client (see [`crate::pty::relay`]), and the arriving client continues
+    /// from there. 0 for a card on its first screen.
     #[serde(default)]
     pub up_ms: u64,
 }
 
 /// Where a switch landed among the sessions `<prefix> n` and `<prefix> p`
-/// step through, for the arrival that says so: the names either side of it,
-/// and for a step, which way it went.
+/// step through: the names either side and, for a step, its direction.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
-    /// The session `<prefix> p` goes to from here, where that is not the one
-    /// `<prefix> n` goes to as well: with two sessions, the other is `next`.
+    /// Where `<prefix> p` goes, unless that is also `next` (two sessions).
     pub prev: Option<String>,
-    /// The session `<prefix> n` goes to from here.
+    /// Where `<prefix> n` goes.
     pub next: Option<String>,
-    /// For a switch by `<prefix> n` or `<prefix> p` among three sessions or
-    /// more, which moves the row one name the way it went.
+    /// For a `<prefix> n` or `<prefix> p` switch among three or more
+    /// sessions, which shifts the row one name.
     pub step: Option<Step>,
 }
 
-/// A step along the [`Row`]: which way it went, and the name that goes off
-/// the end of the row as it moves.
+/// A step along the [`Row`]: its direction and the name leaving the row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
-    /// Forward, as `<prefix> n` goes; back, as `<prefix> p` does.
+    /// True for `<prefix> n`, false for `<prefix> p`.
     pub forward: bool,
-    /// The session beyond the one left, on its far side from the one landed
-    /// in: in the row before the step, and not after it.
+    /// The session beyond the one left, on the far side from the one landed
+    /// in: in the row before the step, not after.
     pub gone: String,
 }
 
@@ -220,9 +196,9 @@ impl Card {
         }
     }
 
-    /// A card with news: `kind`, from `title`'s session, saying `body`, `age`
-    /// seconds old, with `footer` naming the key that acts on it. It leaves
-    /// its own sign, and is about nobody in particular.
+    /// A news card: `kind` from `title`'s session, saying `body`, `age`
+    /// seconds old, with `footer` naming the key that acts on it. Leaves its
+    /// own sign and is about nobody in particular.
     pub fn news(id: u64, kind: Kind, title: &str, body: &str, age: u64, footer: &str) -> Self {
         Self {
             id,
@@ -292,8 +268,7 @@ impl Card {
         }
     }
 
-    /// Its text made safe, as it is on the way in: for a card that came off
-    /// the wire, which says what nvmux sent but is read as though it might not.
+    /// Its text made safe again: a card off the wire is not trusted.
     fn cleaned(mut self) -> Self {
         self.title = clean(&self.title);
         self.body = self.body.as_deref().map(clean);
@@ -312,27 +287,23 @@ impl Card {
 pub enum Command {
     /// Show this card, above the others.
     Show(Card),
-    /// Let this one go: it has been acted on, or what it is about has nothing
-    /// more to say.
+    /// Drop this card: acted on, or its subject has nothing more to say.
     Drop { id: u64 },
-    /// Let them all go: this client has just come back to the front, and
-    /// whatever it was showing when it left is old. Back from
-    /// [`Command::Away`], if it was there.
+    /// Drop all cards: this client is back in front and what it showed is
+    /// stale. Also ends [`Command::Away`].
     Clear,
-    /// This client has gone to the back — parked, or started ahead of its
-    /// session's first visit — and nothing it draws is seen until it is told
-    /// [`Command::Clear`]: it stops animating, and draws what changes at most
-    /// once in a while, for what nvmux keeps of its screen meanwhile. Told
-    /// that, it draws at once, and something even where nothing changed: a
-    /// frame the relay waits for, to bring the screen back as it is now.
+    /// This client is in the back (parked, or started before its first
+    /// visit), unseen until [`Command::Clear`]: it stops animating and redraws
+    /// changes only now and then, for nvmux's copy of its screen. On `Clear`
+    /// it draws at once, even with nothing changed: the relay waits for that
+    /// frame.
     Away,
-    /// The prefix is held, or it is not any more: while it is, the card the
-    /// key acts on says so.
+    /// Whether the prefix is held; while it is, the card the key acts on says
+    /// so.
     Keys { held: bool },
-    /// Draw with these settings from now on: the settings screen has
-    /// changed them since the client was started, or was last told (see
-    /// [`crate::config::Drawing`]). Not a card's business, though it comes
-    /// the cards' way.
+    /// Draw with these settings from now on: changed on the settings screen
+    /// since the client started or was last told (see
+    /// [`crate::config::Drawing`]). Not about cards; it shares their channel.
     Settings(crate::config::Drawing),
 }
 
@@ -349,8 +320,8 @@ pub fn encode(cmd: &Command) -> Vec<u8> {
     out
 }
 
-/// The command a sequence's body — what comes after [`OPEN`], without its
-/// terminator — carries, or `None` for one that carries none.
+/// The command in a sequence's body (after [`OPEN`], without the
+/// terminator), or `None`.
 pub fn decode(body: &[u8]) -> Option<Command> {
     if !body.len().is_multiple_of(2) {
         return None;
@@ -375,8 +346,8 @@ fn nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// `s` fit to be drawn in a cell: control characters, C1 ones included, as
-/// spaces, the ends trimmed, and no longer than any card is wide.
+/// `s` fit for a cell: control characters (C1 included) as spaces, ends
+/// trimmed, and no longer than any card is wide.
 pub fn clean(s: &str) -> String {
     let text: String = s
         .chars()
@@ -407,8 +378,7 @@ fn plain() -> bool {
     std::env::var_os("NO_COLOR").is_some()
 }
 
-/// A number for a new card, never one another card had: what
-/// [`Command::Drop`] names it by, whichever thread made it.
+/// A card id unique across threads, for [`Command::Drop`].
 pub fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -426,24 +396,22 @@ pub enum Go {
 /// What the notifier has for the relay in front.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Post {
-    /// The session in front it was written for: of its own terminals it says
-    /// `here`, which is nobody else's.
+    /// The session in front it was written for: news of its own terminals
+    /// says `here`, which is true only there.
     pub front: String,
     pub what: Posted,
 }
 
-/// What a [`Post`] says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Posted {
     /// Show this card; acting on it goes here.
     Card(Card, Option<Go>),
-    /// Let go of what is up about this session (see [`Card::about`]): it has
-    /// nothing to tell any more — what it kept has been seen, or it is gone.
+    /// Drop what is up about this session (see [`Card::about`]): it was seen,
+    /// or the session is gone.
     Forget(String),
 }
 
 impl Post {
-    /// The card it shows, if it shows one.
     pub fn card(&self) -> Option<&Card> {
         match &self.what {
             Posted::Card(card, _) => Some(card),
@@ -455,16 +423,14 @@ impl Post {
 /// Where the notifier leaves cards for the relay: see the module docs.
 pub struct Board {
     posts: Mutex<VecDeque<Post>>,
-    /// Written a byte per post, so that the relay's `poll` wakes; the relay
-    /// reads them off again with what was posted.
+    /// A byte per post wakes the relay's `poll`; [`Board::take`] drains them.
     wake: Option<(UnixStream, UnixStream)>,
 }
 
-/// The most cards that wait on the board for a relay to take them; past it the
-/// oldest go, which no relay was there to show while they were new.
+/// The most posts kept waiting; past it the oldest go.
 const BOARD_MAX: usize = 32;
 
-/// The one board there is: one relay is in front at a time.
+/// The one board: one relay is in front at a time.
 pub fn board() -> &'static Board {
     static BOARD: OnceLock<Board> = OnceLock::new();
     BOARD.get_or_init(Board::new)
@@ -486,7 +452,6 @@ impl Board {
         }
     }
 
-    /// Leave `post` for the relay in front.
     pub fn post(&self, post: Post) {
         if let Ok(mut posts) = self.posts.lock() {
             posts.push_back(post);
@@ -500,7 +465,6 @@ impl Board {
         }
     }
 
-    /// The descriptor the relay polls for posts, if there is one.
     pub fn wake_fd(&self) -> Option<RawFd> {
         self.wake.as_ref().map(|(r, _)| r.as_raw_fd())
     }
@@ -518,18 +482,17 @@ impl Board {
     }
 }
 
-/// How long the relay's input to its client must have been quiet before a
-/// card goes in where the stream is not known to be between keys: a sequence
-/// of the terminal's that never ended, an `Alt` chord that only looked like
-/// one. A paste is given longer: a card inside one would be pasted.
+/// How long the relay's input to its client must be quiet before a card goes
+/// in when the stream is not known to be between keys (an unterminated
+/// terminal sequence, or what only looked like an `Alt` chord). Longer for a
+/// paste: a card inside one would be pasted.
 const QUIET: Duration = Duration::from_millis(150);
 const QUIET_PASTE: Duration = Duration::from_secs(1);
 
-/// Where the stream the relay passes on to its client stands — between keys,
-/// inside a bracketed paste, or inside a string of the terminal's (an OSC, a
-/// DCS or an APC reply) — by the client's own rules for telling (see
-/// [`crate::client::input`]), so that a card goes in only where the client
-/// will read it as one.
+/// Where the stream passed to the client stands (between keys, in a
+/// bracketed paste, or in an OSC, DCS or APC reply), by the client's own rules
+/// ([`crate::client::input`]), so a card goes in only where the client will
+/// read it as one.
 #[derive(Debug, Default)]
 pub struct Forwarded {
     inside: Inside,
@@ -614,13 +577,13 @@ impl Forwarded {
         }
     }
 
-    /// Whether a card may go in now: between keys, or after long enough with
-    /// nothing passed on that whatever was open has stalled.
+    /// Whether a card may go in now: between keys, or after a quiet long
+    /// enough that whatever was open has stalled.
     pub fn clear(&self, now: Instant) -> bool {
         self.retry_at().is_none_or(|at| now >= at)
     }
 
-    /// When a card may go in, if it may not go in at any time.
+    /// When a card may go in, if not at any time.
     pub fn retry_at(&self) -> Option<Instant> {
         let quiet = match self.inside {
             Inside::Nothing if self.tail.is_empty() => return None,
@@ -630,17 +593,17 @@ impl Forwarded {
         Some(self.last? + quiet)
     }
 
-    /// A card went in, whatever stood open: what was open has stalled, and
-    /// the client, reading the card, has given up on it.
+    /// A card went in regardless: whatever was open has stalled, and the
+    /// client abandons it on reading the card.
     fn reset(&mut self) {
         self.inside = Inside::Nothing;
         self.tail.clear();
     }
 }
 
-/// The relay's side of the cards: what it has told its client to show, which
-/// `<prefix> Enter` acts on, and what waits for a moment between keys to go
-/// in (see [`Forwarded`]). One a relay, for its session only.
+/// The relay's side of the cards, one per relay: what its client shows, what
+/// `<prefix> Enter` acts on, and what waits for a gap between keys (see
+/// [`Forwarded`]).
 #[derive(Debug)]
 pub struct Desk {
     front: String,
@@ -651,8 +614,8 @@ pub struct Desk {
     pub forwarded: Forwarded,
 }
 
-/// A card sent, and up until it is let go of: news stays, as the mark it
-/// leaves, until its session is opened.
+/// A card sent and still up; news stays up, as its mark, until its session
+/// is opened.
 #[derive(Debug)]
 struct Up {
     id: u64,
@@ -661,7 +624,6 @@ struct Up {
 }
 
 impl Desk {
-    /// The desk of a relay of session `front`.
     pub fn new(front: &str) -> Self {
         Self {
             front: front.to_string(),
@@ -672,9 +634,8 @@ impl Desk {
         }
     }
 
-    /// What a relay opens with, before the client has been passed a key: off
-    /// with whatever it was showing when it was last in front, and on with
-    /// the card that says where the switch landed, if it says anything.
+    /// A relay's opening commands, before the client gets any key: clear what
+    /// it showed when last in front, and show the arrival card if any.
     pub fn open(&mut self, arrival: Option<Card>) -> Vec<Command> {
         let mut out = vec![Command::Clear];
         if let Some(card) = arrival {
@@ -688,9 +649,8 @@ impl Desk {
         out
     }
 
-    /// Take what was posted on the board: this relay's, to go in as soon as
-    /// it can; anybody else's dropped — written for a session that is not in
-    /// front any more.
+    /// Queue this relay's posts; drop others', written for a session no
+    /// longer in front.
     pub fn take(&mut self, posts: Vec<Post>) {
         for post in posts {
             if post.front != self.front {
@@ -703,8 +663,7 @@ impl Desk {
         }
     }
 
-    /// Let go of everything about `about`: what is up, and what waits to go
-    /// up.
+    /// Drop everything about `about`, up or queued.
     fn forget(&mut self, about: &str) {
         let is_about = |card: &Card| card.about.as_deref() == Some(about);
         self.queue
@@ -726,9 +685,9 @@ impl Desk {
         }
     }
 
-    /// What may go in to the client now: everything waiting, if the stream is
-    /// between keys, and nothing otherwise. A card about what one up is about
-    /// takes its place, here as on the screen: the key acts on the newer.
+    /// Everything queued, if a card may go in now ([`Forwarded::clear`]);
+    /// otherwise nothing. A card about the same as one up replaces it, for the
+    /// key too.
     pub fn ready(&mut self, now: Instant) -> Vec<Command> {
         if self.queue.is_empty() || !self.forwarded.clear(now) {
             return Vec::new();
@@ -753,8 +712,8 @@ impl Desk {
             .collect()
     }
 
-    /// When to look again for a moment to put what waits in: `None` when
-    /// nothing waits, or it can go in now.
+    /// When to try again to send what is queued: `None` if nothing is, or it
+    /// can go now.
     pub fn retry_at(&self) -> Option<Instant> {
         if self.queue.is_empty() {
             return None;
@@ -762,16 +721,14 @@ impl Desk {
         self.forwarded.retry_at()
     }
 
-    /// Whether [`Desk::go`] would find a card to act on: what the hint bar asks
-    /// before it offers `<prefix> Enter` (see [`crate::hint`]). One stays up
-    /// until it is acted on or what it is about has nothing more to say, as
-    /// news leaves its mark.
+    /// Whether [`Desk::go`] would find a card: asked by the hint bar before
+    /// offering `<prefix> Enter` (see [`crate::hint`]).
     pub fn can_go(&self) -> bool {
         self.up.iter().any(|u| u.go.is_some())
     }
 
-    /// The newest card up that goes somewhere, taken down: what
-    /// `<prefix> Enter` acts on.
+    /// Take down the newest card up that goes somewhere: what `<prefix> Enter`
+    /// acts on.
     pub fn go(&mut self) -> Option<(u64, Go)> {
         let at = self.up.iter().rposition(|u| u.go.is_some())?;
         let up = self.up.remove(at);
@@ -795,7 +752,6 @@ mod tests {
         )
     }
 
-    /// What goes on the wire comes back off it as it went, every command.
     #[test]
     fn a_command_comes_off_the_wire_as_it_went_on() {
         let row = Row {
@@ -822,8 +778,6 @@ mod tests {
         }
     }
 
-    /// Plain ASCII between the opener and the terminator, whatever the card
-    /// says: nothing in a name ends the sequence, or reaches the terminal.
     #[test]
     fn nothing_a_card_says_can_end_its_sequence() {
         let nasty = Card::news(
@@ -844,8 +798,7 @@ mod tests {
         );
     }
 
-    /// What the card says is drawn as text: controls are spaces, on the way
-    /// out and again on the way in.
+    /// Controls become spaces when built, and again when decoded.
     #[test]
     fn a_cards_text_holds_no_control_characters() {
         let card = Card::news(1, Kind::Failed, "a\x1bb", "c\u{9b}d", 0, "e\x07");
@@ -888,7 +841,6 @@ mod tests {
         assert_eq!(row.step.map(|s| s.gone).as_deref(), Some("c d"));
     }
 
-    /// Anything that is not a command is not one.
     #[test]
     fn a_body_that_is_not_a_command_is_ignored() {
         assert_eq!(decode(b"zz"), None);
@@ -897,8 +849,7 @@ mod tests {
         assert_eq!(decode(b"7b7d"), None, "{{}}");
     }
 
-    /// An arrival is a name, and whether the session is waiting for a key;
-    /// it leaves no mark, is about nobody, and stays the shorter while.
+    /// It leaves no mark, is about nobody, and has the shorter life.
     #[test]
     fn an_arrival_is_a_name() {
         let named = Card::arrival(1, "blog", false);
@@ -911,8 +862,6 @@ mod tests {
         assert!(Duration::from_millis(named.life_ms) < NEWS_LIFE);
     }
 
-    /// News leaves its own sign, unless it is told to leave another; it is
-    /// the mark alone only when asked.
     #[test]
     fn news_leaves_its_sign() {
         let news = card();
@@ -930,8 +879,6 @@ mod tests {
         assert_eq!(Kind::Notified.sign(), Some('∗'));
     }
 
-    /// The board hands each post over once, oldest first, and wakes whoever
-    /// polls it.
     #[test]
     fn the_board_hands_over_what_was_posted_once() {
         let board = Board::new();
@@ -956,9 +903,8 @@ mod tests {
         assert_eq!(n, 0, "a wake was left behind");
     }
 
-    /// A card goes in between keys, never inside a paste — where it would be
-    /// pasted — nor inside a string of the terminal's, however the writes
-    /// cut them; and a string that never ends holds cards back only a while.
+    /// Never inside a paste or a terminal string, however writes split them;
+    /// an unterminated string holds cards back only for `QUIET`.
     #[test]
     fn a_card_waits_for_the_stream_to_be_between_keys() {
         let t0 = Instant::now();
@@ -1022,8 +968,6 @@ mod tests {
             .collect()
     }
 
-    /// Settings go to the client as every command does, and come back as
-    /// they went.
     #[test]
     fn settings_go_to_the_client_and_come_back_as_they_went() {
         let mut drawing = crate::config::Drawing::default();
@@ -1039,9 +983,6 @@ mod tests {
         assert_eq!(decode(body), Some(cmd));
     }
 
-    /// A relay opens with a clear and where the switch landed; takes what was
-    /// posted for its own session only; and lets it in when the stream is
-    /// between keys.
     #[test]
     fn a_desk_lets_its_own_cards_in_between_keys() {
         let t0 = Instant::now();
@@ -1063,9 +1004,8 @@ mod tests {
         assert!(desk.ready(t0).is_empty() && desk.retry_at().is_none());
     }
 
-    /// `<prefix> Enter` takes the newest card that goes somewhere down, and
-    /// says where — however long it has been up, as a mark stays up until
-    /// its session is opened.
+    /// However long it has been up: a mark stays up until its session is
+    /// opened.
     #[test]
     fn going_takes_the_newest_card_that_goes_somewhere() {
         let t0 = Instant::now();
@@ -1093,8 +1033,7 @@ mod tests {
         assert_eq!(desk.go(), Some((5, Go::Buffer(7))), "an hour on or now");
     }
 
-    /// A card about what an older one is about takes its place, for the key
-    /// as on the screen; and what is forgotten is let go of, up or waiting.
+    /// Replaced for the key as on screen; forgetting drops cards up or queued.
     #[test]
     fn the_newer_card_about_a_session_takes_the_olders_place() {
         let t0 = Instant::now();
@@ -1131,8 +1070,6 @@ mod tests {
         assert_eq!(desk.go(), None);
     }
 
-    /// The client is told when the prefix is held and when it is let go of,
-    /// and not again while it stays either way.
     #[test]
     fn the_client_is_told_of_the_prefix_as_it_changes() {
         let t0 = Instant::now();
@@ -1147,9 +1084,7 @@ mod tests {
         assert_eq!(ids(&desk.ready(t0)), ["keys false"]);
     }
 
-    /// `can_go` is `go` asked without acting: what the hint bar offers
-    /// `<prefix> Enter` on, so the two must never disagree — a mark included,
-    /// and none once what it is about is let go of.
+    /// The hint bar relies on `can_go` agreeing with `go`, marks included.
     #[test]
     fn can_go_says_whether_going_would_go_anywhere() {
         let t0 = Instant::now();

@@ -1,46 +1,26 @@
-//! Where the motions by words take the cursor in Normal mode, as Neovim
-//! 0.12's `fwd_word`, `bck_word`, `end_word` and `bckend_word` take it —
-//! worked out by the client over the lines it has (see [`super::moves`]):
-//!
-//! - `w`, `<S-Right>` on to the next word's first character, `b`,
-//!   `<S-Left>` back to a word's first, `e` on to a word's last and `ge`
-//!   back to the last of one before;
-//! - and `W`, `<C-Right>`, `B`, `<C-Left>`, `E` and `gE` the same by words
-//!   that only blanks part.
-//!
-//! A word is a run of characters of one class ([`class`]): of `'iskeyword'`'s
-//! characters, of other characters but blanks, or of a script's own — and a
-//! line's end is a blank between its last character and the next line's
-//! first. `w`, `b` and `ge` stop on an empty line as on a word; `e` goes on
-//! past one. A count goes as many words; one that runs into the buffer's
-//! end, or its start, stops there — on its last character, or its first.
-//! The cursor then wants the column it is drawn in, as it does after a move
-//! sideways, wherever it went.
+//! Client-side Normal-mode word motions (`w`, `b`, `e`, `ge`, their WORD
+//! forms and the Shift/Ctrl arrows), ported from Neovim 0.12's `fwd_word`,
+//! `bck_word`, `end_word` and `bckend_word` (see [`super::moves`]). `w`, `b`
+//! and `ge` stop on an empty line, `e` does not; a count stops at the
+//! buffer's start or end.
 
 use super::predict;
 
-/// Which way a motion by words goes, and to which end of a word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Way {
-    /// `w`: on to the next word's first character.
+    /// `w`: start of the next word.
     Next,
-    /// `b`: back to a word's first — the one the cursor is in, if it is not
-    /// on its first.
+    /// `b`: start of this word, or of the previous one if already there.
     Back,
-    /// `e`: on to a word's last — the one the cursor is in, if it is not on
-    /// its last.
+    /// `e`: end of the current word, or of the next one if already there.
     End,
-    /// `ge`: back to the last character of the word before.
+    /// `ge`: end of the previous word.
     BackEnd,
 }
 
-/// The class of character `c` for a motion by words, as Neovim's `cls()`
-/// has it: 0 for a blank, 1 for punctuation and 2 for a character of a
-/// word — for one under 256, as `'iskeyword'` makes it, `keyword` having a
-/// class for each (see `predict::Stepping::classes`); for one above, as
-/// Neovim's own table has it ([`CLASSES`]), a script's characters a class
-/// of their own and an emoji 3. By words only blanks part (`big`), anything
-/// but a blank is 1.
+/// Neovim's `cls()`: 0 blank, 1 punctuation, 2 word, 3 emoji, or a script's
+/// own class. Below 256 from `keyword` (`'iskeyword'`), above from
+/// [`CLASSES`]. With `big` every non-blank is 1.
 pub fn class(c: char, keyword: &[u8], big: bool) -> u32 {
     let class = match u32::from(c) {
         0x20 | 0x09 => 0,
@@ -64,23 +44,18 @@ pub fn class(c: char, keyword: &[u8], big: bool) -> u32 {
     }
 }
 
-/// The lines a motion by words goes over: the text of each, from nought,
-/// where the client has it whole and Neovim steps over its characters as
-/// the client does (see [`predict::ordinary`]); how many the buffer has;
-/// and what `'iskeyword'` makes of each character under 256 (see
-/// [`class`]).
+/// `text` gives a 0-based line only where the client has it whole and it is
+/// [`predict::ordinary`]; `keyword` holds the [`class`] of each character
+/// below 256.
 pub struct Lines<'a> {
     pub text: &'a dyn Fn(i64) -> Option<&'a str>,
     pub count: i64,
     pub keyword: &'a [u8],
 }
 
-/// Where a motion by words `way`, by words only blanks part if `big`,
-/// counted `count`, takes the cursor from byte `byte` of line `line`, over
-/// `lines`: the line it lands on, and the byte of the character there — as
-/// Neovim 0.12.6 was found to take it, failing or not. `None` where it would
-/// pass a line the client does not have, or the client does not know what
-/// `'iskeyword'` makes of the characters.
+/// Where `way` (WORD if `big`) `count` times takes the cursor from `(line,
+/// byte)`, as Neovim 0.12.6 does even when the motion fails. `None` if it
+/// would cross a missing line or `'iskeyword'` is unknown.
 pub fn moved(
     way: Way,
     big: bool,
@@ -100,28 +75,26 @@ pub fn moved(
         Way::End => at.end_word(count)?,
         Way::BackEnd => at.bckend_word(count)?,
     };
-    // Neovim's `adjust_cursor`: gone on past a line's last character, onto
-    // its end, the cursor goes back to it — where it went forward at all.
+    // Neovim's `adjust_cursor`: a forward move that ends on a line end steps
+    // back onto its last character.
     if matches!(way, Way::Next | Way::End) && (at.line, at.i) > from && at.i > 0 && at.end() {
         at.i -= 1;
     }
-    // Neovim leaves the cursor on a line's end only where the line is empty.
+    // The cursor rests on a line end only on an empty line.
     match at.cs.get(at.i) {
         Some(&(byte, _)) => Some((at.line, byte)),
         None => at.cs.is_empty().then_some((at.line, 0)),
     }
 }
 
-/// A place in the buffer as Neovim's `inc()` and `dec()` step over it: a
-/// character of a line, or the line's end past its last — the byte a line's
-/// text ends with, `NUL`, where the cursor stops only on an empty line.
+/// A position as Neovim's `inc()`/`dec()` step: a character, or the line end.
 struct Walk<'a, 'b> {
     lines: &'a Lines<'b>,
     big: bool,
     line: i64,
-    /// The line's characters, as their first bytes and themselves.
+    /// Characters with their byte offsets.
     cs: Vec<(usize, char)>,
-    /// Which of the line's characters, or how many it has for its end.
+    /// Index into `cs`; `cs.len()` is the line end.
     i: usize,
 }
 
@@ -138,8 +111,7 @@ impl<'a, 'b> Walk<'a, 'b> {
         Some(walk)
     }
 
-    /// Onto line `line`, where the client has it: its characters as
-    /// [`predict::chars`] has them, combining marks with the one before.
+    /// Load `line`, merging combining marks as [`predict::chars`] does.
     fn load(&mut self, line: i64) -> Option<()> {
         let text = (self.lines.text)(line)?;
         self.cs = text
@@ -150,26 +122,23 @@ impl<'a, 'b> Walk<'a, 'b> {
         Some(())
     }
 
-    /// Whether at the line's end.
     fn end(&self) -> bool {
         self.i >= self.cs.len()
     }
 
-    /// The class of the character here, a line's end a blank's (`cls()`).
+    /// `cls()`: the class here; a line end is a blank.
     fn cls(&self) -> u32 {
         self.cs
             .get(self.i)
             .map_or(0, |&(_, c)| class(c, self.lines.keyword, self.big))
     }
 
-    /// Whether on an empty line, which the cursor is at the start of.
     fn on_empty(&self) -> bool {
         self.cs.is_empty()
     }
 
-    /// On a character (`inc()`): 0 onto the next of the line, 2 onto its end
-    /// — 1 from its end onto the next line's first, and -1 from the last
-    /// line's end, going nowhere.
+    /// `inc()`: 0 within the line, 2 onto the line end, 1 from the end onto
+    /// the next line, -1 (no move) at the buffer's end.
     fn inc(&mut self) -> Option<i8> {
         if !self.end() {
             self.i += 1;
@@ -183,9 +152,8 @@ impl<'a, 'b> Walk<'a, 'b> {
         Some(-1)
     }
 
-    /// Back a character (`dec()`): 0 within the line, the end's onto its
-    /// last; 1 from its first onto the end of the line before; -1 from the
-    /// buffer's first, going nowhere.
+    /// `dec()`: 0 within the line (including end to last character), 1 onto
+    /// the previous line's end, -1 (no move) at the buffer's start.
     fn dec(&mut self) -> Option<i8> {
         if self.i > 0 {
             self.i -= 1;
@@ -199,8 +167,7 @@ impl<'a, 'b> Walk<'a, 'b> {
         Some(-1)
     }
 
-    /// Past the characters of class `class` from here, forward or back
-    /// (`skip_chars()`): whether it ran into the buffer's end, or its start.
+    /// `skip_chars()`; returns whether it hit the buffer's start or end.
     fn skip(&mut self, class: u32, forward: bool) -> Option<bool> {
         while self.cls() == class {
             let went = if forward { self.inc()? } else { self.dec()? };
@@ -211,8 +178,7 @@ impl<'a, 'b> Walk<'a, 'b> {
         Some(false)
     }
 
-    /// `w`, `count` times (`fwd_word()`, for no operator): whether it got as
-    /// far, or ran into the buffer's last character.
+    /// `fwd_word()` without an operator; `false` is Neovim's FAIL.
     fn fwd_word(&mut self, count: i64) -> Option<bool> {
         for _ in 0..count.max(1) {
             let sclass = self.cls();
@@ -221,7 +187,7 @@ impl<'a, 'b> Walk<'a, 'b> {
             if i == -1 || (i >= 1 && last_line) {
                 return Some(false);
             }
-            // Past the end of the word the cursor is in, if any.
+            // Skip the rest of the current word.
             if sclass != 0 {
                 while self.cls() == sclass {
                     if self.inc()? == -1 {
@@ -229,7 +195,7 @@ impl<'a, 'b> Walk<'a, 'b> {
                     }
                 }
             }
-            // On to the next character that is not a blank, or an empty line.
+            // Skip blanks, stopping on an empty line.
             while self.cls() == 0 {
                 if self.i == 0 && self.on_empty() {
                     break;
@@ -242,14 +208,13 @@ impl<'a, 'b> Walk<'a, 'b> {
         Some(true)
     }
 
-    /// `b`, `count` times (`bck_word()`): whether it got as far, or ran into
-    /// the buffer's first character.
+    /// `bck_word()`; `false` is Neovim's FAIL.
     fn bck_word(&mut self, count: i64) -> Option<bool> {
         for _ in 0..count.max(1) {
             if self.dec()? == -1 {
                 return Some(false);
             }
-            // Back past the blanks before the word, stopping on an empty line.
+            // Skip blanks backwards, stopping on an empty line.
             let mut empty = false;
             while self.cls() == 0 {
                 if self.i == 0 && self.on_empty() {
@@ -263,7 +228,7 @@ impl<'a, 'b> Walk<'a, 'b> {
             if empty {
                 continue;
             }
-            // Back to the word's start, and on the one too far.
+            // Back past the word's start, then forward one.
             if self.skip(self.cls(), false)? {
                 return Some(true);
             }
@@ -272,8 +237,7 @@ impl<'a, 'b> Walk<'a, 'b> {
         Some(true)
     }
 
-    /// `e`, `count` times (`end_word()`, for no operator): whether it got as
-    /// far, or ran into the buffer's end.
+    /// `end_word()` without an operator; `false` is Neovim's FAIL.
     fn end_word(&mut self, count: i64) -> Option<bool> {
         for _ in 0..count.max(1) {
             let sclass = self.cls();
@@ -286,8 +250,8 @@ impl<'a, 'b> Walk<'a, 'b> {
                     return Some(false);
                 }
             } else {
-                // At a word's end: past the blanks, empty lines and all, to
-                // the end of the next.
+                // At a word's end: skip blanks, empty lines included, to the
+                // next word's end.
                 while self.cls() == 0 {
                     if self.inc()? == -1 {
                         return Some(false);
@@ -297,21 +261,20 @@ impl<'a, 'b> Walk<'a, 'b> {
                     return Some(false);
                 }
             }
-            // Back the one too far.
+            // Step back from the overshoot.
             self.dec()?;
         }
         Some(true)
     }
 
-    /// `ge`, `count` times (`bckend_word()`, for no operator): whether it got
-    /// as far, or ran into the buffer's first character.
+    /// `bckend_word()` without an operator; `false` is Neovim's FAIL.
     fn bckend_word(&mut self, count: i64) -> Option<bool> {
         for _ in 0..count.max(1) {
             let sclass = self.cls();
             if self.dec()? == -1 {
                 return Some(false);
             }
-            // Back past the start of the word the cursor is in, if any.
+            // Skip back over the current word.
             if sclass != 0 {
                 while self.cls() == sclass {
                     if self.dec()? == -1 {
@@ -319,7 +282,7 @@ impl<'a, 'b> Walk<'a, 'b> {
                     }
                 }
             }
-            // Back to the end of the word before, or an empty line.
+            // Skip blanks back to the previous word's end or an empty line.
             while self.cls() == 0 {
                 if self.i == 0 && self.on_empty() {
                     break;
@@ -333,10 +296,8 @@ impl<'a, 'b> Walk<'a, 'b> {
     }
 }
 
-/// What `'iskeyword'` at its default, `@,48-57,_,192-255`, makes of each
-/// character under 256, for tests: ASCII letters, digits and `_`, and 192
-/// to 255, a word's, the blanks blanks, and the rest punctuation — as
-/// Neovim has it for every character the tests use.
+/// Classes for the default `'iskeyword'` (`@,48-57,_,192-255`), matching
+/// Neovim for every character the tests use.
 #[cfg(test)]
 pub fn defaults() -> Vec<u8> {
     (0..256u32)
@@ -349,11 +310,9 @@ pub fn defaults() -> Vec<u8> {
         .collect()
 }
 
-/// The classes Neovim 0.12.6 gives the characters from 256 on that are not
-/// a word's (2): runs of code points, `(first, last, class)`, in order — 0
-/// a blank, 1 punctuation, 3 an emoji, and a script's own its first code
-/// point's, as Neovim's `utf_class_tab` and the emoji data it was built
-/// with have them, read off its `charclass()` for every code point.
+/// Neovim 0.12.6's classes for code points from 256 that are not 2 (word):
+/// sorted `(first, last, class)` runs, 0 blank, 1 punctuation, 3 emoji, else
+/// a script's first code point. Read off `charclass()` for every code point.
 #[rustfmt::skip]
 const CLASSES: &[(u32, u32, u32)] = &[
     (0x37e, 0x37e, 1), (0x387, 0x387, 1), (0x55a, 0x55f, 1),
@@ -477,7 +436,7 @@ const CLASSES: &[(u32, u32, u32)] = &[
 mod tests {
     use super::*;
 
-    /// Each class as Neovim 0.12.6's `charclass()` was found to give it.
+    /// Expected values read off Neovim 0.12.6's `charclass()`.
     #[test]
     fn characters_are_of_the_classes_neovim_gives_them() {
         let k = defaults();
@@ -514,7 +473,6 @@ mod tests {
         }
     }
 
-    /// The table is in order, its runs apart, and none a word's.
     #[test]
     fn the_table_is_runs_in_order() {
         assert!(CLASSES.windows(2).all(|w| w[0].1 < w[1].0));

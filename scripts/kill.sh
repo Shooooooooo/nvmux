@@ -14,9 +14,8 @@
 #   unknown   what owns the socket could not be determined; nothing was
 #             signalled and nothing was removed
 #
-# There is no graceful RPC step: nvmux terminates a session rather than asking
-# it to quit. SIGTERM first, so nvim runs VimLeavePre, writes its ShaDa file and
-# unlinks its own socket; SIGKILL if it will not go.
+# No graceful RPC step. SIGTERM first, so nvim runs VimLeavePre, writes ShaDa
+# and unlinks its socket; SIGKILL if it will not go.
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 dir="${1:?usage: kill.sh <runtime_dir> <id> <pid>}"
@@ -25,11 +24,10 @@ pid="${3:-}"
 
 sock="$dir/$id.sock"
 
-# A process that has exited but not yet been reaped. Sessions are spawned
-# detached, so their parent is pid 1, and an init that does not reap promptly --
-# the norm in containers -- leaves an exited nvim as a zombie indefinitely.
-# `kill -0` SUCCEEDS on a zombie and its command line reads "[nvim] <defunct>",
-# so without this a session that is already gone looks "alive but not ours".
+# Exited but unreaped. Sessions are detached (parent pid 1), and an init that
+# reaps slowly, common in containers, leaves zombies indefinitely. `kill -0`
+# succeeds on one and its command line reads "[nvim] <defunct>", so a gone
+# session would look alive but not ours.
 is_zombie() {
   case "$(ps -o stat= -p "$1" 2>/dev/null)" in
     Z*) return 0 ;;
@@ -43,9 +41,8 @@ gone() {
   is_zombie "$1"
 }
 
-# Poll for up to $2 tenths of a second: every hundredth for the first tenth,
-# when most sessions go. Neither sleep is POSIX, so fall back to a whole second
-# where they are rejected.
+# Poll for up to $2 tenths of a second, every hundredth for the first tenth
+# (when most sessions exit). Fractional sleep is not POSIX: fall back to 1s.
 wait_gone() {
   i=0
   while [ "$i" -lt "$(($2 * 10))" ]; do
@@ -61,8 +58,7 @@ wait_gone() {
   gone "$1"
 }
 
-# The recorded pid is only a starting guess -- it was validated at spawn time,
-# but pids are reused -- so it is used only if it still owns this socket.
+# The recorded pid is used only if it still owns this socket: pids are reused.
 target=''
 if [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && ! gone "$pid" && owns_socket "$pid" "$sock"; then
   target=$pid
@@ -71,12 +67,12 @@ else
 fi
 
 if [ -n "$target" ]; then
-  # SIGTERM, never SIGINT: on SIGINT nvim dies from the signal and leaves the
-  # socket behind, which looks exactly like a crash to the next listing.
+  # Never SIGINT: nvim dies from it and leaves the socket behind, which the
+  # next listing reads as a crash.
   kill -TERM "$target" 2>/dev/null
 
-  # Generous: this is where VimLeavePre and ShaDa writes happen, and cutting it
-  # short to feel responsive corrupts exit-time state.
+  # Generous: VimLeavePre and ShaDa writes happen here, and cutting them
+  # short corrupts exit-time state.
   if ! wait_gone "$target" 100; then
     kill -KILL "$target" 2>/dev/null
     wait_gone "$target" 20
@@ -90,13 +86,12 @@ if [ -n "$target" ]; then
 elif can_inspect || [ ! -e "$sock" ]; then
   result=absent
 else
-  # A socket is present and we cannot see whether anything serves it. Deleting
-  # on that basis could orphan a live session forever.
+  # A socket exists and we cannot tell if anything serves it; deleting could
+  # orphan a live session.
   result=unknown
 fi
 
-# Only once the session is genuinely gone: deleting while nvim still runs
-# orphans it permanently, with no socket left for any listing to find.
+# Only once the session is known gone (see `purge`).
 if [ "$result" = killed ] || [ "$result" = absent ]; then
   purge "$dir" "$id"
 fi

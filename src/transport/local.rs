@@ -1,10 +1,7 @@
-//! Sessions on this machine. No SSH anywhere in this file.
-//!
-//! What is local about a local session: its socket is reachable as it is, its
-//! liveness can be asked over that socket rather than taken from a script's
-//! process-table lookup, and its metadata is a file right here — re-read and
-//! edited in place, so a rename another nvmux landed in between is kept. The
-//! rest is the shared bodies in [`crate::transport`].
+//! Sessions on this machine. The socket is reachable directly, liveness is
+//! probed over it rather than taken from the script's process-table lookup,
+//! and metadata is a local file edited in place. The rest is shared with
+//! [`crate::transport`].
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -21,13 +18,12 @@ use crate::transport::{self, plan_rename, Host, Location, Transport};
 pub struct LocalTransport {
     location: Location,
     dir: PathBuf,
-    /// `dir` as the scripts take it. Built once; every script run needs it.
+    /// `dir` as the scripts take it.
     dir_arg: String,
-    /// This user's home directory, or empty if `$HOME` is unset or relative.
-    /// The local answer to the question `scripts/hello.sh` asks a remote host.
+    /// `$HOME`, or empty if unset or relative.
     home: String,
-    /// The `sh` every script runs in. Started by the first script that needs
-    /// it, so building a transport does no I/O, and replaced if it dies.
+    /// The `sh` every script runs in. Started lazily, so building a transport
+    /// does no I/O, and replaced if it dies.
     shell: Mutex<Option<Shell>>,
 }
 
@@ -36,8 +32,7 @@ impl LocalTransport {
         Self::with_dir(paths::ensure_runtime_dir()?)
     }
 
-    /// Use an explicit runtime directory instead of the default, so integration
-    /// tests do not touch the user's real sessions. The same security check
+    /// Use an explicit runtime directory (for tests). The same security check
     /// applies.
     pub fn with_dir(dir: PathBuf) -> Result<Self> {
         paths::ensure_dir_secure(&dir)?;
@@ -54,13 +49,10 @@ impl LocalTransport {
         Ok(SessionPaths::new(&self.dir, id)?)
     }
 
-    /// Whether a socket file is safe to delete as stale: nothing listening,
-    /// `lstat` says it really is a socket, and we own it.
-    ///
-    /// The middle check is not paranoia. On `AF_UNIX`, `connect()` returns
-    /// `ECONNREFUSED` for *any* non-listening inode — a regular file does, and
-    /// so does a directory — so reaping on the errno alone would delete whatever
-    /// happened to be sitting at that path.
+    /// Whether a stale socket file is safe to delete: `lstat` says it is a
+    /// socket and we own it. On `AF_UNIX`, `connect()` returns `ECONNREFUSED`
+    /// for any non-listening inode, files and directories included, so the
+    /// errno alone is not enough.
     fn is_reapable(&self, sock: &Path) -> bool {
         match std::fs::symlink_metadata(sock) {
             Ok(meta) => {
@@ -77,9 +69,8 @@ impl LocalTransport {
                 }
                 true
             }
-            // Nothing to reap. A dangling symlink does NOT arrive here:
-            // `symlink_metadata` succeeds on one, and the `is_socket()` check
-            // above is what rejects it.
+            // A dangling symlink does not land here: `symlink_metadata`
+            // succeeds on it and `is_socket()` rejects it.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 tracing::warn!(path = %sock.display(), error = %e, "refusing to reap");
@@ -88,12 +79,9 @@ impl LocalTransport {
         }
     }
 
-    /// Parse `<id>.json`, or `None` when there is not one.
-    ///
-    /// A missing file is not an error here: it is how both a session reaped
-    /// since the listing and an orphan — a live socket whose metadata was never
-    /// written — present themselves, and the two callers want to say different
-    /// things about that.
+    /// Parse `<id>.json`, or `None` if missing: a session reaped since the
+    /// listing, or an orphan (live socket, no metadata). Not an error: each
+    /// caller handles `None` its own way.
     fn read_meta(&self, json: &Path) -> Result<Option<Session>> {
         let bytes = match std::fs::read(json) {
             Ok(b) => b,
@@ -103,7 +91,6 @@ impl LocalTransport {
         Ok(Some(Session::from_json(&bytes, json)?))
     }
 
-    /// Delete a dead session's files.
     fn reap(&self, paths: &SessionPaths) {
         tracing::info!(sock = %paths.sock.display(), "reaping dead session");
         for p in [&paths.sock, &paths.json, &paths.log] {
@@ -125,13 +112,9 @@ impl Host for LocalTransport {
         &self.dir_arg
     }
 
-    /// Run one of the shared scripts in this machine's shell.
-    ///
-    /// A script that fails is an `Ok` with a status, which each caller reads
-    /// its own way. `Err` is the shell itself: gone mid-run, or not startable.
-    /// A shell found dead is replaced *before* a run and never after one — a
-    /// script that was half way through must not run twice — so the caller
-    /// that hit the death sees it, and the next one gets a fresh shell.
+    /// A failing script is `Ok` with its status; `Err` means the shell died
+    /// mid-run or could not start. A dead shell is replaced before a run, never
+    /// after, so a half-run script is not run twice.
     fn run(&self, script: &str, args: &[&str]) -> Result<proc::Output> {
         let mut slot = transport::claim_shell(&self.shell)?;
         if slot.as_mut().is_none_or(|shell| !shell.is_alive()) {
@@ -144,16 +127,10 @@ impl Host for LocalTransport {
         })
     }
 
-    /// The script's liveness hint is only a hint; the socket is right here,
-    /// so it is replaced with the real answer, and a session found dead is
-    /// reaped on the spot.
-    ///
-    /// Every session is asked at once, each on a thread of its own. A busy
-    /// one holds its probe for the whole of its budget, and asked one after
-    /// another they held the listing for that long each: two sessions in a
-    /// `:!make` were six seconds before the picker came up, at three seconds
-    /// a probe. Together they hold it for one budget, however many there are:
-    /// a quarter of a second ([`rpc::QUICK_PROBE_TIMEOUT`]).
+    /// Replaces the script's liveness hint with a probe over the socket, and
+    /// reaps sessions found dead. Probes run in parallel: a busy session uses
+    /// its whole budget ([`rpc::QUICK_PROBE_TIMEOUT`]), so the listing waits
+    /// one budget in total rather than one per session.
     fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>> {
         let t_probe = std::time::Instant::now();
         let budget = rpc::QUICK_PROBE_TIMEOUT;
@@ -167,8 +144,7 @@ impl Host for LocalTransport {
                 .iter()
                 .map(|p| scope.spawn(move || rpc::probe_within(&p.sock, budget)))
                 .collect();
-            // A probe that panicked proved nothing, and nothing is reaped on
-            // that.
+            // A panicked probe proves nothing; do not reap on it.
             probes
                 .into_iter()
                 .map(|p| p.join().unwrap_or(Liveness::Busy))
@@ -199,18 +175,15 @@ impl Host for LocalTransport {
         Ok(alive)
     }
 
-    /// `SessionPaths::new` is what bounds the length.
+    /// `SessionPaths::new` bounds the length.
     fn host_sock(&self, id: &str) -> Result<PathBuf> {
         Ok(self.paths(id)?.sock)
     }
 
-    /// The identity function: the socket is already here.
     fn reach(&self, _id: &str, host_sock: &Path) -> Result<PathBuf> {
         Ok(host_sock.to_path_buf())
     }
 
-    /// A socket the script could not remove would resurrect the session in
-    /// the next listing.
     fn sweep(&self, id: &str) {
         if let Ok(paths) = self.paths(id) {
             if paths.sock.exists() && self.is_reapable(&paths.sock) {
@@ -227,8 +200,7 @@ impl Host for LocalTransport {
         self.dir.join(format!("{id}.log"))
     }
 
-    /// The last few lines of a session's log, included in the error because it
-    /// is the first thing anyone wants when a session will not start.
+    /// The last 15 lines of a session's log, for start-up errors.
     fn log_tail(&self, id: &str) -> Option<String> {
         let Ok(body) = std::fs::read_to_string(self.log_path(id)) else {
             return Some("(no log file)".to_string());
@@ -273,8 +245,7 @@ impl Transport for LocalTransport {
 
         let paths = self.paths(&s.id)?;
         let Some(mut session) = self.read_meta(&paths.json)? else {
-            // The session was killed, or reaped, between the picker listing it
-            // and the rename being confirmed.
+            // Killed or reaped since the picker listed it.
             return Err(NvmuxError::Session(SessionError::NotFound(s.name.clone())));
         };
         session.name = new_name.to_string();
@@ -284,17 +255,14 @@ impl Transport for LocalTransport {
         Ok(())
     }
 
-    /// Read, edit, write — rather than writing the record the picker is holding.
-    /// The file is right here, so a rename another nvmux landed between the
-    /// listing and this edit is kept rather than clobbered.
+    /// Read, edit, write rather than writing the picker's copy, so a rename by
+    /// another nvmux since the listing is kept.
     fn renumber(&self, sessions: &[Session]) -> Result<()> {
         for s in sessions {
             let paths = self.paths(&s.id)?;
             let Some(mut on_disk) = self.read_meta(&paths.json)? else {
-                // No metadata to edit: an orphan, whose name the picker only
-                // synthesised, or a session reaped since the listing. Writing
-                // one would make a placeholder name real, and a vanished row
-                // must not abort the rest of the arrangement.
+                // An orphan (its name is a placeholder; writing would make it
+                // real) or reaped since the listing. Skip it, do not abort.
                 tracing::debug!(id = %s.id, "no metadata to renumber");
                 continue;
             };
@@ -305,18 +273,13 @@ impl Transport for LocalTransport {
     }
 
     fn local_socket_for(&self, s: &Session) -> Result<PathBuf> {
-        // Locally the identity function; the SSH implementation is where this
-        // seam earns its keep.
         Ok(self.paths(&s.id)?.sock)
     }
 }
 
-/// This machine's home directory, as a session host would report it.
-///
-/// `$HOME` rather than the password database, matching what `scripts/hello.sh`
-/// reads on a remote host and for the same reason: it is the answer the user's
-/// own shell would give. Anything unset or relative is no answer at all, and an
-/// empty string says so rather than standing in for one.
+/// `$HOME` rather than the password database, as `scripts/hello.sh` reads on
+/// a remote host: it is what the user's shell would say. Empty if unset or
+/// relative.
 fn home_dir() -> String {
     match std::env::var_os("HOME") {
         Some(h) if Path::new(&h).is_absolute() => h.to_string_lossy().into_owned(),
@@ -352,9 +315,8 @@ mod tests {
             .pid()
     }
 
-    /// One `sh` runs every script the transport sends — that is the whole
-    /// point — and a script that fails does not cost it. A shell that died
-    /// while idle is replaced by the next script, not reported forever.
+    /// A failing script keeps the shell; one that died while idle is replaced
+    /// by the next script, not reported forever.
     #[test]
     fn one_shell_runs_every_script_and_a_dead_one_is_replaced() {
         let (t, dir) = transport("shell");
@@ -370,8 +332,7 @@ mod tests {
             assert_eq!(shell_pid(&t), pid, "a listing started a new shell");
         }
 
-        // A script that fails: spawn.sh with a program that is not there exits
-        // on its error path, and the shell it ran in is still the shell.
+        // spawn.sh fails on a missing program; the shell must survive.
         let hopeless = Launch::parse("nvmux-no-such-editor --listen {sock}").expect("parses");
         assert!(t.create_session("hopeless", &hopeless, "/").is_err());
         assert_eq!(shell_pid(&t), pid, "a failed script cost the shell");

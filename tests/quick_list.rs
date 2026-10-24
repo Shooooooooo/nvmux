@@ -1,6 +1,5 @@
-//! A quick listing, end to end, against real `nvim --headless` processes: a
-//! listing waits no more than a quarter of a second on a session that cannot
-//! answer (see `nvmux::rpc::QUICK_PROBE_TIMEOUT`).
+//! Quick listing against real `nvim --headless`: it waits at most a quarter
+//! second on a session that cannot answer (`nvmux::rpc::QUICK_PROBE_TIMEOUT`).
 
 #[macro_use]
 mod common;
@@ -11,10 +10,8 @@ use common::Scratch;
 use nvmux::session::Liveness;
 use nvmux::transport::Transport;
 
-/// A session blocked as `:!make` blocks it holds a listing a quarter of a
-/// second, and is listed as it would be at the end of a longer wait: busy,
-/// and kept. One idle beside it answers, as ever; and one that has gone is
-/// found gone in that quarter of a second, and reaped.
+/// A blocked session (as by `:!make`) is listed busy and kept, an idle one
+/// answers, and a dead one is found dead and reaped, all within that budget.
 #[test]
 fn a_quick_listing_does_not_wait_on_a_busy_session() {
     require_nvim!();
@@ -38,7 +35,7 @@ fn a_quick_listing_does_not_wait_on_a_busy_session() {
         doomed_sock.exists(),
         "precondition: SIGKILL should leave a stale socket"
     );
-    // Longer than the three seconds a listing once waited.
+    // Longer than a full probe timeout (3 s).
     common::block_editor(
         &busy_sock,
         "call system('sleep 8')",
@@ -58,8 +55,7 @@ fn a_quick_listing_does_not_wait_on_a_busy_session() {
         !doomed_sock.exists(),
         "the stale socket should have been reaped"
     );
-    // Waiting on the busy session is waiting out a probe's budget, which a
-    // listing that does not leaves well short of, on a busy machine too.
+    // Must finish well short of a full probe timeout, even on a busy machine.
     assert!(
         took < nvmux::rpc::PROBE_TIMEOUT - Duration::from_millis(500),
         "the listing waited {took:?} on a busy session"

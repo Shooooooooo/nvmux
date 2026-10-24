@@ -1,79 +1,33 @@
-//! What a session has to report to the picker: that something in it is busy,
-//! has failed or has finished, and the desktop notifications the programs in
-//! it send.
+//! What a session reports to the picker: busy, failed or finished work, and
+//! desktop notifications from its programs.
 //!
-//! # Where it comes from
+//! None of this reaches nvmux unaided: Neovim only fires local autocommands,
+//! a `--headless` server never emits OSC 9;4 progress, and UI events reach
+//! only UIs attached at the time. So nvmux installs a watcher in each session
+//! ([`WATCHER`], augroup `nvmux_notes`) that records:
+//! - `Progress` messages (0.12+, except Neovim's own) and `LspProgress`;
+//! - via `TermRequest`: OSC 777 `notify` (Ghostty, urxvt), OSC 9 (iTerm2),
+//!   OSC 99 (kitty, multi-part), and OSC 133 shell command exits;
+//! - via `TermClose`: a terminal program's exit, positive failed, 0 finished.
 //!
-//! An agent in a terminal buffer tells its terminal when it wants you — Claude
-//! Code sends `ESC ] 777 ; notify ; Claude Code ; Claude needs your
-//! permission` — and a shell there can say how each command went: fish marks
-//! where one starts and ends, and with what exit status (OSC 133). A plugin
-//! that knows it is working says so with a progress message, and a language
-//! server with LSP's own progress: clangd's `indexing`, say. None of it
-//! reaches nvmux by itself. Neovim's terminal keeps what a program sends to
-//! itself: it fires `TermRequest`, and `TermClose`, with the exit code, when
-//! the program ends, and that is all. Its LSP client does the same with a
-//! server's progress: it fires `LspProgress`, and makes no progress message
-//! of it. And a session started `--headless` never draws its progress
-//! messages as a terminal's progress bar (OSC 9;4), because Neovim sets that
-//! up at startup only when a terminal UI is already attached, which a
-//! server's never is. Whatever a session does send its UIs goes to the ones
-//! attached at that moment, which for a session nobody has visited since
-//! nvmux started is none.
+//! A program's own OSC 9;4 is ignored (Claude Code's stays busy through its
+//! permission prompts). The watcher outlives nvmux, since recording unattended
+//! is its job; it sets no options, maps no keys, opens no windows and prints
+//! nothing.
 //!
-//! So the session keeps the record itself. nvmux leaves a watcher in it
-//! ([`WATCHER`]): one augroup, `nvmux_notes`, with a `Progress` autocommand —
-//! every progress message but Neovim's own, on 0.12 and later — an
-//! `LspProgress` one, for what each language server says it is working on, a
-//! `TermRequest` one, which takes the three notifications terminals know —
-//! OSC 777 `notify` (Ghostty's, urxvt's), OSC 9 (iTerm2's) and OSC 99
-//! (kitty's, sent in parts) — and a shell's word on how each of its commands
-//! ended, and a `TermClose` one, for how a terminal's own program does: with
-//! 0, it finished, and with any other code, it failed. The picker reads it
-//! over plain RPC ([`read`]), the way it already asks a session whether it is
-//! alive. A program's own OSC 9;4 is not read: an agent's is no guide to
-//! whether it wants you — Claude Code's stays busy through its permission
-//! prompts — and what the session's progress messages say is.
+//! The picker reads it ([`read`]) every [`POLL`] on a [`Poller`] thread,
+//! asking the mode first as [`crate::rpc::probe`] does, so a session blocked
+//! on a key keeps its old note instead of stalling.
 //!
-//! # It stays
+//! Notifications, failures and finished commands are news until seen: cleared
+//! ([`SEEN`]) in the session when it comes to the front ([`touch`]) and when it
+//! leaves ([`seen`]), so other nvmux instances stop showing them too. Busy is
+//! state, shown while it lasts.
 //!
-//! The agent nvmux's own client leaves in a session goes when that client
-//! does (see [`crate::client`]). The watcher stays when nvmux leaves, because
-//! recording while nobody is looking is what it is for. It sets no option,
-//! maps no key, opens no window and prints nothing, and what it runs on an
-//! event is a string match and a table write.
-//!
-//! # Read, not waited on
-//!
-//! A read asks the mode first, as [`crate::rpc::probe`] does — a fast call,
-//! answered even at a hit-enter prompt — and does not wait on the deferred one
-//! behind it when the editor is blocked, so a session waiting for a key keeps
-//! the note it had rather than holding anything up. The picker's reads run on
-//! a thread of their own ([`Poller`]), every [`POLL`] while it is up.
-//!
-//! # Seen
-//!
-//! A notification is news until its session has been looked at: nvmux clears
-//! it ([`SEEN`]) when a session comes to the front ([`touch`]) and again when
-//! it leaves ([`seen`]) — in the session, so that another nvmux, on another
-//! machine, stops showing it too. A failure is kept the same way, and so,
-//! apart from them, is a command that has finished: news too, but asking
-//! nothing of you, so that a notification or a failure comes before it.
-//! Whether something is busy is not news but state, and is shown for as long
-//! as it lasts.
-//!
-//! # Told, where asked
-//!
-//! The cards that tell the session in front what the others say
-//! ([`crate::tell`]) are read for as long as nvmux runs, not just while the
-//! picker is up, and not asked for every two seconds but listened for
-//! ([`listen`]). A listener holds a connection to
-//! the session open, and the watcher sends a notification down it whenever
-//! what it keeps changes — news comes, or is seen — for the listener's nvmux
-//! to read. A read names the listener's channel ([`hear`]), which is what has
-//! the watcher tell it from then on, and says whether it was being told
-//! already: a watcher put in by a read that named nobody, or by an nvmux of
-//! another version, tells nobody until a read names the listener.
+//! For [`crate::tell`]'s cards nvmux listens instead of polling ([`listen`]):
+//! the watcher sends [`NEWS`] to each listener channel when its news changes.
+//! A read naming the channel ([`hear`]) registers it; until then a watcher
+//! installed by another read or nvmux version tells nobody.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -86,81 +40,57 @@ use rmpv::Value;
 use crate::error::RpcError;
 use crate::rpc;
 
-/// The watcher's version. A session holding an older one is given this one,
-/// the record it kept carried over; a newer nvmux does the same to this one.
+/// Watcher version. A session with any other version gets this watcher,
+/// keeping its record.
 pub const VERSION: i64 = 9;
 
-/// How long the picker waits between reads of its sessions.
+/// Picker read interval.
 pub const POLL: Duration = Duration::from_secs(2);
 
-/// What one read may take, from the connect to the answer. A session that is
-/// slower than this keeps the note it had until the next read.
+/// Limit for one read, connect to answer; a slower session keeps its note.
 const BUDGET: Duration = Duration::from_secs(1);
 
-/// How long the poller waits after a session is handed to it before reading,
-/// so that the sessions of one listing, handed over one by one, are read in
-/// one round of reads.
+/// Delay before reading newly handed sessions, so a listing's sessions are
+/// read in one round.
 const SETTLE: Duration = Duration::from_millis(30);
 
-/// The watcher, sent with `nvim_exec_lua` and its version as the argument.
-/// Installing it again replaces the autocommands and keeps the record, but
-/// for what the language servers were doing, which starts afresh: another
-/// version's watcher, in the meantime, may have missed the end of it. Its
-/// answer is the record, as [`READ`] gives it.
+/// The watcher, run with `nvim_exec_lua` (args: version, optional listener
+/// channel); returns the record as [`READ`] does. Reinstalling replaces the
+/// autocommands and keeps the record, except LSP work, which restarts since
+/// another version's watcher may have missed its end.
 ///
-/// What it records: each progress message running, by source and id, with its
-/// title, text, percentage — 0 is no percentage, which is what Neovim 0.12
-/// gives a message that has none — and when it started; each language
-/// server's work the same way, by client and token, its server's name for the
-/// title and what it says it is doing for the text, `indexing 3/120` — a
-/// report gives only what has changed, so what it leaves out stands — until
-/// it ends or the server goes, which a read sees to, since a server that dies
-/// mid-work never says it has finished; the last notification or failure — a
-/// failed progress message, a terminal's program that exits with a code other
-/// than 0, or a command its shell says did — and, apart from it, the last
-/// command to finish — a terminal's program that exits with 0, or a command
-/// its shell says did — each until [`SEEN`] clears it. Text is kept without
-/// control characters and to 200 characters.
+/// It records:
+/// - running progress by source and id (title, text, start time, percent;
+///   Neovim 0.12 sends 0 for none);
+/// - LSP work by client and token: server name as title, e.g.
+///   `indexing 3/120` as text (a report carries only changes, so a missing
+///   message or percentage stands). Kept until it ends or the server goes,
+///   checked on read, as a dying server never ends its work;
+/// - the last notification or failure (failed progress, non-zero terminal
+///   exit or shell command) and, separately, the last finished command, each
+///   until [`SEEN`].
 ///
-/// Each of those two is numbered as it comes, from one count the session
-/// keeps, so that whoever reads the record can tell one it has not seen from
-/// one it has (see [`crate::tell`]); and says, where it came from a terminal
-/// buffer, whether that buffer was on the screen — in a window of the current
-/// tab page — at the time, so that the session in front need not be told what
-/// it was already showing. A read says which buffer that was, while it still
-/// is one, and the number of the tab page a window shows it in now, if any:
-/// what the card that tells the session in front of it says, and shows it by
-/// (see [`crate::card`]).
+/// Text has control characters blanked and is cut to 200 characters.
 ///
-/// A command that ends, failed or finished, is named by what its shell said
-/// it was, where the shell says — fish's `OSC 133 ; C` carries the command
-/// line, URL-encoded — and otherwise by the terminal's program, from its
-/// buffer name (`term://…//1234:cargo build`) and without its directory:
-/// `exited with code 101`, or `a command exited with code 101` when it is the
-/// shell's.
+/// A command is named by the shell's OSC 133;C `cmdline_url` if given, else by
+/// the terminal's program from the buffer name (`term://…//1234:cargo build`,
+/// directory dropped), with body `exited with code 101`, or `a command exited
+/// with code 101` for a shell command without a name.
 ///
-/// A terminal's program has finished only where it was a job's: a terminal a
-/// plugin draws into itself (`nvim_open_term`) closes with 0 too, though
-/// nothing ran in it. One whose buffer is deleted while its program runs
-/// closes with -1, which is neither a failure nor a finish. And a command its
-/// shell says succeeded has finished only where the shell said it started
-/// (`OSC 133 ; C`): a shell set up by hand may say how the last command went
-/// at every prompt, the first one included, and with 0 where nothing ran.
+/// - Exit 0 is "finished" only for job terminals; `nvim_open_term` ones also
+///   close with 0. A buffer deleted while running closes with -1: neither.
+/// - A shell's exit 0 counts only after its OSC 133;C: hand-configured shells
+///   may report a status at every prompt, 0 when nothing ran.
+/// - Neovim's own progress (`source` `nvim`) is skipped: writes and completion
+///   scans start and end within one command, and a failed one never ends,
+///   leaving the session busy forever. Older watchers kept them, so they are
+///   purged on install.
 ///
-/// Neovim's own progress messages, `source` `nvim`, are left out: a write's
-/// and a completion's scan begin and end within the command that says them,
-/// so a read never finds one running — and a write that fails never says it
-/// has ended, nor does a scan, which would leave the session busy for good.
-/// An older watcher kept them, so they go from the record on the way in.
-///
-/// Whenever one of those two comes, or [`SEEN`] clears what there was, it
-/// tells the listeners a read has named ([`READ`], [`listen`]): a
-/// notification, [`NEWS`], on each one's channel. A channel that cannot be
-/// told any more is let go of — channels are never numbered twice, so one
-/// gone is never another listener — and the listeners are kept when the
-/// watcher is put in again. Given a listener's channel after its version, as
-/// a read is, it is told from now on; but the record does not say it was,
-/// since the watcher this one replaced may have told it nothing.
+/// When news arrives or is cleared it sends [`NEWS`] to every listener a read
+/// registered ([`READ`], [`listen`]). Failing channels are dropped (channel ids
+/// are never reused); listeners survive reinstalling. A listener passed here
+/// is registered, but the record does not report it as `listening`, since the
+/// replaced watcher may not have told it.
 const WATCHER: &str = r#"local version, listener = ...
 local api = vim.api
 local N = package.loaded['nvmux.notes']
@@ -435,18 +365,14 @@ end
 return N.snapshot()
 "#;
 
-/// The record, as a map: `busy` (the progress message, or language server's
-/// work, running that started last: `title`, `text`, `percent` when it has
-/// one, and `age` in seconds), `note` (`kind` `notify` or `failed`, `title`,
-/// `body`, `age`) and `finished` (the command that finished last, `kind`
-/// `finished`, and the rest the same), each there only when the session has
-/// one, and those two with their number (`seq`) and, where they came from a
-/// terminal buffer, whether it was on the screen (`shown`). `false` where
-/// there is no watcher, or one older or newer than this nvmux's.
+/// Returns the record map, or `false` if the watcher is missing or another
+/// version. Keys, each present only when set: `busy` (latest-started progress
+/// or LSP work: `title`, `text`, `percent`, `age` in seconds); `note` (`kind`
+/// `notify` or `failed`) and `finished`, both with `title`, `body`, `age`,
+/// `seq`, `shown`, `buf`, `tab`.
 ///
-/// Given a listener's channel as well ([`listen`]), it has the watcher tell
-/// that listener its news from now on, and says whether it was already
-/// (`listening`).
+/// With a listener channel ([`listen`]) it registers it and reports whether it
+/// already was (`listening`).
 const READ: &str = r#"local version, listener = ...
 local N = package.loaded['nvmux.notes']
 if type(N) ~= 'table' or N.version ~= version or type(N.snapshot) ~= 'function' then
@@ -460,12 +386,10 @@ end
 return out
 "#;
 
-/// The notification the watcher sends its listeners when what it keeps has
-/// changed (see [`listen`]).
+/// Sent to listeners when the watcher's news changes (see [`listen`]).
 const NEWS: &str = "nvmux_news";
 
-/// Clear what the session was keeping: the notification, or failure, and the
-/// command that finished.
+/// Clears the kept notification or failure and finished command.
 const SEEN: &str = r#"local N = package.loaded['nvmux.notes']
 if type(N) == 'table' and type(N.seen) == 'function' then
   N.seen()
@@ -473,64 +397,51 @@ end
 return true
 "#;
 
-/// What a note is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// A program in a terminal buffer asked for a desktop notification.
+    /// A terminal program asked for a desktop notification.
     Notified,
-    /// A progress message ended in failure, or a command in a terminal buffer
-    /// did.
+    /// A progress message or a terminal command failed.
     Failed,
-    /// A command in a terminal buffer finished: it exited with 0.
+    /// A terminal command exited with 0.
     Finished,
-    /// A progress message, or a language server's work, is running, and with
-    /// a percentage where it says how far it has got.
+    /// Progress or LSP work running, with its percentage if reported.
     Busy(Option<u8>),
 }
 
-/// The one thing a session has to say: a notification or a failure, which
-/// wait for you, then a command that has finished, and then anything running.
+/// The one note shown per session, by priority: notification or failure,
+/// then finished command, then busy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub kind: Kind,
-    /// The notification's title, or the progress message's: the program or
-    /// plugin it came from, as often as not — `Claude Code`, `claude` — and
-    /// for a language server's work, the server's name, `clangd`; for a
-    /// command that failed or finished, the command: `cargo build`.
+    /// Notification or progress title (often the source, e.g. `Claude Code`),
+    /// the LSP server name (`clangd`), or the command (`cargo build`).
     pub title: String,
-    /// The notification's body, the progress message's text, what the
-    /// language server says it is doing — `indexing 3/120` — or how a command
-    /// ended: `exited with code 101`.
+    /// Body, progress text (`indexing 3/120`) or exit (`exited with code 101`).
     pub text: String,
-    /// How old it was when it was read, by the session's own clock, which a
-    /// remote host's need not agree with this one's on.
+    /// Age at read time by the session's clock (a remote host's may differ).
     pub age: Duration,
-    /// When it was read, by this one's: the time since, added to `age`, is how
-    /// old it is now (see [`Note::age_now`]).
+    /// Local time of the read, for [`Note::age_now`].
     pub read_at: Instant,
 }
 
 impl Note {
-    /// How old it is now.
     pub fn age_now(&self) -> Duration {
         self.age + self.read_at.elapsed()
     }
 }
 
-/// What a read of one session came to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reading {
-    /// Its note, or that it has none.
     Said(Option<Note>),
-    /// It could not say just now: waiting for a key, busy, or slow. The note
-    /// it had stands.
+    /// No answer now (blocked on a key, busy, or slow); keep the old note.
     Unknown,
-    /// Nothing is listening on its socket any more.
+    /// Nothing listens on its socket.
     Gone,
 }
 
-/// Read what the session on `sock` has to say, giving it the watcher first
-/// where it has none, or another version's.
+/// Read the session on `sock`, installing the watcher if missing or another
+/// version.
 pub fn read(sock: &Path) -> Reading {
     let mut client = match rpc::Client::connect(sock, BUDGET) {
         Ok(c) => c,
@@ -545,9 +456,8 @@ pub fn read(sock: &Path) -> Reading {
     }
 }
 
-/// One of the things a session keeps until it is seen — a notification, a
-/// failure, a command that finished — numbered, so that a reader can tell it
-/// from one it has already had (see [`crate::tell`]).
+/// A notification, failure or finished command kept until seen, numbered so
+/// a reader can tell it from one it already had (see [`crate::tell`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct News {
     pub kind: Kind,
@@ -555,45 +465,38 @@ pub struct News {
     pub title: String,
     /// As a [`Note`]'s.
     pub text: String,
-    /// Its number in the session's count, which only goes up: 0 from a
-    /// watcher too old to keep one.
+    /// From the session's increasing counter; 0 from a watcher too old to
+    /// keep one.
     pub seq: u64,
-    /// Whether the terminal buffer it came from was on the screen when it
-    /// came, and `None` where it came from no buffer: a progress message.
+    /// Whether its terminal buffer was in a window of the current tab when it
+    /// came, so the front session is not told what it showed; `None` if not
+    /// from a buffer (progress).
     pub shown: Option<bool>,
-    /// How long ago it came, in seconds, as of the read.
+    /// Seconds since it came, as of the read.
     pub age: u64,
-    /// The terminal buffer it came from, while that is still a buffer.
+    /// Its terminal buffer, while still valid.
     pub buf: Option<i64>,
-    /// The number of the tab page a window shows that buffer in, as of the
-    /// read: `None` where no window does.
+    /// Number of a tab page showing that buffer at read time.
     pub tab: Option<u32>,
 }
 
-/// What a careful read of one session came to (see [`hear`]).
+/// Result of [`hear`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Heard {
-    /// What it is keeping, oldest first: none, one or both of the two; and
-    /// whether the listener the read named was being told its news already,
-    /// which it is from now on.
+    /// Kept news, oldest first (up to two), and whether the named listener
+    /// was already registered (it is now).
     Said { news: Vec<News>, listening: bool },
-    /// It could not say just now, and nothing was left with it to run later.
+    /// No answer now; nothing was left queued in the session.
     Unknown,
-    /// Nothing is listening on its socket any more.
+    /// Nothing listens on its socket.
     Gone,
 }
 
-/// Read the news the session on `sock` is keeping, giving it the watcher first
-/// where it has none, or another version's — and asking nothing of an editor
-/// waiting for a key. With `listener`, the channel of one listening to the
-/// session ([`listen`]), the watcher tells it the news from now on.
-///
-/// [`read`] asks the mode and the record together, and leaves the record to be
-/// read when the key comes, which costs nothing for the minutes the picker is
-/// up. This is for a reader that runs for as long as nvmux does, of a session
-/// that may wait for its key all night, so the record is asked for only once
-/// the mode says the editor can answer: a round trip more, and nothing piled
-/// up in the session for the morning.
+/// Read the session's news, installing the watcher if needed; with `listener`
+/// ([`listen`]'s channel), the watcher notifies it from now on. Unlike
+/// [`read`], the record is requested only once the mode shows the editor is
+/// free: one more round trip, but nothing queues up in a session blocked all
+/// night.
 pub fn hear(sock: &Path, listener: Option<u64>) -> Heard {
     let mut client = match rpc::Client::connect(sock, BUDGET) {
         Ok(c) => c,
@@ -612,9 +515,8 @@ pub fn hear(sock: &Path, listener: Option<u64>) -> Heard {
     }
 }
 
-/// [`snapshot`], one question at a time: `None`, and nothing asked, of an
-/// editor waiting for a key. The listener is named to a watcher put in afresh
-/// too, whose record does not say it was being told.
+/// [`snapshot`] one request at a time: `None`, asking nothing more, if the
+/// editor is blocked. A freshly installed watcher also gets the listener.
 fn carefully<S: Read + Write>(
     client: &mut rpc::Client<S>,
     listener: Option<u64>,
@@ -631,35 +533,27 @@ fn carefully<S: Read + Write>(
     Ok(Some(record))
 }
 
-/// What a listener hears from its session (see [`listen`]).
+/// Events from [`listen`].
 #[derive(Debug)]
 pub enum Pushed {
-    /// It is connected, as the session's channel `chan`: what a read is to
-    /// name for the watcher to tell it ([`hear`]). `stop` ends the listening,
-    /// from any thread.
+    /// Connected as session channel `chan`, which [`hear`] must name for the
+    /// watcher to notify it. `stop` ends listening from any thread.
     Listening { chan: u64, stop: rpc::Interrupt },
-    /// What the session keeps has changed: news has come, or been seen. A
-    /// read says which.
+    /// News arrived or was seen; a read says which.
     News,
 }
 
-/// Listen to the session on `sock`, handing `heard` what it hears for as long
-/// as it returns `true`, the session is there and the connection is not
-/// stopped: first that it is listening, and on which channel, then each time
-/// the session's news changes.
+/// Pass [`Pushed`] events from the session on `sock` to `heard` until it
+/// returns `false`, the session goes, or the connection is stopped.
 ///
-/// The connection is held open, with no budget once it is: a session says
-/// nothing for as long as it has no news, which may be all day. The channel is
-/// asked for with the mode, as [`read`] asks for the record, and an editor
-/// waiting for a key, which would not answer before the key comes, is not
-/// listened to: this returns at once, having heard nothing, to be tried again
-/// later. Nothing else is asked of the session: what has the watcher tell the
-/// channel is a read that names it ([`hear`]).
+/// No time budget once connected: a session may be quiet all day. If the
+/// editor is blocked on a key this returns at once, to be retried. Registering
+/// the channel with the watcher is left to [`hear`].
 pub fn listen(sock: &Path, mut heard: impl FnMut(Pushed) -> bool) -> Result<(), RpcError> {
     let mut client = rpc::Client::connect(sock, BUDGET)?;
     let mode = client.ask_mode()?;
-    // `0` is the channel asking, which a call through `nvim_exec_lua` is not:
-    // there it is the session's own, and has no number.
+    // `0` means this channel; inside `nvim_exec_lua` it would be the
+    // session's own, which has no id.
     let asked = client.ask("nvim_get_chan_info", vec![Value::from(0)])?;
     if client.mode_reply(mode)?.blocking {
         return Ok(());
@@ -681,9 +575,8 @@ pub fn listen(sock: &Path, mut heard: impl FnMut(Pushed) -> bool) -> Result<(), 
     }
 }
 
-/// A session coming to the front: the watcher put in where it is missing, and
-/// what it kept cleared, being looked at now. Best effort, and quiet: a
-/// session that cannot answer now gets both on the next visit or listing.
+/// On a session coming to the front: install the watcher if missing and
+/// clear its news. Best effort; one that cannot answer gets both next time.
 pub fn touch(sock: &Path) {
     let Ok(mut client) = rpc::Client::connect(sock, BUDGET) else {
         return;
@@ -695,16 +588,14 @@ pub fn touch(sock: &Path) {
     }
 }
 
-/// A session that has just been looked at: what it kept, cleared. Best
-/// effort, like [`touch`].
+/// Clear the news of a session just looked at. Best effort.
 pub fn seen(sock: &Path) {
     if let Err(e) = unblocked(sock, SEEN) {
         tracing::debug!(error = %e, "notes: could not clear");
     }
 }
 
-/// [`touch`] or [`seen`] on a thread of its own, so that nothing waits for a
-/// round trip a session's switch has no use for.
+/// Run [`touch`] or [`seen`] on its own thread so a switch does not wait.
 pub fn later(sock: PathBuf, what: fn(&Path)) {
     let spawned = std::thread::Builder::new()
         .name("nvmux-notes-seen".into())
@@ -714,9 +605,8 @@ pub fn later(sock: PathBuf, what: fn(&Path)) {
     }
 }
 
-/// [`seen`], begun on a thread of its own for the way out of nvmux, which
-/// waits for it with [`Seeing::wait_until`] once it has done whatever else it
-/// has to: the two then take as long as the longer of them, not both.
+/// Start [`seen`] on its own thread at exit; [`Seeing::wait_until`] waits for
+/// it after the rest of shutdown, so the two overlap.
 pub fn seen_begin(sock: PathBuf) -> Seeing {
     let (done, finished) = mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -728,13 +618,12 @@ pub fn seen_begin(sock: PathBuf) -> Seeing {
     Seeing(spawned.is_ok().then_some(finished))
 }
 
-/// [`seen`] under way on its thread: see [`seen_begin`]. `None` where no
-/// thread could be had, which leaves nothing to wait for.
+/// A [`seen_begin`] in progress; `None` if no thread could be spawned.
 pub struct Seeing(Option<mpsc::Receiver<()>>);
 
 impl Seeing {
-    /// Wait for it to have been said, but not past `deadline`: the way out of
-    /// nvmux would otherwise end the thread before it had said anything.
+    /// Wait for it until `deadline`; exiting would otherwise kill the thread
+    /// first.
     pub fn wait_until(self, deadline: Instant) {
         if let Some(said) = self.0 {
             let _ = said.recv_timeout(deadline.saturating_duration_since(Instant::now()));
@@ -742,15 +631,12 @@ impl Seeing {
     }
 }
 
-/// The record, with the watcher installed first where it is missing or is
-/// another version's; `None` while the editor waits for a key, which is when
-/// a deferred call would not be answered.
+/// The record, installing the watcher if missing or another version; `None`
+/// while the editor is blocked on a key (deferred calls go unanswered).
 ///
-/// The read is asked with the mode, before either is waited for, so the two
-/// cost one round trip. Left unread when the editor is blocked: the session
-/// runs it once the key comes, which costs nothing, since all a read writes
-/// is to forget a language server that has gone, as true then as now — and
-/// the watcher, which writes the record, is only sent once it has answered.
+/// The read is pipelined with the mode: one round trip. If blocked, it runs
+/// harmlessly once the key comes (it only drops LSP work of dead servers); the
+/// watcher, which writes the record, is sent only after an answer.
 fn snapshot<S: Read + Write>(client: &mut rpc::Client<S>) -> Result<Option<Value>, RpcError> {
     let mode = client.ask_mode()?;
     let asked = client.ask("nvim_exec_lua", lua(READ))?;
@@ -764,8 +650,8 @@ fn snapshot<S: Read + Write>(client: &mut rpc::Client<S>) -> Result<Option<Value
     Ok(Some(record))
 }
 
-/// Run `code` in the session on `sock`, unless its editor is waiting for a
-/// key; then it runs once the key comes, if it is still connected by then.
+/// Run `code` in the session without waiting if the editor is blocked on a
+/// key; it then runs once the key comes, if still connected.
 fn unblocked(sock: &Path, code: &'static str) -> Result<(), RpcError> {
     let mut client = rpc::Client::connect(sock, BUDGET)?;
     let mode = client.ask_mode()?;
@@ -776,22 +662,19 @@ fn unblocked(sock: &Path, code: &'static str) -> Result<(), RpcError> {
     client.reply_to(asked).map(drop)
 }
 
-/// The arguments of `nvim_exec_lua` for one of the chunks above: the chunk,
-/// and the version as its one argument.
+/// `nvim_exec_lua` arguments: the chunk, with [`VERSION`] as its argument.
 fn lua(code: &str) -> Vec<Value> {
     lua_naming(code, None)
 }
 
-/// [`lua`], and a listener's channel after the version, where there is one.
+/// [`lua`], plus a listener channel after the version if given.
 fn lua_naming(code: &str, listener: Option<u64>) -> Vec<Value> {
     let mut args = vec![Value::from(VERSION)];
     args.extend(listener.map(Value::from));
     vec![Value::from(code), Value::Array(args)]
 }
 
-/// The note a record comes to, if any: the notification or failure it keeps
-/// first, since those wait for you, then the command that finished, and then
-/// whatever is running.
+/// The record's note, by [`Note`]'s priority.
 fn note_of(record: &Value, read_at: Instant) -> Option<Note> {
     let kept = |n: &Value, kind| Note {
         kind,
@@ -824,8 +707,7 @@ fn note_of(record: &Value, read_at: Instant) -> Option<Note> {
     })
 }
 
-/// The news a record holds, oldest first: the notification or failure, and
-/// the command that finished, each where there is one.
+/// The record's news, oldest first.
 fn news_of(record: &Value) -> Vec<News> {
     let mut news: Vec<News> = ["note", "finished"]
         .into_iter()
@@ -854,7 +736,6 @@ fn news_of(record: &Value) -> Vec<News> {
     news
 }
 
-/// A key of a msgpack map.
 fn field<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
     map.as_map()?
         .iter()
@@ -862,10 +743,9 @@ fn field<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
         .map(|(_, v)| v)
 }
 
-/// A string of the record, fit to be drawn: the watcher already keeps control
-/// characters out, and a cell holding one would hand the terminal a sequence
-/// of nvmux's choosing — or rather of whoever wrote the notification — so the
-/// picker does not take that on trust.
+/// A record string, safe to draw. The watcher already strips control
+/// characters, but the text comes from whoever sent the notification, so it is
+/// not trusted.
 fn text(v: Option<&Value>) -> String {
     let s = v.and_then(Value::as_str).unwrap_or_default();
     let clean: String = s
@@ -875,9 +755,8 @@ fn text(v: Option<&Value>) -> String {
     clean.trim().to_string()
 }
 
-/// A count of the record — Lua's numbers reach msgpack as integers when they
-/// are whole, and as floats otherwise. Never negative: a clock that went back
-/// says nothing about how long ago.
+/// A record count. Lua numbers arrive as integers when whole, else floats.
+/// Negative (a clock gone back) reads as `None`.
 fn number(v: &Value) -> Option<u64> {
     v.as_u64()
         .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
@@ -887,27 +766,21 @@ fn seconds(v: Option<&Value>) -> Duration {
     Duration::from_secs(v.and_then(number).unwrap_or(0))
 }
 
-/// What the picker hands its sessions to.
 enum Command {
-    /// Read this session, on this socket, from now on.
     Watch(String, PathBuf),
 }
 
-/// The picker's reads, on a thread of their own: every session it is handed
-/// is read at once, then every [`POLL`], all of them at a time, and what they
-/// say comes back as a map from session id to note.
-///
-/// Dropping it stops the thread without waiting for it: a read in flight, its
-/// budget at most a second, finishes to nobody. Nothing is joined, so leaving
-/// the picker never waits on a session.
+/// The picker's reads on their own thread, every [`POLL`] in parallel,
+/// yielding a session id to note map. Dropping it never joins the thread, so
+/// leaving the picker never waits on a session.
 pub struct Poller {
     commands: Sender<Command>,
     updates: Receiver<HashMap<String, Note>>,
 }
 
 impl Poller {
-    /// Start reading. `seen` is the session the picker was opened from, which
-    /// has just been looked at: it is cleared before it is first read.
+    /// `seen` is the session the picker was opened from; it is cleared before
+    /// its first read.
     pub fn start(seen: Option<String>) -> Self {
         let (commands, inbox) = mpsc::channel();
         let (outbox, updates) = mpsc::channel();
@@ -920,13 +793,11 @@ impl Poller {
         Self { commands, updates }
     }
 
-    /// Read session `id` through `sock` from now on.
     pub fn watch(&self, id: &str, sock: PathBuf) {
         let _ = self.commands.send(Command::Watch(id.to_string(), sock));
     }
 
-    /// What the sessions said, if they have said anything since this was last
-    /// asked: the latest of it, every session at once.
+    /// The latest notes of all sessions, if updated since last asked.
     pub fn take(&self) -> Option<HashMap<String, Note>> {
         self.updates.try_iter().last()
     }
@@ -1003,17 +874,14 @@ mod tests {
         )
     }
 
-    /// On the way out of nvmux, what is said is waited for until its deadline
-    /// and no longer: a session that takes the connection and never answers
-    /// holds the way out for the deadline alone, and one that is not there at
-    /// all holds it for nothing.
+    /// A session that accepts but never answers holds exit until the deadline;
+    /// a missing one does not hold it at all.
     #[test]
     fn the_way_out_waits_for_seen_until_its_deadline_and_no_longer() {
         let path = crate::test_support::scratch_sock("notes-seen-deadline");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let started = Instant::now();
         let seeing = seen_begin(path.clone());
-        // Accepted, and never answered.
         let (_server, _) = listener.accept().expect("accept");
         seeing.wait_until(started + Duration::from_millis(150));
         let took = started.elapsed();
@@ -1033,8 +901,6 @@ mod tests {
         );
     }
 
-    /// A notification or a failure waits for you, so it is the note even
-    /// while something else in the session runs.
     #[test]
     fn a_notification_comes_before_what_is_running() {
         let at = Instant::now();
@@ -1081,9 +947,8 @@ mod tests {
         assert_eq!(note.text, "exited with code 1");
     }
 
-    /// The news is both of what a session keeps, whichever the picker would
-    /// show, oldest first, each with its number and whether its terminal was on
-    /// the screen; an older watcher's says neither.
+    /// Both kept items, oldest first; an older watcher's items lack `seq` and
+    /// `shown`.
     #[test]
     fn the_news_is_both_of_what_is_kept_by_number() {
         let record = map(vec![
@@ -1154,8 +1019,6 @@ mod tests {
         assert!(news_of(&Value::Boolean(false)).is_empty());
     }
 
-    /// A command that finished is news, so it comes before what is running;
-    /// but it asks nothing of you, so a notification comes before it.
     #[test]
     fn a_finished_command_comes_between_a_notification_and_what_is_running() {
         let finished = (
@@ -1196,8 +1059,7 @@ mod tests {
         );
     }
 
-    /// Lua's numbers are whole or not: a percentage arrives either way, is
-    /// held to 100, and 0 is no percentage at all.
+    /// Integer or float, capped at 100; 0 means none.
     #[test]
     fn busy_carries_its_percentage_when_it_has_one() {
         let busy = |percent: Option<Value>| {
@@ -1223,9 +1085,6 @@ mod tests {
         assert_eq!(note_of(&Value::Boolean(false), Instant::now()), None);
     }
 
-    /// The picker draws what it is given straight into cells, so nothing in a
-    /// notification may reach the terminal as a control character, whatever
-    /// the watcher let through.
     #[test]
     fn control_characters_never_reach_the_picker() {
         let record = map(vec![(

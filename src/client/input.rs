@@ -1,77 +1,61 @@
-//! What the terminal sends, as what Neovim takes.
+//! Parses terminal input into Neovim key notation and events.
 //!
-//! `nvim --remote-ui` reads its terminal with libtermkey and hands the server
-//! keys in Neovim's own notation; this is the same job for this client, and
-//! it reads the same encodings, since nvmux passes every byte on as the
-//! terminal spelt it (see [`crate::keyseq`]):
+//! Does what libtermkey does for `nvim --remote-ui`, on the same encodings,
+//! since nvmux passes bytes on as the terminal sent them (see
+//! [`crate::keyseq`]):
 //!
-//! - plain text, and the C0 bytes as `Ctrl` chords — `0x08` is `<C-h>` and
-//!   `0x7f` is `<BS>`, as termkey makes them for Neovim;
+//! - plain text, and C0 bytes as `Ctrl` chords (`0x08` is `<C-h>`, `0x7f` is
+//!   `<BS>`, as termkey makes them for Neovim);
 //! - `ESC` and a key as that key with `Alt`;
-//! - `CSI` and `SS3` keys, with xterm's modifier parameter — the arrows,
-//!   Home and End, the function keys, the keypad;
-//! - the kitty keyboard protocol's `CSI … u`, which the client asks for where
-//!   the terminal has it (see `super::term`), and xterm's `modifyOtherKeys`
-//!   (`CSI 27 ; mods ; key ~`) where it does not;
-//! - SGR mouse reports, bracketed paste, and focus reports;
-//! - and the terminal's answers to questions — the client's own, which it
-//!   keeps, and anybody else's, which go to the server as a `termresponse`
-//!   without the string terminator, which is how the server's handlers expect
-//!   them (`vim.tty.query` and the background detection in `_core/defaults`).
+//! - `CSI` and `SS3` keys with xterm's modifier parameter;
+//! - kitty's `CSI … u` where the terminal has it (see `super::term`), else
+//!   xterm's `modifyOtherKeys` (`CSI 27 ; mods ; key ~`);
+//! - SGR mouse reports, bracketed paste, focus reports;
+//! - query replies: the client's own are kept; others go to the server as a
+//!   `termresponse` without the string terminator, as its handlers expect
+//!   (`vim.tty.query`, background detection in `_core/defaults`).
 //!
-//! # A lone `ESC`
-//!
-//! The Escape key and the first byte of every sequence are the same byte, so
-//! an `ESC` at the end of what has arrived could be either. It is held, and
-//! [`Parser::waiting`] says so, until the rest comes or `'ttimeoutlen'`
-//! passes — Neovim's own TUI's rule, and the reason it has that option — and
-//! no longer than the relay's own wait, which it has been held for already
-//! (see `super::RELAYED_ESCAPE`). A sequence cut short by the end of a read
-//! is held the same way.
-//!
-//! An answer already known to be one — an OSC or a DCS string whose first
-//! bytes no key makes ([`Parser::in_reply`]) — is no key to be let go of
-//! quickly, and is given longer: an OSC 52 paste can be hundreds of kilobytes
-//! long. One longer still than the client keeps is dropped up to its end,
-//! never typed.
+//! A trailing `ESC` may be the Escape key or a sequence start, so it is held
+//! ([`Parser::waiting`]) until more arrives or `'ttimeoutlen'` passes, as in
+//! Neovim's TUI, but no longer than the relay's own wait, which it was already
+//! held for (see `super::RELAYED_ESCAPE`). A sequence cut by a read is held
+//! the same way. A known reply (an OSC, DCS or APC whose first bytes no key
+//! makes, [`Parser::in_reply`]) is held longer, since an OSC 52 paste can be
+//! hundreds of KB; one longer than the client keeps is dropped through its end.
 
 use std::fmt::Write as _;
 
-/// One thing the terminal said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
-    /// Keys in Neovim's notation, for `nvim_input`. Runs of plain keys come as
-    /// one.
+    /// Keys in Neovim's notation, for `nvim_input`; runs of plain keys merged.
     Keys(String),
     Mouse(Mouse),
-    /// Part of a bracketed paste, for `nvim_paste`: `phase` 1 for the first
-    /// part, 2 for one in the middle, 3 for the last, and -1 for a paste that
-    /// arrived all at once.
+    /// Part of a bracketed paste, for `nvim_paste`: `phase` 1 first, 2 middle,
+    /// 3 last, -1 for a paste that arrived all at once.
     Paste {
         phase: i64,
         data: Vec<u8>,
     },
-    /// The terminal gained or lost focus.
+    /// `true` when the terminal gained focus.
     Focus(bool),
-    /// An answer to a question.
     Reply(Reply),
-    /// What nvmux says to show, in the sequence only it writes here (see
-    /// [`crate::card`]): the sequence's body, between its opener and its end.
+    /// The body of nvmux's own card sequence (see [`crate::card`]), without
+    /// its opener and terminator.
     Card(Vec<u8>),
 }
 
-/// A terminal's answer to a question.
+/// A terminal's reply to a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     /// Primary device attributes: `CSI ? … c`.
     DeviceAttributes(Vec<u8>),
     /// The kitty keyboard protocol's flags: `CSI ? flags u`.
     KittyFlags,
-    /// Anything else, as the server is to be handed it.
+    /// Anything else, as it is to be handed to the server.
     Other(Vec<u8>),
 }
 
-/// A mouse report, in `nvim_input_mouse`'s terms, at a cell of the screen.
+/// A mouse report in `nvim_input_mouse`'s terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mouse {
     pub button: &'static str,
@@ -82,66 +66,61 @@ pub struct Mouse {
     pub col: usize,
 }
 
-/// Where a parse of what has arrived got to.
+/// Result of parsing from the start of the pending bytes.
 enum Step {
     /// The first `n` bytes made this.
     Took(usize, Option<Input>),
-    /// Not enough has arrived to say.
+    /// Needs more bytes.
     More,
-    /// The first `n` bytes are a reply too long to keep, and not yet ended:
-    /// they go, and so does the rest of it as it comes.
+    /// The first `n` bytes start a reply too long to keep, not yet ended:
+    /// they are dropped, and so is the rest of it as it arrives.
     TooLong(usize),
 }
 
-/// The longest a sequence is let grow before it is given up on: past this it
-/// is no key, and holding it would hold every key after it. An OSC reply —
-/// an OSC 52 paste — is allowed far longer.
+/// Longest a sequence may grow before it is given up on: past this it is no
+/// key, and holding it would hold every later key. String replies (e.g. an
+/// OSC 52 paste) may reach `MAX_STRING`.
 const MAX_SEQUENCE: usize = 256;
 const MAX_STRING: usize = 1 << 20;
 
-/// What may follow `ESC ]`, `ESC P` and `ESC _` in a reply, and in no Alt
-/// chord: an OSC's number, the few characters a DCS reply starts with,
-/// kitty's `G` for a graphics reply — and nvmux's own `~`, for what it tells
-/// the client to show ([`crate::card::OPENER`]).
+/// What may follow `ESC ]`, `ESC P` and `ESC _` in a reply but in no Alt
+/// chord: an OSC number, a DCS reply's first characters, kitty's `G` for
+/// graphics, and nvmux's `~` for cards ([`crate::card::OPENER`]).
 pub(crate) const OSC_OPENS: &[u8] = b"0123456789";
 pub(crate) const DCS_OPENS: &[u8] = b"0123456789>|+$=";
 pub(crate) const APC_OPENS: &[u8] = &[b'G', crate::card::OPENER];
 
-/// The parser, and what it is holding.
 #[derive(Debug, Default)]
 pub struct Parser {
     pending: Vec<u8>,
-    /// Inside a bracketed paste, and whether its first part has gone.
+    /// Inside a bracketed paste; `true` once its first part has gone.
     paste: Option<bool>,
-    /// Inside a reply too long to keep — an OSC, a DCS or an APC, by its
-    /// introducer — whose rest is dropped up to its end.
+    /// Introducer of a reply too long to keep (OSC, DCS or APC), whose rest
+    /// is dropped through its end.
     skipping: Option<u8>,
 }
 
-/// The bracketed paste's markers.
 pub(crate) const PASTE_START: &[u8] = b"\x1b[200~";
 pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
 
 impl Parser {
-    /// Read `bytes`, appending what they make to `out`.
     pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Input>) {
         self.pending.extend_from_slice(bytes);
         self.run(out, false);
     }
 
-    /// Whether something is held to see what comes next.
+    /// Whether bytes are held pending what comes next.
     pub fn waiting(&self) -> bool {
         !self.pending.is_empty() && self.paste.is_none()
     }
 
-    /// Whether what is held is a reply part way through — an OSC or a DCS
-    /// string already known to be no key — or the rest of one being dropped:
-    /// see the module docs.
+    /// Whether what is held is a partial reply (an OSC, DCS or APC string known
+    /// not to be a key) or the rest of one being dropped.
     pub fn in_reply(&self) -> bool {
         self.paste.is_none() && (self.skipping.is_some() || string_opener(&self.pending).is_some())
     }
 
-    /// Nothing more came: what is held is what it is.
+    /// Nothing more arrived: resolve what is held as it stands.
     pub fn timeout(&mut self, out: &mut Vec<Input>) {
         // A reply being dropped has stalled: whatever comes next is new.
         self.skipping = None;
@@ -161,8 +140,8 @@ impl Parser {
                         continue;
                     }
                     None => {
-                        // All of it, but an `ESC` that may begin the `ESC \`
-                        // that ends it.
+                        // Drop all but a trailing `ESC`, which may start the
+                        // terminating `ESC \`.
                         let keep = usize::from(rest.last() == Some(&0x1b));
                         flush_keys(&mut keys, out);
                         let len = self.pending.len();
@@ -214,16 +193,16 @@ impl Parser {
         self.pending.drain(..at);
     }
 
-    /// The part of a paste from `at`: up to its end marker, or up to the end
-    /// of what has arrived, keeping back what could be the start of the
-    /// marker or of a character. `None` when there is nothing to hand on yet.
+    /// The paste from `at`, through its end marker or to the end of what has
+    /// arrived, holding back a possible partial marker or character. `None`
+    /// when there is nothing to pass on yet.
     fn paste_part(&mut self, at: usize, out: &mut Vec<Input>) -> Option<usize> {
         let rest = &self.pending[at..];
         let first = !self.paste.unwrap_or(false);
         if let Some(end) = find(rest, PASTE_END) {
             let data = rest[..end].to_vec();
-            // The whole paste in one read is one call (-1); otherwise this is
-            // the last of several.
+            // A whole paste in one read is one call (-1); otherwise this is
+            // the last part.
             let phase = if first { -1 } else { 3 };
             out.push(Input::Paste { phase, data });
             self.paste = None;
@@ -261,7 +240,7 @@ fn partial_suffix(hay: &[u8], needle: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// How many bytes at the end of `bytes` are a character not yet complete.
+/// How many bytes at the end of `bytes` are an incomplete character.
 fn partial_char(bytes: &[u8]) -> usize {
     for back in 1..=3.min(bytes.len()) {
         let b = bytes[bytes.len() - back];
@@ -274,7 +253,7 @@ fn partial_char(bytes: &[u8]) -> usize {
     0
 }
 
-/// How long a UTF-8 sequence starting with `b` is; 1 for a byte that starts
+/// Length of a UTF-8 sequence starting with `b`; 1 for a byte that starts
 /// none, which is then taken alone.
 fn utf8_len(b: u8) -> usize {
     match b {
@@ -285,7 +264,7 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
-/// One thing from the start of `bytes`, which is not empty.
+/// Parse one input from the start of non-empty `bytes`.
 fn parse(bytes: &[u8], final_: bool) -> Step {
     match bytes[0] {
         0x1b => escape(bytes, final_),
@@ -304,15 +283,14 @@ fn parse(bytes: &[u8], final_: bool) -> Step {
                     let c = s.chars().next().expect("one character");
                     Step::Took(need, Some(Input::Keys(plain(c))))
                 }
-                // Not a character: dropped, a byte at a time.
+                // Invalid UTF-8: dropped a byte at a time.
                 Err(_) => Step::Took(1, None),
             }
         }
     }
 }
 
-/// A key typed on its own: itself, or `<lt>` for the one character the
-/// notation reserves.
+/// A plain key; `<` is spelt `<lt>`.
 fn plain(c: char) -> String {
     if c == '<' {
         "<lt>".into()
@@ -321,7 +299,7 @@ fn plain(c: char) -> String {
     }
 }
 
-/// A C0 byte or DEL as the chord it is, with `mods` in front.
+/// A C0 byte or DEL as its chord, prefixed with `mods`.
 fn control(b: u8, mods: &str) -> String {
     let name: String = match b {
         0x00 => "C-Space".into(),
@@ -338,7 +316,6 @@ fn control(b: u8, mods: &str) -> String {
     format!("<{mods}{name}>")
 }
 
-/// What follows an `ESC`.
 fn escape(bytes: &[u8], final_: bool) -> Step {
     let Some(&next) = bytes.get(1) else {
         return if final_ {
@@ -347,9 +324,9 @@ fn escape(bytes: &[u8], final_: bool) -> Step {
             Step::More
         };
     };
-    // An OSC, a DCS or an APC reply opens with what no Alt chord does (see
+    // OSC, DCS and APC replies open with bytes no Alt chord makes (see
     // `OSC_OPENS`). Anything else after `ESC ]`, `ESC P` or `ESC _` is Alt and
-    // a key — and so is a lone one the wait gave up on.
+    // a key, as is a lone one the wait gave up on.
     let opens = |starts: &[u8]| match bytes.get(2) {
         Some(b) => starts.contains(b),
         None => !final_,
@@ -360,20 +337,18 @@ fn escape(bytes: &[u8], final_: bool) -> Step {
         b']' if opens(OSC_OPENS) => string(bytes, b']', final_),
         b'P' if opens(DCS_OPENS) => string(bytes, b'P', final_),
         b'_' if opens(APC_OPENS) => match string(bytes, next, final_) {
-            // nvmux's own, for the client and nobody else: never typed, and
-            // never handed to the server.
+            // nvmux's card: for the client only, never typed or sent on.
             Step::Took(n, Some(Input::Reply(Reply::Other(s))))
                 if s.get(2) == Some(&crate::card::OPENER) =>
             {
                 Step::Took(n, Some(Input::Card(s[3..].to_vec())))
             }
-            // Graphics replies answer nothing the server asked, and are
-            // dropped.
+            // Graphics replies answer nothing the server asked: dropped.
             Step::Took(n, _) => Step::Took(n, None),
             more => more,
         },
         // `ESC ESC [ A`: Alt and an arrow, as some terminals spell it. Two
-        // Escapes and nothing after them are two Escapes.
+        // Escapes alone are two Escapes.
         0x1b => match escape(&bytes[1..], final_) {
             Step::Took(n, Some(Input::Keys(k))) if is_key_sequence(&bytes[1..=n]) => {
                 Step::Took(n + 1, Some(Input::Keys(with_alt(&k))))
@@ -394,13 +369,12 @@ fn escape(bytes: &[u8], final_: bool) -> Step {
     }
 }
 
-/// Whether these bytes are a key's escape sequence rather than a reply or a
-/// lone escape, for the `ESC ESC` form of Alt.
+/// Whether `seq` is a key's escape sequence, not a reply or a lone escape
+/// (for the `ESC ESC` form of Alt).
 fn is_key_sequence(seq: &[u8]) -> bool {
     seq.len() > 2 && matches!(seq[1], b'[' | b'O')
 }
 
-/// A key given Alt.
 fn with_alt(keys: &str) -> String {
     match keys.strip_prefix('<') {
         Some(rest) => format!("<M-{rest}"),
@@ -421,7 +395,7 @@ fn alt(bytes: &[u8], final_: bool) -> Step {
     }
 }
 
-/// A character as it is written inside `<…>`.
+/// A character as written inside `<…>`.
 fn name_in_brackets(c: char) -> String {
     match c {
         ' ' => "Space".into(),
@@ -432,9 +406,8 @@ fn name_in_brackets(c: char) -> String {
     }
 }
 
-/// The introducer of the reply `bytes` open — `]` for an OSC, `P` for a DCS,
-/// `_` for an APC — if they open one no key could: the test [`escape`] makes,
-/// once there is a byte after the introducer to make it on.
+/// The introducer (`]` OSC, `P` DCS, `_` APC) if `bytes` open a reply no key
+/// could: [`escape`]'s test, once a byte follows the introducer.
 fn string_opener(bytes: &[u8]) -> Option<u8> {
     match bytes {
         [0x1b, b']', b, ..] if OSC_OPENS.contains(b) => Some(b']'),
@@ -444,8 +417,8 @@ fn string_opener(bytes: &[u8]) -> Option<u8> {
     }
 }
 
-/// Where a reply of this kind that `bytes` are the middle of ends: just past
-/// its terminator, BEL for an OSC or `ESC \` for any.
+/// Offset just past the terminator of the `kind` reply `bytes` are inside:
+/// BEL for an OSC, or `ESC \` for any.
 fn string_end(bytes: &[u8], kind: u8) -> Option<usize> {
     bytes.iter().enumerate().find_map(|(i, b)| match b {
         0x07 if kind == b']' => Some(i + 1),
@@ -454,8 +427,8 @@ fn string_end(bytes: &[u8], kind: u8) -> Option<usize> {
     })
 }
 
-/// An OSC or DCS reply, up to its terminator — BEL, or `ESC \` — handed on
-/// without it.
+/// An OSC, DCS or APC reply up to its terminator (BEL for an OSC, or
+/// `ESC \`), passed on without it.
 fn string(bytes: &[u8], kind: u8, final_: bool) -> Step {
     let mut i = 2;
     while i < bytes.len() {
@@ -468,8 +441,8 @@ fn string(bytes: &[u8], kind: u8, final_: bool) -> Step {
                     Some(b'\\') => {
                         Step::Took(i + 2, Some(Input::Reply(Reply::Other(bytes[..i].to_vec()))))
                     }
-                    // Another sequence starting before this one ended: this
-                    // one is abandoned where it stands.
+                    // Another sequence started before this one ended: drop
+                    // this one.
                     Some(_) => Step::Took(i, None),
                     None if final_ => Step::Took(i, None),
                     None => Step::More,
@@ -487,8 +460,8 @@ fn string(bytes: &[u8], kind: u8, final_: bool) -> Step {
     }
 }
 
-/// `ESC O` and a final byte, maybe with xterm's modifier between: the cursor
-/// keys in application mode, F1 to F4, the keypad.
+/// `ESC O`, optional xterm modifier, final byte: application-mode cursor
+/// keys, F1 to F4, the keypad.
 fn ss3(bytes: &[u8], final_: bool) -> Step {
     let mut i = 2;
     while bytes.get(i).is_some_and(u8::is_ascii_digit) {
@@ -528,7 +501,7 @@ fn ss3(bytes: &[u8], final_: bool) -> Step {
         b'p'..=b'y' => {
             return Step::Took(i + 1, Some(Input::Keys(format!("<{mods}k{}>", fin - b'p'))))
         }
-        // Not a key: Alt-O, and what came after it stands on its own.
+        // Not a key: Alt-O, and what follows stands on its own.
         _ => return Step::Took(2, Some(Input::Keys("<M-O>".into()))),
     };
     Step::Took(i + 1, Some(Input::Keys(format!("<{mods}{name}>"))))
@@ -578,7 +551,7 @@ fn csi(bytes: &[u8], final_: bool) -> Step {
         };
     };
     if !(0x40..=0x7e).contains(&fin) {
-        // A byte no sequence holds: the sequence ended before it, broken.
+        // Not a valid byte here: the sequence is broken and ends before it.
         return Step::Took(i, None);
     }
     let n = i + 1;
@@ -634,20 +607,19 @@ impl Params {
         self.0.len()
     }
 
-    /// Parameter `i`'s main value, 0 for one absent.
+    /// Parameter `i`'s main value, 0 if absent.
     fn get(&self, i: usize) -> u32 {
         self.0.get(i).and_then(|p| p.first()).copied().unwrap_or(0)
     }
 
-    /// Sub-parameter `j` of parameter `i`.
     fn sub(&self, i: usize, j: usize) -> Option<u32> {
         self.0.get(i).and_then(|p| p.get(j)).copied()
     }
 }
 
-/// A modifier parameter — one plus a mask: shift 1, alt 2, ctrl 4, super 8,
-/// hyper 16, meta 32, and the locks, which say nothing about the chord — as
-/// the prefix Neovim writes for it.
+/// A modifier parameter as Neovim's prefix. The parameter is 1 + a mask:
+/// shift 1, alt 2, ctrl 4, super 8, hyper 16, meta 32, plus lock bits. Hyper
+/// and the locks are ignored; meta is written as alt.
 fn modifiers(param: u32) -> String {
     let m = param.saturating_sub(1);
     let mut s = String::new();
@@ -659,8 +631,8 @@ fn modifiers(param: u32) -> String {
     s
 }
 
-/// A key with a letter for its final byte: the cursor keys, Home and End,
-/// F1 to F4, Shift-Tab, the keypad's middle.
+/// A key with a letter final byte: cursor keys, Home, End, F1 to F4,
+/// Shift-Tab, the keypad's middle.
 fn letter(fin: u8, params: &Params) -> Option<Input> {
     let mods = if params.len() >= 2 {
         modifiers(params.get(1))
@@ -685,8 +657,8 @@ fn letter(fin: u8, params: &Params) -> Option<Input> {
     Some(Input::Keys(format!("<{mods}{name}>")))
 }
 
-/// `CSI number ; mods ~`: the editing keys and F5 on, by number — and
-/// xterm's `modifyOtherKeys`, which is `CSI 27 ; mods ; key ~`.
+/// `CSI number ; mods ~`: editing keys and F5 up, and xterm's
+/// `modifyOtherKeys` (`CSI 27 ; mods ; key ~`).
 fn tilde(params: &Params) -> Option<Input> {
     let n = params.get(0);
     if n == 27 && params.len() >= 3 {
@@ -715,8 +687,8 @@ fn tilde(params: &Params) -> Option<Input> {
 }
 
 /// The kitty keyboard protocol's `CSI key[:shifted[:base]] ; mods[:event] u`.
-/// A release is no keystroke and is dropped; the client asks for no
-/// releases, but a terminal another client set up may send them.
+/// Releases are dropped: the client asks for none, but a terminal another
+/// client set up may send them.
 fn kitty(params: &Params) -> Option<Input> {
     if params.sub(1, 1) == Some(3) {
         return None;
@@ -725,8 +697,8 @@ fn kitty(params: &Params) -> Option<Input> {
     key_code(params.get(0), mods)
 }
 
-/// A key by its code — a codepoint, or one of kitty's for a key that has
-/// none — with a modifier parameter.
+/// A key by code (a codepoint, or kitty's code for a key with none) with a
+/// modifier parameter.
 fn key_code(code: u32, mods_param: u32) -> Option<Input> {
     let m = mods_param.saturating_sub(1);
     let named = |name: &str| Some(Input::Keys(format!("<{}{name}>", modifiers(mods_param))));
@@ -761,9 +733,8 @@ fn key_code(code: u32, mods_param: u32) -> Option<Input> {
         _ => {}
     }
     let c = char::from_u32(code)?;
-    // Shift on its own with a character is that character shifted: the
-    // terminal sends it as text unless it was asked for more, and Neovim
-    // reads `<S-a>` as `A` anyway.
+    // Shift alone with a character is that character shifted: the terminal
+    // sends it as text unless asked for more, and Neovim reads `<S-a>` as `A`.
     if m & !(64 | 128) == 1 {
         let shifted: String = c.to_uppercase().collect();
         if shifted != c.to_string() {
@@ -778,8 +749,8 @@ fn key_code(code: u32, mods_param: u32) -> Option<Input> {
     Some(Input::Keys(out))
 }
 
-/// An SGR (or X10) mouse report as `nvim_input_mouse` takes it: `b` the
-/// report's button byte, `col` and `row` from zero.
+/// An SGR (or X10) mouse report for `nvim_input_mouse`: `b` is the button
+/// byte; `col` and `row` are 0-based.
 fn mouse(b: u32, col: u32, row: u32, release: bool) -> Option<Mouse> {
     let mut mods = String::new();
     if b & 4 != 0 {
@@ -813,8 +784,8 @@ fn mouse(b: u32, col: u32, row: u32, release: bool) -> Option<Mouse> {
             0 => "left",
             1 => "middle",
             2 => "right",
-            // No button: a plain move, or a legacy release that does not say
-            // which button went up.
+            // No button: a plain move, or a legacy release that does not
+            // name the button.
             _ if b & 32 != 0 => "move",
             _ => "left",
         };
@@ -850,10 +821,9 @@ mod tests {
         out
     }
 
-    /// What nvmux tells its client to show is the client's own: kept as a
-    /// card, between whatever keys it came between, and never typed or handed
-    /// to the server — however the reads fell. A graphics reply is still
-    /// dropped, and `ESC _` and a key still Alt and the key.
+    /// nvmux's card sequence becomes an `Input::Card` in place among the
+    /// keys, never typed or sent to the server, however the reads split it.
+    /// Graphics replies are still dropped, and `ESC _` and a key is still Alt.
     #[test]
     fn what_nvmux_says_to_show_is_never_typed() {
         let card = crate::card::encode(&crate::card::Command::Clear);
@@ -872,8 +842,8 @@ mod tests {
             ]
         );
 
-        // Cut anywhere, it is held whole — as a reply, not as an escape the
-        // wait could give up on as a key.
+        // Cut anywhere, it is held whole as a reply, not as an escape the wait
+        // could give up on as a key.
         for cut in 1..card.len() {
             let mut p = Parser::default();
             let mut out = Vec::new();
@@ -886,7 +856,7 @@ mod tests {
             assert_eq!(out, [Input::Card(body.clone())], "cut at {cut}");
         }
 
-        // After a lone Escape the parser was holding, it is still a card.
+        // Still a card after a held lone Escape.
         let mut escaped = b"\x1b".to_vec();
         escaped.extend_from_slice(&card);
         assert_eq!(
@@ -915,7 +885,7 @@ mod tests {
         assert_eq!(keys(b"a<b"), "a<lt>b");
     }
 
-    /// The C0 bytes as termkey makes them for Neovim.
+    /// As termkey makes them for Neovim.
     #[test]
     fn control_bytes_are_their_chords() {
         assert_eq!(keys(b"\x00"), "<C-Space>");
@@ -956,7 +926,7 @@ mod tests {
         assert_eq!(keys(b"\x1b\x1b[A"), "<M-Up>");
     }
 
-    /// The cursor keys in both modes, with xterm's modifiers.
+    /// Both cursor-key modes, with xterm's modifiers.
     #[test]
     fn cursor_and_editing_keys() {
         assert_eq!(keys(b"\x1b[A"), "<Up>");
@@ -988,9 +958,8 @@ mod tests {
         assert_eq!(keys(b"\x1b[57414u"), "<kEnter>");
     }
 
-    /// kitty's form: codes for keys with no character, codepoints for the
-    /// rest, and the shift folded into the character when it is the only
-    /// modifier.
+    /// Kitty codes for keys without a character, codepoints otherwise; Shift
+    /// alone is folded into the character.
     #[test]
     fn the_kitty_keyboard_protocol() {
         assert_eq!(keys(b"\x1b[27u"), "<Esc>");
@@ -1015,7 +984,6 @@ mod tests {
         assert_eq!(keys(b"\x1b[27;6;65~"), "<C-S-A>");
     }
 
-    /// A lone Escape is held until it is plain that nothing follows it.
     #[test]
     fn a_lone_escape_waits_for_the_timeout() {
         let mut p = Parser::default();
@@ -1028,7 +996,6 @@ mod tests {
         assert!(!p.waiting());
     }
 
-    /// A sequence split by a read is put back together.
     #[test]
     fn a_split_sequence_is_joined() {
         let mut p = Parser::default();
@@ -1046,8 +1013,7 @@ mod tests {
         assert_eq!(out, vec![Input::Keys("中".into())]);
     }
 
-    /// Clicks, drags, releases, the wheel and plain moves, with their
-    /// modifiers, from zero.
+    /// Clicks, drags, releases, wheel and moves, with modifiers; 0-based.
     #[test]
     fn sgr_mouse_reports() {
         let m = |bytes: &[u8]| match read(bytes).pop() {
@@ -1071,7 +1037,7 @@ mod tests {
         assert_eq!(read(b"\x1b[O"), vec![Input::Focus(false)]);
     }
 
-    /// Replies are told from keys, and handed on without their terminator.
+    /// Replies are passed on without their terminator.
     #[test]
     fn replies_are_not_keys() {
         assert_eq!(
@@ -1108,8 +1074,8 @@ mod tests {
         );
     }
 
-    /// A reply under way is known for one as soon as its first bytes say so,
-    /// and not before: a lone `ESC ]` may be Alt and `]`.
+    /// Known as soon as its first bytes say so, not before: a lone `ESC ]` may
+    /// be Alt and `]`.
     #[test]
     fn a_reply_under_way_is_known_for_one() {
         let held = |bytes: &[u8]| {
@@ -1126,8 +1092,8 @@ mod tests {
         assert!(!held(b"\x1b[1;"));
     }
 
-    /// A reply longer than the client keeps is dropped, all of it, up to its
-    /// end however many reads it takes — and the keys after it are keys.
+    /// Dropped through its end over any number of reads; the keys after it
+    /// are still keys.
     #[test]
     fn a_reply_too_long_to_keep_is_dropped_to_its_end() {
         let mut p = Parser::default();
@@ -1154,9 +1120,8 @@ mod tests {
         assert_eq!(out, vec![Input::Keys("y".into())]);
     }
 
-    /// A paste in one read, split across reads, and split in the middle of
-    /// its end marker or of a character: the same bytes come out, in parts
-    /// numbered as `nvim_paste` counts them.
+    /// Split anywhere, even inside the end marker or a character, the same
+    /// bytes come out, in parts numbered as `nvim_paste` counts them.
     #[test]
     fn a_bracketed_paste_comes_out_whole_however_it_was_read() {
         let whole = "\x1b[200~line one\r\nl<ine 中\x1b[201~x".as_bytes();
@@ -1189,8 +1154,7 @@ mod tests {
         }
     }
 
-    /// Keys in a row go to Neovim as one call; anything else in between
-    /// splits them.
+    /// Consecutive keys go as one call; anything else between splits them.
     #[test]
     fn plain_keys_are_batched() {
         assert_eq!(
@@ -1203,7 +1167,6 @@ mod tests {
         );
     }
 
-    /// Bytes that are not a character are dropped rather than typed.
     #[test]
     fn invalid_bytes_are_dropped() {
         assert_eq!(keys(b"a\xffb"), "ab");

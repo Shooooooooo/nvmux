@@ -1,60 +1,30 @@
-//! The settings screen — a fifth screen, shown by `,` on the picker and by
-//! `<prefix> ,` in a session: every setting the file has, a tab a table,
-//! changed on the spot.
+//! The settings screen (`,` on the picker, `<prefix> ,` in a session): one
+//! tab per table and one row per [`crate::settings`] entry, so none can be
+//! left out.
 //!
-//! From the picker full screen it takes the terminal the way the help screen
-//! does ([`super::help`]). From a session, or the picker floating over one,
-//! it floats over the session instead, in a panel the relay draws and gives
-//! its keys to ([`Panel`], and see `crate::pty::panel`), and the session goes
-//! on behind it, the hint row staying where it is full screen, along the
-//! bottom of the screen — unless `[style] float` is off, or the terminal is
-//! too small for a panel ([`panel_area`]), where it takes the terminal as from
-//! the picker and hands the same client back afterwards. And `[style] float`,
-//! flipped on the screen itself, moves it at once: off where it floats, it
-//! goes out with the session and comes up full screen in its place; on where
-//! it is full screen over a session — brought up from one, or from the picker
-//! brought up over one — it goes, and the session comes back with it
-//! floating over it ([`Outcome::Float`]).
-//! Either way the screen is the same: its rows are
-//! [`crate::settings`]' — one per setting, so the screen cannot leave one out
-//! — and every change it makes is applied as it is made ([`config::apply`]):
-//! the theme shows on the screen itself on the next frame, the picker's
-//! effects come back with the picker, and the rest reach what they govern as
-//! the table in [`crate::settings`] says. Until a save the file is untouched,
-//! and the tab row marks each tab with something unsaved on it.
+//! From the full-screen picker it takes the terminal, like [`super::help`].
+//! From a session (or the picker floating over one) it floats over the
+//! running session in a relay-drawn [`Panel`] (see `crate::pty::panel`),
+//! unless `[style] float` is off or the terminal is too small
+//! ([`panel_area`]); then it goes full screen and hands the same client back
+//! afterwards. Floating, its hint row stays on the screen's last row.
+//! Toggling `[style] float` here switches at once ([`Outcome::Float`]).
 //!
-//! # What a row says
+//! Changes apply immediately ([`config::apply`]); the file is untouched until
+//! `w`, and tabs with unsaved changes are marked. A dim row has no effect as
+//! things stand and says why (`needs fade`); a `•` and a bold value mark an
+//! unsaved change. The line under the rows is the selected setting's help, or
+//! an error in bold.
 //!
-//! The name, then the value, plain, whether it is the default or the file's.
-//! Dim means one thing: the setting has no effect as things stand, and the row
-//! says why at its end — `needs fade`. A `•` beside it, and the value in bold,
-//! mean changed and not saved. The line under the rows is the selected
-//! setting's help, and an error takes its place, in bold.
+//! Keys are read raw, not only via [`super::translate`], so changing the
+//! prefix can see the chord (as [`super::setup`] does); that also detects the
+//! prefix itself. The prefix and the next key are swallowed, as on the help
+//! screen, so a habitual `<prefix> d` changes nothing; `<prefix> ,` closes.
 //!
-//! # Keys
-//!
-//! Read raw rather than through [`super::translate`] alone: changing the
-//! prefix means seeing the chord that is pressed, as the first-run screen does
-//! ([`super::setup`]), and the same reading is what recognises the prefix
-//! itself. That one is swallowed with the key after it, as on the help screen,
-//! so a habitual `<prefix> d` cannot change a setting — but for `<prefix> ,`,
-//! which closes the screen as it opened it.
-//!
-//! # The mouse
-//!
-//! By the picker's rules ([`super::app::App::on_mouse`]): pointing at a row
-//! selects it, a press on the selected row arms its release to do what `Enter`
-//! does, and the wheel moves the selection a row at a time, stopping at the
-//! ends. A click on a tab opens it. A click ends an edit without keeping it, as
-//! `Esc` does, and the wheel does not. Nothing is dragged.
-//!
-//! # The bar
-//!
-//! The selected row is a bar the block's width, and the row it leaves fades
-//! back from it as the picker's does (see [`super::effects`], and
-//! `[effects.cursor]`), so the bar glides rather than jumps. Only the row just
-//! left fades: a held key moves the fade along with the bar rather than
-//! leaving a tail of them.
+//! The mouse follows the picker ([`super::app::App::on_mouse`]); a click on a
+//! tab opens it, and a click (not the wheel) cancels an edit. The row the bar
+//! leaves fades as in the picker ([`super::effects`]); only the last row
+//! left fades.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -80,62 +50,53 @@ use crate::keys::{self, BINDINGS};
 use crate::palette::Rgb;
 use crate::settings::{self as registry, Kind, Setting, Tab, Value};
 
-/// The selected row's marker, and every other row's indent to match: the
-/// picker's.
+/// The picker's selection marker, and the matching indent of other rows.
 const MARKER: &str = "▸ ";
 const INDENT: &str = "  ";
 
 /// Between a row's name and its value, and its value and why it is dim.
 const GAP: &str = "  ";
 
-/// Columns a value is given. Wide enough for the session command at its
-/// default, `nvim --headless --listen {sock}`.
+/// Value column width; fits the default session command,
+/// `nvim --headless --listen {sock}`.
 const VALUE_WIDTH: usize = 31;
 
-/// Beside a row whose value has changed and is not saved, and after a tab
-/// holding one.
+/// Marks unsaved rows and the tabs holding them.
 const UNSAVED: &str = "•";
 
-/// Between the tab row's names.
 const TAB_GAP: &str = "   ";
 
-/// The find's cursor, as the picker's filter has it.
 const CURSOR: &str = "▋";
 
-/// Where a value too long for its room is cut.
 const ELLIPSIS: &str = "…";
 
-/// The terminal's own colours `←` and `→` step `[style] color` through after
-/// `terminal`, by their ANSI indices 1 to 6, and what each is called.
+/// Names of ANSI colours 1 to 6, which `←`/`→` step `[style] color` through
+/// after `terminal`.
 const COLOUR_NAMES: [&str; 6] = ["red", "green", "yellow", "blue", "magenta", "cyan"];
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 const BAR: Style = Style::new().add_modifier(Modifier::REVERSED.union(Modifier::BOLD));
 
-/// What the screen is doing between keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
-    /// Moving between rows, and changing what changes in place.
+    /// Moving between rows; `←`/`→` change a value in place.
     Browse,
-    /// The prefix being changed: the chord pressed so far, which `Enter`
-    /// keeps.
+    /// Changing the prefix: the chord pressed so far, kept by `Enter`.
     Chord(Option<u8>),
-    /// A command's key being changed: the next key is it.
+    /// Changing a command's key: the next key is it.
     Key,
     /// A number, a colour or the session command being typed.
     Text(Field),
 }
 
-/// `/`: what has been typed, and which of the settings it matches is
-/// selected.
+/// `/`: the query, and the selected match.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Find {
     query: String,
     at: usize,
 }
 
-/// What one key or gesture left for the caller to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Stay,
@@ -144,8 +105,7 @@ enum Step {
     Save,
 }
 
-/// One key as the screen reads it: as every screen does, and as the chord the
-/// first-run screen would make of it.
+/// A key as every screen reads it, and as a first-run screen chord.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Press {
     key: Key,
@@ -162,16 +122,16 @@ fn press(k: KeyEvent) -> Press {
     }
 }
 
-/// What the pointer is over: a tab's name on the tab row, or a row of
-/// settings, by its place among the rows on screen.
+/// What the pointer is over: a tab, or a row by its index among the rows on
+/// screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Hit {
     Tab(Tab),
     Row(usize),
 }
 
-/// A mouse gesture, with what it landed on already resolved. The picker's
-/// ([`super::app::Mouse`]), with the tabs.
+/// A mouse gesture with its target resolved: the picker's
+/// ([`super::app::Mouse`]), plus tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gesture {
     Hover(Option<Hit>),
@@ -198,43 +158,40 @@ fn gesture(m: MouseEvent, hit: Option<Hit>) -> Option<Gesture> {
     }
 }
 
-/// Which tab and row the screen was left on, for the next time it opens in
-/// this run.
+/// The tab and row last left on, restored on the next open in this run.
 static SPOT: Mutex<Option<(Tab, usize)>> = Mutex::new(None);
 
-/// The screen, between keys. Pure, as the picker's [`super::app::App`] is:
-/// the caller reads the keys, applies what changed, and draws.
+/// The screen's state. Pure, like [`super::app::App`]: the caller reads
+/// keys, applies changes and draws.
 #[derive(Debug, Clone)]
 struct State {
     /// The settings as changed here: what nvmux runs on.
     live: Settings,
-    /// What the file holds. What `live` differs from it in is unsaved.
+    /// What the file holds; where `live` differs, it is unsaved.
     saved: Settings,
     tab: Tab,
-    /// The selected row, among the tab's.
+    /// The selected row among the tab's (a find has its own).
     selected: usize,
     mode: Mode,
     find: Option<Find>,
-    /// What the last key did, said on the hint row in place of the hints.
+    /// What the last key did, shown in place of the hints.
     message: Option<String>,
-    /// Why the last key did not do what it asked, in bold in place of the
-    /// selected setting's help.
+    /// Why the last key failed, shown in bold in place of the help.
     error: Option<String>,
-    /// The row the left button went down on, and whether it was the selected
-    /// one, until it comes up. See [`State::on_mouse`].
+    /// The row the left button went down on, and whether it was selected,
+    /// until release. See [`State::on_mouse`].
     pressed: Option<(usize, bool)>,
     /// The prefix has been pressed: the next key is swallowed.
     armed: bool,
-    /// The settings a save was refused for because the file had changed the
-    /// same ones: a second `w` with nothing changed since overwrites them.
+    /// Settings whose save was refused because the file changed the same
+    /// ones; a second `w` with nothing changed since overwrites them.
     clash: Option<Settings>,
     /// The terminal's colours 1 to 6, for `[style] color`.
     colours: [Rgb; 6],
-    /// The row the bar last left, fading back from it. See [`State::tick`].
+    /// The row the bar last left, fading. See [`State::tick`].
     glow: Option<Glow>,
 }
 
-/// A row the bar has left, and how long ago.
 #[derive(Debug, Clone, Copy)]
 struct Glow {
     setting: &'static Setting,
@@ -260,8 +217,7 @@ impl State {
         }
     }
 
-    /// The screen as nvmux has it now, on the tab and row it was last left
-    /// on.
+    /// Current settings, on the tab and row last left on.
     fn open() -> Self {
         let mut state = Self::new(
             (*config::get()).clone(),
@@ -275,13 +231,11 @@ impl State {
         state
     }
 
-    /// Keep where the screen is for the next time it opens.
     fn remember(&self) {
         *SPOT.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.tab, self.selected));
     }
 
-    /// The rows on screen: the tab's, or while finding, every setting that
-    /// matches.
+    /// The tab's rows, or while finding, every match.
     fn rows(&self) -> Vec<&'static Setting> {
         match &self.find {
             Some(find) => matches(&find.query),
@@ -289,7 +243,6 @@ impl State {
         }
     }
 
-    /// Which of the rows on screen is selected.
     fn at(&self) -> usize {
         let at = match &self.find {
             Some(find) => find.at,
@@ -305,8 +258,7 @@ impl State {
         }
     }
 
-    /// The selected setting, if there is one: a find that matches nothing
-    /// has none.
+    /// The selected setting; `None` when a find matches nothing.
     fn current(&self) -> Option<&'static Setting> {
         self.rows().get(self.at()).copied()
     }
@@ -320,14 +272,12 @@ impl State {
         setting.value(&self.live) != setting.value(&self.saved)
     }
 
-    /// Whether a save now should overwrite what the file changed too: asked
-    /// for by a second `w`, with nothing changed since the first.
+    /// Whether to overwrite the file's own changes: a second `w` with nothing
+    /// changed since the first.
     fn overwrite(&self) -> bool {
         self.clash.as_ref() == Some(&self.live)
     }
 
-    /// What came of a save: on the hint row, whatever it was; and saved, the
-    /// file holds what runs.
     fn report_save(&mut self, result: std::result::Result<config::Saved, crate::error::SaveError>) {
         self.clash = None;
         match result {
@@ -355,18 +305,17 @@ impl State {
         self.armed = false;
     }
 
-    /// The selected setting, where the selection is a bar that leaves a glow
-    /// behind it: while browsing or finding, not while a value is changed.
+    /// The selected setting while it is a bar that leaves a glow: browsing or
+    /// finding, not editing.
     fn cursor(&self) -> Option<&'static Setting> {
         (self.mode == Mode::Browse)
             .then(|| self.current())
             .flatten()
     }
 
-    /// If the bar has moved off `was`, start that row fading back from it, as
-    /// the picker's cursor does; whatever was fading before stops. Not for a
-    /// row that is no longer on screen — another tab's, or one a find
-    /// keystroke took — and not with `[effects.cursor]` off.
+    /// If the bar moved off `was`, start that row's glow, replacing any
+    /// other. Skipped if the row left the screen (another tab, or filtered by
+    /// a find) or with `[effects.cursor]` off.
     fn glow_from(&mut self, was: Option<&'static Setting>) {
         if !self.live.effects.cursor_enabled() {
             return;
@@ -383,8 +332,8 @@ impl State {
         });
     }
 
-    /// Move the row fading back from the bar on by `elapsed`. The clock is
-    /// the caller's, as the picker's is, so the state stays pure.
+    /// Advance the glow by `elapsed`; the caller keeps the clock so the state
+    /// stays pure.
     fn tick(&mut self, elapsed: Duration) {
         if let Some(glow) = &mut self.glow {
             glow.age += elapsed;
@@ -394,13 +343,11 @@ impl State {
         }
     }
 
-    /// Whether a row is fading back from the bar, so the caller draws at a
-    /// frame's pace until it is done.
     fn glowing(&self) -> bool {
         self.glow.is_some()
     }
 
-    /// A change this screen made that nvmux would not run on: put back.
+    /// Revert a change nvmux cannot run on, showing why.
     fn refused(&mut self, why: String, running: Settings) {
         self.live = running;
         self.error = Some(why);
@@ -417,8 +364,8 @@ impl State {
         self.message = None;
         self.error = None;
         if self.armed {
-            // The key after the prefix: a command elsewhere, and nothing
-            // here — but for the one that opened the screen.
+            // The key after the prefix does nothing here, except the one
+            // that opened the screen.
             self.armed = false;
             let settings = self.live.keys.bind.key(keys::Action::Settings);
             return if settings.is_some() && byte_of(press.key) == settings {
@@ -463,8 +410,7 @@ impl State {
             Key::End | Key::Char('G') => self.selected = last,
             Key::Tab | Key::Char(']') => self.turn(1),
             Key::BackTab | Key::Char('[') => self.turn(Tab::ALL.len() - 1),
-            // Closes rather than quits, as on the help screen: quitting is
-            // the picker's.
+            // Closes rather than quits, as on the help screen.
             Key::Esc | Key::Char('q') | Key::CtrlC => return Step::Close,
             Key::Char('/') => self.find = Some(Find::default()),
             Key::Char('w') if self.unsaved().is_empty() => {
@@ -528,9 +474,8 @@ impl State {
         }
     }
 
-    /// `←` or `→`: a switch turned over, a choice or a colour stepped through,
-    /// wrapping, and a number stepped along its grid, held to its range. The
-    /// rest change on `Enter`.
+    /// `←`/`→`: toggle a switch, cycle a choice or colour, or step a number
+    /// along its grid within its range. Other kinds change on `Enter`.
     fn step(&mut self, setting: &'static Setting, up: bool) {
         let value = match (setting.kind, setting.value(&self.live)) {
             (_, Value::Switch(on)) => Value::Switch(!on),
@@ -548,8 +493,8 @@ impl State {
         self.put(setting, value);
     }
 
-    /// `Enter`, or a click on the selected row: what `→` does for a switch
-    /// or a choice, and for the rest the edit it takes.
+    /// `Enter` or a click on the selected row: `→` for a switch or choice,
+    /// otherwise start the matching edit.
     fn activate(&mut self, setting: &'static Setting) {
         self.mode = match (setting.kind, setting.value(&self.live)) {
             (Kind::Switch { .. } | Kind::Choice { .. }, _) => return self.step(setting, true),
@@ -557,16 +502,15 @@ impl State {
             (Kind::Key(_), _) => Mode::Key,
             (_, Value::Number(n)) => Mode::Text(Field::with(n.to_string())),
             (_, Value::Text(command)) => Mode::Text(Field::with(command)),
-            // A colour of the terminal's own is a hex once it is typed at:
-            // `#` alone where nothing is chosen, to type after.
+            // The terminal's own colour has no hex: start typing from `#`.
             (_, Value::Colour(ThemeColor::Terminal)) => Mode::Text(Field::with("#".into())),
             (_, Value::Colour(colour)) => Mode::Text(Field::with(colour.name())),
             _ => Mode::Browse,
         };
     }
 
-    /// `r`: back to the default. A command's key goes back by the swap a
-    /// key put on it any other way would make.
+    /// `r`: back to the default. A command's key is reset via the same swap
+    /// as any rebinding.
     fn reset(&mut self, setting: &'static Setting) {
         let default = setting.default_value();
         if setting.value(&self.live) == default {
@@ -644,8 +588,8 @@ impl State {
         }
     }
 
-    /// `Enter` on what has been typed: kept if it is a value the setting can
-    /// take, and otherwise said why, with the typing left to go on with.
+    /// `Enter` while typing: keep a valid value, or show why not and keep
+    /// editing.
     fn submit(&mut self) {
         let (Some(setting), Mode::Text(field)) = (self.current(), &self.mode) else {
             return;
@@ -654,7 +598,7 @@ impl State {
         let value = match setting.kind {
             Kind::Number { lo, hi, .. } => match text.parse::<u64>() {
                 Ok(n) if (lo..=hi).contains(&n) => Ok(Value::Number(n)),
-                // Digits, and too many of them for the range or for a u64.
+                // All digits, but out of range or too big for a u64.
                 _ if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => {
                     Err(format!("{} must be between {lo} and {hi}", setting.path()))
                 }
@@ -674,17 +618,16 @@ impl State {
         }
     }
 
-    /// Put `value` in the settings, if they would still be ones nvmux runs
-    /// on; and if not, say why. Whether it went in.
+    /// Set `value` if the result validates, else show why. Returns whether
+    /// it was set.
     fn put(&mut self, setting: &Setting, value: Value) -> bool {
         let mut next = self.live.clone();
         setting.set(&mut next, &value);
         self.commit(next)
     }
 
-    /// Put the command on row `row` on `byte`. A command already there is
-    /// put on the key this one leaves, and the hint row says so: the two
-    /// trade, and putting the first back where it was trades them back.
+    /// Bind the command on row `row` to `byte`. A command already there takes
+    /// the freed key (said on the hint row), so rebinding back swaps back.
     fn set_key(&mut self, row: usize, byte: u8) {
         let mut next = self.live.clone();
         let Some(old) = next.keys.bind.bindings().nth(row).map(|b| b.key) else {
@@ -726,8 +669,6 @@ impl State {
         }
     }
 
-    /// What `←` and `→` step `[style] color` through: the terminal's own,
-    /// and then its colours.
     fn colour_options(&self) -> Vec<ThemeColor> {
         std::iter::once(ThemeColor::Terminal)
             .chain(self.colours.iter().copied().map(ThemeColor::Mono))
@@ -756,8 +697,7 @@ impl State {
             return Step::Stay;
         }
         if self.mode != Mode::Browse {
-            // A click ends an edit without keeping it, as `Esc` does; the
-            // wheel is not deliberate enough to.
+            // A click cancels an edit like `Esc`; the wheel is too casual to.
             if matches!(gesture, Gesture::Press(_)) {
                 self.mode = Mode::Browse;
                 self.pressed = None;
@@ -772,7 +712,7 @@ impl State {
                 self.select(i);
             }
             Gesture::Press(_) => self.pressed = None,
-            // Off the row it went down on, a press is no click.
+            // Dragged off its row, a press is no longer a click.
             Gesture::Drag(hit) => {
                 if self.pressed.is_some_and(|(i, _)| hit != Some(Hit::Row(i))) {
                     self.pressed = None;
@@ -796,7 +736,6 @@ impl State {
         Step::Stay
     }
 
-    /// A value as its row shows it.
     fn shown(&self, setting: &Setting, value: &Value) -> String {
         match value {
             Value::Switch(on) => if *on { "on" } else { "off" }.to_string(),
@@ -812,8 +751,8 @@ impl State {
             Value::Key(byte) => keys::key_label(*byte),
             Value::Text(text) => text.clone(),
             Value::Colour(ThemeColor::Terminal) => ThemeColor::Terminal.name(),
-            // One of the terminal's own by its name, with the hex the file
-            // gets; any other by its hex.
+            // A terminal colour by name plus the hex the file gets; others
+            // by hex.
             Value::Colour(colour @ ThemeColor::Mono(rgb)) => {
                 match self.colours.iter().position(|c| c == rgb) {
                     Some(i) => format!("{} ({})", COLOUR_NAMES[i], colour.name()),
@@ -824,8 +763,7 @@ impl State {
     }
 }
 
-/// The terminal's colours 1 to 6, as it said they are, or xterm's where it
-/// did not say.
+/// The terminal's colours 1 to 6 as it reported them, else xterm's.
 fn terminal_colours() -> [Rgb; 6] {
     let ansi = crate::palette::get().map_or(crate::palette::XTERM_ANSI, |p| p.ansi);
     std::array::from_fn(|i| ansi[i + 1])
@@ -863,8 +801,8 @@ fn along(n: u64, step: u64, up: bool) -> u64 {
     }
 }
 
-/// Where a query's letters fall in `text`, in order, ignoring case: the
-/// columns to underline, or `None` when they do not all fall.
+/// Case-insensitive subsequence match of `query` in `text`: the matched
+/// columns (to underline), or `None`.
 fn subsequence(query: &str, text: &str) -> Option<Vec<usize>> {
     let mut at = Vec::new();
     let mut chars = text.chars().enumerate();
@@ -881,9 +819,8 @@ fn subsequence(query: &str, text: &str) -> Option<Vec<usize>> {
     Some(at)
 }
 
-/// The settings a find matches: by name, and by the whole path once the
-/// query has a `.` in it — the path's letters would otherwise let a short
-/// query match nearly everything.
+/// Settings matching a find: by name, and by path once the query has a `.`
+/// (otherwise a short query would match nearly every path).
 fn matches(query: &str) -> Vec<&'static Setting> {
     registry::all()
         .iter()
@@ -911,33 +848,26 @@ fn best(query: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// How the settings full screen were left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// Closed: back to what they were brought up from.
     Closed,
-    /// Turned to float (`[style] float`), with a session behind them and room
-    /// on the terminal to float over it: gone, dissolving out, to come up
-    /// again floating over the session as it comes back.
+    /// `[style] float` was turned on with a session behind and room to float:
+    /// dissolved out, to reopen floating over the returning session.
     Float,
 }
 
-/// Show the settings until the user closes them, on a terminal of its own,
-/// handing the session back afterwards — or until they are turned to float
-/// over it ([`Outcome::Float`]). `remote` is whether the sessions are another
-/// machine's, where Neovim's own client takes an `nvim` on this one.
+/// Show the settings full screen until closed or turned to float
+/// ([`Outcome::Float`]). `remote` is whether sessions are on another machine,
+/// where Neovim's own client needs a local `nvim`.
 pub fn run(remote: bool) -> Result<Outcome> {
     // Reached from a session that has just dissolved out, so dissolve in.
     super::owning(|terminal| run_on(terminal, true, remote, true))
 }
 
-/// Show the settings on a terminal the caller already owns — how the picker
-/// answers `,`. `animate` is whether to dissolve in on the way in and out on
-/// the way out; from the picker the screen is already up, so it does not.
-/// `over_session` is whether a session is behind them, for them to float over
-/// once they are turned to: from a session, and from the picker where it came
-/// up over one. Turned to float, they dissolve out whichever way they came,
-/// for the session to come back with them floating over it.
+/// Show the settings on a terminal the caller owns (the picker's `,`).
+/// `animate` dissolves in and out; the picker is already up, so it does not.
+/// `over_session` is whether a session is behind them to float over. Turned
+/// to float, they always dissolve out.
 pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     animate: bool,
@@ -948,18 +878,15 @@ pub(super) fn run_on(
     if animate {
         crate::fade::fade_in(terminal, |f| draw(f, &state))?;
     }
-    // When the prefix's wait runs out, while it is armed: the clock lives
-    // here, so the state stays pure, as `pty::pump` keeps the relay's. And
-    // when the row the bar left was last moved on, for the same reason.
+    // Clocks live here so the state stays pure (as in `pty::pump`): when the
+    // armed prefix's wait runs out, and when the glow was last advanced.
     let mut armed_until: Option<Instant> = None;
     let mut ticked = Instant::now();
-    // `[style] float` as it was before the last key, which a key that turns
-    // it on is told apart by.
+    // `[style] float` before the last key, to detect it being turned on.
     let mut floating = state.live.style.float;
     loop {
         tick(&mut state, &mut ticked);
-        // The area kept for the mouse: a click is resolved against the screen
-        // as it was last drawn, which is the one the user clicked on.
+        // Clicks resolve against the area last drawn, which the user saw.
         let area = terminal
             .draw(|f| {
                 let area = f.area();
@@ -967,7 +894,6 @@ pub(super) fn run_on(
             })?
             .area;
 
-        // A frame's wait while a row fades back from the bar, so it fades.
         let wait = if state.glowing() {
             crate::fade::FRAME
         } else {
@@ -981,8 +907,7 @@ pub(super) fn run_on(
             continue;
         }
         let event = event::read()?;
-        // Up to the moment of the event, so a glow it starts starts from
-        // nothing rather than from however long the wait for it took.
+        // Advance to the event first, so a glow it starts begins at zero.
         tick(&mut state, &mut ticked);
         let step = match event {
             Event::Key(k) if k.kind == KeyEventKind::Press => state.on_key(press(k)),
@@ -998,7 +923,7 @@ pub(super) fn run_on(
         floating = state.live.style.float;
         if turned {
             state.remember();
-            // Whatever they came up from, what comes next is the session.
+            // Whatever opened them, the session comes next.
             crate::fade::fade_out(terminal, |f| draw(f, &state))?;
             return Ok(Outcome::Float);
         }
@@ -1012,25 +937,22 @@ pub(super) fn run_on(
     }
 }
 
-/// Whether the settings full screen go, for the session behind them to come
-/// back with them floating over it: `[style] float` turned on, from `was`
-/// before to on in `live`, with a session behind them to float over, and room
-/// on `screen` for them to ([`panel_area`]). Where there is no room they stay,
-/// as they would have come up full screen there anyway.
+/// Whether full-screen settings should hand over to floating: `[style] float`
+/// just turned on, a session behind, and room on `screen` ([`panel_area`]).
+/// Without room they stay, as they would open full screen anyway.
 fn turned_to_float(was: bool, live: &Settings, over_session: bool, screen: Rect) -> bool {
     !was && live.style.float && over_session && panel_area(screen).is_some()
 }
 
-/// Move whatever is passing on the screen on to now.
 fn tick(state: &mut State, ticked: &mut Instant) {
     let now = Instant::now();
     state.tick(now.saturating_duration_since(*ticked));
     *ticked = now;
 }
 
-/// What follows every key or gesture, wherever the screen is up: the
-/// prefix's wait clocked from the key that armed it, what was changed run on
-/// from now — the next frame already shows a new theme — and `w`'s save made.
+/// After every key or gesture, full screen or floating: start the armed
+/// prefix's timeout, apply changes (the next frame shows a new theme), and
+/// do `w`'s save.
 fn follow(
     state: &mut State,
     step: Step,
@@ -1058,28 +980,23 @@ fn follow(
     }
 }
 
-/// The widest and the tallest the settings are when they float over a
-/// session: room for every row of the longest section, and for the longest
-/// help. Not for the hint row, which is the screen's last row, under the
-/// panel.
+/// Largest floating panel: fits the longest section's rows and the longest
+/// help. The hint row is not in it but on the screen's last row.
 const PANEL_WIDTH: u16 = 72;
 const PANEL_HEIGHT: u16 = 22;
 
-/// How much of the session is left showing round the settings, at the least:
-/// columns either side together, and rows above and below.
+/// Minimum session left visible around the panel, both sides together: in
+/// columns, and in rows.
 const PANEL_SIDES: u16 = 16;
 const PANEL_ENDS: u16 = 6;
 
-/// The smallest screen the settings float on: under this, there is no room
-/// for the rows and a session round them, and they take the screen instead.
+/// Smallest screen the settings float on; below it they go full screen.
 const FLOAT_COLS: u16 = 72;
 const FLOAT_ROWS: u16 = 20;
 
-/// Where the settings float over a session on `screen`: in the middle of the
-/// room above the hint row ([`float::split`]), [`PANEL_WIDTH`] by
-/// [`PANEL_HEIGHT`] where there is room for that and the session round it,
-/// and smaller where there is not; nowhere on a screen under [`FLOAT_COLS`]
-/// by [`FLOAT_ROWS`], which has them full screen.
+/// The floating panel on `screen`, centred above the hint row
+/// ([`float::split`]): up to [`PANEL_WIDTH`] by [`PANEL_HEIGHT`], keeping the
+/// session margins; `None` under [`FLOAT_COLS`] by [`FLOAT_ROWS`].
 pub fn panel_area(screen: Rect) -> Option<Rect> {
     if screen.width < FLOAT_COLS || screen.height < FLOAT_ROWS {
         return None;
@@ -1095,29 +1012,24 @@ pub fn panel_area(screen: Rect) -> Option<Rect> {
     ))
 }
 
-/// The settings floating over a session (see `crate::pty::panel`): the
-/// screen's state, given its keys and the mouse by the relay — which reads
-/// the terminal, the screen being drawn over a session that has it — and
-/// drawn into whatever area the relay gives it. The rules are the screen's
-/// own, every one: what changes is where it is drawn.
+/// The settings floating over a session (see `crate::pty::panel`). The relay
+/// owns the terminal and forwards keys and mouse; the panel picks its own area
+/// ([`panel_area`]). The rules are the full screen's.
 #[derive(Debug)]
 pub struct Panel {
     state: State,
     remote: bool,
     /// When the prefix's wait runs out, while it is armed (see `run_on`).
     armed_until: Option<Instant>,
-    /// Where the screen's parts were last drawn, which a click is resolved
-    /// against: the one the user clicked on.
+    /// The area last drawn, which clicks resolve against.
     drawn: Rect,
-    /// When the row the bar left was last moved on (see [`State::tick`]).
+    /// When the glow was last advanced (see [`State::tick`]).
     ticked: Instant,
 }
 
 impl Panel {
-    /// The settings as nvmux has them now, on the section and row they were
-    /// last left on. Opened by the relay rather than by `main`, they check a
-    /// change of `client.ui` against where the sessions are as `main` said
-    /// at the start ([`config::remote`]).
+    /// Opened by the relay, not `main`, so `client.ui` changes are checked
+    /// against [`config::remote`], recorded at startup.
     pub fn open() -> Self {
         Self {
             state: State::open(),
@@ -1128,7 +1040,6 @@ impl Panel {
         }
     }
 
-    /// The row the bar left moved on to `now`.
     fn move_on(&mut self, now: Instant) {
         self.state.tick(now.saturating_duration_since(self.ticked));
         self.ticked = self.ticked.max(now);
@@ -1151,25 +1062,22 @@ impl Panel {
 }
 
 impl Floating for Panel {
-    /// See [`panel_area`].
     fn area(&self, screen: Rect) -> Option<Rect> {
         panel_area(screen)
     }
 
-    /// A key, as the terminal reported it. Releases are no keys. `Esc`, `q`
-    /// and `<prefix> ,` close.
+    /// Releases are ignored. `Esc`, `q` and `<prefix> ,` close.
     fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did {
         if key.kind == KeyEventKind::Release {
             return Did::Stay;
         }
-        // Up to the key, so a glow it starts starts from nothing.
+        // Advance first, so a glow the key starts begins at zero.
         self.move_on(now);
         let step = self.state.on_key(press(key));
         self.after(step, now)
     }
 
-    /// A mouse report, by the screen's rules; where it is was the relay's to
-    /// say, and a press on the session is the relay's too.
+    /// By the screen's rules; a left press on the session is the relay's.
     fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Did {
         let at = hit(&self.state, self.drawn, mouse.column, mouse.row);
         let Some(g) = gesture(mouse, at) else {
@@ -1180,14 +1088,12 @@ impl Floating for Panel {
         self.after(step, now)
     }
 
-    /// When the prefix's wait runs out, if it is armed.
     fn wake_at(&self) -> Option<Instant> {
         self.armed_until
     }
 
-    /// The panel moved on to `now`: the row the bar left a little further
-    /// back from it, and the prefix's wait run out with no key after it, if
-    /// it has by then. Whether that changed anything.
+    /// Advance the glow and expire the armed prefix's wait; returns whether
+    /// anything changed.
     fn tick(&mut self, now: Instant) -> bool {
         let glowed = self.state.glowing();
         self.move_on(now);
@@ -1199,15 +1105,10 @@ impl Floating for Panel {
         glowed
     }
 
-    /// Whether anything on the panel is moving — a row fading back from the
-    /// bar — so frames come at a frame's pace until it is done.
     fn moving(&self) -> bool {
         self.state.glowing()
     }
 
-    /// The settings drawn into `area`, a buffer of that area, in the theme's
-    /// colour where it has one, and the row the bar left fading back from it:
-    /// as on a terminal of the panel's inside, all but the hint row.
     fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         self.drawn = inside(area);
@@ -1217,8 +1118,6 @@ impl Floating for Panel {
         buf
     }
 
-    /// The settings' hint row drawn into `row`, as full screen, in the
-    /// theme's colour where it has one.
     fn draw_hints(&self, row: Rect) -> Buffer {
         let mut buf = Buffer::empty(row);
         hints_on(&mut buf, row, &self.state);
@@ -1226,15 +1125,14 @@ impl Floating for Panel {
         buf
     }
 
-    /// Keep where the settings are for the next time they open.
+    /// Remember the position for the next open.
     fn close(&self) {
         self.state.remember();
     }
 }
 
-/// Whether nvmux can run on `live`, changed from `running`, beyond what the
-/// file's rules say: Neovim's own client, for sessions on another machine,
-/// is an `nvim` on this one, as `main` checks at the start.
+/// Checks beyond validation: switching to Neovim's own client for remote
+/// sessions needs a local `nvim`, as `main` checks at startup.
 fn runnable(live: &Settings, running: &Settings, remote: bool) -> std::result::Result<(), String> {
     let to_nvim = live.client.ui == config::Ui::Nvim && running.client.ui != config::Ui::Nvim;
     if !(remote && to_nvim) {
@@ -1249,15 +1147,13 @@ fn runnable(live: &Settings, running: &Settings, remote: bool) -> std::result::R
     })
 }
 
-/// Where the screen's parts go on `area`: one function for the drawing and
-/// for the mouse, so a click lands on what the eye sees.
+/// Where the screen's parts go; shared by drawing and the mouse so clicks
+/// land on what is drawn.
 #[derive(Debug, Clone, Copy)]
 struct Layout {
     /// The tab row, or where the find's query goes in its place.
     tabs: Option<u16>,
-    /// The rows of settings.
     body: Rect,
-    /// The selected setting's help.
     help: Option<u16>,
     hint: Rect,
     /// Where the rows' block starts, and how wide it is.
@@ -1265,7 +1161,6 @@ struct Layout {
     width: u16,
 }
 
-/// How wide a row's name column is: the longest name's.
 fn name_width() -> usize {
     registry::all()
         .iter()
@@ -1280,8 +1175,8 @@ fn layout(area: Rect) -> Option<Layout> {
     }
     let (_, hint) = draw::split_hint_row(area);
     let h = area.height;
-    // A row of space either side of the tabs, and above the help, where there
-    // is room for it; one row at a time as there is not.
+    // The blank rows around the tabs and above the help need 8 rows, the help
+    // 4 and the tabs 2.
     let (tabs, body, help) = if h >= 8 {
         (Some(area.y + 1), (area.y + 3, h - 6), Some(area.y + h - 2))
     } else if h >= 4 {
@@ -1303,19 +1198,17 @@ fn layout(area: Rect) -> Option<Layout> {
     })
 }
 
-/// One line of the rows' block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Line {
-    /// A row of settings, by its place among the rows on screen.
+    /// A setting, by its index among the rows on screen.
     Row(usize),
     /// While finding, a tab's name over its matches.
     Head(Tab),
     Blank,
 }
 
-/// The block's lines: the tab's rows, with a blank line where the commands'
-/// keys begin after the prefix's settings; or while finding, the matches under
-/// their tabs' names.
+/// The tab's rows, with a blank line before the command keys; or while
+/// finding, the matches grouped under their tabs' names.
 fn lines(state: &State) -> Vec<Line> {
     let rows = state.rows();
     let mut lines = Vec::new();
@@ -1329,8 +1222,8 @@ fn lines(state: &State) -> Vec<Line> {
                 lines.push(Line::Head(setting.tab));
             }
         } else if before.is_some_and(|b| is_command(b) != is_command(setting)) {
-            // Not at every table: each effect is a table of its own, and the
-            // effects read as one list.
+            // Not between every table: each effect is its own table, but they
+            // read as one list.
             lines.push(Line::Blank);
         }
         lines.push(Line::Row(i));
@@ -1343,9 +1236,8 @@ fn is_command(setting: &Setting) -> bool {
     matches!(setting.kind, Kind::Key(_))
 }
 
-/// Which line goes on the body's first row, and how many rows down it goes:
-/// centred when the lines fit, and otherwise scrolled to keep the selection
-/// in the middle.
+/// The first line shown and its offset from the body's top: centred when the
+/// lines fit, else scrolled to keep the selection in the middle.
 fn placed(lines: &[Line], selected: usize, height: usize) -> (usize, usize) {
     if lines.len() <= height {
         return (0, (height - lines.len()) / 2);
@@ -1357,7 +1249,6 @@ fn placed(lines: &[Line], selected: usize, height: usize) -> (usize, usize) {
     (at.saturating_sub(height / 2).min(lines.len() - height), 0)
 }
 
-/// Where each tab's name starts on the tab row.
 fn tab_columns(area: Rect) -> Vec<(Tab, u16)> {
     let names: Vec<&str> = Tab::ALL.iter().map(|t| t.name()).collect();
     let width = names.join(TAB_GAP).width() as u16;
@@ -1372,9 +1263,8 @@ fn tab_columns(area: Rect) -> Vec<(Tab, u16)> {
         .collect()
 }
 
-/// What is under terminal cell (`column`, `row`), with `area` the frame as
-/// last drawn. A row is the whole width of the terminal, as the picker's
-/// are; a tab is its name and a column either side.
+/// What is at (`column`, `row`) in the last drawn `area`. A row spans the
+/// whole width, as in the picker; a tab is its name plus a column each side.
 fn hit(state: &State, area: Rect, column: u16, row: u16) -> Option<Hit> {
     let l = layout(area)?;
     if column < area.x || column >= area.x + area.width {
@@ -1398,9 +1288,8 @@ fn hit(state: &State, area: Rect, column: u16, row: u16) -> Option<Hit> {
     }
 }
 
-/// Where `setting`'s row is drawn on `area`, as wide as the bar is on it, or
-/// `None` when it is not on screen: what the afterglow paints over, measured
-/// by the same layout the rows are drawn with.
+/// Where `setting`'s row is drawn, as wide as the bar, or `None` if off
+/// screen: what the afterglow paints over.
 fn row_rect(state: &State, area: Rect, setting: &Setting) -> Option<Rect> {
     let l = layout(area)?;
     let i = state
@@ -1420,23 +1309,21 @@ fn draw(frame: &mut Frame, state: &State) {
     draw_on(frame.buffer_mut(), area, state);
 }
 
-/// A frame of the screen as it is up: drawn on `area`, the theme's colour on
-/// it, and the row the bar last left fading back from it over all that, as
-/// the picker's passing effects go over its frame (see [`super::effects`]).
+/// Draw a frame: the screen, then the theme, then the glow on top, as the
+/// picker's effects go over its frame (see [`super::effects`]).
 fn paint_on(buf: &mut Buffer, area: Rect, state: &State) {
     draw_on(buf, area, state);
     crate::theme::paint(buf);
     afterglow(buf, area, state, effects::colours().as_ref());
 }
 
-/// The row the bar last left, fading back from it: in colour where the
-/// terminal said what its colours are, and otherwise held reversed and dim
-/// for a moment, as the picker's are.
+/// The glow on the row the bar last left: in colour if the terminal reported
+/// its colours, else briefly reversed and dim, as in the picker.
 fn afterglow(buf: &mut Buffer, area: Rect, state: &State, colours: Option<&effects::Colours>) {
     let Some(glow) = state.glow else {
         return;
     };
-    // Back on the bar: it glows no longer.
+    // Back under the bar: no glow.
     if state
         .cursor()
         .is_some_and(|s| std::ptr::eq(s, glow.setting))
@@ -1449,9 +1336,8 @@ fn afterglow(buf: &mut Buffer, area: Rect, state: &State, colours: Option<&effec
     }
 }
 
-/// The screen, drawn on `area` of `buf`: the whole of the terminal, or the
-/// inside of the panel floating over a session, which takes all of it but the
-/// hint row (see [`float::lay`]).
+/// Draw on `area`: the whole terminal, or the inside of the floating panel,
+/// which keeps all but the hint row ([`float::lay`]).
 fn draw_on(buf: &mut Buffer, area: Rect, state: &State) {
     let Some(l) = layout(area) else {
         return;
@@ -1482,8 +1368,6 @@ fn draw_on(buf: &mut Buffer, area: Rect, state: &State) {
     hints_on(buf, l.hint, state);
 }
 
-/// The hint row drawn on `row` of `buf`: the screen's last row, full screen or
-/// under the panel floating over a session.
 fn hints_on(buf: &mut Buffer, row: Rect, state: &State) {
     let (text, dim) = hints(
         state,
@@ -1493,9 +1377,8 @@ fn hints_on(buf: &mut Buffer, row: Rect, state: &State) {
     hint_row(buf, row, &text, dim);
 }
 
-/// The hint row as every screen draws it (see [`draw::draw_hint_row`]):
-/// centred, cut rather than wrapped, and dim when it is hints rather than
-/// something being said.
+/// The hint row as every screen draws it (see [`draw::draw_hint_row`]); dim
+/// for hints, plain for messages.
 fn hint_row(buf: &mut Buffer, row: Rect, text: &str, dim: bool) {
     let text = draw::truncate(text, usize::from(row.width));
     let style = if dim { DIM } else { Style::new() };
@@ -1566,9 +1449,8 @@ fn draw_rows(buf: &mut Buffer, l: &Layout, state: &State) {
     }
 }
 
-/// One setting's row: the marker or its indent, the name, the value, and why
-/// it is dim if it is; a `•` left of it while it is unsaved. Selected, the
-/// whole block's width is the bar.
+/// One setting's row: marker or indent, name, value, and why it is dim; a
+/// `•` to its left while unsaved. Selected, the bar spans the block.
 fn draw_row(
     buf: &mut Buffer,
     l: &Layout,
@@ -1661,9 +1543,8 @@ fn draw_row(
     }
 }
 
-/// What is being typed, cut to `room` columns around the cursor, and the
-/// column the cursor is on — after the last character when it is at the end,
-/// where it stands on a blank.
+/// The typed text windowed to `room` columns around the cursor, and the
+/// cursor's column (on a trailing blank when at the end).
 fn windowed(field: &Field, room: usize) -> (String, usize) {
     let cells: Vec<char> = field.input().chars().chain([' ']).collect();
     let room = room.max(1);
@@ -1687,9 +1568,8 @@ fn windowed(field: &Field, room: usize) -> (String, usize) {
     (shown.into_iter().collect(), cursor - start)
 }
 
-/// What the hint row says, and whether it is dim: what the last key did, or
-/// the keys of the moment — the edit's, the find's, or the screen's, as
-/// many of those as fit, the least needed dropped whole first.
+/// The hint row's text and whether it is dim: the last key's message, or the
+/// current keys, as many as fit (see [`fit`]).
 fn hints(state: &State, current: Option<&Setting>, width: usize) -> (String, bool) {
     if let Some(message) = &state.message {
         return (message.clone(), false);
@@ -1745,9 +1625,9 @@ fn hints(state: &State, current: Option<&Setting>, width: usize) -> (String, boo
     (text, true)
 }
 
-/// The entries that fit `width`, dropping the one least needed — the
-/// highest number — whole, one at a time, as the hint bar drops its own. The
-/// picker floating over a session fits its own the same way.
+/// Join `entries` within `width`, dropping whole ones (as the hint bar
+/// does), highest `rank` (least needed) first. Also used for the picker's
+/// hints.
 pub(super) fn fit(entries: &[(Option<&str>, u8)], width: usize) -> String {
     let mut kept: Vec<(&str, u8)> = entries
         .iter()
@@ -1771,7 +1651,6 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-    /// The xterm colours, as a terminal that never answered stands in with.
     fn colours() -> [Rgb; 6] {
         std::array::from_fn(|i| crate::palette::XTERM_ANSI[i + 1])
     }
@@ -1820,8 +1699,8 @@ mod tests {
         test_support::render(w, h, |f| draw(f, state))
     }
 
-    /// The column `needle` starts at in `line`, the last time it is in it:
-    /// columns, not bytes, since a `•` or a `▸` before it is three bytes.
+    /// The column of the last `needle` in `line`: columns, not bytes, since
+    /// `•` and `▸` are three bytes.
     fn column(line: &str, needle: &str) -> u16 {
         let at = line
             .rfind(needle)
@@ -1829,7 +1708,6 @@ mod tests {
         line[..at].width() as u16
     }
 
-    /// The line the row of `name` is on.
     fn line_of<'a>(lines: &'a [String], name: &str) -> &'a String {
         lines
             .iter()
@@ -1868,7 +1746,7 @@ mod tests {
         assert_eq!(ui.value(&s.live), Value::Choice("nvim"));
     }
 
-    /// Along the grid, so a typed value steps onto it, and held to the range.
+    /// A typed off-grid value steps onto the grid.
     #[test]
     fn a_number_steps_along_its_grid_within_its_range() {
         let mut s = state();
@@ -1925,7 +1803,6 @@ mod tests {
         assert_eq!(width.value(&s.live), Value::Number(80), "esc keeps nothing");
     }
 
-    /// The terminal's own colours, by name, and a typed one by its hex.
     #[test]
     fn a_colour_steps_through_the_terminals_and_is_typed_as_hex() {
         let mut s = state();
@@ -1963,8 +1840,8 @@ mod tests {
         );
     }
 
-    /// As on the first-run screen: the chord pressed shows, `Enter` keeps it,
-    /// and `Esc` keeps nothing.
+    /// As on the first-run screen: the chord shows, `Enter` keeps it, `Esc`
+    /// discards it.
     #[test]
     fn the_prefix_is_changed_by_pressing_the_chord_then_enter() {
         let mut s = state();
@@ -1996,8 +1873,7 @@ mod tests {
         );
     }
 
-    /// A key already taken trades places, and the hint row says so; putting
-    /// the first command back trades them back.
+    /// The hint row says so, and rebinding back swaps back.
     #[test]
     fn a_command_key_already_in_use_swaps() {
         let mut s = state();
@@ -2029,8 +1905,8 @@ mod tests {
         assert_eq!(help.value(&s.live), Value::Key(0x0d), "esc keeps nothing");
     }
 
-    /// A command that could never start a session is refused in the words a
-    /// file would be, and left to fix.
+    /// A command that could never start a session is refused with the file's
+    /// error, and left to fix.
     #[test]
     fn the_session_command_is_typed_and_must_name_the_socket() {
         let mut s = state();
@@ -2072,7 +1948,7 @@ mod tests {
         key(&mut s, KeyCode::Char('r'));
         assert_eq!(s.message, None, "nothing to reset, nothing said");
 
-        // A command's key goes back by a swap, as any key would.
+        // A command's key is reset by a swap, like any rebinding.
         let new = to(&mut s, "new");
         key(&mut s, KeyCode::Enter);
         key(&mut s, KeyCode::Char('d'));
@@ -2109,7 +1985,7 @@ mod tests {
         assert_eq!(s.selected, last);
     }
 
-    /// Esc, `q` and Ctrl-c close the screen rather than quitting anything.
+    /// Close, not quit.
     #[test]
     fn esc_q_and_ctrl_c_close() {
         for code in [KeyCode::Esc, KeyCode::Char('q')] {
@@ -2118,8 +1994,6 @@ mod tests {
         assert_eq!(ctrl(&mut state(), 'c'), Step::Close);
     }
 
-    /// The prefix and the key after it are swallowed, as on the help screen,
-    /// so `<prefix> d` changes nothing — but `<prefix> ,` closes.
     #[test]
     fn a_prefix_chord_is_swallowed_but_for_the_one_that_closes() {
         let mut s = on(Tab::Effects);
@@ -2135,7 +2009,7 @@ mod tests {
         ctrl(&mut s, ' ');
         assert_eq!(key(&mut s, KeyCode::Char(',')), Step::Close);
 
-        // On the prefix as it is now, and the key `settings` is on now.
+        // Uses the current prefix and `settings` key.
         let mut s = state();
         s.live.keys.prefix = 0x01;
         s.live.keys.bind.bind("settings", b'S');
@@ -2147,8 +2021,8 @@ mod tests {
         assert_eq!(key(&mut s, KeyCode::Char('S')), Step::Close);
     }
 
-    /// Changing the prefix, the chord is what is being chosen, not the
-    /// prefix arriving.
+    /// While the prefix is being changed, its chord is a choice, not the
+    /// prefix.
     #[test]
     fn the_prefix_is_a_chord_to_choose_while_the_prefix_is_changed() {
         let mut s = state();
@@ -2181,8 +2055,6 @@ mod tests {
         assert_eq!(s.current().map(|r| r.name), Some("windows"));
     }
 
-    /// A query matches names alone, so a few letters do not match every
-    /// path; with a `.` in it, the path too.
     #[test]
     fn find_goes_by_name_and_by_path_once_there_is_a_dot() {
         assert!(!matches("sm").iter().any(|s| s.name == "timeout_ms"));
@@ -2230,8 +2102,6 @@ mod tests {
         assert!(!hints(&s, s.current(), 78).0.contains("w save"));
     }
 
-    /// A setting the file changed too is not overwritten until a second `w`,
-    /// with nothing changed in between.
     #[test]
     fn a_second_w_overwrites_what_the_file_changed_too() {
         let mut s = state();
@@ -2252,8 +2122,7 @@ mod tests {
         assert!(!s.overwrite(), "not once anything has changed since");
     }
 
-    /// Only a switch to Neovim's own client, for another machine's sessions,
-    /// has anything more to it than the file's rules: an `nvim` here.
+    /// Switching to Neovim's client for remote sessions needs a local `nvim`.
     #[test]
     fn only_neovims_client_for_another_machine_needs_anything_more() {
         let running = Settings::default();
@@ -2272,9 +2141,8 @@ mod tests {
         state.on_mouse(g);
     }
 
-    /// Pointing selects; a click on the selected row is `Enter`; a click on
-    /// another row only selects it, for a terminal that does not report
-    /// motion.
+    /// A click on another row only selects it (for terminals that do not
+    /// report motion).
     #[test]
     fn a_click_on_the_selected_row_is_enter() {
         let mut s = on(Tab::Effects);
@@ -2319,7 +2187,6 @@ mod tests {
         assert_eq!((s.tab, s.selected), (Tab::Style, 0));
     }
 
-    /// A click ends an edit, keeping nothing; the wheel does not.
     #[test]
     fn a_click_ends_an_edit_and_the_wheel_does_not() {
         let mut s = state();
@@ -2335,8 +2202,7 @@ mod tests {
 
     // --- the screen -----------------------------------------------------------
 
-    /// The decided layout on 80×24: the tabs on row 1, the rows centred
-    /// between, the help on row 22, the hints on the last.
+    /// On 80×24: tabs on row 1, rows centred, help on row 22, hints last.
     #[test]
     fn the_screen_is_tabs_rows_help_and_hints() {
         let s = on(Tab::Client);
@@ -2359,8 +2225,7 @@ mod tests {
         test_support::assert_no_borders(&lines);
     }
 
-    /// Dim means one thing — no effect as things stand — and the row says
-    /// why; a value is plain whether it is the default or not.
+    /// A value is plain whether it is the default or not.
     #[test]
     fn a_row_with_no_effect_is_dim_and_says_why() {
         let s = on(Tab::Client);
@@ -2383,8 +2248,7 @@ mod tests {
             .intersects(Modifier::DIM | Modifier::BOLD));
     }
 
-    /// Changed and unsaved: a `•` beside the row, the value in bold, and a
-    /// `•` after its tab's name.
+    /// A `•` beside the row and after its tab's name, and the value in bold.
     #[test]
     fn an_unsaved_change_is_marked_on_its_row_and_its_tab() {
         let mut s = on(Tab::Effects);
@@ -2402,7 +2266,6 @@ mod tests {
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
     }
 
-    /// The keys tab holds two tables, a blank line between.
     #[test]
     fn a_blank_line_parts_the_prefix_from_the_commands() {
         let s = state();
@@ -2432,8 +2295,7 @@ mod tests {
         assert_eq!(lines[23].trim(), "↑↓ move  ⏎ go to it  esc clear");
     }
 
-    /// A row is the whole width of the terminal; a tab is its name, and a
-    /// column either side.
+    /// A row spans the terminal; a tab is its name plus a column each side.
     #[test]
     fn the_mouse_finds_rows_and_tabs_where_they_are_drawn() {
         let s = on(Tab::Client);
@@ -2452,7 +2314,6 @@ mod tests {
         assert_eq!(hit(&s, area, 0, 1), None);
     }
 
-    /// On a short terminal the effects tab scrolls with the selection.
     #[test]
     fn a_short_terminal_scrolls_the_rows_with_the_selection() {
         let mut s = on(Tab::Effects);
@@ -2498,8 +2359,7 @@ mod tests {
         }
     }
 
-    /// No SGR colour, so the screen is correct under `NO_COLOR` by
-    /// construction; the theme is a pass over it, as over every screen.
+    /// So `NO_COLOR` holds by construction; the theme is a separate pass.
     #[test]
     fn nothing_sets_a_colour() {
         let mut s = on(Tab::Effects);
@@ -2508,10 +2368,8 @@ mod tests {
         test_support::assert_no_colour(80, 24, |f| draw(f, &s));
     }
 
-    /// The settings float in the middle of the room above the hint row, at
-    /// most 72 by 22 and leaving at least eight columns either side and three
-    /// rows above and below; on a screen under 72 by 20 they do not float at
-    /// all.
+    /// At most 72×22, centred above the hint row, leaving at least 8 columns
+    /// each side and 3 rows above and below; no float under 72×20.
     #[test]
     fn the_panel_floats_in_the_middle_with_the_session_round_it() {
         let screen = |w, h| Rect::new(0, 0, w, h);
@@ -2523,10 +2381,7 @@ mod tests {
         assert_eq!(panel_area(screen(120, 19)), None, "too short");
     }
 
-    /// `[style] float` turned on takes the settings full screen away for the
-    /// session to come back with them floating over it — only as it goes from
-    /// off to on, only with a session behind them, and only where there is
-    /// room for them to float; anywhere else they stay where they are.
+    /// Only on an off-to-on change, with a session behind, and with room.
     #[test]
     fn turned_to_float_they_go_to_float_over_the_session() {
         let screen = |w, h| Rect::new(0, 0, w, h);
@@ -2556,9 +2411,8 @@ mod tests {
         );
     }
 
-    /// Moving the bar leaves the row it was on fading back from it, for the
-    /// picker's afterglow: only the row it last left, each from the start,
-    /// and nothing once the time is up.
+    /// Only the last row left glows, each from the start, until
+    /// [`AFTERGLOW`] is up.
     #[test]
     fn the_row_the_bar_leaves_fades_back_from_it() {
         let mut s = on(Tab::Effects);
@@ -2578,8 +2432,7 @@ mod tests {
         assert!(!s.glowing(), "done");
     }
 
-    /// No row glows with `[effects.cursor]` off, or every effect; nor when
-    /// the row left is no longer on screen; nor when the bar did not move.
+    /// Also none with every effect off, or when the bar did not move.
     #[test]
     fn no_row_glows_with_the_effect_off_or_the_row_gone() {
         let mut s = on(Tab::Effects);
@@ -2598,10 +2451,8 @@ mod tests {
         assert!(!s.glowing(), "already on the first row");
     }
 
-    /// The row left is drawn as the bar was at first — the ink its
-    /// background, the terminal's background its text — and comes back to
-    /// the plain row as the glow runs out. Without colours it is held
-    /// reversed and dim for a moment, and then let go.
+    /// It starts as the bar was (ink background, background-coloured text)
+    /// and fades to plain. Without colours it is briefly reversed and dim.
     #[test]
     fn the_row_left_is_painted_back_from_the_bar() {
         use ratatui::style::Color;
@@ -2653,8 +2504,7 @@ mod tests {
         assert!(!buf[(rect.x, rect.y)].modifier.contains(held), "let go");
     }
 
-    /// The afterglow goes where the row is drawn, as wide as the bar is,
-    /// whether the rows fit or scroll.
+    /// The glow is as wide as the bar, whether the rows fit or scroll.
     #[test]
     fn a_row_glows_where_it_is_drawn() {
         for (w, h) in [(80, 24), (60, 12)] {
@@ -2684,7 +2534,6 @@ mod tests {
         }
     }
 
-    /// The text of a buffer's rows, as the screen tests read a frame.
     fn rows_of(buf: &Buffer) -> Vec<String> {
         let area = buf.area;
         (area.y..area.y + area.height)
@@ -2698,11 +2547,8 @@ mod tests {
             .collect()
     }
 
-    /// Drawn into its area, the panel is the screen with a column clear
-    /// either side and its last row — the hint row's, full screen — clear:
-    /// the sections on its second row, the selected setting's help on the
-    /// row above the last. The hint row is the full screen's, cell for cell,
-    /// on the screen's last row.
+    /// A clear column each side and a clear last row; tabs on the second row,
+    /// the help on the row above the last.
     #[test]
     fn the_panel_is_the_screen_inside_a_margin_and_its_hints_the_screens() {
         let mut panel = Panel::open();
@@ -2745,8 +2591,7 @@ mod tests {
         );
     }
 
-    /// The panel's keys are the screen's: Tab moves on a section, a release
-    /// is no key, and Esc closes.
+    /// Tab moves a section, a release is ignored, and Esc closes.
     #[test]
     fn the_panel_takes_the_screens_keys() {
         let now = Instant::now();
@@ -2764,8 +2609,6 @@ mod tests {
         assert_eq!(panel.on_key(esc, now), Did::Close);
     }
 
-    /// A click lands on what the panel drew there, and the prefix's wait runs
-    /// out on its own clock.
     #[test]
     fn the_panel_answers_the_mouse_where_it_drew_and_its_prefix_times_out() {
         let mut panel = Panel::open();
@@ -2787,7 +2630,7 @@ mod tests {
         };
         assert_eq!(panel.on_mouse(click, now), Did::Stay);
         assert_eq!(panel.state.current().map(|s| s.name), Some("smear"));
-        // The row the click took the bar off fades back from it, and is done.
+        // The row the click moved the bar off glows, then finishes.
         assert!(panel.moving());
         assert!(panel.tick(now + AFTERGLOW), "the last of the glow");
         assert!(!panel.moving());

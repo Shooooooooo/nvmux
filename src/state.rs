@@ -1,8 +1,5 @@
-//! What nvmux remembers between runs.
-//!
-//! One thing so far: the command each host's sessions were last launched with,
-//! so the create prompt can offer it again rather than making the user retype a
-//! path to a nightly build every time.
+//! State kept between runs: the last launch command per host, offered again by
+//! the create prompt.
 //!
 //! ```toml
 //! # ~/.local/state/nvmux/state.toml — written by nvmux; safe to delete.
@@ -11,20 +8,11 @@
 //! "ssh:myhost" = "/opt/nvim-nightly/bin/nvim --headless --listen {sock}"
 //! ```
 //!
-//! # The mirror image of [`crate::config`]
-//!
-//! A config file is written by a person, so it is strict and loud: an unknown
-//! key is a startup error and a bad value stops nvmux before it draws anything.
-//! This file is written by nvmux, so it is the opposite on every count —
-//! **best-effort and silent**. Absent, unreadable, malformed, or holding a
-//! command that no longer parses: each of those is a debug log line and a
-//! fallback to the configured default, never an error. It is a convenience, and
-//! nothing about running sessions depends on it.
-//!
-//! Two consequences worth stating plainly. There is no `deny_unknown_fields`, so
-//! a file written by a newer nvmux still loads here; and a rewrite by this
-//! version keeps only the keys this version knows, so the newer one's extras are
-//! dropped. Losing a remembered hint is the whole of the damage.
+//! Unlike [`crate::config`], this file is best-effort and silent: any problem
+//! (absent, unreadable, malformed, unparsable command) falls back to the
+//! default, with a debug log unless the file is absent. No
+//! `deny_unknown_fields`, so a newer version's file loads; a rewrite drops keys
+//! this version does not know.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -35,18 +23,14 @@ use serde::{Deserialize, Serialize};
 use crate::config::nonempty;
 use crate::transport::Location;
 
-/// The whole file. Absent tables and keys are simply nothing remembered.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 struct State {
-    /// Launch command by host key — see [`key`].
+    /// Launch command by host [`key`].
     commands: BTreeMap<String, String>,
 }
 
-/// How a location is spelled in the file.
-///
-/// The `ssh:` prefix is not decoration: without it a host actually named `local`
-/// would share an entry with this machine.
+/// The `ssh:` prefix keeps a host named `local` apart from this machine.
 fn key(location: &Location) -> String {
     match location {
         Location::Local => "local".to_string(),
@@ -54,14 +38,8 @@ fn key(location: &Location) -> String {
     }
 }
 
-/// Resolve the state path from the relevant environment, purely.
-///
-/// Precedence mirrors [`crate::config`]: `$NVMUX_STATE` (an exact path) >
-/// `$XDG_STATE_HOME/nvmux/` > `$HOME/.local/state/nvmux/`, and an empty
-/// variable counts as unset, by the config's own rule
-/// ([`crate::config::nonempty`]). Unlike the config there is no
-/// explicit/default distinction, because a missing file is never an error here
-/// whichever named it.
+/// `$NVMUX_STATE` (exact path) > `$XDG_STATE_HOME/nvmux/` >
+/// `$HOME/.local/state/nvmux/`, as in [`crate::config`]; empty counts as unset.
 fn resolve_state_path(
     nvmux_state: Option<&OsStr>,
     xdg_state_home: Option<&OsStr>,
@@ -89,7 +67,6 @@ fn path() -> Option<PathBuf> {
     resolve_state_path(nvmux_state.as_deref(), xdg.as_deref(), home.as_deref())
 }
 
-/// Read the file, or nothing at all. Never an error: see the module docs.
 fn load(path: &Path) -> State {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -106,11 +83,8 @@ fn load(path: &Path) -> State {
     })
 }
 
-/// The command last used on this host, if it is still one nvmux could run.
-///
-/// Validated on the way out rather than trusted: the file is editable, and a
-/// remembered command that no longer parses would otherwise be offered as a
-/// default and then refused the moment the user pressed enter.
+/// The command last used on this host, if it still parses (the file is
+/// editable, and a bad one would be offered and then refused).
 pub fn remembered(location: &Location) -> Option<String> {
     let path = path()?;
     let line = load(&path).commands.remove(&key(location))?;
@@ -123,11 +97,8 @@ pub fn remembered(location: &Location) -> Option<String> {
     }
 }
 
-/// Remember the command used on this host, keeping every other host's.
-///
-/// Failure is logged and dropped: nothing the user did has gone wrong, and the
-/// session they just created is running. A value that is already what is stored
-/// writes nothing at all, so the common case touches no disk.
+/// Remember the command used on this host. Failures are only logged; an
+/// unchanged value is not rewritten.
 pub fn remember(location: &Location, line: &str) {
     let Some(path) = path() else {
         return;
@@ -148,9 +119,6 @@ pub fn remember(location: &Location, line: &str) {
     }
 }
 
-/// Temp file plus `rename(2)`, as everything else nvmux writes
-/// ([`crate::paths::write_atomic`]), under a parent made the gentle way the
-/// config file's is ([`crate::paths::create_private_parent`]).
 fn write_atomic(path: &Path, state: &State) -> std::io::Result<()> {
     let body = toml::to_string(state).map_err(std::io::Error::other)?;
     let contents =
@@ -166,7 +134,6 @@ mod tests {
 
     // --- keys and path resolution (pure) -----------------------------------
 
-    /// A host named `local` must not share this machine's entry.
     #[test]
     fn a_remote_host_cannot_collide_with_the_local_entry() {
         assert_eq!(key(&Location::Local), "local");
@@ -267,8 +234,6 @@ mod tests {
         assert_eq!(remembered(&Location::Local), Some(CLEAN.to_string()));
     }
 
-    /// Each host is asked about separately, so each is remembered separately —
-    /// a nightly build on one box says nothing about another.
     #[test]
     fn hosts_are_remembered_independently() {
         let _lock = guard();
@@ -287,7 +252,6 @@ mod tests {
         );
         assert_eq!(remembered(&Location::Ssh("other".into())), None);
 
-        // And a later write must not lose one of them.
         remember(&Location::Local, "nvim --listen {sock}");
         assert_eq!(
             remembered(&Location::Ssh("myhost".into())),
@@ -297,8 +261,6 @@ mod tests {
         );
     }
 
-    /// The file is a convenience. Every way it can be broken has to end in the
-    /// caller getting `None` and carrying on, never an error.
     #[test]
     fn a_broken_file_is_ignored_rather_than_fatal() {
         let _lock = guard();
@@ -315,8 +277,6 @@ mod tests {
         }
     }
 
-    /// The file is editable, and a command that no longer parses would be
-    /// offered as a default and then refused the instant enter was pressed.
     #[test]
     fn an_unusable_remembered_command_is_not_offered() {
         let _lock = guard();
@@ -330,8 +290,6 @@ mod tests {
         );
     }
 
-    /// A newer nvmux's file must still load here — the keys this version does
-    /// not know are simply not read.
     #[test]
     fn a_file_from_a_newer_version_still_yields_what_it_can() {
         let _lock = guard();
@@ -358,16 +316,14 @@ mod tests {
         assert!(strays.is_empty(), "left temp files behind: {strays:?}");
     }
 
-    /// The common case is creating a session with the same command as last
-    /// time; that must not rewrite the file.
     #[test]
     fn remembering_what_is_already_stored_writes_nothing() {
         let _lock = guard();
         let scratch = Scratch::new("no-op");
 
         remember(&Location::Local, CLEAN);
-        // A mark nvmux would never write. A rewrite replaces the whole file, so
-        // its survival is the evidence that nothing was written.
+        // A rewrite replaces the whole file, so this mark surviving proves
+        // nothing was written.
         let marked = format!(
             "# touched by hand\n{}",
             std::fs::read_to_string(scratch.file()).expect("read")
@@ -382,11 +338,8 @@ mod tests {
         );
     }
 
-    /// Nothing about running sessions may depend on this file being writable.
-    ///
-    /// The parent is a regular file, so the `mkdir` cannot succeed for anybody
-    /// — a merely absent directory would be created, and by root at that, which
-    /// is who CI runs as.
+    /// The parent is a regular file so `mkdir` fails even as root (CI); a
+    /// missing directory would just be created.
     #[test]
     fn an_unwritable_path_is_survivable() {
         let _lock = guard();
@@ -399,8 +352,6 @@ mod tests {
         assert_eq!(remembered(&Location::Local), None);
     }
 
-    /// The file says what it is, so someone who finds it knows they may delete
-    /// it, and reads back as its own state.
     #[test]
     fn the_written_file_explains_itself_and_reloads() {
         let _lock = guard();

@@ -1,26 +1,22 @@
-//! Finding and version-checking the `nvim` binary, up front, because every
-//! failure here otherwise surfaces later as an unexplained connection error.
+//! Finding and version-checking `nvim` up front; otherwise failures surface
+//! later as unexplained connection errors.
 
 use std::process::Command;
 
 use crate::error::NvimError;
 
-/// The minimum Neovim nvmux supports.
-///
-/// 0.11 specifically because that is where `:detach` landed, which is what
-/// makes a session survive its UI going away. Spelled twice — as the errors
-/// print it and as the gate compares it — and a test keeps the two in step.
+/// Minimum supported Neovim: 0.11 added `:detach`, which lets a session
+/// outlive its UI. Must match `MIN` (a test checks).
 pub const MIN_VERSION: &str = "0.11";
 const MIN: (u64, u64) = (0, 11);
 
-/// A Neovim version: parsed from an `nvim --version` banner, or read out of
-/// `nvim_get_api_info` by [`crate::rpc::Client::api_info`].
+/// From an `nvim --version` banner or [`crate::rpc::Client::api_info`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
-    /// `dev`, `dev-1511`, and so on. Present on nightlies.
+    /// `dev`, `dev-1511`, etc. on nightlies.
     pub prerelease: Option<String>,
 }
 
@@ -40,9 +36,7 @@ impl std::fmt::Display for Version {
     }
 }
 
-/// Parse the first line of `nvim --version`.
-///
-/// Has to survive rather more shapes than it looks like:
+/// Parse the first line of `nvim --version`. Shapes seen:
 ///
 /// ```text
 /// NVIM v0.11.4
@@ -52,18 +46,18 @@ impl std::fmt::Display for Version {
 /// NVIM v0.11.4+ubuntu1                      (distro patch suffix)
 /// ```
 ///
-/// Distro packagers can override `NVIM_VERSION_MEDIUM` outright, so this never
-/// keys on a byte offset and never anchors the tail.
+/// Packagers can override `NVIM_VERSION_MEDIUM`, so this never relies on byte
+/// offsets or anchors the tail.
 pub fn parse_version(banner: &str) -> Option<Version> {
     let line = banner.lines().next()?.trim();
-    // The first word that looks like a version: `v0.11.4`, `0.11.4`.
+    // First word that looks like `v0.11.4` or `0.11.4`.
     let token = line.split_whitespace().find(|t| {
         let t = t.strip_prefix('v').unwrap_or(t);
         t.chars().next().is_some_and(|c| c.is_ascii_digit())
     })?;
 
     let token = token.strip_prefix('v').unwrap_or(token);
-    // Build metadata after '+' is never semantically meaningful to us.
+    // Build metadata after '+' is ignored.
     let (core, _build) = token.split_once('+').unwrap_or((token, ""));
     let (numbers, prerelease) = match core.split_once('-') {
         Some((n, p)) => (n, Some(p.to_string())),
@@ -73,7 +67,7 @@ pub fn parse_version(banner: &str) -> Option<Version> {
     let mut parts = numbers.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
-    // A two-component version is legal; treat the missing patch as 0.
+    // Two components are legal; patch defaults to 0.
     let patch = match parts.next() {
         Some(p) => p.parse().ok()?,
         None => 0,
@@ -90,8 +84,8 @@ pub fn parse_version(banner: &str) -> Option<Version> {
     })
 }
 
-/// Check the local `nvim`: the one local sessions run, and Neovim's own
-/// client (`--remote-ui`).
+/// Check the local `nvim`, used for local sessions and as the `--remote-ui`
+/// client.
 pub fn check_local() -> Result<Version, NvimError> {
     let out = Command::new("nvim")
         .arg("--version")
@@ -103,9 +97,8 @@ pub fn check_local() -> Result<Version, NvimError> {
     check_banner("local", &String::from_utf8_lossy(&out.stdout))
 }
 
-/// The gate both machines go through once their `nvim --version` banner is in
-/// hand: it has to parse, and what it says has to be new enough. `where_` names
-/// the machine, for the error.
+/// Check an `nvim --version` banner (local or remote) parses and is new
+/// enough. `where_` names the machine in the error.
 pub fn check_banner(where_: &str, banner: &str) -> Result<Version, NvimError> {
     let version = parse_version(banner).ok_or_else(|| NvimError::UnparsableVersion {
         where_: where_.into(),
@@ -192,14 +185,11 @@ mod tests {
         assert_eq!(v(0, 13, 0, Some("dev-1511")).to_string(), "0.13.0-dev-1511");
     }
 
-    /// The minimum the errors print is the minimum the gate enforces.
     #[test]
     fn the_printed_minimum_is_the_enforced_one() {
         assert_eq!(MIN_VERSION, format!("{}.{}", MIN.0, MIN.1));
     }
 
-    /// Both machines' banners go through one gate, and each way it can refuse
-    /// names the machine and says what it saw.
     #[test]
     fn the_banner_gate_refuses_old_and_unreadable_banners_by_name() {
         assert_eq!(
@@ -223,13 +213,10 @@ mod tests {
         }
     }
 
-    /// Runs against whatever nvim is actually installed, when there is one.
     #[test]
     fn agrees_with_the_real_binary() {
         let Ok(out) = Command::new("nvim").arg("--version").output() else {
-            // No nvim here; the unit cases above still cover the parser. Unless
-            // the environment insists (CI does), in which case its absence is
-            // the bug.
+            // Skip without nvim, unless `NVMUX_TEST_REQUIRE` demands it (CI).
             let strict = std::env::var("NVMUX_TEST_REQUIRE")
                 .is_ok_and(|v| v.split(',').any(|w| w.trim() == "nvim"));
             assert!(

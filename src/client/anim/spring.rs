@@ -1,21 +1,14 @@
-//! A critically damped spring: what every animation here moves by.
+//! Critically damped spring driving every animation.
 //!
-//! The thing animated is the distance still to go — so the target is always
-//! zero, and a target that moves part way through is a new distance added to
-//! the one left, with the speed kept. That last part is why a spring and not
-//! an easing curve: holding `j` moves the cursor's destination a row at a time
-//! faster than any animation settles, and a curve restarted at every row
-//! would lurch at every row, where a spring carries on.
-//!
-//! Critically damped is the one setting that never overshoots: a cursor that
-//! went past its cell and came back would look like a mistake.
+//! It animates the remaining distance (target 0), so retargeting mid-way adds
+//! to the distance and keeps the velocity; an easing curve restarted on each
+//! `j` repeat would lurch. Critical damping never overshoots.
 
-/// How many time constants a spring takes to settle: at `ω t = 6.64` a spring
-/// let go from rest is within one per cent of its target. So `duration` means
-/// what it says, as near as a spring can.
+/// Time constants to settle: at `ω t = 6.64` a spring released from rest is
+/// within 1% of its target, so `duration` is the settling time.
 const SETTLE: f32 = 6.64;
 
-/// A distance still to go, and how fast it is closing.
+/// Distance still to go, and how fast it is closing.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Spring {
     pub position: f32,
@@ -23,7 +16,6 @@ pub struct Spring {
 }
 
 impl Spring {
-    /// At rest, `position` from the target.
     pub fn at(position: f32) -> Self {
         Self {
             position,
@@ -31,12 +23,9 @@ impl Spring {
         }
     }
 
-    /// Move on `dt` seconds, settling in `duration` seconds. Says whether it
-    /// is still moving; one that has stopped is exactly at its target.
-    ///
-    /// The exact solution, not a step of an integrator: the same `dt` taken
-    /// in one piece or in many ends in the same place, so a frame that comes
-    /// late costs no accuracy.
+    /// Advance `dt` seconds towards settling in `duration`; returns whether
+    /// still moving (once stopped, it is exactly on target). Exact solution,
+    /// so a late frame loses no accuracy.
     pub fn step(&mut self, dt: f32, duration: f32) -> bool {
         if duration <= 0.0 || !duration.is_finite() {
             *self = Spring::default();
@@ -48,8 +37,7 @@ impl Spring {
         let decay = (-omega * dt).exp();
         self.position = (a + b * dt) * decay;
         self.velocity = (self.velocity - omega * b * dt) * decay;
-        // A hundredth of a cell, closing at half a cell a second: nothing a
-        // terminal can show is left to move.
+        // Under 0.01 cell and 0.5 cell/s: nothing visible is left to move.
         if self.position.abs() < 0.01 && self.velocity.abs() < 0.5 {
             *self = Spring::default();
             return false;
@@ -61,17 +49,14 @@ impl Spring {
         self.position != 0.0 || self.velocity != 0.0
     }
 
-    /// The whole cells still to go, rounded towards the target: a scroll
-    /// shows its first row at once, and a scroll of one row is no slower than
-    /// none. See [`super::scroll`].
+    /// Whole cells to go, rounded towards the target.
     pub fn cells(&self) -> i64 {
         self.position.trunc() as i64
     }
 
-    /// The whole cells still to go, rounded to the nearest: unlike
-    /// [`Spring::cells`], a distance added part way keeps what is drawn where
-    /// it was, whichever way it turns — which a window, moved and moved back,
-    /// needs. See [`super::motion`].
+    /// Whole cells to go, rounded to the nearest. Unlike [`Spring::cells`],
+    /// whole cells added mid-way, either way, do not shift what is drawn (see
+    /// [`super::motion`]).
     pub fn nearest(&self) -> i64 {
         self.position.round() as i64
     }
@@ -81,8 +66,6 @@ impl Spring {
 mod tests {
     use super::*;
 
-    /// Within a hair of its target by the duration, and stopped dead at it
-    /// soon after; never past it on the way.
     #[test]
     fn a_spring_settles_in_its_duration_without_overshooting() {
         let mut s = Spring::at(10.0);
@@ -101,7 +84,6 @@ mod tests {
         assert_eq!(s, Spring::default());
     }
 
-    /// One long step lands where many short ones do.
     #[test]
     fn a_late_frame_costs_no_accuracy() {
         let mut one = Spring::at(5.0);
@@ -114,8 +96,6 @@ mod tests {
         assert!((one.velocity - many.velocity).abs() < 1e-2);
     }
 
-    /// A target that moves part way through keeps the speed it had: the
-    /// distance is added to, not restarted.
     #[test]
     fn a_new_distance_keeps_the_speed() {
         let mut s = Spring::at(4.0);

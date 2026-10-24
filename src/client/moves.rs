@@ -1,131 +1,87 @@
-//! Where the keys that move the cursor in Normal mode take it, as Neovim
-//! 0.12 was found to take it — worked out by the client for the keys it
-//! sends, from where Neovim last said the cursor was (see
-//! [`super::predict::Ack`]).
+//! Predicts where Normal-mode motions take the cursor, matching Neovim 0.12,
+//! from the position Neovim last reported (see [`super::predict::Ack`]).
 //!
-//! These are the motions that stay on a line, go a line at a time, or go
-//! by words, each with a count:
+//! Followed, each with a count: `h` `l` and kin (wrapping lines where
+//! `'whichwrap'` allows, see [`wrapped`]); `0` `^` `$` `g_` `|` `<Home>`;
+//! `j` `k` and kin, keeping the wanted column (`curswant`); `+` `-` `_`;
+//! word motions (see [`super::words`]); `f` `t` `F` `T`; `}` `{` (see
+//! [`paragraph`]); `H` `M` `L` (see [`window`]); `gg` `G`. `h`, `l` and
+//! finds that cannot move keep the wanted column.
 //!
-//! - `h`, `<Left>`, `<BS>` and `<C-h>` a character back, `l`, `<Right>` and
-//!   `<Space>` one on — a character with combining marks one, a character two
-//!   cells wide one — stopping at the line's first or last, or going on past
-//!   it to the next line, or the one before, where `'whichwrap'` says: the
-//!   line's end a step, an empty line a place to step onto (see
-//!   [`wrapped`]); one that cannot go at all leaves the column the cursor
-//!   wants as it was;
-//! - `0` to the line's first character, `^` to its first that is not a
-//!   blank, `$` and `<End>` to its last, `g_` to its last that is not a
-//!   blank — or its first, for a line all blanks — those two with a count
-//!   on the line one fewer than counted down, `|` to the character over a
-//!   display column, and `<Home>` to the one over the first, as `1|` takes
-//!   it, the cursor wanting that column rather than the one it is drawn in,
-//!   a tab's last;
-//! - `j`, `k` and their kind a line down or up in the column the cursor
-//!   wants (Neovim's `curswant`), no further than the buffer goes: onto the
-//!   character over that column, a tab or a character two cells wide that
-//!   covers it, or a shorter line's last — the end of every line, after
-//!   `$` — the column wanted kept as it was;
-//! - `+`, `<CR>`, `-` and `_` a line down or up, or none for `_`, to its
-//!   first character that is not a blank;
-//! - `w`, `b`, `e` and `ge`, and `W`, `B`, `E` and `gE`, and the arrows
-//!   with Shift or Ctrl that make some of them, by words, from line to line
-//!   where they go on past one's end (see [`super::words`]);
-//! - `f`, `t`, `F` and `T` along the line to the character typed after
-//!   them — the one counted of those, on or back — or till it, stopping on
-//!   the character before; one that finds too few goes nowhere, leaving
-//!   the column the cursor wants as it was;
-//! - `}` and `{` by paragraphs, to the empty line after the next or
-//!   before the last, or the line `'paragraphs'` and `'sections'` start one
-//!   with (see [`paragraph`]);
-//! - `H`, `M` and `L` to the line at the view's top, its middle or its
-//!   bottom, `'scrolloff'` in from them (see [`window`]);
-//! - and `gg` and `G` to the buffer's first line or its last, or the line
-//!   counted — these and the three before onto the column the cursor wants
-//!   as `j` and `k` land it, or with `'startofline'` the first character
-//!   that is not a blank;
+//! After other sideways moves the cursor wants the column it is drawn in (a
+//! character's first, or a tab's last), except after `$` (the line end) and
+//! `|` or `<Home>` (the column asked). Moving past `'scrolloff'` scrolls as
+//! Neovim's `update_topline` does: just far enough for a short move, centring
+//! the cursor for a long one (see [`keep_in_view`]). Views that do not wrap
+//! scroll sideways per [`predict::showing`].
 //!
-//! — and after a move sideways the cursor wants the column it is drawn in:
-//! a character's first, or a tab's last. A motion that takes the cursor up
-//! or down past `'scrolloff'` moves the view as Neovim's `update_topline`
-//! moves it: for a short move, just far enough to keep `'scrolloff'`, and
-//! for a longer one, far enough to centre the cursor in it (see
-//! [`keep_in_view`]); one that would move a view that does not wrap
-//! sideways moves it as Neovim does ([`predict::showing`]).
-//!
-//! The client follows the keys it sends by these, draws where they take the
-//! cursor at once (see `super::anim::chain`), and judges each against where
-//! Neovim says it put the cursor (see `super::App`; and, for the log, every
-//! motion followed, drawn or not, [`super::predict::Predictor::judge`]).
+//! The client draws predicted positions at once (see `super::anim::chain`)
+//! and checks each against Neovim's (see `super::App` and
+//! [`super::predict::Predictor::judge`]).
 
 use super::predict::{self, Ch, Edge, Pos, Rest, Shape, Want};
 use super::typing;
 use super::words::{self, Way};
 
-/// A motion in Normal mode, as the client follows it: see [`moved`].
+/// A Normal-mode motion the client follows; see [`moved`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
-    /// `h`, `<Left>`, `<BS>`, `<C-h>`: back a character. Each lets the
-    /// cursor go on to the line before where `'whichwrap'` has its letter:
-    /// `h`, `<`, `b`, `b`.
+    /// `h`, `<Left>`, `<BS>`, `<C-h>`; the `'whichwrap'` letter that lets
+    /// each wrap to the line before: `h`, `<`, `b`, `b`.
     Left(char),
-    /// `l`, `<Right>`, `<Space>`: on a character, `'whichwrap'`'s `l`, `>`
-    /// or `s` letting it go on to the next line.
+    /// `l`, `<Right>`, `<Space>`; `'whichwrap'` letter `l`, `>` or `s`.
     Right(char),
     /// `j`, `<Down>`, `<C-j>`, `<C-n>`; `k`, `<Up>`, `<C-p>`.
     Down,
     Up,
-    /// `0`: the line's first character.
+    /// `0`.
     Start,
-    /// `^`: its first that is not a blank — its last, for a line all blank.
+    /// `^`: first non-blank, or the last character of an all-blank line.
     First,
-    /// `$`, `<End>`: its last, the cursor wanting the end of every line
-    /// after it — with a count, the last of the line one fewer down.
+    /// `$`, `<End>`: the last character, wanting the end of every line; with
+    /// a count, on the line count - 1 down.
     End,
-    /// `g_`: its last that is not a blank — its first, for a line all
-    /// blanks — with a count, of the line one fewer down.
+    /// `g_`: last non-blank, or the first character of an all-blank line;
+    /// with a count, on the line count - 1 down.
     LastNonBlank,
-    /// `|`: the character over the display column counted, from one.
+    /// `|`: the character over the counted display column, from 1.
     Column,
-    /// `<Home>`: `1|`, whatever the count, which Neovim reads and lets go.
+    /// `<Home>`: `1|`; Neovim reads any count and drops it.
     Home,
-    /// `+`, `<CR>` down a line, `-` up one, `_` none — or one fewer than
-    /// counted, `here` — to its first character that is not a blank.
+    /// To the first non-blank: `+`, `<CR>` a line down, `-` up, `_` (`here`)
+    /// count - 1 down.
     LineFirst {
         down: bool,
         here: bool,
     },
-    /// `w`, `<S-Right>`, `b`, `<S-Left>`, `e` and `ge` by words; and `W`,
-    /// `<C-Right>`, `B`, `<C-Left>`, `E` and `gE` by words only blanks part,
-    /// `big`.
+    /// `w`, `<S-Right>`, `b`, `<S-Left>`, `e`, `ge`; with `big`, `W`,
+    /// `<C-Right>`, `B`, `<C-Left>`, `E`, `gE` (words split only by blanks).
     Word {
         way: Way,
         big: bool,
     },
-    /// `f`, `t`, `F` and `T` and the character typed after them: on along
-    /// the line to the character counted that is `c`, or `back` to it —
-    /// or `till` it, onto the character before, or after.
+    /// `f`, `t`, `F`, `T` and the character typed after: to the counted `c`
+    /// along the line, or `back`; `till` stops one character short.
     Find {
         c: char,
         till: bool,
         back: bool,
     },
-    /// `}` on past a paragraph, `{` `back` past one: see [`paragraph`].
+    /// `}`, or `{` if `back`; see [`paragraph`].
     Paragraph {
         back: bool,
     },
-    /// `H`, `M` and `L`: to the line at the view's top, its middle or its
-    /// bottom — or, counted, that many in from the top or the bottom — see
-    /// [`window`].
+    /// `H`, `M`, `L`, or with a count that many lines in from the top or
+    /// bottom; see [`window`].
     Window(Edge),
-    /// `gg` and `G`: to the line counted, from one, or the buffer's first —
-    /// or its `last`.
+    /// `gg`, `G`: to the counted line (from 1), else the first or `last`.
     Goto {
         last: bool,
     },
 }
 
-/// The motion a key typed in Normal mode makes, if it is one followed here:
-/// `g_`, which takes two, is made out by whoever has the `g`.
+/// The motion `key` makes in Normal mode, if followed here. Motions after
+/// `g` are [`g_motion`]'s.
 pub fn motion(key: &str) -> Option<Motion> {
     Some(match key {
         "h" => Motion::Left('h'),
@@ -174,8 +130,7 @@ pub fn motion(key: &str) -> Option<Motion> {
     })
 }
 
-/// The motion `g` and then `key` make, if it is one followed here: `g_`,
-/// `ge` and `gE` back to a word's end, and `gg`.
+/// The motion `g` then `key` makes: `g_`, `ge`, `gE`, `gg`.
 pub fn g_motion(key: &str) -> Option<Motion> {
     Some(match key {
         "_" => Motion::LastNonBlank,
@@ -188,8 +143,8 @@ pub fn g_motion(key: &str) -> Option<Motion> {
     })
 }
 
-/// Whether `key` is `f`, `t`, `F` or `T`, which wait for a character to
-/// look for: whether it stops `till` the character, and looks `back`.
+/// For `f`, `t`, `F`, `T`, which wait for a character: whether it stops
+/// `till` the character, and looks `back`.
 pub fn finds(key: &str) -> Option<(bool, bool)> {
     Some(match key {
         "f" => (false, false),
@@ -200,11 +155,10 @@ pub fn finds(key: &str) -> Option<(bool, bool)> {
     })
 }
 
-/// The character a key typed after `f`, `t`, `F` or `T` has them look for,
-/// as Neovim takes it, mappings aside: a character on its own other than a
-/// control character or a combining mark — or `<Space>`, `<lt>`, `<Bar>`,
-/// `<Bslash>` or `<Tab>` for one. `None` for any other, which Neovim may
-/// take otherwise: `<C-k>` for a digraph, `<Esc>` to give up.
+/// The character `key`, typed after `f` and kin, looks for, mappings aside:
+/// a plain character other than a control character or combining mark, or
+/// `<Space>`, `<lt>`, `<Bar>`, `<Bslash>`, `<Tab>`. `None` for others, which
+/// Neovim may treat otherwise (`<C-k>` digraph, `<Esc>` to cancel).
 pub fn sought(key: &str) -> Option<char> {
     if key.eq_ignore_ascii_case("<Tab>") {
         return Some('\t');
@@ -215,14 +169,13 @@ pub fn sought(key: &str) -> Option<char> {
     }
 }
 
-/// The largest count Neovim keeps: a digit more leaves it as it is.
+/// Neovim's largest count; a further digit leaves it unchanged.
 const MAX_COUNT: i64 = 999_999_999;
 
-/// The motions a run of keys typed in Normal mode with nothing pending
-/// makes, each with the count typed before it: `None` where any key of them
-/// is not a motion followed here, or `mapped` says something maps it — or
-/// starts a mapping with it — or the run ends in a count, a `g` or an `f`
-/// or its kind.
+/// The motions, each with its count, made by keys typed in Normal mode with
+/// nothing pending. `None` if any key is not a followed motion, `mapped` says
+/// a key is mapped or starts a mapping, or the keys end in a count, `g`, or
+/// an `f`-like key.
 pub fn parse<'a>(
     keys: impl IntoIterator<Item = &'a str>,
     mapped: impl Fn(&str) -> bool,
@@ -232,15 +185,15 @@ pub fn parse<'a>(
     let mut g = false;
     let mut find = None;
     for key in keys {
-        // The character `f` and its kind look for: no mapping but `:lmap`'s
-        // takes it for another (see [`Ctx::lmap`]).
+        // Only `:lmap` mappings can change the character `f` and kin look
+        // for (see `Ctx::lmap`).
         if let Some((till, back)) = find.take() {
             let c = sought(key)?;
             out.push((Motion::Find { c, till, back }, count.take()));
             continue;
         }
-        // `g`, and `_` or `e` after it, `g_` or `ge` as a whole looked up:
-        // Neovim's own mappings of `g…` make a prefix of `g` alone.
+        // After `g`, look up `g{key}` whole: Neovim's own `g…` mappings make
+        // `g` alone a prefix.
         if std::mem::take(&mut g) {
             if mapped(&format!("g{key}")) {
                 return None;
@@ -277,47 +230,40 @@ pub fn parse<'a>(
     (count.is_none() && !g && find.is_none()).then_some(out)
 }
 
-/// What a window and its lines are, for working out a motion in it.
+/// A window and its lines, for working out a motion.
 pub struct Ctx<'a> {
     pub shape: &'a Shape,
     pub line_count: i64,
-    /// The window's text rows, and its columns, its gutter and all.
+    /// The window's text rows, and its columns, gutter included.
     pub rows: i64,
     pub width: usize,
-    /// The text of a line, from nought, where the client has it whole.
+    /// A line's text (0-based), where the client has it whole.
     pub text: &'a dyn Fn(i64) -> Option<&'a str>,
-    /// `'whichwrap'`, where the client knows it — the agent says it only
-    /// where it says what Neovim made of each key: not knowing it, a move
-    /// sideways that would go past the end of its line is not followed,
-    /// wherever it would have gone.
+    /// `'whichwrap'`, if known (the agent reports it only along with what
+    /// Neovim did with each key). Unknown, a sideways move past the line's
+    /// end is not followed.
     pub whichwrap: Option<&'a str>,
-    /// `'scrolljump'` and `'smoothscroll'`, where the client knows them, as
-    /// `'whichwrap'`: not knowing them, a motion that would move the view is
-    /// not followed.
+    /// `'scrolljump'` and `'smoothscroll'`; unknown, a motion that moves the
+    /// view is not followed.
     pub scrolling: Option<Scrolling>,
-    /// What `'iskeyword'` makes of each character under 256 in the window's
-    /// buffer, as `'whichwrap'`: not knowing it, a motion by words is not
-    /// followed (see [`words::class`]).
+    /// `'iskeyword'`'s class of each character below 256 (see
+    /// [`words::class`]); unknown, word motions are not followed.
     pub keyword: Option<&'a [u8]>,
-    /// Whether `:lmap` mappings may take the character typed after `f` and
-    /// its kind for another — the buffer's `'iminsert'` 1 — as
-    /// `'whichwrap'`: where they may, or the client does not know, a motion
-    /// to a character is not followed.
+    /// Whether `:lmap` mappings may change the character after `f` and kin
+    /// (`'iminsert'` 1). If they may, or this is unknown, finds are not
+    /// followed.
     pub lmap: Option<bool>,
-    /// The macros `'sections'` and `'paragraphs'` name, as `'whichwrap'`:
-    /// not knowing them, a motion by paragraphs is not followed.
+    /// The macros `'sections'` and `'paragraphs'` name; unknown, paragraph
+    /// motions are not followed.
     pub macros: Option<Macros<'a>>,
 }
 
 impl Ctx<'_> {
-    /// The line a view from line `top` shows first once the cursor goes to
-    /// line `line`: that line, where `'scrolloff'` is kept between the
-    /// cursor and its edges — but for the buffer's own — or one just far
-    /// enough to keep it, or one that centres the cursor, as far as Neovim
-    /// scrolls (see [`keep_in_view`]); where the window shows its lines one
-    /// to a row. `None` where the client cannot say: the view moved, not
-    /// knowing how Neovim scrolls it, or a line in it, or one Neovim looks
-    /// at to work it out, too long for a row or not one the client has.
+    /// The top line of a view at `top` once the cursor goes to `line`:
+    /// unchanged while `'scrolloff'` holds (buffer edges aside), else
+    /// scrolled as Neovim does (see [`keep_in_view`]), with one line per row.
+    /// `None` if the view moves and scrolling options are unknown, or a line
+    /// shown or consulted is too long for a row or unknown to the client.
     fn view(&self, top: i64, line: i64) -> Option<i64> {
         let (h, so) = (self.rows, self.shape.scrolloff as i64);
         let one_row =
@@ -331,26 +277,23 @@ impl Ctx<'_> {
         (shown.contains(&line) && shown.all(one_row)).then_some(to)
     }
 
-    /// Where a view that does not wrap shows a line from once the cursor is
-    /// drawn on `ch` of it, shown from `left` till then: see
-    /// [`predict::showing`].
+    /// The left column of a non-wrapping view of `text` once the cursor is on
+    /// `ch`, previously shown from `left`; see [`predict::showing`].
     fn left(&self, text: &str, ch: Option<&Ch>, left: usize) -> usize {
         let vcol = ch.map_or(0, |ch| ch.at(self.shape));
         predict::showing(text, self.shape, vcol, left, self.width)
     }
 
-    /// Whether `'whichwrap'` lets a move sideways go on past the end of its
-    /// line, for the letter `ww` of the key that makes it: `None` where the
-    /// client does not know.
+    /// Whether `'whichwrap'` has the key's letter `ww`, letting a sideways
+    /// move cross the line's end; `None` if unknown.
     fn wraps(&self, ww: char) -> Option<bool> {
         Some(self.whichwrap?.split(',').any(|f| f.starts_with(ww)))
     }
 }
 
-/// Where `m`, counted `count`, takes the cursor from `at`, in the window
-/// and over the lines `cx` says, as Neovim 0.12 was found to take it, and
-/// where the view goes with it, up or down (see [`Ctx::view`]): `None`
-/// where the client cannot say.
+/// Where `m` with `count` takes the cursor from `at` in `cx`, as Neovim 0.12
+/// does, including any vertical scroll (see [`Ctx::view`]). `None` where the
+/// client cannot say.
 pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
     if at.rest != Rest::Normal || cx.view(at.top, at.line) != Some(at.top) {
         return None;
@@ -362,8 +305,7 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
     let cs = predict::chars(text, shape);
     // The cursor's character: the one its byte is in.
     let i = cs.iter().rposition(|ch| ch.byte <= at.byte).unwrap_or(0);
-    // To character `j` of the cursor's line, wanting what the cursor is
-    // drawn in there, or `want`.
+    // To character `j` of this line, wanting its drawn column or `want`.
     let sideways = |j: Option<usize>, want: Option<Want>| {
         let ch = j.and_then(|j| cs.get(j));
         Pos {
@@ -373,15 +315,13 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             ..*at
         }
     };
-    // To line `line`, onto the character `pick` finds there, wanting what
-    // the cursor is drawn in there, or `want`; the view moved with it.
+    // To the character `pick` finds on `line`, wanting its drawn column or
+    // `want`, scrolling the view.
     let down = |line: i64, pick: &dyn Fn(&[Ch]) -> Option<usize>, want: Option<Want>| {
         put(line, cx.view(at.top, line)?, pick, want, at, cx)
     };
-    // Neovim's `beginline(BL_SOL | BL_FIX)`, as `H` and `G` and their kind
-    // land on line `line`: onto its first character that is not a blank,
-    // with `'startofline'`; without, onto the column the cursor wants, as
-    // `j` and `k` land it.
+    // Neovim's `beginline(BL_SOL | BL_FIX)` for `H`, `G` and kin: the first
+    // non-blank with `'startofline'`, else the wanted column as `j` uses.
     let begin = |line: i64| {
         if shape.startofline {
             down(line, &first_non_blank, None)
@@ -390,8 +330,7 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             down(line, &|cs| over(cs, want), Some(at.want))
         }
     };
-    // `g_`'s: the last that is not a blank, or the first of a line all
-    // blanks.
+    // `g_`: last non-blank, or the first of an all-blank line.
     let last_non_blank = |cs: &[Ch]| {
         cs.iter()
             .rposition(|ch| !matches!(ch.c, ' ' | '\t'))
@@ -410,7 +349,7 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
                 return wrapped(left, n, at, cx);
             }
             match n.min(room) {
-                // Nowhere to go: the column wanted as it was.
+                // Nowhere to go: the wanted column is unchanged.
                 0 => Some(*at),
                 n => Some(sideways(Some(if left { i - n } else { i + n }), None)),
             }
@@ -431,10 +370,9 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
         Motion::Start | Motion::First if count.is_some() => None,
         Motion::Start => Some(sideways(Some(0), None)),
         Motion::First => Some(sideways(first_non_blank(&cs), None)),
-        // With a count, on the line one fewer than counted down, or the
-        // buffer's last — but from that, nowhere: the cursor stays on its
-        // character, wanting the end of the line all the same, as Neovim
-        // sets that before it finds it cannot go down.
+        // With a count, on the line count - 1 down, or the last. From the
+        // last line the cursor stays put but still wants the line end, as
+        // Neovim sets that before finding it cannot go down.
         Motion::End | Motion::LastNonBlank if n > 1 => {
             if at.line == last {
                 return Some(Pos {
@@ -493,8 +431,7 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
             }
             let n = usize::try_from(n).unwrap_or(usize::MAX);
             match find(text, at.byte, c, (till, back), n) {
-                // Not found as often as counted: nowhere, the column wanted
-                // as it was.
+                // Fewer matches than counted: no move, wanted column kept.
                 None => Some(*at),
                 Some(byte) => Some(sideways(cs.iter().position(|ch| ch.byte == byte), None)),
             }
@@ -502,9 +439,8 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
         Motion::Paragraph { back } => {
             let macros = cx.macros?;
             let found = paragraph(back, n, at.line, cx.line_count, cx.text, macros)?;
-            // Run into the buffer's edge before the last count: nowhere —
-            // but the cursor wants the column it is drawn in all the same,
-            // as Neovim's `nv_findpar` has it want before it looks.
+            // Hit the buffer's edge before the last count: no move, but the
+            // cursor wants its drawn column, as `nv_findpar` sets that first.
             let Some((line, byte)) = found else {
                 return Some(sideways(Some(i), None));
             };
@@ -526,14 +462,12 @@ pub fn moved(m: Motion, count: Option<i64>, at: &Pos, cx: &Ctx) -> Option<Pos> {
     }
 }
 
-/// The line `H`, `M` or `L` — at the view's `edge` — counted `n` takes the
-/// cursor to in a view from line `top`, `rows` tall, a line a row, over
-/// `count` lines, `'scrolloff'` `so`, as Neovim's `nv_scroll` and then its
-/// `cursor_correct` take it: `H` the line counted from the top, `L` from the
-/// bottom — or the buffer's first, counted past it — and `M` the line
-/// halfway down the lines shown; then as far in from the view's edges as
-/// `'scrolloff'` has it, but for the buffer's own, which the view is never
-/// moved for.
+/// The line `H`, `M` or `L` (`edge`) with count `n` takes the cursor to, in
+/// a view from `top`, `rows` tall at a line per row, over `count` lines, as
+/// Neovim's `nv_scroll` then `cursor_correct` do: `H` the n-th line from the
+/// top, `L` from the bottom (the first line if counted past it), `M` halfway
+/// down the lines shown; then `'scrolloff'` (`so`) in from the view's edges,
+/// except the buffer's own. The view never moves.
 pub fn window(edge: Edge, n: i64, top: i64, (rows, so): (i64, i64), count: i64) -> i64 {
     let n = n.max(1);
     // One past the last line shown.
@@ -556,9 +490,8 @@ pub fn window(edge: Edge, n: i64, top: i64, (rows, so): (i64, i64), count: i64) 
             top + k
         }
     };
-    // Neovim's `cursor_correct`: none of `'scrolloff'` wanted at the
-    // buffer's start, or its end, where the view shows it, and no more than
-    // half the view on the other side then.
+    // Neovim's `cursor_correct`: no `'scrolloff'` at the buffer's start or
+    // end when shown, and then at most half the view on the other side.
     let last_shown = top + rows >= count;
     let mut above_wanted = if top == 0 { 0 } else { so };
     let mut below_wanted = if top == 0 { so.min(rows / 2) } else { so };
@@ -593,12 +526,10 @@ pub fn window(edge: Edge, n: i64, top: i64, (rows, so): (i64, i64), count: i64) 
     }
 }
 
-/// Where `f` — `t`, `till` the character, and `F` and `T`, `back` —
-/// looking for `c`, counted `n`, takes the cursor from byte `byte` of a
-/// line of `text`, as Neovim's `searchc` takes it: the first byte of the
-/// character it lands on, or `None` where it finds fewer than counted. A
-/// character at a time, a combining mark with the one it goes with, each
-/// whose first is `c` is found.
+/// Where `f` (`t` if `till`, `F`/`T` if `back`) for the n-th `c` takes the
+/// cursor from `byte` of `text`, as Neovim's `searchc` does: the landing
+/// character's first byte, or `None` if fewer are found. A combining mark
+/// goes with its base character.
 pub fn find(
     text: &str,
     byte: usize,
@@ -620,32 +551,29 @@ pub fn find(
     let j = match (till, back) {
         (false, _) => j,
         (true, false) => j - 1,
-        // To the byte after `c`: the next character's first — or, where a
-        // combining mark goes with `c`, the mark's, which Neovim takes back
-        // to the first of the character it is in.
+        // To the byte after `c`: the next character's, or a combining mark's
+        // on `c`, which Neovim moves back to `c`'s first byte.
         (true, true) if cs[j].0 + c.len_utf8() < cs[j + 1].0 => j,
         (true, true) => j + 1,
     };
     Some(cs[j].0)
 }
 
-/// What `'sections'` and `'paragraphs'` name: the nroff macros that start a
-/// section or a paragraph, on a line that starts with `.` and one of them.
+/// The nroff macros `'sections'` and `'paragraphs'` name, which start a
+/// section or paragraph on a line beginning with `.` and the macro.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Macros<'a> {
     pub sections: &'a str,
     pub paragraphs: &'a str,
 }
 
-/// Where `}` — `{`, `back` — counted `n` takes the cursor from line `line`
-/// of `count` lines, `text` giving each, as Neovim's `findpar` takes it:
-/// past as many paragraphs, each ended by the first line after one that is
-/// not empty that starts one (see [`starts`]), to the line that ends the
-/// last — or to the buffer's last line or its first, where the last count
-/// runs into it — onto its first character, or the last of the buffer's
-/// last line, going on: `(line, byte)`. `Some(None)` where a count before
-/// the last runs into it, which goes nowhere; `None` where it passes a line
-/// the client does not have.
+/// Where `}` (`{` if `back`) with count `n` takes the cursor from `line` of
+/// `count`, as Neovim's `findpar` does: past `n` paragraphs, each ended by
+/// the first starting line (see [`starts`]) after a non-empty one, or to the
+/// buffer's first or last line if the last count reaches it. Lands on the
+/// first character, or going forward on the buffer's last line, its last.
+/// `Some(None)` if an earlier count reaches the edge (no move); `None` if a
+/// line passed is not known to the client.
 pub fn paragraph<'a>(
     back: bool,
     n: i64,
@@ -676,8 +604,8 @@ pub fn paragraph<'a>(
             }
         }
     }
-    // The last character's first byte, a combining mark with the one it
-    // goes with.
+    // The last character's first byte, combining marks going with their
+    // base.
     let byte = if back || at < count - 1 {
         0
     } else {
@@ -689,10 +617,9 @@ pub fn paragraph<'a>(
     Some(Some((at, byte)))
 }
 
-/// Whether a line of `text` starts a paragraph or a section, as Neovim's
-/// `startPS` has it for `{` and `}`: an empty line, one that starts with a
-/// form feed, or with `.` and a macro `macros` names. `None` where Neovim
-/// reads past the line's end to say.
+/// Whether a line starts a paragraph or section, per Neovim's `startPS` for
+/// `{` and `}`: empty, starting with a form feed, or `.` and a macro `macros`
+/// names. `None` where Neovim reads past the line's end to say.
 fn starts(text: &str, macros: Macros) -> Option<bool> {
     match text.as_bytes() {
         [] | [b'\x0c', ..] => Some(true),
@@ -701,10 +628,9 @@ fn starts(text: &str, macros: Macros) -> Option<bool> {
     }
 }
 
-/// Whether `s`, a line after its `.`, starts with a macro `opt` names, as
-/// Neovim's `inmacro` has it: two characters at a time, a blank in `opt`
-/// matching a blank or the line's end. `None` where Neovim reads past the
-/// end of a line of `.` alone to say.
+/// Whether `s` (a line after its `.`) starts with a macro `opt` names, per
+/// Neovim's `inmacro`: two characters each, a blank in `opt` matching a blank
+/// or the line's end. `None` where Neovim reads past the end of a lone `.`.
 fn named(opt: &str, s: &[u8]) -> Option<bool> {
     let (s0, s1) = (
         s.first().copied().unwrap_or(0),
@@ -726,25 +652,23 @@ fn named(opt: &str, s: &[u8]) -> Option<bool> {
     Some(false)
 }
 
-/// Where a scroll lands the cursor on the line it takes it to: see [`onto`].
+/// How a scroll lands the cursor on its new line; see [`onto`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Landing {
-    /// Onto the character over the column it wants, as a motion down or up
-    /// lands it: what most scrolls do.
+    /// On the character over the wanted column, as `j` and `k` land: most
+    /// scrolls.
     Want,
-    /// Onto the line's first character that is not a blank, wanting the
-    /// column it is drawn in: a page or half of one with `'startofline'`,
-    /// and `z<CR>`, `z.` and `z-`.
+    /// On the first non-blank, wanting its drawn column: a page or half page
+    /// with `'startofline'`, and `z<CR>`, `z.`, `z-`.
     First,
-    /// Onto the character at the byte it was at, or the line's last before
-    /// it, wanting what it did: `zt`, `zz` and `zb` counted, which take it
-    /// to the line counted as `check_cursor_col` does.
+    /// On the character at the old byte, or the line's last before it,
+    /// wanting as before: counted `zt`, `zz`, `zb`, as `check_cursor_col`.
     Byte,
 }
 
-/// Where a scroll takes the cursor from `at`, the view going to line `top`
-/// and the cursor to line `line`, landing as `how` says — as Neovim 0.12.6
-/// was found to. `None` where the client does not have the line whole.
+/// The cursor after a scroll from `at` that puts the view at `top` and the
+/// cursor on `line`, landing per `how`, as Neovim 0.12.6 does. `None` if the
+/// line is not known whole.
 pub fn onto(line: i64, how: Landing, top: i64, at: &Pos, cx: &Ctx) -> Option<Pos> {
     match how {
         Landing::Want => {
@@ -760,9 +684,9 @@ pub fn onto(line: i64, how: Landing, top: i64, at: &Pos, cx: &Ctx) -> Option<Pos
     }
 }
 
-/// The cursor from `at` on line `line` of a view from line `top`, on the
-/// character `pick` finds there, wanting what it is drawn in there, or
-/// `want`; the view moved sideways to show it, where it does not wrap.
+/// The cursor from `at` on `line` of a view from `top`, on the character
+/// `pick` finds, wanting its drawn column or `want`; a view that does not
+/// wrap scrolls sideways to show it.
 fn put(
     line: i64,
     top: i64,
@@ -791,26 +715,20 @@ fn over(cs: &[Ch], vcol: usize) -> Option<usize> {
         .or(cs.len().checked_sub(1))
 }
 
-/// The first character that is not a blank — the last, of a line all
-/// blanks.
+/// The first non-blank, or the last character of an all-blank line.
 fn first_non_blank(cs: &[Ch]) -> Option<usize> {
     cs.iter()
         .position(|ch| !matches!(ch.c, ' ' | '\t'))
         .or(cs.len().checked_sub(1))
 }
 
-/// Where a move sideways of `n` characters — back if `left` — takes the
-/// cursor from `at` where `'whichwrap'` lets it go on past the ends of its
-/// line, as Neovim's `nv_left` and `nv_right` take it: from a line's last
-/// character on to the next line's first, or from its first back to the
-/// line before's last, is a step as a character is, and an empty line a
-/// place of its own to step onto; the buffer's first line or last is as far
-/// as it goes. The cursor then wants the column it is drawn in — or, having
-/// gone nowhere at all, what it wanted. `None` where it would pass a line
-/// the client does not have whole, or out of the view's band — the lines
-/// `'scrolloff'` leaves the cursor, where the view stays (see
-/// [`Ctx::view`]) — which a count as long as the buffer would: so many
-/// lines walked are no more than the view has.
+/// Where a sideways move of `n` characters (back if `left`) takes the cursor
+/// when `'whichwrap'` lets it cross line ends, as Neovim's `nv_left` and
+/// `nv_right` do: crossing to the adjacent line is one step, an empty line is
+/// a stop of its own, and the buffer's first and last lines are the limit.
+/// The cursor then wants its drawn column, or keeps its want if it did not
+/// move. `None` if it would pass a line not known whole, or leave the lines
+/// where the view stays (see [`Ctx::view`]), which also bounds the walk.
 fn wrapped(left: bool, n: usize, at: &Pos, cx: &Ctx) -> Option<Pos> {
     let last = (cx.line_count - 1).max(0);
     let mut line = at.line;
@@ -851,20 +769,19 @@ fn wrapped(left: bool, n: usize, at: &Pos, cx: &Ctx) -> Option<Pos> {
     })
 }
 
-/// How Neovim scrolls a window's view to keep the cursor in it, besides
-/// `'scrolloff'`: see [`keep_in_view`].
+/// How Neovim scrolls to keep the cursor in view, besides `'scrolloff'`; see
+/// [`keep_in_view`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scrolling {
-    /// `'scrolljump'`: how far a motion past `'scrolloff'` scrolls the view
-    /// at least — lines or, below nought, a share of the window.
+    /// `'scrolljump'`: the least a motion past `'scrolloff'` scrolls, in
+    /// lines or, if negative, a percentage of the window.
     pub jump: i64,
-    /// `'smoothscroll'`, in a window that wraps: the view centred on the
-    /// cursor by rows rather than by lines.
+    /// `'smoothscroll'` in a wrapping window: centre by rows, not lines.
     pub smooth: bool,
 }
 
 impl Default for Scrolling {
-    /// Neovim's own: `'scrolljump'` one, and no `'smoothscroll'`.
+    /// Neovim's defaults.
     fn default() -> Self {
         Self {
             jump: 1,
@@ -873,23 +790,17 @@ impl Default for Scrolling {
     }
 }
 
-/// The line Neovim puts at the top of a view of `h` rows from line `top`
-/// once a motion takes the cursor to line `cursor`, of a buffer whose last
-/// is `last`, `'scrolloff'` `so`, scrolling as `how` has it — as Neovim
-/// 0.12.6's `update_topline` puts it: where it was, if the cursor is `so`
-/// lines or more from its edges, or from the buffer's own; else just far
-/// enough to have it so — at least `'scrolljump'` lines further — as its
-/// `scroll_cursor_top` and `scroll_cursor_bot` scroll for a short move; and
-/// for a longer one, wherever has the cursor in the view's middle, as its
-/// `scroll_cursor_halfway` centres it: up, from half the window less one
-/// and never under two; down, from where the lines from the view's bottom
-/// to the cursor would no longer fit in it with as many again below. Over
-/// lines a row each: `None` where one it looks at takes other than a row of
-/// its own, as `one_row` says; and for a `so` past half the window, which
-/// keeps the cursor in its middle by rules of its own, whatever the move. As
-/// Neovim 0.12.6 was found to, from every view of windows from 4 rows to 40
-/// over buffers short and long, with every `'scrolloff'` to half of them
-/// (see `tests/client.rs`'s `views_go_where_neovim_takes_them`).
+/// The top line Neovim 0.12.6's `update_topline` gives a view of `h` rows at
+/// `top` once a motion puts the cursor on `cursor` (buffer's last line
+/// `last`, `'scrolloff'` `so`, scrolling per `how`). The view stays if the
+/// cursor is at least `so` lines from its edges (buffer edges aside); for a
+/// short move it scrolls just far enough, by at least `'scrolljump'`
+/// (`scroll_cursor_top`/`scroll_cursor_bot`); for a longer one it centres the
+/// cursor (`scroll_cursor_halfway`). Lines must take one row each: `None` if
+/// `one_row` says a consulted line does not, or if `so` exceeds half the
+/// window (Neovim then keeps the cursor centred by other rules). Checked
+/// against Neovim for windows of 4 to 40 rows and every `'scrolloff'` up to
+/// half (`tests/client.rs`'s `views_go_where_neovim_takes_them`).
 pub fn keep_in_view(
     (top, cursor): (i64, i64),
     (h, last): (i64, i64),
@@ -916,10 +827,9 @@ pub fn keep_in_view(
     Some(view.update(top.checked_add(1)?, cursor.checked_add(1)?)? - 1)
 }
 
-/// A window as Neovim's `update_topline` and the functions it calls work
-/// out its view: `h` rows over `n` lines, its lines from one as Neovim
-/// numbers them, each a row (see [`keep_in_view`]); `'scrolloff'` `so`,
-/// and at least `jump` lines a scroll.
+/// A window as `update_topline` and its helpers see it: `h` rows over `n`
+/// lines numbered from 1, a row each (see [`keep_in_view`]); `'scrolloff'`
+/// `so`, and at least `jump` lines per scroll.
 struct Topline<'a> {
     h: i64,
     n: i64,
@@ -930,20 +840,19 @@ struct Topline<'a> {
 }
 
 impl Topline<'_> {
-    /// A row, line `l`'s height: `None` where it takes other.
+    /// `Some` if line `l` takes exactly one row.
     fn row(&self, l: i64) -> Option<()> {
         (self.one_row)(l - 1).then_some(())
     }
 
-    /// `w_botline`: the line after the last the view from line `t` shows.
+    /// `w_botline`: the line after the last one shown from `t`.
     fn botline(&self, t: i64) -> Option<i64> {
         let b = t.saturating_add(self.h).min(self.n + 1);
         (t..b).try_for_each(|l| self.row(l))?;
         Some(b)
     }
 
-    /// `update_topline`: the view from line `t` once the cursor is on line
-    /// `c`.
+    /// `update_topline`: the view from `t` once the cursor is on `c`.
     fn update(&self, t: i64, c: i64) -> Option<i64> {
         let (h, so) = (self.h, self.so);
         let mut t = t;
@@ -976,8 +885,8 @@ impl Topline<'_> {
                 t = self.top(t, c)?;
             }
         }
-        // Too near the bottom, or below it: the view showing more lines
-        // than there are below the cursor, short of `'scrolloff'`.
+        // Too near the bottom, or below it: fewer than `'scrolloff'` lines
+        // shown below the cursor.
         if check_botline {
             let b = self.botline(t)?;
             if b <= self.n {
@@ -1012,10 +921,9 @@ impl Topline<'_> {
         Some(t)
     }
 
-    /// `scroll_cursor_top`: the view from line `t` moved up for the cursor
-    /// on line `c`, just far enough to show `'scrolloff'` lines above it —
-    /// and at least `'scrolljump'` lines — or centred on it where the lines
-    /// it would show either side of it fit no window.
+    /// `scroll_cursor_top`: scroll up for the cursor on `c`, just enough to
+    /// show `'scrolloff'` lines above it (and by at least `'scrolljump'`), or
+    /// centre it if the lines wanted around it do not fit.
     fn top(&self, t: i64, c: i64) -> Option<i64> {
         let (h, so, n) = (self.h, self.so, self.n);
         self.row(c)?;
@@ -1051,11 +959,10 @@ impl Topline<'_> {
         Some(t.min(new_topline).min(c))
     }
 
-    /// `scroll_cursor_bot`: the view from line `t` moved down for the
-    /// cursor on line `c`, just far enough to show `'scrolloff'` lines below
-    /// it — and at least `'scrolljump'` lines — or centred on it, from as far
-    /// as the lines from the view's bottom to it, and as many below it, would
-    /// fill the window.
+    /// `scroll_cursor_bot`: scroll down for the cursor on `c`, just enough to
+    /// show `'scrolloff'` lines below it (and by at least `'scrolljump'`), or
+    /// centre it once the lines from the view's bottom to it, and as many
+    /// below, would fill the window.
     fn bot(&self, t: i64, c: i64) -> Option<i64> {
         let (h, so, n) = (self.h, self.so, self.n);
         let b = self.botline(t)?;
@@ -1110,9 +1017,8 @@ impl Topline<'_> {
                 }
             }
         }
-        // How many lines the view scrolls by: as many as the rows past its
-        // bottom, those it shows among them — or, past them all, as many as
-        // Neovim gives for more than it can count.
+        // Lines to scroll: those holding the rows past the bottom, or, past
+        // them all, Neovim's 9999 for more than it can count.
         let lines = if scrolled <= 0 {
             0
         } else if used > h {
@@ -1133,21 +1039,19 @@ impl Topline<'_> {
         if lines >= h && lines > self.jump {
             return self.halfway(c, true);
         }
-        // With `'smoothscroll'`, by the rows counted past the bottom rather
-        // than the lines they are on: as many, for lines a row each — but
-        // not as many as the lines counted where they overran the window.
+        // With `'smoothscroll'`, by rows past the bottom rather than lines:
+        // equal for one-row lines, except where the count overran the window.
         let by = if self.smooth { scrolled } else { lines };
-        // Scrolled past the cursor — by a `'scrolljump'` more than the window
-        // shows — Neovim's `scrollup` puts the cursor on the view's top line,
-        // and goes on from there.
+        // A `'scrolljump'` larger than the window can scroll past the cursor;
+        // Neovim's `scrollup` then moves it to the top line and carries on,
+        // which is not followed.
         let to = t.saturating_add(by.max(0)).min(n);
         (to <= c).then_some(to)
     }
 
-    /// `scroll_cursor_halfway`: the view with the cursor on line `c` in its
-    /// middle, a line below it and one above in turn — above first where it
-    /// prefers that — till the window is full, but for what the buffer's
-    /// edges leave out; by rows, both at once, with `'smoothscroll'`.
+    /// `scroll_cursor_halfway`: centre the cursor on `c`, adding a line below
+    /// and above in turn (above first if `prefer_above`) until the window is
+    /// full or the buffer ends; with `'smoothscroll'`, both at once.
     fn halfway(&self, c: i64, prefer_above: bool) -> Option<i64> {
         let (h, n) = (self.h, self.n);
         self.row(c)?;
@@ -1164,8 +1068,8 @@ impl Topline<'_> {
                     self.row(below)?;
                     used += 1;
                 }
-                // Past the window: a line it would show part of, which a
-                // line a row never is.
+                // Past the window: a line only partly shown, which a one-row
+                // line never is.
                 if used > h {
                     break;
                 }
@@ -1212,9 +1116,8 @@ impl Topline<'_> {
     }
 }
 
-/// The display column the cursor is drawn in, in Normal mode, at byte
-/// `byte` of a line of `text`: its character's first, or a tab's last (see
-/// [`Ch::at`]); nought on an empty line.
+/// The display column of the Normal-mode cursor at `byte` of `text`: its
+/// character's first, or a tab's last (see [`Ch::at`]); 0 on an empty line.
 pub fn drawn(text: &str, shape: &Shape, byte: usize) -> usize {
     let cs = predict::chars(text, shape);
     cs.iter()
@@ -1259,9 +1162,8 @@ mod tests {
         }
     }
 
-    /// The lines the motions were tried on in Neovim 0.12.6: a buffer of
-    /// these, each motion fed with `nvim_feedkeys` from a start a few keys
-    /// put the cursor at, and `winsaveview()` read before and after.
+    /// The buffer the motions were probed on in Neovim 0.12.6: each fed with
+    /// `nvim_feedkeys`, with `winsaveview()` read before and after.
     const LINES: &[&str] = &[
         "hello world",
         "ab",
@@ -1278,8 +1180,8 @@ mod tests {
         "last",
     ];
 
-    /// `(line, byte, curswant or -1 for the end of the line, topline,
-    /// leftcol)`, lines from nought, as the probe prints a state.
+    /// `(line, byte, curswant or -1 for line end, topline, leftcol)`, lines
+    /// 0-based, as the probe prints a state.
     type State = (i64, usize, i64, i64, usize);
 
     fn pos((line, byte, want, top, left): State) -> Pos {
@@ -1297,8 +1199,7 @@ mod tests {
         }
     }
 
-    /// The keys from `from`, in a window of `shape` 22 rows by 80 columns
-    /// over [`LINES`], `'whichwrap'` as `ww` says.
+    /// Runs `keys` from `from` in a 22x80 window over [`LINES`].
     fn run(keys: &str, from: State, shape: &Shape, ww: Option<&str>) -> Option<Pos> {
         let text = |l: i64| usize::try_from(l).ok().and_then(|l| LINES.get(l)).copied();
         let keyword = words::defaults();
@@ -1320,24 +1221,23 @@ mod tests {
             .try_fold(pos(from), |at, (m, count)| moved(m, count, &at, &cx))
     }
 
-    /// Each motion from where Neovim had the cursor to where it took it,
-    /// over [`LINES`] — `'whichwrap'` at its default, `b,s`, 8 columns to a
-    /// tab, 22 rows and none scrolled.
+    /// Neovim's before and after for each motion, with the default
+    /// `'whichwrap'` (`b,s`), tabstop 8, 22 rows, unscrolled.
     #[test]
     fn motions_go_where_neovim_takes_them() {
         #[rustfmt::skip]
         let cases: &[(State, &str, State)] = &[
             ((2, 0, 0, 0, 0), "0", (2, 0, 0, 0, 0)),
             ((2, 0, -1, 0, 0), "0", (2, 0, 0, 0, 0)),
-            // On a tab, the cursor is drawn in its last column, and wants it.
+            // On a tab, the cursor is drawn in and wants its last column.
             ((3, 0, 7, 0, 0), "0", (3, 0, 7, 0, 0)),
             ((4, 0, 0, 0, 0), "l", (4, 1, 7, 0, 0)),
             ((4, 0, 0, 0, 0), "2l", (4, 2, 8, 0, 0)),
-            // A combining mark goes with its character; a wide one is one.
+            // A combining mark goes with its character; a wide one is one step.
             ((6, 0, 0, 0, 0), "l", (6, 3, 1, 0, 0)),
             ((5, 0, 0, 0, 0), "l", (5, 3, 2, 0, 0)),
             ((0, 0, 0, 0, 0), "100l", (0, 10, 10, 0, 0)),
-            // Going nowhere, the column wanted is kept.
+            // No move keeps the wanted column.
             ((1, 1, -1, 0, 0), "l", (1, 1, -1, 0, 0)),
             ((1, 1, 4, 0, 0), "l", (1, 1, 4, 0, 0)),
             ((1, 1, 4, 0, 0), "h", (1, 0, 0, 0, 0)),
@@ -1371,8 +1271,8 @@ mod tests {
             ((0, 10, -1, 0, 0), "l", (0, 10, -1, 0, 0)),
             ((0, 0, 0, 0, 0), "<Home>", (0, 0, 0, 0, 0)),
             ((0, 5, 5, 0, 0), "<Home>", (0, 0, 0, 0, 0)),
-            // `<Home>` is `1|`: on a tab, the cursor wants its first column,
-            // not the last it is drawn in; and a count is no matter.
+            // `<Home>` is `1|`: on a tab it wants the first column, not the
+            // last it is drawn in; a count is ignored.
             ((3, 1, -1, 0, 0), "<Home>", (3, 0, 0, 0, 0)),
             ((3, 1, -1, 0, 0), "3<Home>", (3, 0, 0, 0, 0)),
             ((11, 17, -1, 0, 0), "<Home>", (11, 0, 0, 0, 0)),
@@ -1445,8 +1345,8 @@ mod tests {
             ((6, 3, -1, 0, 0), "h", (6, 0, 0, 0, 0)),
             ((9, 0, 0, 0, 0), "$", (9, 24, -1, 0, 0)),
             ((11, 0, 0, 0, 0), "$", (11, 17, -1, 0, 0)),
-            // `g_`: the last that is not a blank, a tab's last column
-            // wanted; the first of a line all blanks.
+            // `g_`: last non-blank (a tab's last column wanted); the first
+            // of an all-blank line.
             ((0, 0, 0, 0, 0), "g_", (0, 10, 10, 0, 0)),
             ((1, 0, 0, 0, 0), "g_", (1, 1, 1, 0, 0)),
             ((2, 0, 0, 0, 0), "g_", (2, 0, 0, 0, 0)),
@@ -1461,9 +1361,8 @@ mod tests {
             ((0, 3, 3, 0, 0), "g_", (0, 10, 10, 0, 0)),
             ((0, 0, 0, 0, 0), "1g_", (0, 10, 10, 0, 0)),
             ((0, 4, 4, 0, 0), "g_j", (1, 1, 10, 0, 0)),
-            // Past a line's end, `<Space>` and `<BS>` go on to the next line,
-            // and to the one before: the end a step, an empty line a place;
-            // no further than the buffer's first line and its last.
+            // `<Space>` and `<BS>` wrap lines: the line end is a step, an
+            // empty line a stop, the buffer's ends the limit.
             ((0, 10, -1, 0, 0), " ", (1, 0, 0, 0, 0)),
             ((0, 10, -1, 0, 0), "2 ", (1, 1, 1, 0, 0)),
             ((0, 10, -1, 0, 0), "3 ", (2, 0, 0, 0, 0)),
@@ -1488,8 +1387,8 @@ mod tests {
             ((11, 0, 0, 0, 0), "<BS>", (10, 24, 24, 0, 0)),
             ((12, 0, 0, 0, 0), "<BS>", (11, 17, 24, 0, 0)),
             ((2, 0, 0, 0, 0), "2<BS>", (1, 0, 0, 0, 0)),
-            // `$` and `g_` counted: on the line one fewer down, or the last;
-            // from the last, nowhere, wanting the end of the line.
+            // Counted `$` and `g_`: on the line count - 1 down, or the last;
+            // from the last, no move but wanting the line end.
             ((0, 0, 0, 0, 0), "2$", (1, 1, -1, 0, 0)),
             ((0, 0, 0, 0, 0), "3$", (2, 0, -1, 0, 0)),
             ((0, 0, 0, 0, 0), "4$", (3, 1, -1, 0, 0)),
@@ -1508,10 +1407,9 @@ mod tests {
             ((12, 0, 0, 0, 0), "2g_", (12, 0, -1, 0, 0)),
             ((12, 2, 2, 0, 0), "2g_", (12, 2, -1, 0, 0)),
             ((11, 0, 0, 0, 0), "5g_", (12, 3, 3, 0, 0)),
-            // Down and up onto a tab, a character two cells wide, shorter
-            // lines and empty ones, the column wanted kept; the end of the
-            // line kept to after `$`; and after `<CR>`, `_` and `-`, the
-            // first non-blank's column wanted.
+            // Vertical moves over tabs, wide characters, short and empty
+            // lines keep the wanted column (the line end after `$`); `<CR>`,
+            // `_` and `-` want the first non-blank's column.
             ((0, 4, 4, 0, 0), "jjj", (3, 0, 4, 0, 0)),
             ((0, 4, 4, 0, 0), "jjjj", (4, 1, 4, 0, 0)),
             ((0, 1, 1, 0, 0), "jjjjj", (5, 0, 1, 0, 0)),
@@ -1554,9 +1452,8 @@ mod tests {
         }
     }
 
-    /// With `'whichwrap'` letting `h`, `l` and the arrows go on past a
-    /// line's ends too, each does as `<BS>` and `<Space>` do — and those,
-    /// left out of it, stop there — as Neovim 0.12.6 was found to.
+    /// With `h,l,<,>` in `'whichwrap'`, those keys wrap as `<BS>` and
+    /// `<Space>` do by default, and these, left out, stop.
     #[test]
     fn moves_past_a_lines_end_go_on_where_whichwrap_says() {
         #[rustfmt::skip]
@@ -1584,10 +1481,8 @@ mod tests {
         }
     }
 
-    /// Where the client does not know whether `'whichwrap'` would take the
-    /// cursor on to another line, the move is not followed; and neither is
-    /// one Neovim takes some other way than these, or that the view would
-    /// move for.
+    /// Not followed: a wrap with `'whichwrap'` unknown, keys Neovim treats
+    /// otherwise, and moves that scroll an unknown way.
     #[test]
     fn what_cannot_be_followed_is_not() {
         let s = shape();
@@ -1596,13 +1491,13 @@ mod tests {
         };
         not("100l", (0, 0, 0, 0, 0), None);
         not(" ", (0, 10, -1, 0, 0), None);
-        // Counted where Neovim takes a count otherwise, and pending.
+        // A count Neovim treats otherwise, and a pending count.
         not("3^", (0, 5, 5, 0, 0), Some("b,s"));
         not("3", (0, 5, 5, 0, 0), Some("b,s"));
-        // A key that is not a motion, or that something maps.
+        // Not a motion, or mapped.
         not("x", (0, 0, 0, 0, 0), Some("b,s"));
         assert_eq!(parse(["j"], |k| k == "j"), None);
-        // Not in Normal mode with nothing pending.
+        // Not idle in Normal mode.
         let text = |l: i64| usize::try_from(l).ok().and_then(|l| LINES.get(l)).copied();
         let cx = Ctx {
             shape: &s,
@@ -1621,8 +1516,8 @@ mod tests {
             ..pos((0, 0, 0, 0, 0))
         };
         assert_eq!(moved(Motion::Down, None, &busy, &cx), None);
-        // Past the edge of a view of four rows, not knowing how Neovim
-        // scrolls it — but not past it, to its last row.
+        // Past the edge of a four-row view with scrolling unknown; to its
+        // last row is fine.
         let short = Ctx { rows: 4, ..cx };
         let from = pos((2, 0, 0, 0, 0));
         let blind = Ctx {
@@ -1633,8 +1528,8 @@ mod tests {
         assert_eq!(moved(Motion::Down, Some(2), &from, &blind), None);
         let lower = pos((4, 0, 0, 4, 0));
         assert_eq!(moved(Motion::Up, Some(1), &lower, &blind), None);
-        // On past a line's end, out of the view: a count as long as the
-        // buffer walks no further than the view.
+        // Wrapping out of the view; a huge count walks no further than the
+        // view.
         assert_eq!(moved(Motion::Right('s'), Some(10), &from, &short), None);
         assert_eq!(moved(Motion::Left('b'), Some(10), &lower, &short), None);
         assert_eq!(
@@ -1642,14 +1537,12 @@ mod tests {
             Some(pos((12, 3, 3, 0, 0))),
             "to the buffer's last line, in view"
         );
-        // A counted `$` to a line out of it, not knowing how it scrolls.
+        // A counted `$` out of view with scrolling unknown.
         assert_eq!(moved(Motion::End, Some(4), &from, &blind), None);
-        // A line too long for a window that wraps puts the rows out of step
-        // with the lines.
+        // A line too long for a wrapping window breaks line-per-row.
         let narrow = Ctx { width: 5, ..cx };
         assert_eq!(moved(Motion::Down, None, &from, &narrow), None);
-        // A view from a line past reckoning, which no agent sends: no view
-        // of these lines, and no overflow working that out.
+        // An absurd topline (no agent sends one) must not overflow.
         let far = pos((0, 0, 0, i64::MAX - 1, 0));
         assert_eq!(moved(Motion::Down, None, &far, &cx), None);
         let so = Shape {
@@ -1660,10 +1553,8 @@ mod tests {
         assert_eq!(moved(Motion::Down, None, &far, &kept), None);
     }
 
-    /// `g_` past blanks at the end of a line, a tab among them, and onto a
-    /// character two cells wide; on a line of one tab, onto the tab, drawn
-    /// in its first column but wanting its last — as Neovim 0.12.6 was
-    /// found to.
+    /// `g_` past trailing blanks with a tab among them, onto a wide
+    /// character, and on a lone tab onto the tab, wanting its last column.
     #[test]
     fn the_last_non_blank_is_found_as_neovim_finds_it() {
         let lines = ["trail  \t ", "x\t", "\t", "ab日 "];
@@ -1695,7 +1586,7 @@ mod tests {
             );
             assert_eq!(drawn(lines[line], &s, to.byte), vcol, "{:?}", lines[line]);
         }
-        // With a count, on the line one fewer down.
+        // With a count, on the line count - 1 down.
         let from = pos((0, 0, 0, 0, 0));
         let to = moved(Motion::LastNonBlank, Some(2), &from, &cx).expect("followed");
         assert_eq!((to.line, to.byte, to.want), (1, 0, Want::Col(0)));
@@ -1704,7 +1595,7 @@ mod tests {
         assert_eq!(parse(["g"], |_| false), None, "pending");
     }
 
-    /// A count is digits before a motion, `0` among them but not first.
+    /// Digits before a motion, `0` among them but not first.
     #[test]
     fn counts_are_read_as_neovim_reads_them() {
         assert_eq!(
@@ -1733,7 +1624,7 @@ mod tests {
                 (find('<', false, false), None),
             ])
         );
-        // What `f` is followed by is no key a mapping is looked up for.
+        // The character after `f` is not looked up as a mapping.
         assert_eq!(
             parse(predict::tokens("fj"), |k| k == "j"),
             Some(vec![(find('j', false, false), None)])
@@ -1750,12 +1641,8 @@ mod tests {
         );
     }
 
-    /// Each motion by words from where Neovim had the cursor to where it
-    /// took it, over [`LINES`] — `'iskeyword'` at its default, 8 columns to a
-    /// tab, 22 rows and none scrolled: along a line and on to the next, over
-    /// tabs, scripts of their own, a combining mark, blanks and an empty
-    /// line, into the buffer's start and its end, the cursor wanting the
-    /// column it is drawn in after each — a tab's last.
+    /// Default `'iskeyword'`; the cursor then wants its drawn column (a
+    /// tab's last).
     #[test]
     fn motions_by_words_go_where_neovim_takes_them() {
         #[rustfmt::skip]
@@ -1819,8 +1706,7 @@ mod tests {
                 "{keys} from {from:?}"
             );
         }
-        // Not knowing what `'iskeyword'` makes of the characters, a motion by
-        // words is not followed.
+        // With `'iskeyword'` unknown, word motions are not followed.
         let text = |l: i64| usize::try_from(l).ok().and_then(|l| LINES.get(l)).copied();
         let cx = Ctx {
             shape: &s,
@@ -1841,13 +1727,9 @@ mod tests {
         assert_eq!(moved(w, None, &pos((0, 0, 0, 0, 0)), &cx), None);
     }
 
-    /// Each of `f`, `t`, `F` and `T` from where Neovim had the cursor to
-    /// where it took it, over [`LINES`], 8 columns to a tab, 22 rows and none
-    /// scrolled: to the character counted, or till it, over tabs, a blank,
-    /// characters two cells wide and one with a combining mark — which `T`
-    /// stops on, as Neovim does, rather than after — the cursor wanting the
-    /// column it is drawn in after each, even where it stays; but where
-    /// too few are found, going nowhere and wanting what it did.
+    /// `T` stops on a character with a combining mark, as Neovim does. The
+    /// cursor then wants its drawn column, even if it stays; too few matches
+    /// is no move and keeps the want.
     #[test]
     fn motions_to_a_character_go_where_neovim_takes_them() {
         #[rustfmt::skip]
@@ -1901,7 +1783,7 @@ mod tests {
             ((12, 3, 3, 0, 0), "Fl", (12, 0, 0, 0, 0)),
             ((8, 0, 0, 0, 0), "f<lt>", (8, 0, 0, 0, 0)),
             ((10, 0, -1, 0, 0), "fq", (10, 4, 4, 0, 0)),
-            // From on a character looked for, the next.
+            // From on a sought character, to the next.
             ((0, 4, 4, 0, 0), "fo", (0, 7, 7, 0, 0)),
             ((0, 3, 3, 0, 0), "tl", (0, 8, 8, 0, 0)),
             ((0, 2, 2, 0, 0), "2fl", (0, 9, 9, 0, 0)),
@@ -1915,8 +1797,7 @@ mod tests {
                 "{keys} from {from:?}"
             );
         }
-        // Where `:lmap` mappings may take the character typed for another,
-        // or the client does not know, it is not followed.
+        // Not followed if `:lmap` may change the character, or if unknown.
         let text = |l: i64| usize::try_from(l).ok().and_then(|l| LINES.get(l)).copied();
         for lmap in [Some(true), None] {
             let cx = Ctx {
@@ -1940,19 +1821,14 @@ mod tests {
         }
     }
 
-    /// Neovim's own `'sections'` and `'paragraphs'`.
+    /// Neovim's default `'sections'` and `'paragraphs'`.
     const MACROS: Macros = Macros {
         sections: "SHNHH HUnhsh",
         paragraphs: "IPLPPPQPP TPHPLIPpLpItpplpipbp",
     };
 
-    /// Each `}` and `{` from where Neovim had the cursor to where it took
-    /// it, over [`LINES`], 22 rows and none scrolled: to the empty line that
-    /// ends a paragraph — not one of blanks — or on, past the last, to the
-    /// buffer's last character, or back to its first line; with counts, and
-    /// with a count that runs into the buffer's edge before it is done,
-    /// nowhere — the cursor wanting the column it is drawn in, though, as it
-    /// does after every other.
+    /// To the empty (not all-blank) line ending a paragraph. A count that
+    /// hits the edge early is no move but still sets the wanted column.
     #[test]
     fn motions_by_paragraphs_go_where_neovim_takes_them() {
         #[rustfmt::skip]
@@ -1988,12 +1864,8 @@ mod tests {
         }
     }
 
-    /// Each `H`, `M` and `L` from where Neovim had the cursor to where it
-    /// took it, over [`LINES`], 22 rows and none scrolled: to the first line,
-    /// the one halfway down those shown — not down the window — and the
-    /// last; counted, that many in, or to the buffer's other end, counted
-    /// past it. Onto the column the cursor wants, as `j` and `k` land it, or
-    /// with `'startofline'` the first character not a blank.
+    /// `M` is halfway down the lines shown, not the window. Landing is on the
+    /// wanted column, or the first non-blank with `'startofline'`.
     #[test]
     fn motions_to_the_window_edges_go_where_neovim_takes_them() {
         #[rustfmt::skip]
@@ -2048,12 +1920,8 @@ mod tests {
         }
     }
 
-    /// Each `gg` and `G` from where Neovim had the cursor to where it took
-    /// it, over [`LINES`], 22 rows and none scrolled: to the buffer's first
-    /// line and its last, or the line counted, from one — the last, counted
-    /// past it — and from the line the cursor is on, nowhere but the column
-    /// it wants. Onto that column, as `j` and `k` land it, or with
-    /// `'startofline'` the first character not a blank.
+    /// Counted past the end, to the last line. Landing is on the wanted
+    /// column, or the first non-blank with `'startofline'`.
     #[test]
     fn motions_to_a_line_go_where_neovim_takes_them() {
         #[rustfmt::skip]
@@ -2110,13 +1978,9 @@ mod tests {
         }
     }
 
-    /// Paragraphs and sections that start as Neovim 0.12.6 was found to
-    /// start them with its own `'sections'` and `'paragraphs'`: at a line
-    /// that starts with `.` and a macro they name — `PP`, or `P` alone —
-    /// even right after an empty line, or with a form feed; not at a `.`
-    /// with none, alone or before a stylesheet's selector. The cursor on
-    /// the buffer's first line, on a tab, wants the tab's last column; and
-    /// not knowing the macros, the motion is not followed.
+    /// With the default macros, `.PP`, `.P` and a form feed start one, even
+    /// right after an empty line; `.` alone or before a CSS selector does
+    /// not. Unknown macros: not followed.
     #[test]
     fn paragraphs_start_where_neovim_starts_them() {
         let lines = [
@@ -2178,9 +2042,8 @@ mod tests {
         assert_eq!(moved(down, None, &pos((0, 0, 0, 0, 0)), &cx(None)), None);
     }
 
-    /// Empty lines in a run end one paragraph between them, as Neovim
-    /// 0.12.6 was found to have them: from one of them, `}` and `{` go on
-    /// past the rest to the next that ends one.
+    /// A run of empty lines ends one paragraph: from one of them, `}` and `{`
+    /// skip the rest to the next paragraph end.
     #[test]
     fn empty_lines_in_a_run_end_one_paragraph() {
         let lines = ["a", "", "", "b", "", "c"];
@@ -2216,9 +2079,8 @@ mod tests {
         }
     }
 
-    /// A letter with a combining mark is one character to `f` and its kind,
-    /// found by the letter, as Neovim 0.12.6 was found to: on, back, and
-    /// till it — `T` onto it, the byte after the letter being the mark's.
+    /// Found by the letter; `T` lands on the letter, the byte after it being
+    /// the mark's.
     #[test]
     fn a_letter_with_a_combining_mark_is_one_character_to_look_for() {
         let text = "ae\u{301}xe\u{301}";
@@ -2239,9 +2101,7 @@ mod tests {
         }
     }
 
-    /// In a window that does not wrap, ten columns wide, a move out of view
-    /// moves the view sideways as Neovim 0.12.6 was found to: as far as it
-    /// takes, or with the cursor half a view or more out, to centre it.
+    /// Just enough, or centring the cursor if it is half a view or more out.
     #[test]
     fn a_view_that_does_not_wrap_follows_the_cursor_sideways() {
         let s = Shape {
@@ -2287,11 +2147,8 @@ mod tests {
         }
     }
 
-    /// Past the edges of a view five rows tall, over [`LINES`]: a line or
-    /// more, `'scrolloff'` as each says, by `j`, `k` and their kind, the
-    /// view moved just far enough with the cursor, or as far as has the
-    /// buffer's last line at the bottom, or its first at the top, where
-    /// Neovim centres the cursor — as Neovim 0.12.6 was found to move them.
+    /// A 5-row view scrolls just enough, or, where Neovim centres the cursor,
+    /// as far as the buffer's ends allow.
     #[test]
     fn motions_past_the_edges_move_the_view_with_them() {
         #[rustfmt::skip]
@@ -2354,24 +2211,18 @@ mod tests {
         }
     }
 
-    /// [`keep_in_view`] over lines a row each, Neovim's `'scrolljump'` and
-    /// no `'smoothscroll'`.
+    /// [`keep_in_view`] with one-row lines and default scrolling.
     fn kept(top: i64, cursor: i64, h: i64, so: i64, last: i64) -> Option<i64> {
         keep_in_view((top, cursor), (h, last), so, Scrolling::default(), &|_| {
             true
         })
     }
 
-    /// Every top [`keep_in_view`] gives is just far enough, or not, where
-    /// Neovim's is, over every window from 4 rows to 60, every `'scrolloff'`
-    /// to half of it, and a count of up to as many lines, down and up from
-    /// the row nearest the edge `'scrolloff'` lets the cursor be on (see
-    /// [`TOPLINE`]). Up, Neovim scrolls just far enough for a count of up to
-    /// half the window less one, or two, whatever `'scrolloff'` is — two
-    /// rows, of four; nine, of 21; ten, of 22 and 23 — and down further;
-    /// `gj` and `gk` as `j` and `k`. Further, it centres the cursor: nine
-    /// up in 21 rows, onto the middle row, and ten up in 22, the upper of
-    /// the two middle ones.
+    /// [`keep_in_view`] scrolls minimally exactly where [`TOPLINE`] says
+    /// Neovim does, from the row nearest the edge `'scrolloff'` allows.
+    /// Upward that is counts below half the window less one (at least 2), or
+    /// every count at the largest `'scrolloff'`; beyond, it centres: 9 up in
+    /// 21 rows onto the middle row, 10 up in 22 onto the upper middle one.
     #[test]
     fn motions_past_the_edges_scroll_as_neovim_does() {
         let (top, last) = (400, 999);
@@ -2419,12 +2270,9 @@ mod tests {
         assert_eq!(up(22, 10), Some(380));
     }
 
-    /// A `'scrolloff'` past half the window keeps the cursor in its middle
-    /// by rules of its own, which Neovim follows for every move: the view
-    /// it leaves is not worked out, however short the move — nor where it
-    /// would not move at all. Half the window less a row — ten of 22, the
-    /// cursor kept to the two rows between — scrolls just far enough, as
-    /// any less does.
+    /// A `'scrolloff'` over half the window keeps the cursor centred by
+    /// Neovim's own rules, so it is refused even where the view would not
+    /// move. Half the window less a row (10 of 22) still scrolls minimally.
     #[test]
     fn so_past_half_the_window_is_refused() {
         for so in [11, 999] {
@@ -2437,11 +2285,10 @@ mod tests {
         assert_eq!(kept(400, 411, 22, 10, 999), Some(400));
     }
 
-    /// Generated by `scripts/sweep-topline.lua` with Neovim 0.12.6: for
-    /// each window height, and for `j`, `gj`, `k` and `gk` in turn, how far a
-    /// count goes, for each 'scrolloff' from nought to half the height, with
-    /// Neovim scrolling the view no further than it must — the count before the
-    /// first it scrolls further for, or the height where none is.
+    /// Generated by `scripts/sweep-topline.lua` with Neovim 0.12.6. Per window
+    /// height, for `j`, `gj`, `k`, `gk`, and each 'scrolloff' from 0 to half
+    /// the height: the largest count for which Neovim scrolls no further than
+    /// it must (the height if every count does).
     #[rustfmt::skip]
     const TOPLINE: &[(i64, [&[i64]; 4])] = &[
         (4, [

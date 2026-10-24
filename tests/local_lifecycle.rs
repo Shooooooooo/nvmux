@@ -1,13 +1,9 @@
-//! End-to-end tests for the local session lifecycle, against real
-//! `nvim --headless` processes — no TUI, no mocks. The failures they exist for
-//! (a session that spawns but is never ready, a stale socket that resurrects a
-//! dead session, a kill that signals the wrong pid) cannot be caught by unit
-//! tests.
+//! End-to-end tests of the local session lifecycle against real
+//! `nvim --headless` processes (no TUI, no mocks).
 //!
-//! Each test gets its own runtime directory, so they run in parallel without
-//! racing and never touch the user's real `/tmp/nvmux-<uid>`. They skip, rather
-//! than fail, when there is no usable `nvim` on `$PATH` — unless
-//! `$NVMUX_TEST_REQUIRE` names `nvim`, which is how CI keeps them honest.
+//! Each test has its own runtime directory, so they run in parallel and never
+//! touch the real `/tmp/nvmux-<uid>`. They skip without `nvim` on `$PATH`
+//! unless `$NVMUX_TEST_REQUIRE` names `nvim` (as in CI).
 
 #[macro_use]
 mod common;
@@ -19,11 +15,9 @@ use common::{command_line, Scratch};
 use nvmux::session::{Liveness, Session};
 use nvmux::transport::Transport;
 
-/// Have [`nvmux::pty::spawn`] start Neovim's own client, `nvim --remote-ui`.
-/// The default is nvmux's own, which `spawn` starts as the running executable
-/// with `--client` — and running here, that is this test binary, not nvmux.
-/// The attaches here are about how the relay reaches a session that cannot
-/// answer, whichever client it starts; `tests/client.rs` has nvmux's own.
+/// Make [`nvmux::pty::spawn`] start `nvim --remote-ui`. The default client is
+/// the running executable with `--client`, which here is this test binary.
+/// `tests/client.rs` covers nvmux's own client.
 fn neovims_client() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -83,9 +77,8 @@ fn create_list_and_kill_a_session() {
     assert!(!sock.exists(), "kill must unlink the socket");
 }
 
-/// A session is ready when its create returns: it answers, it has the
-/// `:Detach` alias, asked for on the connection that found it answering, and
-/// its metadata, written while that connection was being made.
+/// When create returns, the session already answers and has `:Detach` and its
+/// metadata.
 #[test]
 fn a_created_session_answers_and_has_its_alias_and_its_metadata() {
     require_nvim!();
@@ -121,12 +114,8 @@ fn a_created_session_answers_and_has_its_alias_and_its_metadata() {
     t.kill_session(&session).expect("kill");
 }
 
-/// The shell nvmux runs its scripts in — and so `scripts/spawn.sh`, and so the
-/// editor `spawn.sh` launches — runs under the mask nvmux was launched with,
-/// not the 0077 nvmux clamps itself to.
-///
-/// Asked of `sh` directly, so this holds the line on machines with no nvim,
-/// where the session test below can only skip.
+/// The script shell (and so `spawn.sh` and the editor) gets the launch umask,
+/// not nvmux's 0077. Checked on `sh` directly so it runs without nvim.
 #[test]
 fn the_script_shell_runs_under_the_launch_umask() {
     common::establish_launch_umask();
@@ -140,18 +129,12 @@ fn the_script_shell_runs_under_the_launch_umask() {
     );
 }
 
-/// A session writes the user's files, so it gets the user's umask.
+/// A session writes the user's files, so it gets the launch umask.
 ///
-/// Asked of the session rather than of the spawn: `system('umask')` runs a shell
-/// as a child of the editor, which is the inheritance a `:terminal`, a `:!make`
-/// and a language server get — and the one a user notices when a new file comes
-/// out 0600.
-///
-/// The whole production wiring is under test here: `restrict_umask` clamping the
-/// process and recording what it replaced, `proc::sh_command` handing that back
-/// to the shell, and `spawn.sh` adding no mask of its own. The modes asserted
-/// afterwards are the other half of the trade — what keeps the socket private
-/// now that the mask does not.
+/// Asked via `system('umask')`, i.e. a child of the editor, as `:terminal`,
+/// `:!make` and language servers are. Covers `restrict_umask`,
+/// `proc::sh_command` and `spawn.sh`; the mode checks verify the socket is
+/// still private without the restrictive mask.
 #[test]
 fn a_session_runs_under_the_umask_nvmux_was_launched_with() {
     require_nvim!();
@@ -175,8 +158,8 @@ fn a_session_runs_under_the_umask_nvmux_was_launched_with() {
             .to_string()
     };
 
-    // Born 0775 under that mask, and private anyway: `spawn.sh` chmods it, and
-    // it was never anywhere but inside a 0700 directory.
+    // Created 0775 under that mask, but `spawn.sh` chmods it and it lives in
+    // a 0700 directory.
     use std::os::unix::fs::PermissionsExt;
     let sock_mode = std::fs::metadata(&sock).expect("stat").permissions().mode() & 0o777;
     let dir_mode = std::fs::metadata(&scratch.0)
@@ -222,8 +205,7 @@ fn the_pid_recorded_is_the_process_serving_the_socket() {
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
-    // Require that the pid nvmux would signal is the one actually holding this
-    // socket. Getting it wrong means SIGKILLing an unrelated process.
+    // A wrong pid would mean SIGKILLing an unrelated process.
     let out = std::process::Command::new("ps")
         .args(["-ww", "-eo", "pid=,args="])
         .output()
@@ -261,15 +243,12 @@ fn rename_edits_metadata_and_leaves_the_socket_alone() {
     assert_eq!(listed[0].name, "after");
     assert_eq!(listed[0].id, session.id, "rename must not change identity");
 
-    // The point of rename-as-metadata-edit: the socket path is stable.
     let sock_after = t.local_socket_for(&listed[0]).expect("socket");
     assert_eq!(sock_before, sock_after, "the socket path must not move");
     assert!(sock_after.exists(), "the socket must still be live");
     assert_eq!(listed[0].state.liveness, Liveness::Alive);
 
-    // A rename edits the name and nothing else: neither the rank on disk nor
-    // the row it sorts into, or `<prefix> <n>` would start naming a different
-    // session every time one was renamed.
+    // Neither rank nor row may change, or `<prefix> <n>` would shift.
     assert_eq!(
         listed[0].num, session.num,
         "rename must not change the rank"
@@ -277,8 +256,7 @@ fn rename_edits_metadata_and_leaves_the_socket_alone() {
     assert_eq!(listed[0].state.num, session.state.num);
 }
 
-/// The column is recalculated on every listing: kill the second of three and
-/// the third becomes the second, against real metadata rather than a fixture.
+/// Row numbers are recomputed on every listing, against real metadata.
 #[test]
 fn killing_a_session_renumbers_the_ones_below_it() {
     require_nvim!();
@@ -302,8 +280,7 @@ fn killing_a_session_renumbers_the_ones_below_it() {
 
     t.kill_session(&second).expect("kill");
 
-    // The whole point: "third" moves up into the hole, and nothing had to be
-    // written to its metadata for that to happen.
+    // "third" moves up without its metadata being rewritten.
     let listed = t.list_sessions().expect("list");
     let numbered: Vec<(String, u32)> = listed
         .iter()
@@ -320,8 +297,7 @@ fn killing_a_session_renumbers_the_ones_below_it() {
         "the ranks on disk are untouched, hole and all"
     );
 
-    // A create appends rather than reusing the freed rank, so the new session
-    // comes up at the bottom of the list and nothing above it moves.
+    // A create appends rather than reusing the freed rank.
     let fourth = t
         .create_session("fourth", &common::launch(), common::anywhere())
         .expect("create");
@@ -347,10 +323,7 @@ fn killing_a_session_renumbers_the_ones_below_it() {
     );
 }
 
-/// A reorder is only worth anything if it sticks. The picker arranges the
-/// numbers, `renumber` writes them, and the next listing has to read the same
-/// order back — against real sessions and real metadata, which is the part the
-/// pure tests cannot cover.
+/// A `renumber` must survive the next listing, with real metadata.
 #[test]
 fn a_reorder_is_still_there_after_a_relisting() {
     require_nvim!();
@@ -365,8 +338,8 @@ fn a_reorder_is_still_there_after_a_relisting() {
     let names: Vec<&str> = listed.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["first", "second", "third"]);
 
-    // What the picker sends after dragging "third" to the top: every visible
-    // session, each paired with the number of the row it now sits in.
+    // What the picker sends after moving "third" to the top: every visible
+    // session with its new row number.
     let numbers: Vec<u32> = listed.iter().map(|s| s.state.num).collect();
     let arranged = ["third", "first", "second"];
     let batch: Vec<Session> = arranged
@@ -393,7 +366,7 @@ fn a_reorder_is_still_there_after_a_relisting() {
         "the numbers themselves should not have changed, only their owners"
     );
 
-    // And it is on disk, not just in the listing this process built.
+    // And on disk.
     for s in &listed {
         let v = common::read_meta(&scratch.0.join(format!("{}.json", s.id)));
         assert_eq!(
@@ -405,10 +378,8 @@ fn a_reorder_is_still_there_after_a_relisting() {
     }
 }
 
-/// A session with no metadata is skipped rather than having some conjured for
-/// it. An orphan — a live socket whose `<id>.json` was never written — is shown
-/// under a name the picker made up, and a reorder passing over one must not make
-/// that placeholder real.
+/// An orphan (live socket, no `<id>.json`) is listed under a placeholder name;
+/// a reorder must not write metadata for it.
 #[test]
 fn a_reorder_never_writes_metadata_for_a_session_that_has_none() {
     require_nvim!();
@@ -425,10 +396,9 @@ fn a_reorder_never_writes_metadata_for_a_session_that_has_none() {
     orphaned.num = 7;
     let renumbered = t.renumber(&[orphaned]);
 
-    // Killed here, before anything below can fail: `Scratch` finds what to
-    // kill through `<id>.json`, which this session no longer has. A signal
-    // rather than `kill_session`, which deletes `<id>.json` and so would hide
-    // one that `renumber` had wrongly written.
+    // Killed before any assert can fail, since `Scratch` cleans up via
+    // `<id>.json`. A signal, not `kill_session`, which would delete a wrongly
+    // written `<id>.json`.
     common::sigkill_and_wait(session.pid);
 
     renumbered.expect("a missing file is not an error");
@@ -438,8 +408,7 @@ fn a_reorder_never_writes_metadata_for_a_session_that_has_none() {
     );
 }
 
-/// The number has to survive the round trip through `<id>.json`, which is the
-/// only thing a second nvmux on another machine ever sees.
+/// `<id>.json` is all a second nvmux on another machine sees.
 #[test]
 fn a_number_survives_the_metadata_round_trip() {
     require_nvim!();
@@ -459,8 +428,7 @@ fn a_number_survives_the_metadata_round_trip() {
     assert_eq!(t.list_sessions().expect("list")[0].num, session.num);
 }
 
-/// Metadata written before numbering existed has no `num` key at all. It must
-/// still list, and still be reachable by keystroke.
+/// Metadata from before numbering has no `num` key.
 #[test]
 fn metadata_without_a_number_still_lists_and_gets_one() {
     require_nvim!();
@@ -472,7 +440,6 @@ fn metadata_without_a_number_still_lists_and_gets_one() {
         .expect("create");
     let path = scratch.0.join(format!("{}.json", session.id));
 
-    // Rewrite it the way an older nvmux would have.
     let mut v = common::read_meta(&path);
     v.as_object_mut().expect("object").remove("num");
     common::write_meta(&path, &v);
@@ -513,13 +480,12 @@ fn duplicate_names_are_refused_on_create_and_rename() {
         t.rename_session(&second, "taken").is_err(),
         "renaming onto an existing name must be refused"
     );
-    // ...but renaming a session to its own name is not a conflict with itself.
+    // Renaming to its own name is not a conflict.
     t.rename_session(&first, "taken")
         .expect("self-rename should work");
 }
 
-/// Killing is unconditional: unsaved buffers neither block it nor are consulted.
-/// The route out without losing work is `:q` in the session itself.
+/// Kill is unconditional; `:q` in the session is the safe way out.
 #[test]
 fn unsaved_buffers_do_not_block_a_kill() {
     require_nvim!();
@@ -578,8 +544,7 @@ fn a_dead_session_is_reaped_from_the_listing() {
 #[test]
 fn a_regular_file_masquerading_as_a_socket_is_never_deleted() {
     let scratch = Scratch::new("notasocket");
-    // 0700, not create_dir_all's default: the runtime-dir security check
-    // rightly refuses a group- or world-accessible directory.
+    // 0700, or the runtime-dir security check refuses it.
     std::fs::DirBuilder::new()
         .mode(0o700)
         .recursive(true)
@@ -622,8 +587,7 @@ fn a_busy_session_is_never_reaped() {
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
-    // Block the editor's main loop the way `:!make` would. `system()` does not
-    // pump the event loop, so deferred RPC calls stop answering entirely.
+    // Block the main loop like `:!make`; deferred RPC calls stop answering.
     common::block_editor(&sock, "call system('sleep 8')", Duration::from_millis(500));
 
     let listed = t.list_sessions().expect("list");
@@ -636,9 +600,8 @@ fn a_busy_session_is_never_reaped() {
     assert!(sock.exists(), "a busy session must never be reaped");
 }
 
-/// Busy sessions hold their probes for the whole of the probe's budget, and
-/// are probed together: two of them blocked at once are listed in about one
-/// budget, not one each, and both still busy and kept.
+/// Busy sessions use the whole probe budget, so they must be probed in
+/// parallel: two take about one budget, not two.
 #[test]
 fn busy_sessions_are_probed_together() {
     require_nvim!();
@@ -654,8 +617,7 @@ fn busy_sessions_are_probed_together() {
             t.local_socket_for(&session).expect("socket")
         })
         .collect();
-    // Longer than both budgets together, so that one after another the
-    // second probe is held as long as the first.
+    // Longer than two budgets, so serial probes would each take a full one.
     for sock in &socks {
         common::block_editor(sock, "call system('sleep 10')", Duration::ZERO);
     }
@@ -707,10 +669,8 @@ fn names_with_shell_metacharacters_survive_a_round_trip() {
     }
 }
 
-/// Every listing after the first runs in the shell the first one started.
-/// What a fresh shell and a kept one must agree on is the whole of the
-/// listing: names, ids, numbers, liveness — and the `list.sh` sweep in between
-/// must find nothing to sweep, or the tenth answer would differ from the first.
+/// Listings after the first reuse the first one's shell; a fresh and a kept
+/// shell must give the same listing.
 #[test]
 fn ten_listings_on_one_transport_agree() {
     require_nvim!();
@@ -723,10 +683,8 @@ fn ten_listings_on_one_transport_agree() {
         .create_session("beta", &common::launch(), common::anywhere())
         .expect("create beta");
 
-    // Everything the picker draws and everything a switch resolves against
-    // that the listing decides. Not whether a session is busy or idle, which
-    // a probe of a quarter of a second decides, each time, and a busy machine
-    // can have it say either of an idle one: that it is not dead.
+    // Busy vs idle is excluded: a 250 ms probe on a loaded machine can say
+    // either. Only "not dead" is checked.
     let rows = |sessions: &[Session]| -> Vec<(String, String, u32, u32)> {
         assert!(
             sessions.iter().all(|s| s.state.liveness != Liveness::Dead),
@@ -744,9 +702,7 @@ fn ten_listings_on_one_transport_agree() {
         assert_eq!(again, first, "listing {i} differs from the first");
     }
 
-    // A script that fails in that shell — a spawn of a program that is not
-    // there, which exits on its error path — changes nothing for the listing
-    // after it.
+    // A failing script in that shell must not affect the next listing.
     let hopeless = nvmux::launch::Launch::parse("nvmux-no-such-editor --listen {sock}")
         .expect("a well-formed command naming a program that is not there");
     assert!(t
@@ -759,15 +715,9 @@ fn ten_listings_on_one_transport_agree() {
     assert!(t.list_sessions().expect("list").is_empty());
 }
 
-/// Regression: a session busy in CPU-bound Lua must not be reaped.
-///
-/// The original bug ran `nvim_get_api_info` under a 250ms budget and mapped the
-/// resulting timeout to `Dead`, which made `list_sessions` unlink a live
-/// session's socket. `api_info` is answered off the main loop during `system()`
-/// calls — which is why the `a_busy_session_is_never_reaped` test above passed —
-/// but it is *not* answered during CPU-bound Lua, where it was measured at 3.7s.
-///
-/// So this test uses a busy loop specifically, not `system('sleep')`.
+/// Regression: a 250 ms `nvim_get_api_info` timeout was mapped to `Dead` and
+/// the live socket unlinked. `api_info` is answered during `system()` but not
+/// during CPU-bound Lua (measured 3.7 s), hence a busy loop here.
 #[test]
 fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
     require_nvim!();
@@ -780,7 +730,7 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
     let sock = t.local_socket_for(&session).expect("socket");
     let pid = session.pid;
 
-    // Peg the main loop with real work for longer than any probe budget.
+    // Longer than any probe budget.
     common::block_editor(
         &sock,
         "call luaeval('(function() local t=os.clock() while os.clock()-t<6 do end return 1 end)()')",
@@ -806,13 +756,9 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
     );
 }
 
-/// Regression: a timed-out call must condemn the connection.
-///
-/// rmpv consumes the stream incrementally, so abandoning a read part-way leaves
-/// the tail of that frame in the socket. Without poisoning, the next call
-/// decodes something well-formed out of it and returns it as the answer to a
-/// different question — a leftover `nvim_list_uis` reply read as the answer to
-/// `nvim_get_mode`, say, with no error anywhere.
+/// Regression: a timed-out read leaves the rest of its frame in the socket
+/// (rmpv decodes incrementally), and the next call would silently return
+/// that leftover as its answer.
 #[test]
 fn a_timed_out_call_poisons_the_connection() {
     require_nvim!();
@@ -823,7 +769,6 @@ fn a_timed_out_call_poisons_the_connection() {
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket");
 
-    // Block the editor, then make a call that cannot possibly be answered.
     common::block_editor(&sock, "call system('sleep 4')", Duration::from_millis(400));
 
     let mut client =
@@ -843,15 +788,9 @@ fn a_timed_out_call_poisons_the_connection() {
     );
 }
 
-/// A wrong recorded pid must not misdirect the kill.
-///
-/// The pid in `<id>.json` was validated when the session was spawned, but that
-/// could have been days ago and pids are reused. So it is treated as a guess:
-/// used only while it still owns this session's socket, and otherwise ignored
-/// in favour of searching by socket, because the socket is the identity.
-///
-/// The two failures this guards are opposite and both bad — signalling an
-/// innocent process that inherited the number, and failing to kill the session.
+/// The recorded pid may have been reused, so it is trusted only while it owns
+/// the session's socket; otherwise the session is found by socket. Guards
+/// against both signalling an innocent process and failing to kill.
 #[test]
 fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     require_nvim!();
@@ -863,14 +802,13 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     let sock = t.local_socket_for(&session).expect("socket");
     let json = sock.with_extension("json");
 
-    // A live pid that is emphatically not this session — the shape a recycled
-    // pid takes after a reboot or a long uptime.
+    // A live pid that is not this session, as a recycled one would be.
     let mut decoy = std::process::Command::new("sleep")
         .arg("30")
         .spawn()
         .expect("spawn decoy");
 
-    // The embedded script, not the file on disk: this is the copy that ships.
+    // The embedded script is the copy that ships.
     let out = nvmux::proc::run_local(
         nvmux::shell::KILL_SCRIPT,
         &[
@@ -897,7 +835,6 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     let _ = decoy.wait();
 }
 
-/// With nothing serving the socket, the leftover files are swept up.
 #[test]
 fn killing_an_already_dead_session_cleans_up_its_files() {
     require_nvim!();
@@ -917,15 +854,9 @@ fn killing_an_already_dead_session_cleans_up_its_files() {
     assert!(!json.exists(), "the orphaned metadata should be gone");
 }
 
-/// A host with `/proc` but no `ps` must still be able to kill a session.
-///
-/// `list.sh` always had a `/proc` path; `kill.sh` and `spawn.sh` did not, and
-/// looked the session up with `ps` alone. On a minimal container — `/proc`
-/// mounted, procps not installed — `kill.sh` therefore found nothing, reported
-/// `absent`, deleted the socket and left nvim running with no socket left for
-/// any listing to find it by. Exactly the orphan its own comments forbid.
-///
-/// Linux only: the fallback being tested is the `/proc` one.
+/// Regression: without `ps` (minimal containers), `kill.sh` reported `absent`,
+/// deleted the socket and left nvim running unreachable. Tests the `/proc`
+/// fallback, so Linux only.
 #[test]
 #[cfg(target_os = "linux")]
 fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
@@ -987,7 +918,6 @@ fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
     assert!(!sock.exists(), "the socket should have been removed");
 }
 
-/// The first `tool` on `$PATH`, so the sandbox above can link real binaries.
 #[cfg(target_os = "linux")]
 fn which(tool: &str) -> Result<std::path::PathBuf, ()> {
     std::env::var_os("PATH")
@@ -998,11 +928,8 @@ fn which(tool: &str) -> Result<std::path::PathBuf, ()> {
         .ok_or(())
 }
 
-/// A stale pid in the metadata must not stop a normal kill from working.
-///
-/// The graceful `qa!` goes over the socket and never touches the pid, so the
-/// session shuts down cleanly; reporting "could not kill" because a signal was
-/// not delivered would be a false alarm about a session that is now gone.
+/// The graceful `qa!` goes over the socket, so a stale pid must not turn a
+/// clean shutdown into a "could not kill" error.
 #[test]
 fn a_stale_pid_does_not_break_an_otherwise_normal_kill() {
     require_nvim!();
@@ -1027,11 +954,8 @@ fn a_stale_pid_does_not_break_an_otherwise_normal_kill() {
     assert!(!json.exists());
 }
 
-/// A session that exits on its own leaves metadata and an unbounded log behind.
-///
-/// Sessions are discovered through `*.sock`, so once nvim unlinks its own
-/// socket those files are invisible to every later listing and nothing would
-/// ever clean them up.
+/// A session that exits on its own unlinks its socket but leaves metadata and
+/// log, which a listing driven by `*.sock` would never find.
 #[test]
 fn metadata_left_by_a_self_terminating_session_is_swept_up() {
     require_nvim!();
@@ -1059,13 +983,9 @@ fn metadata_left_by_a_self_terminating_session_is_swept_up() {
     assert!(!log.exists(), "the orphaned log was never cleaned up");
 }
 
-/// A session waiting at a hit-enter prompt cannot answer a deferred call, and
-/// the picker used to wait the whole probe budget for it — on a cleared
-/// screen, once per such session. It is listed at once now, as busy, and kept:
-/// it is reachable, so it must never be reaped.
-///
-/// AstroNvim's `cmdheight = 0` puts a session there on every one-line error;
-/// any message that scrolls does it at the default `cmdheight`.
+/// Regression: a session at a hit-enter prompt cannot answer a deferred call,
+/// and the picker waited the full probe budget for each one. Common with
+/// `cmdheight = 0` (AstroNvim) or any scrolling message.
 #[test]
 fn a_session_at_a_hit_enter_prompt_is_listed_at_once_as_busy() {
     require_nvim!();
@@ -1081,12 +1001,8 @@ fn a_session_at_a_hit_enter_prompt_is_listed_at_once_as_busy() {
     let listed = t.list_sessions().expect("list");
     let took = started.elapsed();
 
-    // Not held up by the session at its prompt for a probe's whole budget, as
-    // a listing that waited one out would be. A probe waiting on a deferred
-    // call again would cost a listing only its quick budget, a quarter of a
-    // second, too little to tell from a busy machine's listing:
-    // probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it holds the probe
-    // itself to that.
+    // Only catches a full-budget wait; a 250 ms quick-budget wait is checked
+    // by probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it.
     assert!(
         took < nvmux::rpc::PROBE_TIMEOUT - Duration::from_millis(500),
         "listing took {took:?}: it waited out a probe's whole budget on the session at its prompt"
@@ -1099,8 +1015,6 @@ fn a_session_at_a_hit_enter_prompt_is_listed_at_once_as_busy() {
     assert!(sock.exists(), "a session at a prompt must never be reaped");
 }
 
-/// The probe's verdict is "busy" only while the prompt lasts: once the prompt
-/// is ended, the same session is alive again. Pins both branches the probe took.
 #[test]
 fn probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it() {
     require_nvim!();
@@ -1127,10 +1041,8 @@ fn probe_is_busy_at_a_hit_enter_prompt_and_alive_after_it() {
     );
 }
 
-/// A fresh attach to a session at a hit-enter prompt used to fail after the
-/// probe budget — `nvim_list_uis` is deferred, and the only client that could
-/// end the prompt was the one about to be started. It now ends the prompt
-/// itself, with the one key the prompt consumes, and attaches.
+/// Regression: `nvim_list_uis` is deferred, so attaching to a session at a
+/// hit-enter prompt timed out. The attach now sends the key that ends it.
 #[test]
 fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
     require_nvim!();
@@ -1155,10 +1067,9 @@ fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
         !common::at_hit_enter(&sock),
         "the prompt should have been ended by the attach"
     );
-    // `spawn` returns as soon as the client is forked, and the client takes a
-    // few milliseconds to attach its UI; the count is polled for, not asserted
-    // at once. Two means the helper's client and the new one, and that the
-    // deferred call answering is the proof the prompt is over.
+    // Polled: `spawn` returns at fork, before the UI attaches. Two UIs are the
+    // helper's and the new one; a deferred call answering proves the prompt
+    // is over.
     assert!(
         common::wait_until(Duration::from_secs(5), || {
             nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
@@ -1172,20 +1083,13 @@ fn a_fresh_attach_to_a_session_at_a_hit_enter_prompt_ends_it_and_attaches() {
     attachment.terminate();
 }
 
-/// **The attach that never came back.** A session waiting for a key nvmux may
-/// not press must still be attached to — promptly, and without being typed at.
+/// Regression: a session waiting for a key held the attach probe forever
+/// (`nvim_list_uis` is deferred and the probe had no budget).
 ///
-/// This is the shape of the reported bug. `nvim_list_uis` is deferred and the
-/// attach probe's connection has no budget, so a session in this state held the
-/// probe for ever: the spinner turned, nothing happened, and `Esc` was the only
-/// way out. It looked like nvmux had lost the session.
-///
-/// It is also why the fix is not a cleverer key. Mode `n` with `blocking` set
-/// is what a crashed `vim.schedule()` callback leaves behind *and* what a
-/// half-typed `g` leaves behind, and over RPC those are one state. So the probe
-/// says so and gets out of the way: the client it is holding back is how the
-/// user presses the key that ends the wait, since `nvim_input` is a fast call
-/// and lands whatever the editor is parked in.
+/// nvmux must not press a key itself: mode `n` with `blocking` is the same
+/// over RPC after a crashed `vim.schedule()` callback and a half-typed `g`.
+/// Instead it attaches, and the user's key (`nvim_input` is a fast call) ends
+/// the wait.
 #[test]
 fn a_session_waiting_for_a_key_is_attached_to_without_being_typed_at() {
     require_nvim!();
@@ -1206,8 +1110,7 @@ fn a_session_waiting_for_a_key_is_attached_to_without_being_typed_at() {
         "the attach took {took:?}: it waited on a session that cannot answer"
     );
 
-    // The whole invariant, in one assertion: the session is *still* waiting for
-    // its second key. Nothing nvmux did completed the command the user started.
+    // Still waiting for its second key: nvmux typed nothing.
     let after = common::mode(&sock).expect("the mode is a fast call");
     assert!(
         after.blocking && after.mode == "n",
@@ -1217,11 +1120,8 @@ fn a_session_waiting_for_a_key_is_attached_to_without_being_typed_at() {
     attachment.terminate();
 }
 
-/// The other half: once a key does arrive — from the user, on the client the
-/// attach just handed them — the session serves deferred calls again and the
-/// paint queued behind the wait is released.
-///
-/// Attaching is therefore the whole recovery, not a workaround for it.
+/// Once the user's key arrives through the attached client, deferred calls
+/// (including the queued UI attach) proceed.
 #[test]
 fn a_key_ends_the_wait_and_releases_what_was_queued_behind_it() {
     require_nvim!();
@@ -1234,18 +1134,16 @@ fn a_key_ends_the_wait_and_releases_what_was_queued_behind_it() {
     let sock = t.local_socket_for(&session).expect("socket");
     common::block_on_a_key(&sock);
 
-    // Deferred calls are dead while it waits: this is what parked the probe.
     assert_eq!(nvmux::rpc::probe(&sock), Liveness::Busy);
 
     let attachment = nvmux::pty::spawn(&session.id, &sock, "1  wedged").expect("attach");
-    // The client's UI attach is deferred too, so it is queued behind the same
-    // key and the session is still blocked with it forked.
+    // The client's UI attach is deferred too, queued behind the same key.
     assert!(
         common::mode(&sock).is_some_and(|m| m.blocking),
         "the attach should not have ended the wait by itself"
     );
 
-    // The user presses a key. `nvim_input` is what the client sends one with.
+    // The user presses a key; the client sends it with `nvim_input`.
     nvmux::rpc::Client::connect(&sock, Duration::from_secs(2))
         .expect("connect")
         .input("<Esc>")
@@ -1268,9 +1166,6 @@ fn a_key_ends_the_wait_and_releases_what_was_queued_behind_it() {
     attachment.terminate();
 }
 
-/// The whole point of asking how nvim is launched: the command chosen is the
-/// command that runs, and the session it starts is an ordinary session —
-/// listed, reachable, and killable by the same socket-matching as any other.
 #[test]
 fn a_chosen_command_is_what_runs_and_the_session_behaves_normally() {
     require_nvim!();
@@ -1290,8 +1185,6 @@ fn a_chosen_command_is_what_runs_and_the_session_behaves_normally() {
         "a session started with a chosen command is a session like any other"
     );
 
-    // The argument is in the running process, so it really was passed through
-    // rather than dropped somewhere between the prompt and the spawn.
     let args = command_line(session.pid);
     assert!(
         args.contains("--clean"),
@@ -1302,18 +1195,14 @@ fn a_chosen_command_is_what_runs_and_the_session_behaves_normally() {
         "nor did the rest of the line: {args:?}"
     );
 
-    // And it is recorded, so a session's metadata says what produced it.
     let stored = scratch.metadata(&session.id);
     assert_eq!(stored.command, launch.line());
 
-    // Killing still finds it: it is found by its socket, and the socket is
-    // where the command said to put it.
     t.kill_session(&session).expect("kill");
     assert!(t.list_sessions().expect("list").is_empty());
 }
 
-/// A command that names nothing must fail fast and say what was wrong, rather
-/// than spending the readiness budget and blaming the session for not starting.
+/// Must fail fast with the command named, not after the readiness budget.
 #[test]
 fn a_command_that_names_nothing_fails_at_once_and_says_so() {
     require_nvim!();
@@ -1341,13 +1230,9 @@ fn a_command_that_names_nothing_fails_at_once_and_says_so() {
     );
 }
 
-/// The sharp edge of letting the whole line be edited: `--listen <sock>` need
-/// not come last, and a session with arguments after it must still be found.
-///
-/// The scripts' fast path reads a `--listen` argument to the end of the line, so
-/// this is exactly the shape it cannot match. Listing and killing both have to
-/// fall through to asking the process table for the socket instead — which is
-/// the difference between a session nvmux can manage and one it has orphaned.
+/// The scripts' fast path reads `--listen` to the end of the line, so with
+/// arguments after the socket, listing and killing must fall back to
+/// searching the process table.
 #[test]
 fn a_session_whose_socket_is_not_the_last_argument_is_still_found_and_killed() {
     require_nvim!();
@@ -1379,20 +1264,15 @@ fn a_session_whose_socket_is_not_the_last_argument_is_still_found_and_killed() {
     assert!(!sock.exists(), "kill must unlink the socket");
 }
 
-/// The whole point of asking: the editor really is started in the directory it
-/// was given, not in whatever directory nvmux happened to be run from.
-///
-/// Asked of the live Neovim rather than of `/proc`, which does not exist on
-/// macOS, and rather than of the pid's environment, which would not notice a
-/// `cd` at all.
+/// Asked of Neovim itself: `/proc` does not exist on macOS, and the process
+/// environment would not reflect a `cd`.
 #[test]
 fn a_session_starts_in_the_directory_it_was_given() {
     require_nvim!();
     let scratch = Scratch::new("cwd");
     let t = scratch.transport();
 
-    // A directory that is definitely not this process's, and definitely not the
-    // home directory a shell would otherwise have dropped the session into.
+    // Neither this process's cwd nor the home directory.
     let where_ = scratch.0.join("workspace");
     std::fs::create_dir_all(&where_).expect("make the working directory");
     let where_ = where_.canonicalize().expect("canonicalise");
@@ -1424,9 +1304,8 @@ fn a_session_starts_in_the_directory_it_was_given() {
     t.kill_session(&session).expect("kill");
 }
 
-/// A directory that is not there is refused by the spawn script before it
-/// launches anything, so the error names the directory rather than arriving
-/// five seconds later as "the session did not become ready".
+/// `spawn.sh` refuses it up front, naming the directory, instead of a
+/// readiness timeout five seconds later.
 #[test]
 fn a_directory_that_is_not_there_is_refused_before_anything_is_spawned() {
     require_nvim!();
@@ -1454,9 +1333,6 @@ fn a_directory_that_is_not_there_is_refused_before_anything_is_spawned() {
     );
 }
 
-/// `<id>.json` records where a session was started, beside what launched it —
-/// so a listing can say, and a future nvmux has the answer without asking the
-/// editor.
 #[test]
 fn the_directory_is_recorded_in_the_session_metadata() {
     require_nvim!();

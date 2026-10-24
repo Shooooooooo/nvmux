@@ -1,12 +1,8 @@
-//! The watcher a session keeps its notes in ([`nvmux::notes`]), against real
-//! `nvim --headless` sessions: what it records of progress messages, of what
-//! language servers say they are doing and of what programs in its terminal
-//! buffers send, what a read makes of that, and that clearing it and a newer
-//! version of it each do what they say — and the picker's reader, which does
-//! all of it on a thread.
+//! The session notes watcher ([`nvmux::notes`]) against real `nvim
+//! --headless` sessions: progress messages, LSP progress and terminal
+//! notifications, clearing, version upgrades, and the picker's reader thread.
 //!
-//! They skip, rather than fail, when there is no usable `nvim` on `$PATH` —
-//! unless `$NVMUX_TEST_REQUIRE` names `nvim`, as it does in CI.
+//! Skipped without a usable `nvim` unless `$NVMUX_TEST_REQUIRE` names `nvim`.
 
 #[macro_use]
 mod common;
@@ -19,13 +15,10 @@ use nvmux::notes::{self, Kind, Note, Poller, Reading};
 use nvmux::transport::Transport;
 use rmpv::Value;
 
-/// Run Lua in the session, as a test's own stand-in for whatever a plugin or
-/// a terminal program would have done there.
 fn lua(sock: &Path, code: &str) -> Value {
     lua_within(sock, code, Duration::from_secs(5))
 }
 
-/// [`lua`], given `budget` to answer in.
 fn lua_within(sock: &Path, code: &str, budget: Duration) -> Value {
     let mut client = nvmux::rpc::Client::connect(sock, budget).expect("connect");
     client
@@ -36,8 +29,8 @@ fn lua_within(sock: &Path, code: &str, budget: Duration) -> Value {
         .expect("nvim_exec_lua")
 }
 
-/// A program in a hidden terminal buffer, printing `printf`'s format and
-/// staying up a while, as an agent at a prompt does.
+/// Run `printf` in a hidden terminal buffer and keep the program alive, like
+/// an agent waiting at a prompt.
 fn in_a_terminal(sock: &Path, printf: &str) {
     lua(
         sock,
@@ -50,12 +43,11 @@ end)"#
     );
 }
 
-/// A job in a hidden terminal buffer that runs `script` and exits, waited for
-/// until its `TermClose` has been, so that the watcher has seen it go.
+/// Run `script` in a hidden terminal buffer and wait for its `TermClose`, so
+/// the watcher has seen it exit.
 fn a_job_that_exits(sock: &Path, script: &str) {
-    // Given longer than the wait in it, so that a job slow to close, on a
-    // busy machine, is waited out by Neovim and not by the call; and one
-    // that never closes fails the call, saying so.
+    // The RPC budget exceeds the Lua wait, so a slow close is waited out in
+    // Neovim and one that never closes raises a clear error.
     lua_within(
         sock,
         &format!(
@@ -81,7 +73,7 @@ end"#
     );
 }
 
-/// Read until the note is what `want` says, or a few seconds have gone.
+/// Read until `want` holds, or 5 s pass.
 fn read_until(sock: &Path, want: impl Fn(Option<&Note>) -> bool) -> Option<Note> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -103,7 +95,7 @@ fn has_watcher(sock: &Path) -> bool {
     ) == Value::Boolean(true)
 }
 
-/// Whether the session's Neovim has progress messages at all (0.12 on).
+/// Progress messages need Neovim 0.12.
 fn has_progress(sock: &Path) -> bool {
     lua(sock, "return vim.fn.has('nvim-0.12') == 1") == Value::Boolean(true)
 }
@@ -114,9 +106,8 @@ fn a_session(scratch: &Scratch, name: &str) -> (nvmux::session::Session, std::pa
         .create_session(name, &common::launch(), common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&s).expect("socket");
-    // Past its startup before a test asks it anything on a budget of a
-    // second, as the notes' reads do: Neovim takes a call that waits for its
-    // main loop only once it has started, which a busy machine makes later.
+    // Wait out startup: the notes' reads have a 1 s budget, and Neovim only
+    // answers main-loop calls once started, which is slow on a busy machine.
     lua(&sock, "return 1");
     (s, sock)
 }
@@ -127,8 +118,7 @@ fn a_session_says_what_runs_in_it_and_what_its_terminals_ask_for() {
     let scratch = Scratch::new("notes-said");
     let (_, sock) = a_session(&scratch, "noted");
 
-    // The first read is what gives the session its watcher, and there is
-    // nothing to say yet.
+    // The first read installs the watcher.
     assert!(!has_watcher(&sock));
     assert_eq!(notes::read(&sock), Reading::Said(None));
     assert!(has_watcher(&sock));
@@ -151,8 +141,8 @@ fn a_session_says_what_runs_in_it_and_what_its_terminals_ask_for() {
             "vim.api.nvim_echo({ { 'indexing' } }, false, { kind = 'progress', \
              source = 'lsp', title = 'lua_ls', status = 'running', percent = 42 })",
         );
-        // The progress message that started last is the one shown — unless
-        // both started in the same second, when either may be.
+        // The last-started message is shown, or either if both started in the
+        // same second.
         let latest = read_until(&sock, |n| n.is_some_and(|n| n.kind == Kind::Busy(Some(42))));
         assert!(latest.is_some());
 
@@ -174,7 +164,7 @@ fn a_session_says_what_runs_in_it_and_what_its_terminals_ask_for() {
         );
     }
 
-    // What an agent sends in Ghostty, from a terminal no window shows.
+    // OSC 777, as an agent sends in Ghostty.
     in_a_terminal(
         &sock,
         r"\033]777;notify;Claude Code;Claude needs your permission\007",
@@ -184,7 +174,8 @@ fn a_session_says_what_runs_in_it_and_what_its_terminals_ask_for() {
     assert_eq!(notified.title, "Claude Code");
     assert_eq!(notified.text, "Claude needs your permission");
 
-    // iTerm2's, and kitty's — in Claude Code's three parts, ST-terminated.
+    // OSC 9 (iTerm2), and OSC 99 (kitty) in Claude Code's three
+    // ST-terminated parts.
     notes::seen(&sock);
     in_a_terminal(&sock, r"\033]9;Task done\007");
     let iterm =
@@ -203,10 +194,9 @@ fn a_session_says_what_runs_in_it_and_what_its_terminals_ask_for() {
     );
 }
 
-/// A language server at work is busy, by its own name, from its `begin` to
-/// its `end` — or until it goes, since one that dies mid-work never says it
-/// has finished. The server is a stand-in in the session itself, as Neovim's
-/// own tests have one, saying what clangd says while it indexes.
+/// A server that dies mid-work never sends `end`, so exiting must clear it
+/// too. The server is an in-process stand-in sending what clangd sends while
+/// indexing.
 #[test]
 fn a_language_server_is_busy_until_its_work_ends_or_it_goes() {
     require_nvim!();
@@ -290,10 +280,9 @@ end"#,
     );
 }
 
-/// Neovim's own progress messages are nothing running: a write's begins and
-/// ends within `:write`, and one that fails never says it has ended, which
-/// would leave the session busy for good. What an older watcher kept of one
-/// goes on the way in.
+/// A write's progress begins and ends within `:write`, and a failed one never
+/// ends, which would leave the session busy forever. Neovim's own entries kept
+/// by an older watcher are dropped on upgrade.
 #[test]
 fn neovims_own_progress_messages_are_never_busy() {
     require_nvim!();
@@ -327,10 +316,8 @@ N.version = -1",
     );
 }
 
-/// A command in a terminal buffer that fails is kept like a failed progress
-/// message: one its shell says has (OSC 133, the way fish says it, naming the
-/// command line as it starts), and a job that exits with a code other than 0.
-/// One that succeeds is no failure.
+/// A failure is an OSC 133 `D` with a non-zero code (as fish sends it, with
+/// the command line in `C`) or a job exiting non-zero.
 #[test]
 fn a_command_that_fails_in_a_terminal_is_kept() {
     require_nvim!();
@@ -349,7 +336,7 @@ fn a_command_that_fails_in_a_terminal_is_kept() {
         ("cargo build", "exited with code 101")
     );
 
-    // A shell that does not name the command line: the terminal's program.
+    // Without a command line, the title is the terminal's program.
     notes::seen(&sock);
     in_a_terminal(&sock, r"\033]133;D;2\033\134");
     let unnamed = read_until(&sock, |n| n.is_some()).expect("the unnamed failure");
@@ -358,8 +345,7 @@ fn a_command_that_fails_in_a_terminal_is_kept() {
         ("sh", "a command exited with code 2")
     );
 
-    // A command that succeeds, after a notification it would otherwise
-    // have taken the place of.
+    // A success must not replace the notification before it.
     notes::seen(&sock);
     in_a_terminal(
         &sock,
@@ -383,13 +369,10 @@ fn a_command_that_fails_in_a_terminal_is_kept() {
     );
 }
 
-/// A command in a terminal buffer that succeeds has finished, and is kept as
-/// a failure is, until it is seen — but apart from a notification or a
-/// failure, so it never takes the place of one: one its shell says has (OSC
-/// 133, the way fish says it), once the shell has said it started, and a job
-/// that exits with 0. A terminal a plugin draws into itself closes with 0
-/// too, with nothing run in it, and one whose buffer is deleted while its
-/// program runs closes with -1: neither has finished.
+/// A success (OSC 133 `D;0` after a `C`, or a job exiting 0) is kept until
+/// seen but never replaces a notification or failure. A plugin-drawn terminal
+/// also closes with 0, and one whose buffer is deleted closes with -1;
+/// neither counts.
 #[test]
 fn a_command_that_finishes_in_a_terminal_is_kept() {
     require_nvim!();
@@ -408,7 +391,7 @@ fn a_command_that_finishes_in_a_terminal_is_kept() {
         ("cargo test", "exited with code 0")
     );
 
-    // A shell that does not name the command line: the terminal's program.
+    // Without a command line, the title is the terminal's program.
     notes::seen(&sock);
     in_a_terminal(&sock, r"\033]133;C\033\134\033]133;D;0\033\134");
     let unnamed = read_until(&sock, |n| n.is_some()).expect("the unnamed finish");
@@ -417,8 +400,8 @@ fn a_command_that_finishes_in_a_terminal_is_kept() {
         ("sh", "a command exited with code 0")
     );
 
-    // A shell's word that the last command went well, at a prompt where none
-    // started — its first, or one after an empty line — is no finish.
+    // A `D;0` with no `C` since the last one (first prompt, or after an
+    // empty line) is not a finish.
     notes::seen(&sock);
     in_a_terminal(
         &sock,
@@ -441,8 +424,6 @@ fn a_command_that_finishes_in_a_terminal_is_kept() {
         ("sh", "exited with code 0")
     );
 
-    // A notification comes before it, and another finish after that leaves
-    // the notification where it is.
     in_a_terminal(
         &sock,
         r"\033]777;notify;Claude Code;Claude needs your permission\007",
@@ -497,8 +478,8 @@ vim.api.nvim_buf_delete(buf, { force = true })",
     );
 }
 
-/// A program's own progress bar, and ConEmu's other commands under OSC 9, are
-/// not notifications.
+/// ConEmu's OSC 9 subcommands (e.g. `9;4` progress bars) are not
+/// notifications.
 #[test]
 fn a_programs_own_progress_bar_is_not_a_note() {
     require_nvim!();
@@ -513,8 +494,7 @@ fn a_programs_own_progress_bar_is_not_a_note() {
     assert_eq!(n.text, "then this", "nothing before it was taken for one");
 }
 
-/// A session holding another nvmux's watcher is given this one's, and keeps
-/// what it recorded.
+/// An older watcher version is replaced, keeping what it recorded.
 #[test]
 fn a_watcher_is_replaced_in_place() {
     require_nvim!();
@@ -542,8 +522,6 @@ fn a_watcher_is_replaced_in_place() {
     );
 }
 
-/// A session coming to the front is given the watcher if it has none, and
-/// what it kept is cleared, being looked at.
 #[test]
 fn a_session_brought_to_the_front_is_watched_from_then_on() {
     require_nvim!();
@@ -561,8 +539,8 @@ fn a_session_brought_to_the_front_is_watched_from_then_on() {
     );
 }
 
-/// What the picker reads with: every session handed over is read at once,
-/// the one it was opened from cleared first.
+/// The picker's reader reads every session, clearing the one it was opened
+/// from first.
 #[test]
 fn the_pickers_reader_reads_each_session_and_clears_the_one_just_left() {
     require_nvim!();

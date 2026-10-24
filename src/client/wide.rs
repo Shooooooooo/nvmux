@@ -1,56 +1,33 @@
-//! A terminal wider than a window's text needs: what `[client] centre` does
-//! with it (see [`crate::config::ClientSettings::centre`]).
+//! `[client] centre`: centring a window's text when the terminal is wider
+//! than it needs (see [`crate::config::ClientSettings::centre`]).
 //!
-//! Neovim keeps the whole terminal, and a window wider than it wants, as the
-//! measure left in the editor says ([`MEASURE_LUA`]), is asked for a grid
-//! that wide (`nvim_ui_try_resize_grid`, which only a UI with `ext_multigrid`
-//! can ask): Neovim draws its text to that width — wraps its lines there,
-//! ends its cursor line there — and the client puts it in the middle of the
-//! window ([`inset`]), a float anchored to it with it, as far as keeps the
-//! float on the screen (see [`super::model::Model::inset`]). The status line
-//! under it is still the window's width, as Neovim draws it, and has its
-//! words moved in to stand over the text ([`realign`]). A window showing a
-//! terminal wants the whole terminal, so it is not asked: its grid is as
-//! wide as Neovim tells the program in it its terminal is. A grid asked for
-//! is the window's for every UI of the session: as the client goes, it asks
-//! for each window's own width back, and waits a moment for Neovim to have
-//! done it ([`super::run`]).
+//! With `ext_multigrid`, the client asks Neovim (`nvim_ui_try_resize_grid`)
+//! for a grid narrower than its window, at the width [`MEASURE_LUA`] reports,
+//! so Neovim wraps text there. The client draws the grid in the window's
+//! middle ([`inset`]), moving anchored floats with it as far as they stay on
+//! screen (see [`super::model::Model::inset`]), and moves the full-width
+//! status line's words over the text ([`realign`]). Terminal windows are
+//! never narrowed. Grid sizes are shared by every UI of the session, so on
+//! exit the client asks for each window's width back and briefly waits for it
+//! ([`super::run`]).
 //!
-//! The client cuts its own copy of a grid to the width it asks for as it
-//! asks, as Neovim cuts its own once it has the ask: a window split off
-//! another has its text in its middle from the first frame of its flying in,
-//! not a round trip later — over a slow link, once it had landed against the
-//! window's edge — and Neovim's grid of that width, when it comes, moves
-//! nothing, but for where long lines wrap. Nor does its answer to an ask
-//! asked again since for less, as a window split off another is — asked for
-//! `window_width` before the measure has said what it wants, and then for
-//! what it wants: Neovim drew nothing of its grid at the first width, and
-//! cuts it again on the next ask, so the client's copy keeps the narrower
-//! width through it (see `App::grid_resized`). Text that moves in or out of a
-//! window that stays where it is — the window's width judged again, or the
-//! window wanting the whole terminal — slides there rather than jumping (see
-//! [`super::anim::Animator::insets`]).
+//! The client cuts its own grid copy as soon as it asks, so a new split is
+//! centred from its first frame rather than a round trip later. If a grid is
+//! asked for again, narrower, before Neovim answers (a split gets
+//! `window_width` before the measure, then the measured width), the copy
+//! keeps the narrower width (see `App::grid_resized`). Inset changes slide
+//! ([`super::anim::Animator::insets`]).
 //!
-//! A client killed outright — by nvmux, still there two seconds after it was
-//! hung up, or by a crash — asks for nothing back, and Neovim keeps a grid
-//! as it was asked for until a UI asks for the window whole. So a client
-//! with windows of their own looks at each window once an attach, the first
-//! time it knows how wide both the window and its grid are, and asks for one
-//! on a grid not its width whole, unless it narrows that window itself. Two
-//! clients attached at once share the grids: the one to attach last has the
-//! windows as it wants them, and the other draws them as they are.
+//! A killed client restores nothing, and Neovim keeps a grid as asked until
+//! some UI asks for the full width. So once per attach the client asks for
+//! the full width of each window whose grid is not the window's width, unless
+//! it narrows that window itself. With two clients attached, the last to
+//! attach wins.
 //!
-//! What Neovim draws after a line's end — the text of a mark at its end, a
-//! language server's diagnostic or a blame — it cuts at the grid's edge,
-//! which on a grid narrower than its window is where the window has room for
-//! more of it: a line about as long as the text is wide had all of its
-//! diagnostic cut. So the editor says, as it draws, what each row of such a
-//! window has after its line's end, and where Neovim put that ([`TAILS_LUA`]);
-//! and the client draws what Neovim cut on in the margin past the grid's
-//! edge, as far as the window goes ([`past`]), and with its row as that
-//! moves. Where it is on the row is checked against what Neovim drew there,
-//! and where the window conceals text, which moves a line's end where the
-//! editor cannot see, it is found there ([`place`]).
+//! Neovim cuts end-of-line virtual text (diagnostics, blame) at the grid's
+//! edge. [`TAILS_LUA`] reports each such row's full tail and where it starts;
+//! the client draws the cut part in the margin ([`past`]), locating it on the
+//! drawn row ([`place`]), since concealed text shifts the line's end.
 
 use std::collections::BTreeMap;
 
@@ -62,40 +39,29 @@ use super::grid::{Cell, Text};
 use super::model::syntax_hl;
 use super::redraw;
 
-/// What each window of the tab page in front wants, given how wide a
-/// window's text is (the first argument) and whether to judge each by what
-/// it shows (the second: `[client] centre = "smart"`, see
-/// [`crate::config::ClientSettings::centre`]).
+/// Lua returning the width each window of the current tab page wants, given
+/// the configured text width, whether `[client] centre = "smart"`, and
+/// optionally the client's channel.
 ///
-/// A window showing a terminal wants the whole terminal, more than any is
-/// wide — the program in it is told its window's width. So does one whose
-/// text is in its middle already, as a start screen's is: every line set in
-/// from the left by about as much as the longest stops short of the
-/// window's right edge — to within a couple of columns, and the gutter,
-/// which the screen may or may not have left out. Such a screen laid itself
-/// out for the window's whole width, which `nvim_win_get_width` gives it
-/// whatever the grid; on a narrower grid it would be centred twice over,
-/// and so off to the right. A window that keeps its width wants that. Any
-/// other wants the width given — or, judged by what it shows, its buffer's
-/// `'textwidth'` where it has one, and room for its long lines where they
-/// are not wrapped: all of them with `'wrap'` off, and with it on those of a
-/// Markdown table or code block, where tree-sitter has a parser to say which
-/// those are. Enough room for nine in ten of them, the first few thousand
-/// saying as much as the rest; and the gutter as well — the line numbers,
-/// the signs and the folds.
+/// - Terminal windows want the whole terminal.
+/// - So do windows already centred, like a start screen: every line indented
+///   about as much as the longest stops short of the right edge, within 2
+///   columns plus the gutter. They lay out for `nvim_win_get_width`, so on a
+///   narrower grid they would be centred twice.
+/// - `'winfixwidth'` windows want their width.
+/// - Others want the given width. With `smart`: `'textwidth'` if set, and at
+///   least enough for 90% of unwrapped lines (all with `'nowrap'`, otherwise
+///   Markdown tables and code blocks via tree-sitter) among the first 4000,
+///   plus the gutter.
 ///
-/// Answered as `{ 'laststatus', windows }`, `windows` each window as
-/// `{ window, wanted }`: `'laststatus'` says which windows have a status line
-/// of their own, to stand over their text (see [`realign`]).
+/// Returns `{ 'laststatus', { { window, wanted }, ... } }`; `'laststatus'`
+/// tells which windows have their own status line ([`realign`]).
 ///
-/// Given the client's channel as well, it stays in the editor and says it
-/// again, as an `nvmux_client` notification (`measure`, and the same two),
-/// whenever what the windows want or `'laststatus'` changes: a window made,
-/// closed or resized, a buffer shown in a window, read, written or given a
-/// filetype, a terminal opened, a tab page entered, or an option set that a
-/// window's width or what it wants turns on. Not as its text is typed,
-/// which would have it widen and narrow under the cursor. It goes when this
-/// client's UI does, or the first time it finds the channel gone.
+/// With a channel, it stays installed and sends `measure` on `nvmux_client`
+/// with the same two values whenever they change (window, buffer, tab and
+/// relevant option events), but not on text changes, which would make the
+/// width jump while typing. It removes itself on this UI's `UILeave` or once
+/// the channel is gone.
 pub const MEASURE_LUA: &str = "local most, smart, chan = ...
 local api = vim.api
 local whole = 1073741824
@@ -252,51 +218,40 @@ if chan then
 end
 return last";
 
-/// What takes [`MEASURE_LUA`] and [`TAILS_LUA`] back out of the editor,
-/// given the client's channel: once nothing is centred, nothing is to be
-/// measured, and no grid is narrower than its window.
+/// Lua removing [`MEASURE_LUA`] and [`TAILS_LUA`] for a channel, once
+/// nothing is centred.
 pub const UNMEASURE_LUA: &str = "local chan = ...
 local tails = 'nvmux_tails_' .. chan
 pcall(vim.api.nvim_del_augroup_by_name, 'nvmux_centre_' .. chan)
 pcall(vim.api.nvim_del_augroup_by_name, tails)
 pcall(vim.api.nvim_set_decoration_provider, vim.api.nvim_create_namespace(tails), {})";
 
-/// What tells the client, given its channel, what Neovim draws after the
-/// end of the lines of each window whose grid is narrower than the window —
-/// the text of the marks at their ends, which Neovim cuts at the grid's
-/// edge: for each row with more of it than the grid has room for, the row,
-/// the column the text starts in, as `screenpos()` has the line's end — past
-/// the grid's width where none of it fits — and all of it, a list of pieces
-/// of one highlight group each, the marks' texts in the order Neovim draws
-/// them with a blank between each two. Said as an `nvmux_client`
-/// notification (`tails`, the window, whether the window conceals no text,
-/// the rows), each time a redraw of the window changes it; before it, the
-/// attributes of each group the client has not been sent (`colours`, as the
-/// agent sends them), and all of them again with a new colour scheme.
+/// Lua that, given the client's channel, reports the end-of-line virtual
+/// text Neovim cuts at the edge of grids narrower than their window: per row
+/// that overflows, the start column (from `screenpos()`; past the grid's
+/// width if none fits) and the full text as single-highlight pieces, marks in
+/// draw order separated by a blank. Sent as `nvmux_client` `tails` (window,
+/// whether it conceals nothing, rows) when a redraw changes it, after
+/// `colours` with new groups' attributes in the agent's format (all re-sent
+/// on `ColorScheme`).
 ///
-/// Said at the end of the redraw, from a decoration provider: ahead of the
-/// `flush` that ends what Neovim sends of it, which the client takes it
-/// with. Not the text of a line in a closed fold, which Neovim does not draw;
-/// and of a line with text put in at its end (inline), from after that. It
-/// goes when this client's UI does, or the first time it finds the channel
-/// gone.
+/// Sent from a decoration provider at the end of the redraw, so it arrives
+/// before the `flush` the client applies it with. Lines in closed folds are
+/// skipped; the tail starts after any inline virtual text at the line's end.
+/// Removed on this UI's `UILeave` or once the channel is gone.
 ///
-/// What it asks of a window it asks by the functions that take a window,
-/// never by making the window the current one, as `nvim_win_call` does to
-/// have `foldclosed()` asked in it: with `'autochdir'` set, that has Neovim
-/// draw the windows again, whether or not the directory changes, and Neovim
-/// holds back a window's `win_viewport` — how far the window scrolled — while
-/// the window is to be drawn. Done at the end of every redraw, that would
-/// hold them back for good: the client would see a window's rows scroll with
-/// nothing to say how far, slide none of them, and land none of the scrolls
-/// it made ahead of Neovim.
+/// Never makes a window current (as `nvim_win_call` would for
+/// `foldclosed()`): with `'autochdir'` that causes a redraw, and Neovim
+/// withholds `win_viewport` (scroll amounts) while one is pending. Done every
+/// redraw, scroll amounts would never arrive, breaking scroll animation and
+/// the client's predicted scrolls.
 pub const TAILS_LUA: &str = "local chan = ...
 local api = vim.api
 local name = 'nvmux_tails_' .. chan
 local ns = api.nvim_create_namespace(name)
 local group = api.nvim_create_augroup(name, { clear = true })
--- The windows drawn since the last redraw ended, what was last said of
--- each, and the groups the client has the attributes of.
+-- Windows drawn since the last redraw, the last report per window, and the
+-- groups whose attributes were sent.
 local drawn, said, sent = {}, {}, {}
 local function stop()
   pcall(api.nvim_set_decoration_provider, ns, {})
@@ -324,7 +279,7 @@ local function attrs(gid)
   cterm.foreground, cterm.background = a.ctermfg, a.ctermbg
   return { gid, rgb, cterm }
 end
--- Text as Neovim draws it from column col: each tab out to the next stop.
+-- Expand tabs as drawn from column col.
 local function untab(text, col, ts)
   if not text:find('\\t', 1, true) then
     return text
@@ -340,10 +295,9 @@ local function untab(text, col, ts)
   end
   return table.concat(out)
 end
--- Each row of a window whose text after its line's end runs past its grid's
--- edge, as { row, start, pieces }: the window's grid narrower than it. Where
--- a line could be no wider than the grid, text and all, it is left at that:
--- concealed text would only make it narrower.
+-- { row, start, pieces } for each row whose end-of-line text runs past a
+-- narrowed grid's edge. Lines that fit even unconcealed are skipped:
+-- conceal only makes them narrower.
 local function tails(win, fresh)
   local width = vim.fn.winwidth(win)
   if api.nvim_win_get_config(win).relative ~= '' or width >= api.nvim_win_get_width(win) then
@@ -373,7 +327,7 @@ local function tails(win, fresh)
   local at = api.nvim_win_get_position(win)
   local ts = vim.bo[buf].tabstop
   local count = api.nvim_buf_line_count(buf)
-  -- As wide as text is in the window: each tab out to its buffer's stops.
+  -- Display width of chunks, tabs expanded.
   local function wide(chunks)
     local n = 0
     for _, c in ipairs(chunks) do
@@ -381,16 +335,14 @@ local function tails(win, fresh)
     end
     return n
   end
-  -- How many rows lines a to b take in the window, a closed fold one.
+  -- Screen rows lines a..b take; a closed fold takes one.
   local function rows(a, b)
     return api.nvim_win_text_height(win, { start_row = a, end_row = b }).all
   end
-  -- Whether line r, its end where screenpos() puts p, is in a closed fold,
-  -- which Neovim draws as a row with nothing after its lines' ends. Every
-  -- column of a line in one is where the fold's text starts, the one past
-  -- its end too; an empty line has no other to tell by, but is in one with
-  -- a line beside it, the two taking a row between them where apart they
-  -- take two.
+  -- Whether line r (its end at screenpos() p) is in a closed fold, which is
+  -- drawn without tails. In a fold every column maps to the fold's start,
+  -- even past the end; an empty line is folded if it and a neighbour take
+  -- one row together but two apart.
   local function folded(r, line, p)
     if p.endcol ~= info.wincol + info.textoff then
       return false
@@ -404,8 +356,8 @@ local function tails(win, fresh)
   local out = {}
   for r, l in pairs(lines) do
     local line = #l.ends > 0 and api.nvim_buf_get_lines(buf, r, r + 1, false)[1]
-    -- What is put in at the line's end, which the text after it follows;
-    -- and as wide as the line could be, text and all.
+    -- Width of inline text at the line's end (the tail follows it), and the
+    -- widest the line could be, tail included.
     local inline, most = 0, 0
     if line then
       for _, i in ipairs(l.inline) do
@@ -419,9 +371,9 @@ local function tails(win, fresh)
       end
     end
     if line and most > width then
-      -- The line's end is the cell after its last character, as far as
-      -- screenpos() sees, even past the window's edge where the line fills
-      -- it; the text after it starts a cell on, past any put in there.
+      -- The line's end is the cell after its last character as screenpos()
+      -- sees it, even past the window's edge; the tail starts one cell on,
+      -- after any inline text.
       local p = vim.fn.screenpos(win, r + 1, math.max(#line, 1))
       local col = (line == '' and p.col - at[2] or p.endcol - at[2] + 1) + inline
       if p.row > 0 and not folded(r, line, p) then
@@ -526,27 +478,23 @@ for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
 end
 pcall(report)";
 
-/// How far into a window `slot` columns wide its grid `grid` columns wide is
-/// drawn: in its middle, odd slack to the right; nowhere in for a grid as
-/// wide as its window, or wider.
+/// Left offset centring a `grid`-wide grid in a `slot`-wide window; odd slack
+/// goes to the right.
 pub fn inset(slot: usize, grid: usize) -> usize {
     slot.saturating_sub(grid) / 2
 }
 
-/// A window's status line, `row` as Neovim drew it the window's width, made
-/// to stand over its text, `text` columns of it `inset` columns in: its
-/// widest run of blanks in one colour — the gap `%=` leaves between what it
-/// says on the left and what on the right — closed up by as many columns as
-/// the text is narrower than the window, which go either side of it, blank
-/// in the gap's colour. Left as it is where the gap is not that wide.
+/// Move a full-width status line's words over the text (`text` columns,
+/// `inset` in): its widest single-colour run of blanks (the `%=` gap) shrinks
+/// by the window's extra width, which is added on either side as blanks in
+/// the gap's colour. Unchanged if the gap is too narrow.
 pub fn realign(row: &mut [Out], inset: usize, text: usize) {
     realign_by(row, inset, text, |o| {
         (o.text == Text::Char(' ') && !o.wide).then_some(o.style)
     });
 }
 
-/// [`realign`], of a row of cells of any kind: `blank` says whether a cell
-/// is a blank, and if so in what colour.
+/// [`realign`] for any cell type; `blank` returns a blank cell's colour.
 pub fn realign_by<T: Clone, C: PartialEq>(
     row: &mut [T],
     inset: usize,
@@ -592,23 +540,20 @@ pub fn realign_by<T: Clone, C: PartialEq>(
     }
 }
 
-/// What Neovim draws after the end of the line a row of a window grid
-/// shows — the text of the marks at its end — all of it, as the editor says
-/// it (see [`TAILS_LUA`]): the grid has room for only so much of it.
+/// A grid row's full end-of-line virtual text, as [`TAILS_LUA`] reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tail {
-    /// The column its first cell goes in, as the editor works it out: past
-    /// the grid's width where none of it fits.
+    /// Column of the first cell, per the editor; past the grid's width if
+    /// none of it fits.
     pub start: usize,
     pub cells: Vec<Cell>,
-    /// Whether `start` holds even where the row has only blanks of the tail
-    /// to say so: not in a window that conceals text, which the editor does
-    /// not see, and which puts the line's end left of where it says.
+    /// Whether `start` can be trusted when the row shows only blanks of the
+    /// tail. False in a window that conceals text, which moves the line's end
+    /// left of where the editor says.
     pub sure: bool,
 }
 
-/// What a `tails` notification says of a window's rows (see [`TAILS_LUA`]),
-/// `sure` as it says it of the window: each row's tail, by row.
+/// Parse a `tails` notification's rows, keyed by row; `sure` is per window.
 pub fn tails(rows: Option<&ValueRef<'_>>, sure: bool) -> BTreeMap<usize, Tail> {
     let rows = rows
         .and_then(ValueRef::as_array)
@@ -632,11 +577,10 @@ pub fn tails(rows: Option<&ValueRef<'_>>, sure: bool) -> BTreeMap<usize, Tail> {
         .collect()
 }
 
-/// Pieces of text, each in a highlight group of the editor's, as the cells
-/// Neovim draws them in: each group laid over the default highlight, as the
-/// margin they are drawn in has it (see [`syntax_hl`]); a character two
-/// cells wide a cell and the half after it, a combining mark in with the
-/// character before it, and a control character as Neovim shows one.
+/// Lay out `(text, group)` pieces as Neovim draws them: each group over the
+/// default highlight ([`syntax_hl`]), wide characters as a cell plus a
+/// `Half`, combining marks joined to the previous cell, control characters
+/// as `^X` or `<xx>`.
 fn cells<'a>(pieces: impl Iterator<Item = (&'a str, u32)>) -> Vec<Cell> {
     let mut out: Vec<Cell> = Vec::new();
     for (text, group) in pieces {
@@ -686,18 +630,15 @@ fn cells<'a>(pieces: impl Iterator<Item = (&'a str, u32)>) -> Vec<Cell> {
     out
 }
 
-/// The column `tail` starts in on `row`, a row of a grid as Neovim drew it:
-/// where the editor says, if the row has the tail's start there — or, sure
-/// of it, if nothing but blanks of the tail are on the row to say; else the
-/// rightmost column after a blank from which the row has more than blanks of
-/// the tail's start, as it has where the window conceals text before it.
-/// Past the row's end where none of it is on the row. `None` where neither
-/// is: the row does not have the tail anywhere it can be told.
+/// The column `tail` starts at on a drawn `row`: `tail.start` if the row
+/// matches there with non-blank text (or only blanks, or nothing, when
+/// `sure`); else the rightmost column after a blank where the row matches
+/// with non-blank text, as when concealed text shifted it. `None` if neither.
 pub fn place(row: &[Cell], tail: &Tail) -> Option<usize> {
     let (w, v) = (row.len(), &tail.cells);
-    // Whether the row has the tail's start from column `at`, and whether
-    // more than blanks of it: all of it that fits, but a character two cells
-    // wide in the row's last column, which Neovim has no room for there.
+    // Whether the row matches the tail from `at` (as much as fits, except a
+    // wide character in the last column, which Neovim has no room for), and
+    // if so whether any matched cell is non-blank.
     let has = |at: usize| -> Option<bool> {
         let n = v.len().min(w.saturating_sub(at));
         let mut ink = false;
@@ -723,11 +664,9 @@ pub fn place(row: &[Cell], tail: &Tail) -> Option<usize> {
         .find(|&at| row[at - 1].text.is_blank() && has(at) == Some(true))
 }
 
-/// What of `tail` runs past the end of `row`, a row of a grid as Neovim
-/// drew it (see [`place`]): the cells the row has no room for, and the
-/// column the first goes in — past the row's end, and a character two cells
-/// wide the row's last column cut drawn whole after it. Nothing where the
-/// row has all of it, or does not have it where it can be told.
+/// The cells of `tail` cut off at the end of `row`, and the column the first
+/// goes in (at least the row's end). A wide character cut at the last column
+/// is included whole. `None` if nothing is cut or [`place`] fails.
 pub fn past<'a>(row: &[Cell], tail: &'a Tail) -> Option<(usize, &'a [Cell])> {
     let start = place(row, tail)?;
     let w = row.len();
@@ -782,8 +721,6 @@ mod tests {
         );
     }
 
-    /// The words of a status line close up at its gap to stand over the
-    /// text, the columns either side blank in the gap's colour.
     #[test]
     fn a_status_line_closes_up_over_the_text() {
         let s = styled(3);
@@ -794,8 +731,7 @@ mod tests {
         assert!(r.iter().all(|o| o.style == s));
     }
 
-    /// Where its gap is too narrow to close up by that much, it is left as
-    /// Neovim drew it; and the gap is the widest run of blanks in one colour.
+    /// The gap is the widest run of blanks in one colour.
     #[test]
     fn a_status_line_with_too_narrow_a_gap_is_left_alone() {
         let s = styled(3);
@@ -818,8 +754,6 @@ mod tests {
         );
     }
 
-    /// A row of a grid as Neovim drew it, a cell a character; or a tail's
-    /// cells, in highlight group 7.
     fn drawn(text: &str) -> Vec<Cell> {
         cells(std::iter::once((text, 0)))
     }
@@ -844,10 +778,6 @@ mod tests {
         past(row, tail).map(|(at, cells)| (at, said(cells)))
     }
 
-    /// What Neovim cut at the grid's edge runs on past it, from the first
-    /// column past the edge; a tail all on the row has nothing past it; and
-    /// one that starts past the row's end — the line filling the row — all
-    /// of it, from where it starts.
     #[test]
     fn what_neovim_cut_at_the_edge_runs_on_past_it() {
         let msg = "    ■ mismatched";
@@ -866,9 +796,6 @@ mod tests {
         );
     }
 
-    /// Where the row has only blanks of the tail, nothing says where it
-    /// starts but the editor: taken as it says where it is sure, and not
-    /// where the window conceals text.
     #[test]
     fn a_tail_shown_only_in_blanks_is_placed_only_where_the_editor_is_sure() {
         let row = drawn("let x = 1;   ");
@@ -881,10 +808,7 @@ mod tests {
         assert_eq!(past_of(&full, &tail(12, "■ x", false)), None);
     }
 
-    /// Text concealed before a line's end puts the end left of where the
-    /// editor says: the tail is found where the row has it, more than blanks
-    /// of it after a blank, and what runs past the edge runs on from there.
-    /// A row with none of it anywhere has nothing past it.
+    /// Concealed text puts the line's end left of where the editor says.
     #[test]
     fn a_tail_not_where_the_editor_says_is_found_where_the_row_has_it() {
         // `see [the link](https://…)` concealed down to `see the link`.
@@ -902,8 +826,7 @@ mod tests {
         assert_eq!(past_of(&row, &tail(13, "    ■ broken link", true)), None);
     }
 
-    /// A character two cells wide that the row's last column had no room
-    /// for runs on whole past the edge, where Neovim left a blank.
+    /// Neovim leaves the last column blank when a wide character does not fit.
     #[test]
     fn a_wide_character_the_edge_cut_runs_on_whole() {
         let row = drawn("abcdef ■  ");
@@ -913,10 +836,6 @@ mod tests {
         );
     }
 
-    /// The rows the editor says of, each as its tail's start and cells: each
-    /// piece in its group laid over the default highlight, a character two
-    /// cells wide a cell and a half, a combining mark in with the character
-    /// before it, a control character as Neovim shows one.
     #[test]
     fn tails_are_read_as_the_editor_says_them() {
         use rmpv::Value;

@@ -1,52 +1,41 @@
-//! Session ids and host tokens.
-//!
-//! Ids are short because socket paths are short — see [`crate::paths`] for the
-//! byte budget.
+//! Session ids and host tokens. Ids are short because socket paths are (see
+//! [`crate::paths`] for the byte budget).
 
-/// RFC 4648 base32, lowercased, no padding: unambiguous in a filename, safe in
-/// a shell word without quoting, and never looks like a flag.
+/// RFC 4648 base32, lowercase, no padding: filename- and shell-safe, and never
+/// looks like a flag.
 const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-/// Encode exactly 40 bits (5 bytes) as 8 base32 characters. 40 divides evenly
-/// by 5, so there is no padding case to get wrong.
+/// Encode 40 bits as 8 base32 characters (no padding case).
 fn b32_40(bytes: &[u8; 5]) -> String {
     let n = u64::from(bytes[0]) << 32
         | u64::from(bytes[1]) << 24
         | u64::from(bytes[2]) << 16
         | u64::from(bytes[3]) << 8
         | u64::from(bytes[4]);
-    // Most significant group first, so ids sort the same as their bit patterns.
+    // MSB first, per RFC 4648.
     (0..8)
         .map(|i| ALPHABET[((n >> (35 - i * 5)) & 0x1f) as usize] as char)
         .collect()
 }
 
-/// Eight random base32 characters: forty bits nothing can guess.
-///
-/// The one source of randomness in the crate. A fresh session id is one of
-/// these, and nothing more; so is the secret a [`crate::proc::Shell`] frames
-/// its output with.
+/// Eight random base32 characters (40 bits): session ids, SSH master socket
+/// names and the [`crate::proc::Shell`] output-framing secret.
 pub fn nonce() -> std::io::Result<String> {
     let mut bytes = [0u8; 5];
     getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
     Ok(b32_40(&bytes))
 }
 
-/// Reject anything that is not a well-formed session id.
-///
-/// Ids are also read out of `<id>.json` on disk, and an id becomes a *path*
-/// passed to unlink, to a kill script and to a socket connect — so
-/// `../../elsewhere/precious` would escape the runtime directory entirely.
+/// Ids are read from `<id>.json` on disk and become paths (unlink, kill
+/// script, socket connect), so anything malformed like `../..` is rejected.
 pub fn is_valid_id(id: &str) -> bool {
     id.len() == ID_LEN && id.bytes().all(|b| ALPHABET.contains(&b))
 }
 
-/// The length of a session id, in characters and bytes (the alphabet is ASCII).
+/// Session id length in characters and bytes (the alphabet is ASCII).
 pub const ID_LEN: usize = 8;
 
-/// A session id as a value that can be copied: what a switch to a session by
-/// its id carries from a key to the session loop, as a number or a step does
-/// (see `pty::Target`). Only a well-formed id is one.
+/// A validated session id that is `Copy`, e.g. for `pty::Target`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id([u8; ID_LEN]);
 
@@ -57,21 +46,18 @@ impl Id {
     }
 
     pub fn as_str(&self) -> &str {
-        // Base32's alphabet, so ASCII, which `new` saw to.
+        // `new` checked it is ASCII.
         std::str::from_utf8(&self.0).unwrap_or_default()
     }
 }
 
-/// A short, stable, filename-safe token for a host string, naming the local end
-/// of an SSH forward.
+/// A stable, filename-safe token for a host, naming the local end of an SSH
+/// forward.
 ///
-/// A fixed hash rather than `DefaultHasher`, which is documented as unstable
-/// across Rust releases: a toolchain upgrade must not orphan a live session's
-/// socket. The shape is FNV-1a's (xor, then multiply, over the bytes), with
-/// FNV's 64-bit offset basis — but the multiplier is **not** the FNV-64 prime
-/// (`0x100000001b3`): it has an extra nibble, and has had since the first
-/// release. It is not being corrected, because every forwarded socket name on
-/// disk depends on it; `host_token_is_stable_forever` pins the values.
+/// Not `DefaultHasher`, which may change across Rust releases and orphan live
+/// sockets. FNV-1a with the 64-bit offset basis, but the multiplier is **not**
+/// the FNV-64 prime (`0x100000001b3`): it has an extra zero nibble. Do not fix
+/// it: forwarded socket names on disk depend on it.
 pub fn host_token(host: &str) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x1000_0000_01b3;
@@ -136,7 +122,6 @@ mod tests {
         assert!(is_valid_id(&host_token("myhost")));
     }
 
-    /// Everything here would become a path if it were accepted.
     #[test]
     fn ids_that_would_escape_the_runtime_directory_are_rejected() {
         for bad in [
@@ -160,9 +145,7 @@ mod tests {
         }
     }
 
-    /// If this test ever fails, every live session's forwarded socket path
-    /// changes name. That is the whole reason FNV is spelled out here rather
-    /// than delegated to `DefaultHasher`.
+    /// A failure here renames every live session's forwarded socket.
     #[test]
     fn host_token_is_stable_forever() {
         assert_eq!(host_token("myhost"), "gtqu2ip5");

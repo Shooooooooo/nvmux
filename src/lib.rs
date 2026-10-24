@@ -1,29 +1,17 @@
-//! nvmux — a tmux-style session manager for Neovim.
+//! nvmux — a tmux-style session manager for Neovim. macOS and Linux only.
 //!
-//! A thin multiplexer: the multiplexer does not render Neovim's UI. A client
-//! does, as a child on a PTY whose bytes pass through untouched — nvmux's own,
-//! `nvmux --client`, which animates the editor ([`client`]), or with `[client]
-//! ui = "nvim"` Neovim's, `nvim --server <addr> --remote-ui`. What is left is a
-//! picker ([`ui`]) and a PTY proxy ([`pty`]) that watches stdin for a
-//! `<prefix>` prefix ([`keys`]), however the terminal spells it ([`keyseq`]) —
-//! plus a row along the bottom naming what the next key does while that prefix
-//! waits ([`hint`]), a way back into the session you were in when the link to
-//! its host drops ([`reconnect`]), and what each session has to report beside
-//! its name in the picker — busy, failed, finished, or a notification — from a
-//! watcher left in it ([`notes`]). Notes in the margin are the rest
-//! ([`card`]), drawn by nvmux's own client: on a change of session which one
-//! you landed in, and as it happens what the others have to report ([`tell`])
-//! — the notice once a box of nvmux's own, which is kept ([`announce`]) — and
-//! its settings, changed while it runs, floating over the session
-//! ([`ui::settings`]) with the session dimmed round them as a note's margin is
-//! ([`falloff`]). All of what
-//! nvmux draws itself is in the terminal's own colours, or with its text in
-//! one colour of the user's ([`theme`]).
+//! The editor is drawn by a client on a PTY whose bytes pass through: nvmux's
+//! own animating client ([`client`]) or `nvim --remote-ui`. Main modules:
 //!
-//! macOS and Linux only.
+//! - [`ui`]: the session picker and [`ui::settings`].
+//! - [`pty`]: the PTY proxy, watching stdin for the prefix ([`keys`],
+//!   [`keyseq`]), with the [`hint`] bar.
+//! - [`transport`]: local or SSH sessions; [`reconnect`] after a dropped link.
+//! - [`notes`] and [`tell`]: per-session status for the picker and cards.
+//! - [`card`], [`announce`], [`falloff`], [`theme`]: what nvmux draws itself.
 
-// The docs link private items on purpose — they are written for whoever reads
-// the source, and resolve under `cargo doc --document-private-items`.
+// Docs link private items on purpose; they resolve under
+// `cargo doc --document-private-items`.
 #![allow(rustdoc::private_intra_doc_links)]
 
 pub mod announce;

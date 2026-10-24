@@ -1,58 +1,38 @@
 //! The picker: a centred list of session names and one dim hint line on the
-//! last row. No borders, no popups — the hint line *is* the picker's help, and
-//! the filter and kill confirm replace it in place.
+//! last row, which the filter and kill confirm replace in place. No borders or
+//! popups.
 //!
-//! [`prompt`], [`help`] and [`settings`] are the other three screens. Each
-//! takes the whole terminal rather than drawing over anything, shares the same
-//! vocabulary (centred content, one dim hint row, no borders, no colour), and
-//! hands the same client back afterwards. `prompt::run` owns a terminal for
-//! `<prefix> c`, which arrives with none; `prompt::run_on` borrows the
-//! picker's — nesting the two would enter the alternate screen twice and leave
-//! it once. The help and the settings are reached the same two ways.
+//! [`prompt`], [`help`] and [`settings`] are the other screens, in the same
+//! style (centred, one dim hint row, no borders, no colour); each takes the
+//! whole terminal and hands the same client back. `prompt::run` owns a
+//! terminal (for `<prefix> c`), `prompt::run_on` borrows the picker's: nesting
+//! would enter the alternate screen twice and leave it once. Help and settings
+//! work the same way. [`attaching`] is the wait while the attach probe runs,
+//! and the one screen that leaves the mouse alone (see there).
 //!
-//! [`attaching`] is a fourth, and the odd one out: not a screen the user works
-//! on but the wait between the picker (or a `<prefix>` switch) and the session,
-//! up only while the attach probe is in flight. It keeps the vocabulary — a
-//! centred line where the picker draws its list, one dim hint row on the last
-//! line, no borders, no colour — and is the one screen that leaves the mouse
-//! alone, for a reason given there.
+//! # No preview pane, ever
 //!
-//! # There is no preview pane, and there must never be one
-//!
-//! Neovim sizes the global grid to the per-dimension **minimum** across every
-//! attached UI (`ui_refresh()`, run unconditionally at the end of
-//! `ui_attach_impl()`), so a small preview UI would shrink the grid of the
-//! session being edited in and fire `VimResized`. Confirmed: attaching a 40x10
-//! UI alongside a 120x40 one collapses both to 40x10. No `ui_option` opts out.
-//! So the picker reads session state over plain RPC and never attaches a second
-//! UI to a live session.
+//! Neovim sizes the grid to the per-dimension minimum over all attached UIs
+//! (`ui_refresh()` at the end of `ui_attach_impl()`): a 40x10 UI beside a
+//! 120x40 one shrinks both to 40x10 and fires `VimResized`, and no `ui_option`
+//! opts out. So the picker reads state over plain RPC and never attaches.
 //!
 //! # Colour
 //!
-//! Set no background and hardcode no palette. Do **not** rely on crossterm's
-//! own `NO_COLOR` handling: it turns `SetForegroundColor(c)` into a bare
-//! `ESC[m`, a full SGR reset that wipes bold, reverse and dim mid-line. Call
+//! Set no background and hardcode no palette. Do not rely on crossterm's
+//! `NO_COLOR` handling: it turns `SetForegroundColor(c)` into `ESC[m`, a full
+//! SGR reset that wipes bold, reverse and dim mid-line. Call
 //! `force_color_output(true)`, test the variable directly, and set no colours
 //! when it is present.
 //!
-//! Inheriting the palette has a cost the screens have to pay themselves.
-//! Setting no colours means ratatui writes no SGR before its content, so a
-//! screen is painted in whatever attributes the terminal was already in — and
-//! coming back from a session, that is whatever the editor happened to be
-//! drawing when the relay stopped. [`Screen::open`] therefore drops the
-//! inherited attributes first, which is the one place that can: every screen is
-//! taken through it.
+//! With no SGR written, a screen inherits the terminal's current attributes
+//! (e.g. the editor's, mid-frame), so [`Screen::open`] resets them first.
 //!
-//! The fade ([`crate::fade`]) and the picker's passing effects ([`effects`])
-//! are the only things that paint a colour on these screens, and they do so as
-//! a post-pass over a finished frame, never inside a `draw`: a screen's own
-//! drawing stays colourless, and its tests say so. So does the theme, when
-//! `[style] color` names one ([`crate::theme`]): it is the first pass over
-//! every frame once the screen has drawn it, giving what is drawn at full
-//! strength its ink and leaving what is drawn dim the terminal's own, so the
-//! effects and the fade after it take each cell from the colour it is drawn
-//! in. Every screen's `terminal.draw` makes that pass — the fade's frames
-//! included.
+//! Only the fade ([`crate::fade`]), the effects ([`effects`]) and the theme
+//! ([`crate::theme`], from `[style] color`) paint colour, as post-passes over a
+//! finished frame, never inside `draw`. The theme pass runs first on every
+//! frame (fade frames included), inking full-strength cells and leaving dim
+//! ones, so later passes fade each cell from the colour it is drawn in.
 
 pub mod app;
 pub mod attaching;
@@ -74,46 +54,37 @@ pub mod swap;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-/// What the picker returned.
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    /// Attach to this session.
     Attach {
         session: Session,
-        /// The listing the picker was showing — or, after a session created
-        /// there was moved up to the highlighted row, the one listed once its
-        /// place was stored (see `settle`).
-        ///
-        /// Carried out rather than re-listed, for the reason the picker already
-        /// resolves its own keys against the list in hand: a listing is a script
-        /// run — ~230 ms over SSH, and 88-110 ms on a local host whose forks are
-        /// expensive — and the session loop needs the same two answers the
-        /// picker had. The highest number, so the prefix machine knows when a
-        /// digit can be acted on without waiting; and the rows themselves, so a
-        /// `<prefix>` switch can name one without going back to disk.
+        /// The listing the picker showed (or, after a new session was moved
+        /// below the highlighted row, the one taken once its place was stored;
+        /// see `settle`). Passed on rather than relisted, as a listing costs
+        /// ~230 ms over SSH and 88-110 ms on hosts with slow forks. The
+        /// session loop needs the highest number (to act on a digit without
+        /// waiting) and the rows (to name `<prefix>` switch targets).
         sessions: Vec<Session>,
-        /// The session's name, left standing on the cleared screen for the
-        /// session to take down as it dissolves in — or `None`, the screen
-        /// left empty (see [`crate::handoff`]).
+        /// The session's name, left on the cleared screen for the session to
+        /// remove as it dissolves in; `None` leaves it empty (see
+        /// [`crate::handoff`]).
         hand_off: Option<HandOff>,
-        /// Whether the settings come up floating over the session as it comes
-        /// back: turned to float on the picker's `,`, where the picker came
-        /// up over this session (see [`settings::Outcome::Float`]).
+        /// Whether the settings float over the session as it returns: the
+        /// picker's `,` sets this when it came up over this session (see
+        /// [`settings::Outcome::Float`]).
         float_settings: bool,
     },
-    /// The user quit.
     Quit,
 }
 
 impl Outcome {
-    /// Whether this hands the terminal straight to a client spawn, and so must
-    /// give it back cleared — see [`Screen::close_for_attach`].
+    /// Whether this hands the terminal to a client spawn, so it must be given
+    /// back cleared (see [`Screen::close_for_attach`]).
     fn attaches(&self) -> bool {
         matches!(self, Self::Attach { .. })
     }
 
-    /// What to leave on the screen that is given back cleared: the name being
-    /// handed off, if there is one.
+    /// What to leave on the cleared screen: the handed-off name, if any.
     fn leaves(&self) -> Vec<u8> {
         match self {
             Self::Attach {
@@ -124,50 +95,40 @@ impl Outcome {
     }
 }
 
-/// What the picker opens on: the rows its first frame draws, and whether a
+/// What the picker opens on: the rows for its first frame, and whether a
 /// listing is still to come.
 ///
-/// Over ssh a listing is a round trip to the host, and the first frame used
-/// to wait for one every time the picker came up — after `<prefix> Space` a
-/// third of a second and more of blank screen on a distant host, between
-/// the session dissolving out and the picker dissolving in. Coming back from
-/// a session the session loop has the rows already, as a `<prefix>` switch
-/// does (see `main`), and they are as good as a listing's but for what has
-/// changed since outside this nvmux.
+/// Over SSH a listing is a round trip; a first frame waiting for it leaves the
+/// screen blank for a third of a second or more after `<prefix> Space`.
+/// Returning from a session, the session loop already has the rows (see
+/// `main`), stale only for changes made outside this nvmux.
 #[derive(Debug, Default)]
 pub enum Listing {
-    /// No rows in hand: the picker lists, and its first frame waits for the
-    /// answer.
+    /// No rows in hand: list, and wait for it before the first frame.
     #[default]
     Ask,
-    /// A listing taken a moment ago, which one taken now would only repeat:
-    /// the one nvmux started its clients ahead from (see `main`).
+    /// A listing just taken (the one clients were started ahead from, see
+    /// `main`), which relisting would only repeat.
     Fresh(Vec<Session>),
-    /// The rows as nvmux last had them, drawn at once, and a listing under way
-    /// on a thread of its own, whose answer replaces them once it has come and
-    /// the picker is at rest (see [`take_listing`]).
+    /// The last known rows, drawn at once, and a background listing that
+    /// replaces them once it answers and the picker is at rest (see
+    /// [`take_listing`]).
     InHand(Vec<Session>, Behind),
 }
 
-/// The answer of a listing under way behind the picker: see
-/// [`Listing::InHand`].
+/// The answer of a background listing; see [`Listing::InHand`].
 pub type Behind = std::sync::mpsc::Receiver<Result<Vec<Session>>>;
 
 impl Listing {
-    /// `rows`, up at once, and a listing begun now on a thread `transport` is
-    /// lent to.
-    ///
-    /// A thread that cannot be had leaves the rows as they are: the answer
-    /// that never comes is a channel that has hung up, and the picker takes
-    /// that as no news.
+    /// `rows` at once, plus a listing on a new thread. If no thread can be
+    /// spawned the rows stay: the hung-up channel reads as no news.
     pub fn in_hand(rows: Vec<Session>, transport: &crate::transport::Shared) -> Self {
         let (tell, answer) = std::sync::mpsc::channel();
         let transport = std::sync::Arc::clone(transport);
         let spawned = std::thread::Builder::new()
             .name("nvmux-listing".into())
             .spawn(move || {
-                // A picker gone by now has nobody left to tell, and loses
-                // nothing: the next one lists again.
+                // If the picker is gone, nothing is lost: the next one lists.
                 let _ = tell.send(transport.list_sessions());
             });
         if let Err(e) = spawned {
@@ -196,25 +157,18 @@ use app::{App, Key, Mode, Mouse, Request};
 /// behind an idle keyboard.
 const TICK: Duration = Duration::from_millis(250);
 
-/// The tick for a screen waiting on an answer it deliberately did not block
-/// for — the create prompt's directory completion, and nothing else so far.
-///
-/// A quarter of a second is the right wait for a resize, and far too long for a
-/// suggestion: a local listing comes back in about a millisecond, so on
-/// [`TICK`] the ghost text would appear a fifth of a second after it was ready
-/// and read as lag in the prompt rather than in the disk. Roughly one frame,
-/// and only for the few frames an answer is actually in flight — an idle prompt
-/// is back on [`TICK`] and costs nothing.
+/// The tick while a screen awaits a non-blocking answer (only the create
+/// prompt's directory completion so far). A local listing takes ~1 ms, so on
+/// [`TICK`] the ghost text would visibly lag; this is about one frame, used
+/// only while an answer is in flight.
 const BUSY_TICK: Duration = Duration::from_millis(16);
 
 /// A ratatui screen that is guaranteed to be given back.
 ///
-/// Taking the terminal ([`init`]: `ratatui::try_init` but for its panic hook)
-/// enables raw mode and enters the alternate screen, and nothing undoes that
-/// on `Drop` — so every `?` between init and restore was a way to leave the
-/// user's shell with no echo. This guard owns the terminal
-/// for one screen; dropping it restores, whatever path led there. The picker,
-/// the prompt, the help and the first-run screen all open through here.
+/// [`init`] enables raw mode and the alternate screen, and nothing undoes that
+/// on `Drop`, so any `?` before restore could leave the shell with no echo.
+/// This guard restores on drop. The picker, prompt, help and first-run screen
+/// all open through it.
 pub(crate) struct Screen {
     terminal: ratatui::DefaultTerminal,
     /// Set by the explicit close so `Drop` does not restore a second time.
@@ -222,39 +176,27 @@ pub(crate) struct Screen {
 }
 
 impl Screen {
-    /// Take the terminal — and the mouse.
+    /// Take the terminal and the mouse.
     ///
-    /// Every screen turns mouse reporting on for itself and off again as it
-    /// closes, whatever is behind it. The relay puts a resumed client's own
-    /// setting back: a kept client's (`[client] per_session`, the default) from
-    /// its ledger, as the client last wrote it (see [`crate::ledger`]), and a
-    /// held one's by asking the client's server (see `pty::repaint`); a client
-    /// spawned next enables its own. The screens set no colours so as to
-    /// inherit the terminal's palette, but a *mode* cannot be inherited the
-    /// same way — a client enables the mouse once, at startup, and would never
-    /// re-enable a mode nvmux had turned off — which is why this is restored
-    /// rather than left alone.
+    /// Each screen enables mouse reporting and disables it on close. The relay
+    /// restores a resumed client's setting: a kept client's from its ledger
+    /// ([`crate::ledger`]), a held one's by asking its server (`pty::repaint`);
+    /// a new client enables its own. Unlike colours, the mode cannot be left
+    /// alone: a client enables the mouse once, at startup.
     pub(crate) fn open() -> Result<Self> {
         Self::open_with(true)
     }
 
-    /// [`Screen::open`], saying whether to take the mouse.
-    ///
-    /// Every screen the user works on does. The one that does not is
-    /// [`attaching`], which reads nothing at all for the first seconds of its
-    /// life so that keys typed ahead stay in the terminal's queue for the
-    /// client it is waiting on — and mouse reporting would fill that same
-    /// queue with motion reports, handed to the editor as input the moment
-    /// the relay began. With it off nothing is generated, and the release on
-    /// close is a harmless no-op.
+    /// [`Screen::open`], optionally without the mouse. Only [`attaching`] goes
+    /// without: it reads nothing at first so typed-ahead keys stay queued for
+    /// the client, and mouse reports would fill that queue with motion the
+    /// editor would then receive as input.
     pub(crate) fn open_with(mouse: bool) -> Result<Self> {
         // Stops crossterm second-guessing us; see the module docs on colour.
         ratatui::crossterm::style::force_color_output(true);
 
-        // Before the alternate screen and before the clear below, because both
-        // erase with the *current* background colour, and the screen this takes
-        // over from may be a Neovim client stopped mid-frame. See the module
-        // docs on colour, and `term::reset_inherited_attributes`.
+        // Before the alternate screen and the clear: both erase with the
+        // current background, which a client stopped mid-frame may have set.
         crate::term::reset_inherited_attributes();
 
         let mut screen = Self {
@@ -262,9 +204,9 @@ impl Screen {
             closed: false,
         };
         // A second "enter alternate screen" is a no-op on xterm and kitty, and
-        // ratatui's first draw only paints what differs from an empty buffer —
-        // so without this the content lands in the middle of the editor's last
-        // frame. From here on an error restores through `Drop`.
+        // ratatui's first draw only paints what differs from an empty buffer,
+        // so without this the content lands on the editor's last frame. From
+        // here on an error restores through `Drop`.
         screen.terminal.clear()?;
         if mouse {
             crate::term::enable_mouse();
@@ -272,9 +214,8 @@ impl Screen {
         Ok(screen)
     }
 
-    /// Undo [`crate::term::enable_mouse`]. Before the modes and the screen
-    /// switch, so nothing this writes can land after the one-write handover the
-    /// attach path relies on.
+    /// Undo [`crate::term::enable_mouse`]. Called before the mode and screen
+    /// switch so nothing lands after the attach path's one-write handover.
     fn release_mouse(&mut self) {
         crate::term::disable_mouse();
     }
@@ -283,7 +224,6 @@ impl Screen {
         &mut self.terminal
     }
 
-    /// Give the terminal back, reporting a failure to do so.
     pub(crate) fn close(mut self) -> Result<()> {
         self.closed = true;
         self.release_mouse();
@@ -291,31 +231,22 @@ impl Screen {
         Ok(())
     }
 
-    /// Give the terminal back **cleared**, for a screen that ends by handing it
-    /// to a client spawn.
+    /// Give the terminal back cleared, for a screen ending in a client spawn.
     ///
-    /// Not `ratatui::try_restore()`: that leaves the alternate screen and stops,
-    /// which uncovers the screen this one was drawn over — the session being
-    /// switched away from — and nothing erases it until the next relay begins.
-    /// The spawn in between is two RPC round trips and a fresh `nvim` process,
-    /// so that stale frame is what the user watches for the whole switch.
+    /// `ratatui::try_restore()` would uncover the previous session's frame for
+    /// the whole spawn (two RPC round trips and a new `nvim`). It is just
+    /// `disable_raw_mode` plus `\e[?1049l`, which
+    /// [`crate::term::leave_alt_screen_and_clear`] writes first, so the leave
+    /// and the erase go out in one `write`.
     ///
-    /// `try_restore` is exactly `disable_raw_mode` plus `\e[?1049l`, and that
-    /// escape is the first thing [`crate::term::leave_alt_screen_and_clear`]
-    /// writes — so doing the modes here and the screen there loses nothing and
-    /// puts the leave and the erase in one `write`.
-    ///
-    /// `keep` is drawn on the cleared screen in the same synchronized update
-    /// as the clear: the name of the session being attached to, which the
-    /// picker hands across (see [`crate::handoff`]). Empty, the screen is left
-    /// empty, as it always was.
+    /// `keep` (the attached session's name, see [`crate::handoff`]) is drawn on
+    /// the cleared screen in the same synchronized update; empty leaves it
+    /// blank.
     pub(crate) fn close_for_attach(mut self, keep: &[u8]) -> Result<()> {
         self.closed = true;
         self.release_mouse();
-        // Modes first, for the reason ratatui gives for the same order: dropping
-        // raw mode has the wider side effects. The screen is put back either
-        // way, so a failure to restore the modes cannot also strand the user on
-        // the picker's alternate screen.
+        // Modes first, as ratatui orders it. The screen is restored even if
+        // this fails, so the user is not stranded on the alternate screen.
         let modes = ratatui::crossterm::terminal::disable_raw_mode();
         if keep.is_empty() {
             crate::term::leave_alt_screen_and_clear();
@@ -330,20 +261,16 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         if !self.closed {
-            // The error path: `restore` reports a failure on stderr and goes
-            // on, which is all that can be done while an error is already in
-            // flight.
+            // Error path: `restore` reports failure on stderr and carries on.
             self.release_mouse();
             ratatui::restore();
         }
     }
 }
 
-/// What `ratatui::try_init` does — raw mode, the alternate screen — but for
-/// the panic hook it puts in as well, one more on every call and never taken
-/// out, which ran for the panics nvmux catches too: nvmux has the one hook of
-/// its own instead (see [`crate::panics`]), put in here for a caller that never
-/// went through `main`.
+/// `ratatui::try_init` without its panic hook, which stacks a new hook per
+/// call and also fires for panics nvmux catches. nvmux's own hook
+/// ([`crate::panics`]) is installed here for callers that skip `main`.
 fn init() -> std::io::Result<ratatui::DefaultTerminal> {
     crate::panics::install();
     ratatui::crossterm::terminal::enable_raw_mode()?;
@@ -354,10 +281,8 @@ fn init() -> std::io::Result<ratatui::DefaultTerminal> {
     ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
 }
 
-/// Take the terminal for one screen, run `f` on it, and give it back.
-///
-/// The restore happens before the outcome propagates: an error that leaves the
-/// terminal in raw mode with no echo is far worse than the error itself.
+/// Run `f` on a [`Screen`], restoring before the outcome propagates: raw mode
+/// with no echo is worse than any error.
 pub(crate) fn owning<T>(f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<T>) -> Result<T> {
     let mut screen = Screen::open()?;
     let outcome = f(screen.terminal());
@@ -365,11 +290,9 @@ pub(crate) fn owning<T>(f: impl FnOnce(&mut ratatui::DefaultTerminal) -> Result<
     outcome
 }
 
-/// [`owning`], for a screen that can end by handing the terminal to a session:
-/// `attaches` names that outcome, and it alone gives the terminal back through
-/// [`Screen::close_for_attach`] rather than leaving the outgoing session's frame
-/// on display for the length of the client spawn. `mouse` is whether the
-/// screen takes the mouse — see [`Screen::open_with`].
+/// [`owning`] for a screen that can end in an attach: outcomes matching
+/// `attaches` close through [`Screen::close_for_attach`]. For `mouse` see
+/// [`Screen::open_with`].
 pub(crate) fn owning_for_attach<T>(
     attaches: impl FnOnce(&T) -> bool,
     mouse: bool,
@@ -378,8 +301,8 @@ pub(crate) fn owning_for_attach<T>(
     owning_for_attach_leaving(attaches, |_| Vec::new(), mouse, f)
 }
 
-/// [`owning_for_attach`], with `leaves` saying what to leave standing on the
-/// screen it gives back cleared (see [`Screen::close_for_attach`]).
+/// [`owning_for_attach`], with `leaves` giving what to keep on the cleared
+/// screen.
 pub(crate) fn owning_for_attach_leaving<T>(
     attaches: impl FnOnce(&T) -> bool,
     leaves: impl FnOnce(&T) -> Vec<u8>,
@@ -388,10 +311,8 @@ pub(crate) fn owning_for_attach_leaving<T>(
 ) -> Result<T> {
     let mut screen = Screen::open_with(mouse)?;
     let outcome = f(screen.terminal());
-    // The restore happens before the outcome propagates, as in `owning`, and an
-    // error takes the ordinary close: there is no session coming, and the shell
-    // the error is about to be printed to wants its screen back, not a cleared
-    // one.
+    // Errors take the ordinary close: no session is coming, and the shell that
+    // prints the error wants its screen back.
     match &outcome {
         Ok(v) if attaches(v) => screen.close_for_attach(&leaves(v))?,
         _ => screen.close()?,
@@ -399,21 +320,17 @@ pub(crate) fn owning_for_attach_leaving<T>(
     outcome
 }
 
-/// Wait up to [`TICK`] for a keypress the screens understand.
+/// Wait up to [`TICK`] for a keypress; `Ok(None)` on timeout or a non-press
+/// event. Presses only: with the kitty protocol pushed by Neovim, a release
+/// would count as a second press.
 ///
-/// `Ok(None)` means nothing happened and the caller should loop — either the
-/// poll timed out or the event was not a key press. Press only: with the kitty
-/// protocol pushed by Neovim, a release would otherwise count as a second
-/// keypress.
-///
-/// [`setup`] deliberately does not use this: it needs the raw chord, since
-/// [`translate`] discards every control chord but the three the picker binds.
+/// [`setup`] does not use this: it needs raw chords, and [`translate`] drops
+/// every control chord but the three the picker binds.
 pub(crate) fn poll_key() -> Result<Option<Key>> {
     poll_key_for(TICK)
 }
 
-/// The same, waiting only `tick` — for a caller with something else to check
-/// when the keyboard is idle. See [`BUSY_TICK`].
+/// [`poll_key`] waiting only `tick` (see [`BUSY_TICK`]).
 pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
     if !event::poll(tick)? {
         return Ok(None);
@@ -424,25 +341,17 @@ pub(crate) fn poll_key_for(tick: Duration) -> Result<Option<Key>> {
     })
 }
 
-/// Run the picker until the user attaches or quits. `listing` is what it opens
-/// on: rows in hand or a listing to wait for (see [`Listing`]). `message`
-/// replaces the hint row — how a failed attach reports itself without exiting
-/// the program. `focused` is the session the caller came from, if any: the
-/// cursor starts on it, so `<prefix> Space` opens the picker where the user
-/// already was.
+/// Run the picker until the user attaches or quits.
 ///
-/// `still_attached` says that session still has a client behind it, which is
-/// what makes `Esc` a way back to it rather than a key that does nothing. It is
-/// false where the picker is all there is: the first screen of the program, and
-/// the trip back from a failed attach or a session whose child exited.
-///
-/// `seen` is the session the user was looking at until the picker came up, if
-/// any: what it was keeping to report is not news to them, and is cleared
-/// before the picker reads it (see [`crate::notes`]).
-///
-/// `notifier` is handed every session's socket as the picker finds it, so
-/// that once a session is in front the others can be heard from (see
-/// [`crate::tell`]).
+/// - `listing`: what it opens on (see [`Listing`]).
+/// - `message`: replaces the hint row, e.g. to report a failed attach.
+/// - `focused`: the session the caller came from; the cursor starts on it.
+/// - `still_attached`: that session still has a client, so `Esc` returns to
+///   it. False on the first screen and after a failed attach or exited child.
+/// - `seen`: the session the user was viewing; its notes are cleared as
+///   already seen (see [`crate::notes`]).
+/// - `notifier`: given each session's socket, so the others can be heard from
+///   once one is in front (see [`crate::tell`]).
 pub fn run(
     transport: &dyn Transport,
     listing: Listing,
@@ -458,11 +367,9 @@ pub fn run(
     })
 }
 
-/// The picker as it comes up: on the rows `listing` has, or a listing's, with
-/// the cursor on `focused` and `message` on the hint row — and the listing
-/// under way behind the rows, while it is, to be taken up on the first pass
-/// at rest after it answers (see [`take_listing`]) and let go of by every
-/// listing the picker takes itself (see [`refresh`]).
+/// The picker's initial state, plus any background listing: taken up at rest
+/// once it answers ([`take_listing`]), dropped by any listing the picker makes
+/// itself ([`refresh`]).
 fn open(
     transport: &dyn Transport,
     listing: Listing,
@@ -488,11 +395,9 @@ fn open(
     Ok((app, behind))
 }
 
-/// How long, of one pass of the picker's loop, may go on handing sessions to
-/// the reader of their notes. Locally every session fits in it; over ssh a
-/// session given its first forward takes most of it — an `ssh -O forward`
-/// to the master — so they go a few at a pass, between frames, rather than
-/// all before the first.
+/// Time per loop pass for handing sessions to the notes reader. Locally all
+/// fit; over SSH a session's first forward (`ssh -O forward`) takes most of
+/// it, so they go a few per pass, between frames.
 const HAND_OVER: Duration = Duration::from_millis(8);
 
 fn run_loop(
@@ -504,58 +409,44 @@ fn run_loop(
     notifier: &crate::tell::Notifier,
 ) -> Result<Outcome> {
     app.set_unsaved(unsaved());
-    // What each session has to report: read on a thread of its own (see
-    // `crate::notes::Poller`), each session handed to it once the loop has
-    // its socket, and what they said taken up on every pass.
+    // Notes are read on their own thread (`crate::notes::Poller`); each
+    // session is handed over once its socket is known.
     let poller = crate::notes::Poller::start(seen.map(str::to_string));
     let mut handed: HashSet<String> = HashSet::new();
     let mut unread: VecDeque<Session> = VecDeque::new();
-    // Until the reader first says what the sessions have to report, the loop
-    // waits a frame rather than a tick, so the notes come up with the picker
-    // rather than a quarter of a second after it — no longer than a round of
-    // reads can take.
+    // Until the reader first answers (at most one `notes::POLL`), wait a frame
+    // rather than a tick, so notes appear with the picker.
     let mut heard = false;
     let opened = Instant::now();
 
-    // Dissolve the picker up out of the background before taking any input.
-    // In place of a first draw: the fade's last frame is the plain screen, so
-    // the loop's own first `draw` repaints nothing.
+    // Fade in before taking input. The fade's last frame is the plain screen,
+    // so the first `draw` repaints nothing.
     crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
 
-    // When a half-typed session number must be settled. `App` decides every
-    // unambiguous digit on its own, so this is only ever set when one number is
-    // a prefix of another — sessions 1 and 12 both present.
+    // When a half-typed number must resolve. Only set when one number prefixes
+    // another (sessions 1 and 12); `App` decides the rest itself.
     let mut deadline: Option<Instant> = None;
-    // When whatever is moving on the picker — a trail, a glow, a fading row —
-    // was last moved on. The clock lives here for the same reason the digit
-    // deadline does.
+    // When animations were last advanced; the clock lives here, like the
+    // deadline.
     let mut ticked = Instant::now();
-    // What the effects paint with, if they paint in colour: asked once, since
-    // neither the answer nor `NO_COLOR` changes for the run.
+    // Queried once: neither the palette nor `NO_COLOR` changes during the run.
     let colours = effects::colours();
     let colours = colours.as_ref();
-    // When the loop last drew, and the area it drew: `None` until its first
-    // frame, which is always drawn.
+    // Last draw time and area; `None` until the first frame, always drawn.
     let mut drawn: Option<Instant> = None;
     let mut area = ratatui::layout::Rect::default();
-    // Whether a frame that moves waits for the terminal to have taken it (see
-    // `caught_up`). Given up for the rest of the run the first time the
-    // terminal does not answer.
+    // Whether animated frames wait for the terminal to take them (see
+    // `caught_up`); dropped for the run the first time it does not answer.
     let mut paced = true;
 
     loop {
         tick(&mut app, &mut ticked);
 
-        // The listing behind the rows in hand, if it has answered, before the
-        // sessions are handed over below: one it adds is handed over on this
-        // pass.
+        // Before the hand-over, so sessions it adds are handed over this pass.
         take_listing(&mut app, &mut behind);
 
-        // Every session the listing has that the reader has not been given —
-        // all of them at first, and whatever a later listing adds — made
-        // reachable together, then handed over a few milliseconds' worth at a
-        // time; and whatever they said since the last pass, taken up before
-        // it is drawn.
+        // Make new sessions reachable together, hand them over a few ms at a
+        // time, and take up their notes before drawing.
         let fresh: Vec<Session> = app
             .sessions()
             .iter()
@@ -571,37 +462,24 @@ fn run_loop(
         }
         let awaiting = !heard && opened.elapsed() < crate::notes::POLL;
 
-        // Input already waiting is taken before the screen is drawn again, so
-        // a frame answers everything that came in while the last one was going
-        // out rather than one key of it. One frame a key holds the picker to
-        // the terminal's pace, and a held key repeats faster than some
-        // terminals take a frame: the repeats queue behind the frames, and the
-        // session in flight goes on moving after the key comes up, for longer
-        // the longer it was held. Never more than a frame's time without a
-        // draw, though, so input that does not pause — the pointer sweeping
-        // the list — still sees the screen follow it.
+        // Take waiting input before redrawing, so one frame answers all of it.
+        // A frame per key would tie the picker to the terminal's pace, and a
+        // held key repeats faster than some terminals draw, so a session in
+        // flight would keep moving after release. Still draw every `FRAME`,
+        // so continuous input (a pointer sweep) sees the screen follow.
         let waiting = event::poll(Duration::ZERO)?;
         if !waiting || drawn.is_none_or(|at| at.elapsed() >= crate::fade::FRAME) {
-            // The area kept for the mouse: a click is resolved against the
-            // screen as it was last drawn, which is the one the user clicked
-            // on.
+            // Clicks resolve against the area as last drawn.
             area = terminal.draw(|f| frame(f, &app, colours))?.area;
-            // While anything is moving a frame goes out every `FRAME` whether
-            // or not a key asked for one, and the terminal has to keep up.
             if paced && app.animating() {
                 paced = caught_up();
             }
             drawn = Some(Instant::now());
         }
 
-        // A frame's wait while anything is moving, so it moves, and while the
-        // sessions are still to be handed to the reader of their notes, or it
-        // has yet to answer, so the notes come soon — and while a listing is
-        // under way behind the rows, so what it changes comes as soon; a
-        // spinner's frame while one turns beside a busy session; the rest of
-        // the time — and all the time, with the effects switched off in
-        // `[effects]` and nothing busy — the picker changes on a key and
-        // nothing else, and waits the ordinary tick.
+        // A frame's wait while animating, handing over sessions, awaiting
+        // notes or a background listing; a spinner frame while one spins;
+        // otherwise only a key changes anything, so the ordinary tick.
         let tick_for = if app.animating() || !unread.is_empty() || awaiting || behind.is_some() {
             crate::fade::FRAME
         } else if app.spinning() {
@@ -610,8 +488,8 @@ fn run_loop(
             TICK
         };
         if !waiting && !event::poll(tick_for)? {
-            // The clock lives here rather than in `App`, which stays pure —
-            // the same split `pty::pump` uses for `keys::Prefix`.
+            // The clock lives here so `App` stays pure, as `pty::pump` does
+            // for `keys::Prefix`.
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 deadline = None;
                 if let Request::Attach(id) = app.resolve_pending() {
@@ -623,9 +501,7 @@ fn run_loop(
             continue;
         }
         let event = event::read()?;
-        // Up to the moment of the event, so what it starts — a glow, a fade —
-        // starts from nothing rather than from however long the wait for it
-        // took.
+        // Advance to the event first, so animations it starts begin fresh.
         tick(&mut app, &mut ticked);
         let request = match event {
             Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(translate(k)),
@@ -637,16 +513,10 @@ fn run_loop(
             }
             _ => continue,
         };
-        // A session just put down lands before anything is written: the
-        // renumber that follows blocks over ssh, and the landing is the
-        // answer to the key, so it comes first. Any other request that blocks
-        // is drawn first too, so the screen does not sit on the key's question
-        // — a `[y/N]`, a session in flight — through the I/O.
-        //
-        // A key that asks for nothing blocks on nothing, and the loop draws
-        // next. A frame here as well would be a second for the same key —
-        // with a session in flight, every arrow — and a second chance for a
-        // held key to fall behind the screen.
+        // Before a request blocks (e.g. a renumber over SSH), finish the
+        // landing and draw, so the screen does not show the key's question
+        // through the I/O. Skipped with neither: the loop draws next, and a
+        // second frame per key would let a held key fall behind.
         if app.landing().is_some() || request != Request::None {
             play_out(terminal, &mut app, colours, |app| app.landing().is_some())?;
         }
@@ -655,12 +525,10 @@ fn run_loop(
             .is_some()
             .then(|| Instant::now() + Duration::from_millis(crate::config::get().keys.timeout_ms));
 
-        // Every request names a row the picker is showing, so it is resolved
-        // against the list in hand rather than a fresh listing: over SSH each
-        // listing is a script run (~230 ms), and the action itself finds out
-        // soon enough if the session has gone in the meantime — an attach
-        // pings before spawning, a kill reports "absent", a rename reports
-        // "not found". The list is re-read only after something changed it.
+        // Resolve requests against the list in hand, not a fresh listing
+        // (~230 ms over SSH): each action detects a vanished session itself
+        // (attach pings, kill reports "absent", rename "not found"). Relist
+        // only after a change.
         match request {
             Request::None => {}
             Request::Quit => return Ok(Outcome::Quit),
@@ -672,11 +540,9 @@ fn run_loop(
             }
 
             Request::NewSession => {
-                // A gap opens where the session will go, and the prompt comes
-                // up out of it (see `make_room`); with that off, the prompt
-                // simply replaces the picker. A create dissolves the prompt
-                // out on its way to the client spawn either way — that is the
-                // prompt's own doing, since its screen is the one up.
+                // Open a gap and bring the prompt up out of it (`make_room`),
+                // or just replace the picker if that is off. On create, the
+                // prompt fades itself out.
                 let arrival = make_room(terminal, &mut app, colours)?;
                 let outcome = prompt::run_on(
                     terminal,
@@ -687,9 +553,8 @@ fn run_loop(
                     },
                     arrival,
                 );
-                // Whatever the prompt answered, the gap was only ever the
-                // picker's way out: a created session is in the listing that
-                // follows, and a cancelled one never was.
+                // Close the gap either way: a created session shows up in the
+                // listing that follows.
                 app.close_room();
                 match outcome? {
                     prompt::Outcome::Created(session) => {
@@ -702,8 +567,8 @@ fn run_loop(
                         });
                     }
                     prompt::Outcome::Cancelled => {
-                        // The prompt dissolved out if it dissolved in, and the
-                        // picker it closed onto comes back up the same way.
+                        // The prompt faded out if it faded in; fade the
+                        // picker back in to match.
                         if arrival != prompt::Arrival::Cut {
                             crate::fade::fade_in(terminal, |f| draw::draw(f, &app))?;
                         }
@@ -749,17 +614,15 @@ fn run_loop(
                 if let Err(e) = transport.renumber(&batch) {
                     app.set_message(e.one_line());
                 }
-                // Whether it wrote or failed, what the numbers now are is a
-                // listing's answer and not ours. `set_sessions` restores the
-                // selection by id, so the cursor stays on the session that was
-                // just placed.
+                // Relist either way: only a listing knows the numbers now.
+                // `set_sessions` keeps the cursor on the placed session by id.
                 refresh(&mut app, transport, &mut behind)?;
             }
 
             Request::Help => help::run_on(terminal, false)?,
 
-            // What changed there runs from here: the picker's own copies of
-            // its effects are read again, and the rest it reads as it goes.
+            // Afterwards, reload the picker's copies of the effects settings;
+            // the rest is read live.
             Request::Settings => {
                 let remote = matches!(transport.location(), crate::transport::Location::Ssh(_));
                 let behind = app.came_from().cloned();
@@ -767,10 +630,9 @@ fn run_loop(
                     settings::run_on(terminal, false, remote, behind.is_some())?,
                     behind,
                 ) {
-                    // Turned to float, over the session the picker came up
-                    // from: back to it, with them floating over it, as they
-                    // float in the picker's place where the picker floats.
-                    // They have dissolved out on their way.
+                    // Switched to floating, with a session behind: return to
+                    // it with the settings floating over it. They have already
+                    // faded out.
                     (settings::Outcome::Float, Some(session)) => {
                         return Ok(Outcome::Attach {
                             session,
@@ -800,30 +662,18 @@ fn run_loop(
     }
 }
 
-/// Wait for the terminal to have got through everything written to it.
+/// Wait until the terminal has processed everything written to it.
 ///
-/// A terminal reads what it is sent as it arrives and works through it at its
-/// own pace. While a session is in flight its trail sends a frame every
-/// [`crate::fade::FRAME`], and a terminal that takes nearly that long over each
-/// keeps up with the trail alone, but not with the extra frames a held key
-/// adds. It falls behind during the hold and, the trail still coming, barely
-/// gains on the backlog afterwards. The session goes on moving after the key
-/// comes up, and every key after it waits its turn behind frames already
-/// out of date — until `Enter` puts the session down and the frames stop.
-/// Before the hold, the same terminal was keeping up and a key was instant.
+/// A session in flight sends a frame every [`crate::fade::FRAME`]. A terminal
+/// that barely keeps up falls behind when a held key adds frames, and the
+/// backlog persists, so the session keeps moving after release and later keys
+/// wait behind stale frames. A cursor position query is answered only once the
+/// terminal gets that far, so waiting for it keeps one frame in flight. Keys
+/// arriving meanwhile are buffered by crossterm for the loop. ([`Screen::open`]
+/// already relies on this query via ratatui's `clear`.)
 ///
-/// Asking where the cursor is says when the terminal has caught up: it
-/// answers in turn, once it has got that far through what it was sent. Waiting
-/// for the answer after each frame keeps one frame in flight, so frames go no
-/// faster than the terminal takes them and no key is ever more than a frame
-/// behind. Keys that arrive meanwhile are set aside by crossterm and handed
-/// back to the loop, which takes them all before its next frame.
-///
-/// Nothing new to ask of a terminal: [`Screen::open`] has already asked it
-/// the same thing, through ratatui's `clear`, to get the picker on screen at
-/// all. Still, false when it did not answer within crossterm's two seconds,
-/// and it is not asked again: an unanswered question would cost that wait on
-/// every frame, and an unpaced trail is only what the picker had before.
+/// False if there is no answer within crossterm's 2 s; the caller then stops
+/// asking, since that wait every frame is worse than unpaced frames.
 fn caught_up() -> bool {
     match ratatui::crossterm::cursor::position() {
         Ok(_) => true,
@@ -834,23 +684,20 @@ fn caught_up() -> bool {
     }
 }
 
-/// How many settings are changed and not saved, for quitting to ask about.
+/// Number of unsaved setting changes, for the quit prompt.
 fn unsaved() -> usize {
     crate::settings::changed(&crate::config::get(), &crate::config::saved()).len()
 }
 
-/// Move whatever is passing on the picker on to now.
 fn tick(app: &mut App, ticked: &mut Instant) {
     let now = Instant::now();
     app.tick(now - *ticked);
     *ticked = now;
 }
 
-/// Give the reader of notes the sockets of the sessions in `unread`, for as
-/// long as [`HAND_OVER`] allows, and at least one: locally that is all of
-/// them, and over ssh as many as can be given a forward in the time (see
-/// [`Transport::local_socket_for`], which makes one where there is none). The
-/// notifier is given each one too, with the session's name as it is now.
+/// Hand sockets from `unread` to the notes reader and the notifier: at least
+/// one, then until [`HAND_OVER`] runs out. Over SSH,
+/// [`Transport::local_socket_for`] may have to create a forward for each.
 fn hand_over(
     transport: &dyn Transport,
     poller: &crate::notes::Poller,
@@ -872,19 +719,15 @@ fn hand_over(
     }
 }
 
-/// One frame of the picker: the screen, the theme's colour on it, and then
-/// whatever is passing over it.
 fn frame(f: &mut ratatui::Frame, app: &App, colours: Option<&effects::Colours>) {
     draw::draw(f, app);
     crate::theme::paint(f.buffer_mut());
     effects::paint(f, app, colours);
 }
 
-/// Erase the row a kill was just confirmed for, and only then let the kill
-/// run (see [`backspace`] for why not during it).
-///
-/// The row stays empty afterwards until the listing that follows the kill
-/// replaces it — or, if the kill failed, puts it back.
+/// Play the erase of a confirmed kill's row before the kill runs (see
+/// [`backspace`] for why not during it). The row stays empty until the next
+/// listing replaces it, or restores it if the kill failed.
 fn erase(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -897,24 +740,18 @@ fn erase(
     play_out(terminal, app, colours, App::erasing)
 }
 
-/// Make room in the list for the session `c` is about to create, and close
-/// the picker onto it: what the picker does between the key and the prompt,
-/// and how the prompt should come up after it.
+/// Open a gap for the session `c` will create and close the picker onto it;
+/// returns how the prompt should arrive.
 ///
-/// The rows under the cursor step down a line, and in the gap the session
-/// stands as it will be listed — the number it will be given, and the name the
-/// prompt will offer, numbered after it (see [`prompt::default_name`]), dim —
-/// coming up out of the background over
-/// [`effects::ROOM`] (see [`App::make_room`]). Then the picker closes in onto
-/// that row, and the prompt opens out of its name field, where the same name
-/// is waiting: [`prompt::Arrival::FromName`].
+/// Rows below the cursor step down and the new session rises dim in the gap
+/// over [`effects::ROOM`] ([`App::make_room`]), with its future number and the
+/// prompt's default name ([`prompt::default_name`]). The picker then fades out
+/// onto that row and the prompt opens from its name field
+/// ([`prompt::Arrival::FromName`]).
 ///
-/// The close and the opening are the fade's, so with no fade — switched off,
-/// `NO_COLOR`, or a terminal that never said what its colours are — the gap
-/// is held, dim, for [`effects::ROOM_HELD`] and the prompt cuts in. With
-/// `[effects.create]` off there is no gap, and the prompt cuts in at once, as
-/// it always did. Keys pressed meanwhile wait in the terminal's queue for the
-/// prompt, as they do behind every effect played out here.
+/// Without a fade (off, `NO_COLOR`, or no palette) the gap is held for
+/// [`effects::ROOM_HELD`] and the prompt cuts in; with `[effects.create]` off
+/// there is no gap. Keys pressed meanwhile stay queued for the prompt.
 fn make_room(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -933,9 +770,8 @@ fn make_room(
             crate::fade::fade_out_onto(terminal, |f| draw::draw(f, app), row.y)?;
             Ok(prompt::Arrival::FromName)
         }
-        // Not on screen at all — a terminal with no room for a list — or no
-        // fade to close it with: shown for as long as it is worth reading,
-        // and then the prompt cuts in over it.
+        // Off screen (no room for a list) or no fade: hold it long enough to
+        // read, then cut to the prompt.
         _ => {
             std::thread::sleep(effects::ROOM_HELD.saturating_sub(opened.elapsed()));
             Ok(prompt::Arrival::Cut)
@@ -943,13 +779,10 @@ fn make_room(
     }
 }
 
-/// Draw frames until `playing` says the effect is over — for the three that
-/// must finish before what they precede, the backspace, the landing and the
-/// gap a new session opens —
-/// and then the screen it leaves. Keys pressed meanwhile wait in the
-/// terminal's queue, as they would behind the I/O itself. Nothing playing,
-/// that last frame is the only one: the screen as it stands, for a caller
-/// about to block.
+/// Draw frames until `playing` returns false, then one final frame: for
+/// effects that must finish first (backspace, landing, the new-session gap).
+/// Keys stay queued meanwhile. With nothing playing, it just draws the current
+/// screen before the caller blocks.
 fn play_out(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -966,16 +799,12 @@ fn play_out(
     Ok(())
 }
 
-/// Leave the picker for `session`: dissolve the screen out, then hand back the
-/// outcome that attaches. The picker's own two exits share this so neither
-/// can forget the fade; the prompt's `Created` exit is not one of them, since
-/// the screen up at that moment is the prompt's, and the prompt fades it.
-/// Quitting does not come through here either — the shell wants its screen
-/// back, not a dissolved one.
+/// Fade the picker out and return the attaching outcome. Shared by the
+/// picker's two exits so neither forgets the fade; the prompt's `Created` exit
+/// fades its own screen, and quitting does not fade.
 ///
-/// Where the hand-off is on (see [`crate::handoff`]), the session's name is
-/// kept out of the dissolve, and comes off its bar as plain text where it
-/// stood, to be left on the cleared screen for the session to take down.
+/// With the hand-off on ([`crate::handoff`]), the session's name is kept out
+/// of the fade, left as plain text for the session to remove.
 fn leave_to_session(
     terminal: &mut ratatui::DefaultTerminal,
     app: &App,
@@ -1002,33 +831,25 @@ fn leave_to_session(
     })
 }
 
-/// The name of `session` as the picker has it on screen, ready to be handed
-/// off: where its row draws it, cut where the row cuts it. `None` when its row
-/// is not on screen — a number typed for a session scrolled out of view.
+/// The session's name as drawn (position and truncation), for the hand-off;
+/// `None` if its row is off screen (a number typed for a scrolled-out row).
 fn hand_off_for(app: &App, area: ratatui::layout::Rect, session: &Session) -> Option<HandOff> {
     let name = draw::name_rect(app, area, &session.id)?;
     HandOff::new(&session.name, name.y, name.x, name.width)
 }
 
-/// Put a session just created from the picker after the row that was
-/// highlighted, and hand back the session and the listing the caller attaches
-/// with.
+/// Move a session just created from the picker to after the highlighted row;
+/// returns the session and the listing to attach with.
 ///
-/// Created last, a session is numbered last. Moving it up is a renumber — the
-/// batch a reorder writes, from [`App::placement_of`] — and then a listing,
-/// since what the numbers now are is a listing's answer and not ours (the
-/// reorder above says why). That is two round trips over ssh, paid only when
-/// the highlight was not already on the last row.
+/// New sessions are numbered last, so this is a renumber
+/// ([`App::placement_of`]) then a listing (only a listing knows the numbers):
+/// two round trips over SSH, skipped when the highlight is already last. In
+/// that case the rows plus the new one serve as the listing; order does not
+/// matter to its readers.
 ///
-/// Placed last, nothing is written and nothing listed: the picker's rows plus
-/// the new one are the listing, as they always were — the rows are still
-/// accurate and this is the one they are missing. Order does not matter to
-/// either reader of it — one takes a maximum, the other looks up a number.
-///
-/// Neither step may lose the session, which exists by now. A renumber that
-/// fails leaves it attached where it was created, last; a listing that fails
-/// falls back to the rows in hand. Both are logged, since there is no screen
-/// left to say so on — the next thing on it is the session.
+/// Neither step may lose the session: a failed renumber leaves it last, a
+/// failed listing falls back to the rows in hand. Both are only logged, as the
+/// session is what the screen shows next.
 fn settle(app: &App, transport: &dyn Transport, session: Session) -> (Session, Vec<Session>) {
     let mut appended = app.sessions().to_vec();
     appended.push(session.clone());
@@ -1066,27 +887,19 @@ fn settle(app: &App, transport: &dyn Transport, session: Session) -> (Session, V
     }
 }
 
-/// Re-list, restoring the selection by id (`set_sessions` does that) — and let
-/// go of the listing under way behind the rows in hand, if there is one. It
-/// was asked before whatever this listing follows, a kill or a rename, and
-/// taken up after it would put back what that changed.
+/// Relist (keeping the selection by id) and drop any background listing: it
+/// predates the change just made and would undo it.
 fn refresh(app: &mut App, transport: &dyn Transport, behind: &mut Option<Behind>) -> Result<()> {
     *behind = None;
     app.set_sessions(transport.list_sessions()?);
     Ok(())
 }
 
-/// Take up the answer of the listing under way behind the rows in hand (see
-/// [`Listing::InHand`]), if it has come and the picker is at rest: browsing or
-/// filtering, with nothing on the move. A session picked up to be moved, a
-/// `[y/N]` about one, a row still fading — each of them about the rows as they
-/// are — keeps the answer waiting in its channel until it is over, so the rows
-/// never change under a question about one of them, nor under a frame of one.
-/// At rest, [`App::set_sessions`] has nothing to end but the rows, and keeps
-/// the cursor on its session.
-///
-/// A listing that failed leaves the rows as they are, and whatever needs the
-/// host next says so for itself.
+/// Take up the background listing ([`Listing::InHand`]) if it has answered and
+/// the picker is at rest (browsing or filtering, nothing animating). A move, a
+/// `[y/N]` or a fading row leaves it queued, so rows never change under a
+/// question or mid-effect. [`App::set_sessions`] keeps the cursor on its
+/// session. A failed listing leaves the rows as they are.
 fn take_listing(app: &mut App, behind: &mut Option<Behind>) {
     let Some(answer) = behind.as_ref() else {
         return;
@@ -1110,11 +923,10 @@ pub fn highest_num(sessions: &[Session]) -> u32 {
 
 /// Reduce a crossterm event to the keys the screens understand.
 ///
-/// A control chord is either one of the three that are bound (`Ctrl-c`,
-/// `Ctrl-n`, `Ctrl-p`) or nothing at all — never the bare letter. The prefix
-/// is configurable, and someone who reflexively types `<prefix>` on the picker
-/// must not find that `Ctrl-x` opened the kill confirm or `Ctrl-q` quit; nor
-/// should a chord typed on the help screen close it and forward its second key.
+/// Control chords other than `Ctrl-c`, `Ctrl-n` and `Ctrl-p` become
+/// `Key::Other`, never the bare letter: the prefix is configurable, and a
+/// reflexive `<prefix>` must not open the kill confirm (`x`) or quit (`q`),
+/// nor close the help and forward its second key.
 fn translate(k: KeyEvent) -> Key {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {
@@ -1138,11 +950,8 @@ fn translate(k: KeyEvent) -> Key {
     }
 }
 
-/// Reduce a crossterm mouse event to the gestures the picker understands, with
-/// `row` the visible row under the pointer as [`draw::row_at`] resolved it.
-///
-/// Plain motion, the left button and the wheel, and nothing else: the other
-/// buttons and a horizontal wheel are nothing to the picker.
+/// Reduce a mouse event to the picker's gestures (motion, left button,
+/// vertical wheel); `row` is the row under the pointer per [`draw::row_at`].
 fn translate_mouse(m: MouseEvent, row: Option<usize>) -> Option<Mouse> {
     match m.kind {
         MouseEventKind::Moved => Some(Mouse::Hover(row)),
@@ -1172,8 +981,6 @@ mod tests {
         }
     }
 
-    /// Motion, the left button and the wheel reach the picker, carrying the
-    /// row the caller resolved; everything else is dropped before it can.
     #[test]
     fn only_motion_the_left_button_and_the_wheel_reach_the_picker() {
         assert_eq!(
@@ -1211,8 +1018,6 @@ mod tests {
         }
     }
 
-    /// The three bound chords are the only ones that survive as chords; a
-    /// chord must never arrive as its bare letter (see `translate`).
     #[test]
     fn the_bound_chords_are_distinguished_from_their_plain_letters() {
         for (c, ctrl, want) in [
@@ -1236,13 +1041,9 @@ mod tests {
         }
     }
 
-    /// Only Ctrl-c, Ctrl-n and Ctrl-p are keys of their own; every other
-    /// chord is nothing. The prefix is one of these (Ctrl-Space by default,
-    /// but configurable), and `Ctrl-x`, `Ctrl-q`, `Ctrl-r`, `Ctrl-y` all name
-    /// picker commands as bare letters.
-    ///
-    /// The space bar is in the list for the default prefix's sake: typed with
-    /// Ctrl it must not reach the filter as a space.
+    /// The prefix (default Ctrl-Space) is a control chord, and `x`, `q`, `r`,
+    /// `y` are picker commands. Ctrl-Space must not reach the filter as a
+    /// space.
     #[test]
     fn other_control_chords_are_ignored_not_folded_to_letters() {
         for c in ['t', 'x', 'q', 'r', 'y', 'g', 'a', 'd', ' '] {
@@ -1256,26 +1057,17 @@ mod tests {
 
     #[test]
     fn shifted_letters_arrive_as_uppercase() {
-        // `G` must reach the app as 'G', not as 'g' plus a modifier, or
-        // jump-to-last would be indistinguishable from jump-to-first.
+        // Otherwise `G` (last) would be indistinguishable from `g` (first).
         assert_eq!(
             translate(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
             Key::Char('G')
         );
     }
 
-    /// Why [`Screen::open`] drops the inherited attributes before it draws.
-    ///
-    /// The screens set no colours on purpose, so ratatui's crossterm backend —
-    /// which tracks fg and bg from `Color::Reset` and writes SGR only on a
-    /// difference — emits nothing that would clear an attribute until the whole
-    /// frame has been painted, and never writes a blank cell at all. Whatever
-    /// the terminal was already in is what the screen is drawn in: coming back
-    /// from a session, the editor's own colours, mid-frame.
-    ///
-    /// If ratatui ever leads a frame with a reset of its own this fails and the
-    /// call in `Screen::open` can be revisited — the point of asserting it
-    /// rather than merely writing it down.
+    /// Why [`Screen::open`] resets inherited attributes: ratatui's crossterm
+    /// backend writes SGR only on a change from `Color::Reset`, so a colourless
+    /// screen is drawn in the terminal's current attributes. If ratatui starts
+    /// leading frames with a reset, this fails and that call can go.
     #[test]
     fn a_screen_paints_before_it_clears_anything() {
         let emitted = test_support::emitted(48, 6, |f| draw::draw(f, &App::new(Vec::new())));
@@ -1300,11 +1092,8 @@ mod tests {
         );
     }
 
-    /// A themed picker is the plain one with its full-strength text in the
-    /// ink — the names, and the selection's reversed bar — and everything it
-    /// draws dim, the numbers and the hint row among it, in the terminal's own
-    /// foreground as before. No background is set anywhere, and every glyph
-    /// and modifier is exactly as drawn with no theme.
+    /// Dim text (numbers, hint row) keeps the terminal's foreground; no
+    /// background is set; glyphs and modifiers are unchanged.
     #[test]
     fn a_themed_picker_is_the_plain_one_with_its_ink_where_it_is_not_dim() {
         use ratatui::style::{Color, Modifier};
@@ -1331,9 +1120,7 @@ mod tests {
         assert!(dim > 0, "the fixture draws something dim");
     }
 
-    /// Attaching is the outcome that gives the terminal back cleared; quitting
-    /// must not, because the shell it returns to wants its own screen rather
-    /// than a wiped one.
+    /// Quitting must not clear: the shell wants its own screen back.
     #[test]
     fn only_attaching_hands_the_terminal_to_a_session() {
         let session = Session::new("id000000".into(), "a".into(), 100, 1);
@@ -1347,8 +1134,6 @@ mod tests {
         assert!(!Outcome::Quit.attaches());
     }
 
-    /// The name handed off is the one the picker drew, where it drew it: the
-    /// selected row's, after its marker, number and gap.
     #[test]
     fn the_name_handed_off_is_where_the_picker_drew_it() {
         let a = test_support::picker(&["api-server", "dotfiles", "notes"]);
@@ -1363,8 +1148,6 @@ mod tests {
         assert_eq!(line[..at].chars().count(), usize::from(col), "{line:?}");
     }
 
-    /// Leaving to attach leaves the name drawn on the cleared screen; quitting
-    /// leaves nothing.
     #[test]
     fn only_an_attach_with_a_name_leaves_one() {
         let session = Session::new("id000000".into(), "a".into(), 100, 1);
@@ -1385,8 +1168,7 @@ mod tests {
         assert!(Outcome::Quit.leaves().is_empty());
     }
 
-    /// A host that answers every listing with `rows`, `wait` after it is
-    /// asked, and counts the listings: all the picker's opening asks of one.
+    /// Answers every listing with `rows` after `wait`, counting listings.
     struct Lister {
         location: crate::transport::Location,
         rows: Vec<Session>,
@@ -1441,8 +1223,7 @@ mod tests {
         }
     }
 
-    /// Rows of these names, numbered as a listing numbers them: the ones
-    /// `test_support::picker` opens on, ids and all.
+    /// The rows `test_support::picker` opens on, ids included.
     fn rows(names: &[&str]) -> Vec<Session> {
         test_support::picker(names).sessions().to_vec()
     }
@@ -1451,13 +1232,11 @@ mod tests {
         app.sessions().iter().map(|s| s.name.clone()).collect()
     }
 
-    /// The id of the session the cursor is on.
     fn cursor(app: &App) -> String {
         app.visible()[app.selected_index()].id.clone()
     }
 
-    /// The listing behind the rows, given until `within` to answer and be
-    /// taken up, a pass at a time as the picker's loop takes it.
+    /// Poll [`take_listing`] as the loop would, for up to `within`.
     fn take_up(app: &mut App, behind: &mut Option<Behind>, within: Duration) {
         let deadline = Instant::now() + within;
         while behind.is_some() && Instant::now() < deadline {
@@ -1466,10 +1245,7 @@ mod tests {
         }
     }
 
-    /// **What `<prefix> Space` used to wait for.** The picker opens on the rows
-    /// in hand however long the host takes to list — the cursor on the session
-    /// it came from — and what the listing behind them says replaces them on
-    /// the first pass after it answers, the cursor staying on its session.
+    /// The cursor stays on the session it came from throughout.
     #[test]
     fn the_picker_opens_on_the_rows_in_hand_and_takes_the_listing_when_it_comes() {
         let wait = Duration::from_millis(300);
@@ -1502,12 +1278,10 @@ mod tests {
         assert_eq!(host.asked(), 1);
     }
 
-    /// **What a session that exited used to wait for.** On the way back from
-    /// one, the picker opens at once on the rows in hand less that session,
-    /// the cursor on the first row while its own is not there. A session still
-    /// there — its client ended by `:detach` — is in the listing behind them,
-    /// which puts the cursor back on it; one that is gone is not, and the
-    /// cursor stays. A key pressed meanwhile leaves the cursor the user's.
+    /// The picker opens on the rows in hand minus the exited session, cursor on
+    /// the first row. If the listing still has it (client ended by `:detach`),
+    /// the cursor returns to it; if not, it stays. A key pressed meanwhile
+    /// wins.
     #[test]
     fn the_cursor_goes_back_to_a_session_whose_client_exited_if_it_is_still_there() {
         let wait = Duration::from_millis(300);
@@ -1549,7 +1323,7 @@ mod tests {
         let (mut app, mut behind) = opened(all.clone());
         app.on_key(Key::Down);
         app.on_key(Key::Up);
-        // The rows are taken up at rest: the moves' glow run out first.
+        // Rows are taken up only at rest, after the glow ends.
         app.tick(Duration::from_secs(5));
         take_up(&mut app, &mut behind, Duration::from_secs(10));
         assert_eq!(names(&app), ["one", "two", "three"]);
@@ -1560,9 +1334,7 @@ mod tests {
         );
     }
 
-    /// A listing taken a moment ago is opened on as it is, and the host is
-    /// asked nothing: the one nvmux started its clients ahead from. With no
-    /// rows in hand the picker lists, and opens on the answer.
+    /// With no rows in hand, the picker lists and opens on the answer.
     #[test]
     fn a_fresh_listing_is_opened_on_without_asking_the_host() {
         let host = Lister::new(rows(&["one", "two", "three"]), Duration::ZERO);
@@ -1584,10 +1356,8 @@ mod tests {
         assert_eq!(host.asked(), 1);
     }
 
-    /// A question about a row as it stands — a kill's `[y/N]`, a session
-    /// picked up to be moved — keeps the listing's answer waiting until it is
-    /// over and the picker is still, so the rows do not change under it; then
-    /// the answer is taken up.
+    /// A kill's `[y/N]` or a picked-up session holds the answer until it is
+    /// over and the picker is still.
     #[test]
     fn a_question_about_a_row_keeps_the_listing_waiting() {
         for (what, ask, done) in [
@@ -1613,8 +1383,7 @@ mod tests {
         }
     }
 
-    /// A listing that failed, or a thread that went without answering, leaves
-    /// the rows and the cursor as they were, and is no longer waited for.
+    /// A failed listing or a hung-up thread; the listing is no longer awaited.
     #[test]
     fn no_answer_leaves_the_rows_as_they_were() {
         for what in ["a failed listing", "a thread that went"] {
@@ -1636,9 +1405,7 @@ mod tests {
         }
     }
 
-    /// A listing the picker takes itself, after a kill, a rename or a move,
-    /// lets go of the one behind the rows: asked before what it follows, that
-    /// one would put back what it changed — here a session just killed.
+    /// After a kill, the stale background listing would bring the session back.
     #[test]
     fn a_listing_of_the_pickers_own_lets_go_of_the_one_behind() {
         let mut app = test_support::picker(&["one", "two"]);

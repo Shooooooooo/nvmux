@@ -1,17 +1,11 @@
-//! How a terminal spells a key as an escape sequence, and whether that key is
-//! the prefix.
+//! Recognising the prefix chord in a terminal's escape sequences.
 //!
-//! In its plainest form a `Ctrl` chord is one control byte, and for a long
-//! time that was the only spelling [`crate::keys`] had to know. But
-//! Neovim's TUI asks every terminal for a richer keyboard encoding when it
-//! starts: the kitty keyboard protocol where the terminal answers its
-//! `CSI ? u` query (`CSI > 1 u`; `CSI > 3 u` from Neovim 0.12, which asks for
-//! key-repeat and key-release reports too), and xterm's `modifyOtherKeys`
-//! (`CSI > 4 ; 2 m`) otherwise. A terminal that grants either one then spells
-//! the same chord as an escape sequence — and since the client on the pty is
-//! that TUI or nvmux's own, which asks the same (see [`crate::client`]), and
-//! nvmux relays its negotiation untouched (see [`crate::pty`]), the
-//! terminal's spelling is what arrives on nvmux's stdin:
+//! Neovim's TUI (and nvmux's own client, see [`crate::client`]) requests the
+//! kitty keyboard protocol if the terminal answers its `CSI ? u` query
+//! (`CSI > 1 u`; `CSI > 3 u` from Neovim 0.12, adding repeat and release
+//! events), else xterm's `modifyOtherKeys` (`CSI > 4 ; 2 m`). nvmux relays
+//! that negotiation untouched (see [`crate::pty`]), so stdin may carry any of
+//! three spellings:
 //!
 //! ```text
 //! Ctrl-Space, legacy:          0x00
@@ -19,108 +13,83 @@
 //! Ctrl-Space, modifyOtherKeys: ESC [ 27 ; 5 ; 32 ~
 //! ```
 //!
-//! A remapped `Ctrl-<letter>` prefix is spelled the same three ways under its
-//! own code: `Ctrl-t` is `0x14`, `ESC [ 116 ; 5 u`, `ESC [ 27 ; 5 ; 116 ~`.
+//! A remapped `Ctrl-<letter>` prefix uses its own code: `Ctrl-t` is `0x14`,
+//! `ESC [ 116 ; 5 u`, `ESC [ 27 ; 5 ; 116 ~`. Windows Terminal (1.25+), kitty,
+//! Ghostty, foot, Alacritty, iTerm2 and Rio use kitty; xterm, and WezTerm
+//! without `enable_kitty_keyboard`, use `modifyOtherKeys`. All three must be
+//! accepted, or `<prefix> d` reaches the editor as a pending delete.
 //!
-//! Windows Terminal (from 1.25), kitty, Ghostty, foot, Alacritty, iTerm2 and
-//! Rio all speak the first; xterm, and WezTerm unless `enable_kitty_keyboard`
-//! is set, the second; and a terminal that speaks neither keeps sending the
-//! byte. The prefix machine has to accept all three, or `<prefix> d` reaches
-//! the editor as the prefix chord and a pending delete.
+//! [`classify`] only decides whether a sequence is the prefix (press or
+//! repeat), a key release (which must not count as the next key; the
+//! terminal sends one for the swallowed prefix), a terminal reply (which can
+//! land between a prefix and its command, as the editor queries on every
+//! start and resume), or something else. Nothing is rewritten.
 //!
-//! [`classify`] is deliberately narrow. It decides whether a sequence *is the
-//! prefix* (pressed or held down); whether it reports a key being *released* —
-//! which the machine must not mistake for the next key, since a terminal asked
-//! for release reports sends one for the very key the machine swallowed; whether
-//! it is the terminal's *reply* to one of the editor's queries — not a
-//! keystroke either, and one that can land between a prefix and its command,
-//! because the editor queries at every start and resume; or whether it is
-//! something else. No sequence is decoded any further than that, and none is
-//! ever rewritten.
-//!
-//! Replies are the `CSI` sequences with a private marker (`?`, `>` or `=`)
-//! first, which no key ever has: the kitty and `modifyOtherKeys` answers, DA1,
-//! DA2 and DECRPM. Replies in string form (DCS, OSC) are not recognised; they
-//! go through as ordinary input.
+//! Replies are `CSI` sequences starting with a private marker (`?`, `>`,
+//! `=`), which no key has: kitty and `modifyOtherKeys` answers, DA1, DA2,
+//! DECRPM. String replies (DCS, OSC) pass through as ordinary input.
 //!
 //! # The kitty form
 //!
 //! `CSI key[:shifted[:base]] ; modifiers[:event] [; text] u`. `key` is the
-//! unshifted codepoint — 32 for the space bar, and always lowercase for a
-//! letter; `modifiers` is one plus a bitmask (shift 1, alt 2, ctrl 4, super 8,
-//! hyper 16, meta 32, caps lock 64, num lock 128); `event` is 1 for a press,
-//! 2 for a repeat and 3 for a release,
-//! and is omitted for a press. The protocol withholds the lock bits only from
-//! keys that produce text, and a chord produces none, so a terminal with Caps
-//! Lock on may well report them; they carry no meaning for the chord, so they
-//! are ignored rather than refused. Any other modifier bit makes it a
-//! different chord: `Ctrl-Shift-Space` is not the prefix.
+//! unshifted codepoint (lowercase for letters); `modifiers` is 1 + a bitmask
+//! (shift 1, alt 2, ctrl 4, super 8, hyper 16, meta 32, caps lock 64, num lock
+//! 128); `event` is 1 press (default), 2 repeat, 3 release. Lock bits may be
+//! reported for a chord and are ignored; any other extra modifier makes a
+//! different chord.
 //!
 //! # The xterm form
 //!
-//! `CSI 27 ; modifiers ; key ~`, with the same modifier arithmetic (shift 1,
-//! alt 2, ctrl 4, meta 8) and no event types.
+//! `CSI 27 ; modifiers ; key ~`, same modifier arithmetic (shift 1, alt 2,
+//! ctrl 4, meta 8), no event types.
 
-/// The byte every escape sequence starts with.
 pub const ESC: u8 = 0x1b;
 
-/// Longer than this and it is not a key report or a reply, whatever it is. The
-/// longest spelling of a chord — every optional field present — is about
-/// twenty bytes; a DA1 reply from a terminal proud of its features runs to
-/// forty.
+/// Longest sequence still considered a key report or reply. A chord with
+/// every field is ~20 bytes; a long DA1 reply ~40.
 const MAX_LEN: usize = 64;
 
 const CTRL: u32 = 4;
 const CAPS_LOCK: u32 = 64;
 const NUM_LOCK: u32 = 128;
 
-/// What a run of bytes beginning with [`ESC`] has turned out to be.
+/// What a run of bytes beginning with [`ESC`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sequence {
-    /// Not finished: more bytes could still make it any of the others.
+    /// Incomplete; more bytes could make it any of the others.
     Partial,
-    /// A complete report of the prefix chord being pressed or auto-repeated.
+    /// The prefix chord, pressed or repeated.
     Prefix,
-    /// A complete report of the key with this code being released. Not a
-    /// keystroke, whatever the key.
+    /// Release of the key with this code; not a keystroke.
     Release(u32),
-    /// A complete reply from the terminal to one of the editor's queries. Not
-    /// a keystroke either.
+    /// A terminal reply to an editor query; not a keystroke.
     Reply,
-    /// The first `n` bytes are a whole key that is not the prefix — or a
-    /// sequence that is no key report at all — and any byte after them is
-    /// ordinary input to be handled afresh. `n` is at least 1: a lone `ESC`
-    /// followed by something that cannot continue it is the Escape key.
+    /// The first `n` bytes (at least 1) are a non-prefix key or non-key
+    /// sequence; later bytes are ordinary input. A lone `ESC` followed by a
+    /// byte that cannot continue it is `Other(1)`.
     Other(usize),
 }
 
-/// Classify `seq`, which must start with [`ESC`], as a spelling of the `Ctrl`
-/// chord a terminal reports under the key code `code` — see
-/// `keys::prefix_code`.
+/// Classify `seq` (starting with [`ESC`]) against the `Ctrl` chord whose key
+/// code is `code` (see `keys::prefix_code`).
 ///
-/// Meant to be called again after every byte: the answer for a prefix of a
-/// sequence is [`Sequence::Partial`] until the byte that decides it arrives, and
-/// a decision never changes with more bytes because the decided sequence is
-/// consumed.
+/// Call again after each byte: it returns [`Sequence::Partial`] until the
+/// deciding byte arrives.
 pub fn classify(seq: &[u8], code: u8) -> Sequence {
     debug_assert_eq!(seq.first(), Some(&ESC), "not an escape sequence");
     match seq.get(1) {
         None => return Sequence::Partial,
         Some(b'[') => {}
-        // The Escape key, the ESC that spells Alt in a legacy chord, or the
-        // start of an `ESC O` (SS3) key. Only a CSI sequence can spell the
-        // prefix, so the bytes after this one stand on their own, and go
-        // through as they are.
+        // Escape, legacy Alt, or an SS3 key. Only CSI can spell the prefix,
+        // so the following bytes are handled on their own.
         Some(_) => return Sequence::Other(1),
     }
 
-    // A private marker first is a reply; both spellings of a key start with
-    // a number instead.
+    // A private marker first means a reply; no key report starts with one.
     let reply = matches!(seq.get(2), Some(b'?' | b'>' | b'='));
     for (i, &b) in seq.iter().enumerate().skip(2) {
         match b {
-            // A final byte: the sequence is complete, and this is its end
-            // whatever it says.
+            // Final byte: the sequence is complete.
             0x40..=0x7e if reply => return Sequence::Reply,
             0x40..=0x7e => {
                 return complete(&seq[2..i], b, code).unwrap_or(Sequence::Other(i + 1));
@@ -128,15 +97,14 @@ pub fn classify(seq: &[u8], code: u8) -> Sequence {
             b'?' | b'>' | b'=' if i == 2 => {}
             b'0'..=b'9' => {}
             b';' | b':' if i > 2 => {}
-            // An intermediate byte, as in a DECRPM reply's `$`.
+            // Intermediate byte, as in DECRPM's `$`.
             0x20..=0x2f if reply => {}
-            // A separator first, or any other parameter or intermediate byte,
-            // means a sequence that is neither a key report nor a reply — a
-            // mouse event, say. It is passed on as it stands, and its
-            // remaining bytes are plain text.
+            // A leading separator or any other parameter/intermediate byte:
+            // neither key nor reply (e.g. a mouse event). Its remaining bytes
+            // are plain text.
             0x20..=0x3f => return Sequence::Other(i + 1),
-            // A byte no escape sequence contains: a control byte, `DEL`, or the
-            // start of a multi-byte character. The sequence ended before it.
+            // Control byte, `DEL` or UTF-8 lead byte: the sequence ended
+            // before it.
             _ => return Sequence::Other(i),
         }
     }
@@ -148,8 +116,8 @@ pub fn classify(seq: &[u8], code: u8) -> Sequence {
     }
 }
 
-/// Decide a complete sequence: `params` is everything between `ESC [` and the
-/// final byte. `None` means it is some other key or none.
+/// Decide a complete sequence; `params` is everything between `ESC [` and
+/// the final byte. `None` means some other key or none.
 fn complete(params: &[u8], fin: u8, code: u8) -> Option<Sequence> {
     match fin {
         b'u' => kitty(params, code),
@@ -194,13 +162,12 @@ fn xterm(params: &[u8], code: u8) -> Option<Sequence> {
     (reported == u32::from(code) && ctrl_only(modifiers)).then_some(Sequence::Prefix)
 }
 
-/// The `n`th colon-separated part of a field.
 fn subfield(field: &[u8], n: usize) -> Option<&[u8]> {
     field.split(|&b| b == b':').nth(n)
 }
 
-/// A non-empty run of ASCII digits as a number. Nine digits at most, which is
-/// more than any key report carries and never overflows.
+/// Parse 1 to 9 ASCII digits; nine is enough for any key report and cannot
+/// overflow.
 fn number(digits: &[u8]) -> Option<u32> {
     if digits.is_empty() || digits.len() > 9 || !digits.iter().all(u8::is_ascii_digit) {
         return None;
@@ -210,7 +177,7 @@ fn number(digits: &[u8]) -> Option<u32> {
     })
 }
 
-/// Ctrl and nothing else, lock keys aside.
+/// Ctrl and nothing else, ignoring lock keys.
 fn ctrl_only(modifiers: u32) -> bool {
     modifiers >= 1 && (modifiers - 1) & !(CAPS_LOCK | NUM_LOCK) == CTRL
 }
@@ -223,9 +190,7 @@ mod tests {
     const SPACE: u8 = b' ';
     const T: u8 = b't';
 
-    /// Every proper prefix of a spelling is undecided, and the whole of it is
-    /// the prefix. This is what lets the machine hold a sequence that a read
-    /// boundary has cut in two.
+    /// Lets the machine hold a sequence split across reads.
     #[test]
     fn a_spelling_is_partial_until_its_last_byte() {
         for whole in [
@@ -253,8 +218,6 @@ mod tests {
         }
     }
 
-    /// The lock keys are ignored, every other modifier makes a different chord,
-    /// and a missing modifier field is a plain key.
     #[test]
     fn only_ctrl_and_the_lock_keys_spell_the_prefix() {
         for m in 1u32..=256 {
@@ -267,6 +230,7 @@ mod tests {
                 assert_eq!(got, Sequence::Other(seq.len()), "modifiers {m}");
             }
         }
+        // A missing modifier field is a plain key.
         assert_eq!(classify(b"\x1b[32u", SPACE), Sequence::Other(5));
         // Ctrl-Shift-Space, Ctrl-Alt-Space, Ctrl-Super-Space: not the prefix.
         for seq in [&b"\x1b[32;6u"[..], b"\x1b[32;7u", b"\x1b[32;13u"] {
@@ -274,15 +238,13 @@ mod tests {
         }
     }
 
-    /// A release is a release whatever the key — the prefix's own, another
-    /// key's, an unmodified letter's — and it says which key.
     #[test]
     fn a_release_event_names_its_key() {
         assert_eq!(classify(b"\x1b[32;5:3u", SPACE), Sequence::Release(32));
         assert_eq!(classify(b"\x1b[32;1:3u", SPACE), Sequence::Release(32));
         assert_eq!(classify(b"\x1b[100;1:3u", SPACE), Sequence::Release(100));
         assert_eq!(classify(b"\x1b[27;1:3u", SPACE), Sequence::Release(27));
-        // An event type that is neither press, repeat nor release is nothing.
+        // Unknown event type.
         assert_eq!(classify(b"\x1b[32;5:4u", SPACE), Sequence::Other(9));
     }
 
@@ -297,12 +259,11 @@ mod tests {
         ] {
             assert_eq!(classify(seq, SPACE), Sequence::Other(seq.len()), "{seq:?}");
         }
-        // And the code follows the machine's prefix, not the default: for a
-        // remapped Ctrl-t the letter's code is the prefix and Space's is not.
+        // The code follows the configured prefix.
         assert_eq!(classify(b"\x1b[116;5u", T), Sequence::Prefix);
         assert_eq!(classify(b"\x1b[27;5;116~", T), Sequence::Prefix);
         assert_eq!(classify(b"\x1b[32;5u", T), Sequence::Other(7));
-        // An uppercase code is not what the protocol sends for the chord.
+        // The protocol never sends an uppercase code for the chord.
         assert_eq!(classify(b"\x1b[84;5u", T), Sequence::Other(7));
     }
 
@@ -320,10 +281,6 @@ mod tests {
         }
     }
 
-    /// A lone `ESC` and a byte that cannot continue a CSI sequence: the `ESC`
-    /// is the Escape key, or Alt, or the start of an `ESC O` key — it does
-    /// not matter which, since none of them can be the prefix and all of them
-    /// go through byte by byte — and that byte is handled on its own.
     #[test]
     fn an_escape_followed_by_anything_but_a_bracket_stands_alone() {
         assert_eq!(classify(b"\x1b", SPACE), Sequence::Partial);
@@ -332,10 +289,8 @@ mod tests {
         }
     }
 
-    /// A key report that is not the prefix is a whole unit, decided at its
-    /// final byte; a sequence that cannot be a key report at all is decided
-    /// at the parameter byte that gives it away, and what has arrived by then
-    /// is the unit.
+    /// A non-prefix key is decided at its final byte; a non-key sequence at
+    /// the first byte that rules out a key report.
     #[test]
     fn other_sequences_are_decided_as_soon_as_they_can_be() {
         for (seq, unit) in [
@@ -358,9 +313,7 @@ mod tests {
         }
     }
 
-    /// The terminal's answers to the editor's queries are whole units, and
-    /// not keys: the reply to the kitty query, DA1 (short and long), DA2,
-    /// DECRPM. Every proper prefix of one is still undecided.
+    /// Kitty query reply, DA1 (short and long), DA2, DECRPM.
     #[test]
     fn a_terminal_reply_is_recognised_whole() {
         for reply in [
@@ -390,8 +343,7 @@ mod tests {
         assert_eq!(classify(b"\x1b[?6\x14", SPACE), Sequence::Other(4));
     }
 
-    /// A control byte in the middle ends the sequence before itself: the
-    /// prefix byte typed after a broken sequence must still be the prefix.
+    /// A prefix byte typed after a broken sequence must still be the prefix.
     #[test]
     fn a_byte_that_cannot_belong_ends_the_sequence_before_itself() {
         assert_eq!(classify(b"\x1b[11\x00", SPACE), Sequence::Other(4));
@@ -404,7 +356,7 @@ mod tests {
         let mut seq = b"\x1b[".to_vec();
         seq.extend(std::iter::repeat_n(b'1', MAX_LEN));
         assert_eq!(classify(&seq, SPACE), Sequence::Other(seq.len()));
-        // But it takes the whole allowance to get there.
+        // Not before reaching `MAX_LEN`.
         assert_eq!(classify(&seq[..MAX_LEN - 1], SPACE), Sequence::Partial);
     }
 

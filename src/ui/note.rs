@@ -1,48 +1,30 @@
-//! What a session's note looks like on the picker (see [`crate::notes`]): one
-//! sign beside the row, and the selected session's note in full under the
-//! list. Glyphs and text only — where they go, dim, is [`super::draw`]'s.
+//! Glyphs and text for a session's note on the picker (layout is in
+//! [`super::draw`]).
 //!
-//! # One column, everywhere
-//!
-//! Every sign is one column on every terminal, for the reason the marker and
-//! the back mark are (see [`super::draw`]): a terminal that draws a glyph two
-//! wide where `unicode-width` says one shifts the rest of the row. The
-//! spinner and the gauge are braille, as the attaching screen's spinner and
-//! the picker's trails are. `∗` is the asterisk operator, U+2217, and `✓` the
-//! check mark, U+2713, neither of which is emoji or of ambiguous width (the
-//! heavy check mark, U+2714, is emoji); `!` is plain ASCII.
+//! Every sign must be one column on every terminal, or the row shifts, so
+//! none is emoji or ambiguous-width: braille, `∗` (U+2217), `✓` (U+2713, not
+//! the emoji U+2714) and `!`.
 
 use std::time::Duration;
 
 use super::attaching::{FRAME, GLYPHS};
 use crate::notes::{Kind, Note};
 
-/// How long a frame of a busy session's spinner lasts: the attaching screen's.
 pub(super) const SPIN: Duration = FRAME;
 
-/// The gauge a percentage is drawn with: one to eight of a cell's dots,
-/// filling the left column from the bottom, then the right.
+/// One to eight braille dots, left column bottom-up, then the right.
 const GAUGE: [char; 8] = ['⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿'];
 
-/// The sign for a notification.
 const NOTIFIED: char = '∗';
-
-/// The sign for a failure.
 const FAILED: char = '!';
-
-/// The sign for a command that has finished.
 const FINISHED: char = '✓';
 
-/// The sign beside a session's row: the spinner's `frame` while it is busy
-/// without saying how far it has got, the gauge when it says, `∗` for a
-/// notification, `!` for a failure and `✓` for a command that has finished.
+/// The sign beside a row; `frame` animates a busy note's spinner.
 pub fn sign(note: &Note, frame: usize) -> char {
     glyph(note.kind, frame)
 }
 
-/// The sign for a note of `kind`, as it stands still: the spinner's first
-/// frame for something busy. What the editor in front is told carries it
-/// (see [`crate::tell`]).
+/// The static sign for `kind`, as [`crate::tell`] sends it.
 pub fn mark(kind: Kind) -> char {
     glyph(kind, 0)
 }
@@ -57,24 +39,20 @@ fn glyph(kind: Kind, frame: usize) -> char {
     }
 }
 
-/// Whether the note turns — the spinner — and so wants the picker drawn a
-/// frame at a time while it is on screen.
+/// Whether the note shows the spinner, so the picker must redraw each frame.
 pub fn turns(note: &Note) -> bool {
     note.kind == Kind::Busy(None)
 }
 
-/// A percentage as one cell of the gauge: any progress at all shows a dot,
-/// and only all of it fills the cell.
+/// `percent` to the nearest eighth, at least one dot; 94% and up fill the
+/// cell.
 pub fn gauge(percent: u8) -> char {
     let level = ((u32::from(percent.min(100)) * 8 + 50) / 100).clamp(1, 8);
     GAUGE[level as usize - 1]
 }
 
-/// The selected session's note, under the list: what it is, then how long
-/// ago — `Claude Code · Claude needs your permission · 2m`, `claude: working
-/// · 3m`, `lua_ls: 42% indexing · 12s`.
-///
-/// Progress reads the way Neovim prints a progress message, title first.
+/// The selected note's caption, e.g. `lua_ls: 42% indexing · 12s`; progress
+/// reads as Neovim prints it, title first.
 pub fn caption(note: &Note) -> String {
     format!(
         "{} · {}",
@@ -83,8 +61,7 @@ pub fn caption(note: &Note) -> String {
     )
 }
 
-/// What a note of `kind` says, without how long ago: the caption's first
-/// half, and what the editor in front is told (see [`crate::tell`]).
+/// The caption without its age; also what [`crate::tell`] sends the editor.
 pub fn what(kind: Kind, title: &str, text: &str) -> String {
     match kind {
         Kind::Notified => [title, text]
@@ -98,8 +75,8 @@ pub fn what(kind: Kind, title: &str, text: &str) -> String {
     }
 }
 
-/// `title: 42% text`, with what is missing left out, and `otherwise` when
-/// there is nothing at all to say.
+/// `title: 42% text`, omitting missing parts; `otherwise` replaces an empty
+/// `42% text`.
 fn progress(title: &str, text: &str, percent: Option<u8>, otherwise: &str) -> String {
     let mut body: Vec<String> = Vec::new();
     if let Some(p) = percent {
@@ -120,7 +97,7 @@ fn progress(title: &str, text: &str, percent: Option<u8>, otherwise: &str) -> St
     }
 }
 
-/// How long ago, in the one unit that says it: `12s`, `3m`, `2h`, `1d`.
+/// Age in its largest whole unit: `12s`, `3m`, `2h`, `1d`.
 pub fn age(d: Duration) -> String {
     let s = d.as_secs();
     match s {
@@ -161,8 +138,6 @@ mod tests {
         assert!(!turns(&note(Kind::Busy(Some(42)), "", "", 0)));
     }
 
-    /// The marker's rule, kept: a sign a terminal draws two columns wide
-    /// where `unicode-width` says one would shift the row it stands beside.
     #[test]
     fn every_sign_is_one_column() {
         let signs = GLYPHS

@@ -1,102 +1,21 @@
-//! The hint bar the prefix puts up: one row, along the bottom, saying what the
-//! next key does.
+//! The hint bar: the last row, saying what the next key does while
+//! [`crate::keys::Prefix`] waits for it. Built from the user's
+//! [`crate::keys::Keymap`]; entries are second keys, so the prefix is never
+//! named.
 //!
-//! `<prefix>` used to be silent. [`crate::keys::Prefix`] swallows the byte,
-//! arms, and waits `keys.timeout_ms` for the second key, and until that key
-//! arrives the screen says nothing at all — so the table is only learnable from
-//! `<prefix> ?`, which is itself one of the keys you have to know, and a chord
-//! pressed by accident looks for half a second like a keystroke the editor
-//! dropped. This is the row the picker has always had, on the one screen that
-//! did not have it.
+//! nvmux owns no cells while attached, so the bar is drawn over Neovim's
+//! message row and put back. It goes up at a lull ([`SETTLE`]): with no parser
+//! followed, the only time the child cannot be mid-sequence. While it is up,
+//! the relay follows the terminal's parser ([`crate::boundary`]) and redraws
+//! the bar on the same pass the session draws over it, between its sequences;
+//! otherwise a statusline redrawing faster than a lull would keep it down.
+//! Following the parser has costs (see `Attachment::write_session_frame` in
+//! [`crate::pty`]), so it stops once the bar is down. Unlike the attach notice
+//! there is no fade (the bar must be up as the prefix arms) and no give-up
+//! clock (the prefix bounds its life).
 //!
-//! It is built from [`crate::keys::BINDINGS`] as the user has it — the
-//! [`crate::keys::Keymap`] the prefix machine runs on — like the help screen
-//! ([`crate::ui::help`]), so a command cannot be added without appearing on
-//! it, nor moved to another key without the bar naming that key.
-//!
-//! # What is on it, and what is not
-//!
-//! The commands, and the digit rule. Not the machine's other two branches: a
-//! doubled prefix sends a literal, and any other key is replayed, both of which
-//! the help *screen* has room to describe. This is one row read in a fraction
-//! of a second with a command half-typed, and "press it again to send it to
-//! Neovim" is not something anyone needs told at that moment.
-//!
-//! And never the prefix itself. Every entry is the *second* key, so the row is
-//! the same whatever `[keys] prefix` is set to and there is no way for it to
-//! spell `Ctrl-Space` at somebody who has remapped it. Where a string does have
-//! to name the prefix, [`crate::keys::prefix_label`] is what names it.
-//!
-//! # Why the last row
-//!
-//! It is Neovim's message row, so the bar covers `-- INSERT --`, a `:` command
-//! line, a search prompt or the ruler for as long as it is up.
-//! [`crate::announce`]'s header rejects "print a line on the message row" — but
-//! that objection is to *asking Neovim* to print there, which is editor state
-//! nvmux has no business writing. Drawing over the row from the terminal side
-//! touches none of it: nothing is created in the session, nothing is typed at
-//! it, and the cells come back exactly.
-//!
-//! It is the right row because it is the one the eye is already on for modal
-//! state, and the one row the attach notice's box never wants above three rows.
-//!
-//! The cursor is left where the session had it, which at a `:` prompt means on
-//! this row, blinking over the hint text. [`crate::shadow`] declines to hide the
-//! cursor for an overlay for the same reason: the hide would itself be seen, for
-//! as long as the bar is up.
-//!
-//! # Up at a lull, and kept up between the session's sequences
-//!
-//! nvmux owns no cells while a session is attached, so the bar is written over
-//! the session's screen and put back. It goes *up* at a lull ([`SETTLE`]):
-//! with nothing parsing the child's output, a lull is the one state in which
-//! the child cannot be mid-sequence.
-//!
-//! It is *kept* up another way. The session goes on drawing while the prefix
-//! waits, and the row it draws on most is very often this one: a statusline
-//! with a language server's progress in it, redrawn a few times a second, or
-//! the message row a plugin reports on. Each of those redraws used to wipe the
-//! bar, which went back up at the lull after it — so the editor's row showed
-//! through the bar on every redraw, and on an editor redrawing faster than the
-//! lull, the bar never came back at all. That is the attach notice's old
-//! trouble exactly, and the bar takes the notice's answer to it: from the write
-//! that puts it up to the one that takes it down, the relay follows the
-//! terminal's parser with [`crate::boundary`], and the bar goes back up on the
-//! very pass the session drew over it — between the session's sequences,
-//! inside the same synchronized update as what the session drew, in front of
-//! its frame close for a client that brackets its own frames. The terminal has
-//! no moment at which it could present the one without the other. Nothing
-//! after the lull the bar went up at is a clock, the erase included: it, too,
-//! goes in between the session's sequences, at once.
-//!
-//! The parser is followed for that long and no longer — the second or so a
-//! prefix waits — because following it is not free: the last few bytes of a
-//! write that ends inside a sequence are kept back until the rest of it
-//! arrives, and the writes of a client that does not bracket its own frames
-//! go to the terminal inside updates of nvmux's (see
-//! `Attachment::write_session_frame` in [`crate::pty`]). Neither is worth
-//! having for a row nobody has asked for.
-//!
-//! # The two clocks this does not have
-//!
-//! There is no fade. The bar has to be up the moment the prefix arms — that is
-//! the whole of what it is for, and a dissolve of 100 ms each way is 100 ms of
-//! not yet saying what the next key does. And there is no give-up clock either:
-//! the bar's life is already bounded by the prefix, so a session too chatty to
-//! give a lull simply shows the bar late, or not at all, which is what a lull
-//! rule means. Both of those the attach notice has and needs; neither belongs
-//! here.
-//!
-//! # Coming down
-//!
-//! Most of the ways the bar is dismissed end the relay — the picker, a detach, a
-//! switch — and there the screen is dissolved or cleared on the way out and the
-//! bar goes with it. What is left is the prefix resolving *without* ending the
-//! relay: a lone prefix timing out into a literal, a doubled prefix, a key that
-//! is not a command. Then the cells have to be put back, and only two things
-//! have them: [`crate::shadow`], which has been keeping the session's screen all
-//! along and gives it back exactly ([`Shadow::under`] at `t = 1.0`), and failing
-//! that the server, which the relay asks — see [`Act::Blanked`].
+//! When the prefix resolves without ending the relay, the row is restored from
+//! [`crate::shadow`], or failing that by the server (see [`Act::Blanked`]).
 
 use std::time::{Duration, Instant};
 
@@ -108,101 +27,46 @@ use crate::palette::{self, Palette};
 use crate::pty::PtySize;
 use crate::shadow::{Over, Shadow};
 
-/// How long the child must have been quiet before the bar may be written,
-/// while nothing is following the terminal's parser to say so sooner: which
-/// is how the bar goes up, though not how it is kept up (see the module docs).
-///
-/// A child whose own write blocked because the pty buffer filled leaves the
-/// master momentarily unreadable in the *middle* of a frame. That gap is
-/// microseconds, and a wait this long steps over it. `pty::HOLD_SETTLE` is the
-/// same number for the same reason, and this is its own constant rather than a
-/// shared one because the two agree by coincidence of the same hardware, not by
-/// agreement.
-///
-/// It costs the bar nothing in practice. A human reaching for the prefix is
-/// almost always further than 25 ms from the last byte the editor wrote, so the
-/// lull is already satisfied when the keystroke is read and the bar goes up on
-/// that very pass of the relay.
+/// Quiet time before the bar goes up: steps over the microseconds a child
+/// blocked on a full pty buffer leaves the master unreadable mid-frame. Equal
+/// to `pty::HOLD_SETTLE` by coincidence.
 const SETTLE: Duration = Duration::from_millis(25);
 
-/// Columns between entries. `src/ui/draw.rs`'s, because this is that row.
 const GAP: &str = "  ";
 
-/// The digit rule's entry. `1-n` rather than `1-9` for the reason
-/// [`crate::ui::help`] already gives: `Prefix::feed` reads a number, not a
-/// digit, so `12` reaches the twelfth session.
+/// `1-n`, not `1-9`: `Prefix::feed` reads a number, so `12` reaches the
+/// twelfth session.
 const DIGITS: &str = "1-n session";
 
-/// A reset, then `DIM`. Every nvmux hint row is dim (`draw::draw_hint_row`), and
-/// the reset is what puts the background back, so the modifier rides along on
-/// the same CSI rather than following it.
+/// Reset (restoring the background), then dim.
 const SGR: &str = "\x1b[0;2m";
 
-/// A reset alone: a question on the row is something being asked, which the
-/// picker's hint row draws at full weight as well.
 const QUESTION_SGR: &str = "\x1b[0m";
 
-/// The shortest screen the bar will draw on. Two, so it is never a session's
-/// only row: an editor left with nothing but nvmux's hints is worse than a user
-/// left to find `<prefix> ?`.
+/// The bar never takes a session's only row.
 const MIN_ROWS: u16 = 2;
 
-/// What the relay found on this pass of its loop, as far as the bar is
-/// concerned.
-///
-/// The two questions [`announce::Pass`] asks, for the reason it asks them:
-/// whether the bar may have been drawn over, and whether there is anywhere to
-/// put it back. A session drawing on the bar's row answers yes to both on the
-/// same pass, which is exactly the pass the bar has to go back up on.
+/// What the relay saw on this pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pass {
-    /// The child had something for the terminal, or is having its first paint
-    /// held, or has just had it let through: whatever the bar had on the row
-    /// may have been drawn over, and a lull, if one is being waited for, is
-    /// measured from this pass.
+    /// The child wrote (or its first paint is held or just released).
     pub wrote: bool,
-    /// Where the terminal's parser stands, when the relay is following it
-    /// (see [`crate::boundary`]): `Some(true)` between the session's
-    /// sequences with nothing of the session's open, so the bar may be
-    /// written now, and `Some(false)` in the middle of something, so it may
-    /// not be written at all. `None` when nothing is following it, which
-    /// leaves the bar a lull to go on.
+    /// When the parser is followed: `Some(true)` between the session's
+    /// sequences, `Some(false)` mid-sequence. `None` means wait for a lull.
     pub between: Option<bool>,
 }
 
-/// What the relay must do about the bar on this pass of its loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
-    /// Nothing this time round.
     Idle,
-    /// Write these bytes over the session's screen, and that is all.
     Write(Vec<u8>),
-    /// Write these bytes — and then ask the server to repaint.
-    ///
-    /// The bar is coming down with no shadow to put the row back from, so the
-    /// most these bytes can do is stop showing something wrong: they blank the
-    /// row rather than restore it. Only the server has the cells now, which is
-    /// the position the attach notice is always in, and the relay asks in the
-    /// same way it asks for that one (see `pty::Erasing`).
+    /// Write these bytes, then ask the server to repaint: with no shadow the
+    /// row can only be blanked.
     Blanked(Vec<u8>),
 }
 
-/// Every entry the bar offers, in the order it offers them: the commands as
-/// [`keys::BINDINGS`] lists them, each on the key `keymap` puts it on, then the
-/// digit rule.
-///
-/// All of them but `⏎ go` when `go` is false — no card up that
-/// `<prefix> Enter` would act on (see [`crate::card::Desk::can_go`]). That one
-/// command does nothing then, and a row offering it would send the user to a
-/// key that does nothing.
-///
-/// Keys are spelled [`keys::key_glyph`], which is the picker's hint-row grammar
-/// and not the help screen's: `␣` for the space bar, `⏎` for Enter, and any
-/// other key as itself — lowercase, as the picker's are, unless the user has
-/// put a command on a capital, which is a key of its own and drawn as one.
-/// This is the picker's row on another screen, so it is spelled the picker's way
-/// — two rows that named the same key two ways would be the kind of drift the
-/// rest of this crate pins down with a test, and there is one below.
+/// Without `go` (no card up), `⏎ go` is left out since it would do nothing.
+/// Keys are spelled as on the picker's hint row ([`keys::key_glyph`]).
 fn entries(keymap: &Keymap, go: bool) -> Vec<String> {
     keymap
         .bindings()
@@ -212,23 +76,12 @@ fn entries(keymap: &Keymap, go: bool) -> Vec<String> {
         .collect()
 }
 
-/// What the row says on a screen `cols` wide, or `None` when not even the first
-/// entry fits.
-///
-/// Entries are dropped **whole**, from the right, rather than truncated the way
-/// `draw::truncate` cuts the picker's row: this row is written over somebody's
-/// editor, and half of `1-n sess` there reads as corruption rather than as a
-/// hint. Which entry goes first is [`keys::BINDINGS`]' order and not a second
-/// opinion about priority — one table, one order — so `? help` goes before
-/// `p prev`, and the two that a user pressing the prefix by accident most needs,
-/// the picker and the detach, are the two that survive longest.
+/// Entries are dropped whole from the right, not truncated: a fragment over
+/// the editor reads as corruption. `None` if not even the first fits.
 fn text(pending: Pending, keymap: &Keymap, go: bool, cols: u16) -> Option<String> {
     let cols = usize::from(cols);
     let row = match pending {
-        // A number being typed, as the picker shows one on its own hint row —
-        // without the `▋` it puts after it. That is a prompt cursor on a screen
-        // the picker owns; here Neovim's real cursor is somewhere else on the
-        // screen, and a second one would be a lie.
+        // No `▋` cursor, unlike the picker: Neovim's cursor is elsewhere.
         Pending::Number(n) => format!("#{n}"),
         Pending::Command => {
             let mut row = String::new();
@@ -248,8 +101,7 @@ fn text(pending: Pending, keymap: &Keymap, go: bool, cols: u16) -> Option<String
     (!row.is_empty() && row.width() <= cols).then_some(row)
 }
 
-/// [`overlay`] for a question rather than the commands: `text`, cut to the
-/// screen, centred on the last row.
+/// [`overlay`] for a question: `text`, cut to the screen.
 fn question_overlay(text: &str, size: PtySize) -> Option<Over> {
     if size.rows < MIN_ROWS || size.cols == 0 {
         return None;
@@ -272,29 +124,15 @@ fn question_overlay(text: &str, size: PtySize) -> Option<Over> {
     })
 }
 
-/// Where the bar goes and what it says: the whole of the last row, with the text
-/// centred on it.
-///
-/// The full width, padded out with spaces either side, because the cells beside
-/// the text are what clears the editor's own last row from under it — a row of
-/// hints interleaved with half a statusline would read as damage. That it is
-/// safe to fill the last row to its final column is the property
-/// [`announce::placed`] writes down: nothing printable follows the row, so the
-/// pending-wrap flag its last cell sets is discarded by the `DECRC` rather than
-/// scrolling the session's screen by a line.
-///
-/// `None` when the screen has no room. Pure, so the geometry is testable without
-/// a terminal, and named, because two things need it: the paint, and the erase
-/// that has to put back exactly the cells the paint covered.
+/// The whole last row with the text centred, padded so the editor's row does
+/// not show beside it. Filling the last column is safe: nothing printable
+/// follows, so `DECRC` discards the pending wrap (see [`announce::placed`]).
 pub fn overlay(pending: Pending, keymap: &Keymap, go: bool, size: PtySize) -> Option<Over> {
     if size.rows < MIN_ROWS || size.cols == 0 {
         return None;
     }
     let text = text(pending, keymap, go, size.cols)?;
     let cols = usize::from(size.cols);
-    // Both subtractions are safe: `text` was measured to fit `cols`. Odd slack
-    // falls to the right, which is what integer division does and is not worth a
-    // correction nobody could see.
     let left = (cols - text.width()) / 2;
     let right = cols - text.width() - left;
     Some(Over {
@@ -305,71 +143,33 @@ pub fn overlay(pending: Pending, keymap: &Keymap, go: bool, size: PtySize) -> Op
     })
 }
 
-/// The bar over the life of one relay.
-///
-/// Owned by the relay loop, one per attach, and told the time rather than
-/// reading a clock — like [`announce::Popup`] and [`keys::Prefix`], and for the
-/// same reason: every state it can reach is then reachable from a test.
-///
-/// What it holds is the difference between two pictures of the last row: the one
-/// on the terminal, and the one the prefix machine implies. `agreed` is whether
-/// they match, and a write is owed whenever they do not.
+/// The bar for one relay. Told the time rather than reading a clock, so tests
+/// reach every state.
 #[derive(Debug)]
 pub struct Bar {
-    /// The last pass the child was seen to write on, or the start of the
-    /// relay before it has: where the lull it owes the bar is counted from.
-    /// Kept from the start of the relay rather than from the moment the
-    /// prefix arms, so the lull is already behind us when it does and the bar
-    /// goes up on that pass instead of a wake-up later.
-    ///
-    /// From the write, and not from the first pass that finds the child
-    /// quiet. That pass is the wake-up [`Bar::wake_at`] asks for, a lull after
-    /// the write, so a lull counted from it is two lulls long: see
-    /// `a_child_writing_every_other_lull_leaves_room_for_the_bar`.
+    /// The last pass the child wrote on, or the relay's start. The lull is
+    /// counted from the write, not the first quiet pass, which would make it
+    /// two lulls long.
     spoke: Instant,
-    /// The rectangle on the terminal now, or `None` when the bar is down. Kept,
-    /// rather than worked out again at the time, because the erase has to put
-    /// back the cells the bar *covered* and not whichever cells the last row is
-    /// now.
+    /// The erase must restore the cells covered, not the current last row.
     shown: Option<Over>,
-    /// The rectangle the machine's state implies, worked out on every pass.
     want: Option<Over>,
-    /// Whether the terminal has been made to agree with `want`. False is a write
-    /// owed, and is when [`Bar::wake_at`] asks to be woken — unless `watched`.
+    /// Whether the terminal matches `want`; false means a write is owed.
     agreed: bool,
-    /// Whether the last pass had the terminal's parser to go on rather than a
-    /// lull: then nothing the bar could wait for is a clock, and
-    /// [`Bar::wake_at`] asks for nothing.
     watched: bool,
-    /// The screen the last pass was for. Rows and columns only: a pixel-size
-    /// change moves no cell.
+    /// Rows and columns only: a pixel-size change moves no cell.
     size: (u16, u16),
-    /// The colours a restored row is painted in, `None` when the terminal never
-    /// said what they are. Copied once rather than read at the time, the way
-    /// [`announce::Popup`] is handed its [`crate::fade::Dissolve`]: a bar that
-    /// read a process global mid-relay would have states no test could reach,
-    /// since no palette is ever installed under test.
+    /// Handed in, not read from the global, so tests can reach every state.
     palette: Option<Palette>,
-    /// Which key each command is on, for the entries to name: handed in by
-    /// the relay, from the same settings its prefix machine was built with,
-    /// rather than read here — for the reason the palette is.
     keymap: Keymap,
-    /// A question the relay has put on the row in place of the commands —
-    /// `<prefix> d` with settings unsaved — up, whatever the prefix machine
-    /// says, until the relay takes it down (see [`Bar::ask`]).
     question: Option<String>,
 }
 
 impl Bar {
-    /// A bar with nothing on screen, on a child presumed quiet — which it is,
-    /// at the top of a relay, until it says otherwise — naming each command
-    /// on the key `keymap` puts it on.
     pub fn new(now: Instant, size: PtySize, keymap: Keymap) -> Self {
         Self::with_palette(now, size, keymap, palette::get().copied())
     }
 
-    /// [`Bar::new`] with the colours handed in rather than read, which is how
-    /// the tests reach the restoring path at all.
     fn with_palette(now: Instant, size: PtySize, keymap: Keymap, palette: Option<Palette>) -> Self {
         Self {
             spoke: now,
@@ -384,43 +184,21 @@ impl Bar {
         }
     }
 
-    /// Put `question` on the row in place of the commands, or with `None`
-    /// take it down. It is drawn, kept up and put back as the bar is, at full
-    /// weight rather than dim, being a question.
+    /// Show `question` instead of the commands (e.g. `<prefix> d` with unsaved
+    /// settings) until cleared with `None`.
     pub fn ask(&mut self, question: Option<String>) {
         self.question = question;
     }
 
-    /// Whether the bar is on the screen, or wants to be: what the relay
-    /// follows the terminal's parser for (see [`Pass::between`]). Up from the
-    /// prefix to the erase, and down again once nothing is left on the row.
+    /// While true the relay follows the terminal's parser.
     pub fn is_up(&self) -> bool {
         self.shown.is_some() || self.want.is_some()
     }
 
-    /// When the relay must next wake up on the bar's account, or `None` when it
-    /// owes nothing.
-    ///
-    /// `None` is the common answer, and it has to be: the bar is down and idle
-    /// for almost all of a session, and a relay woken every 25 ms on its account
-    /// would be paying for a row nobody has asked for.
-    ///
-    /// It is also what stops a spin. A bar that *cannot* do what it wants — a
-    /// screen too narrow for one entry, a shadow whose parser has been retired —
-    /// records the decision by agreeing with itself, so this stops asking. Were
-    /// it to keep asking, the poll timeout would round to zero and the relay
-    /// would spin on a write it can never make: the hazard `pty::Hold::wake_at`
-    /// steps around for the held first paint.
-    ///
-    /// And a bar the relay is following the terminal for asks for nothing
-    /// either, owed a write or not, for the reason [`announce::Popup::wake_at`]
-    /// gives: what it waits for is the session leaving the terminal between
-    /// its sequences, which no clock brings about. The session's next bytes
-    /// wake the relay, and so does a tail kept back to keep a sequence whole,
-    /// and the pass that follows either is the pass that writes. Asking for
-    /// the lull instead would be asking, once it had passed, for a wake-up
-    /// already due — on every pass, for as long as the session sat in the
-    /// middle of a sequence of its own.
+    /// When the relay must next wake for the bar. A bar that cannot draw marks
+    /// itself agreed, or the poll timeout would round to zero and the relay
+    /// spin. `None` while the parser is followed: no clock ends a sequence, and
+    /// the session's next bytes wake the relay.
     pub fn wake_at(&self) -> Option<Instant> {
         if self.agreed || self.watched {
             return None;
@@ -428,20 +206,13 @@ impl Bar {
         Some(self.spoke + SETTLE)
     }
 
-    /// Something that is not the child has written over the session's screen —
-    /// a frame of the attach notice — so the bar may no longer be on it.
+    /// Something other than the child (the attach notice) drew over the screen.
     pub fn overdrawn(&mut self) {
         self.may_have_been_covered();
     }
 
-    /// One pass of the relay loop.
-    ///
-    /// `pass` is what the relay found: whether the row may have been drawn
-    /// over, and whether the terminal may be written to now — or, with nothing
-    /// following its parser, nothing about that at all, and then the bar waits
-    /// for a lull. `under` is the session's screen as the shadow has it, which
-    /// is what an erase puts back. `go` is whether a card is up for
-    /// `<prefix> Enter` to act on, and so whether the bar offers it.
+    /// `under` is what an erase restores; `go` is whether a card is up for
+    /// `<prefix> Enter`.
     pub fn step(
         &mut self,
         now: Instant,
@@ -451,20 +222,14 @@ impl Bar {
         go: bool,
         under: Option<&Shadow>,
     ) -> Act {
-        // A resize is its own erase, so the bar forgets what it drew instead of
-        // putting it back: the size reaches the client through the pty and the
-        // client repaints the whole grid, which is the session taking its row
-        // back. Putting it back here would be worse than redundant after a
-        // shrink — the rectangle that was painted is off the grid, and the
-        // terminal would clamp every `CUP` in it onto a row of somebody's text.
+        // A resize makes the client repaint, so forget the bar; after a
+        // shrink, restoring would clamp every `CUP` onto a row of text.
         if self.size != (size.rows, size.cols) {
             self.size = (size.rows, size.cols);
             self.shown = None;
         }
 
-        // Before the lull, not after it: the bar has to know a write is owed in
-        // order to ask to be woken to make it, and the pass that reads the
-        // prefix is often one the child is still talking on.
+        // Before the lull check, so a wake-up can be asked for.
         let want = match &self.question {
             Some(question) => question_overlay(question, size),
             None => pending.and_then(|p| overlay(p, &self.keymap, go, size)),
@@ -479,11 +244,7 @@ impl Bar {
             self.may_have_been_covered();
         }
 
-        // The parser's word, where there is one, is the whole of it: between
-        // the session's sequences the bar goes in at once — which on a pass
-        // the session drew on is inside the frame it drew, before the terminal
-        // can present that frame without the bar — and in the middle of one it
-        // does not go in at all, however long the session has been quiet.
+        // The parser's word, when there is one, decides alone.
         self.watched = pass.between.is_some();
         let free = pass
             .between
@@ -492,9 +253,7 @@ impl Bar {
             return Act::Idle;
         }
 
-        // Whatever comes of this pass, the bar has now had its say about this
-        // state on this screen — including deciding it can say nothing, which is
-        // what keeps `wake_at` quiet.
+        // Even if nothing is drawn, so `wake_at` goes quiet.
         self.agreed = true;
         match self.want.clone() {
             Some(over) => {
@@ -514,40 +273,24 @@ impl Bar {
         }
     }
 
-    /// The terminal may no longer show what `want` says — but only if the bar
-    /// had anything there to be covered. A bar that is down has nothing to put
-    /// back, and saying otherwise would have [`Bar::wake_at`] ask for a wake-up
-    /// after every burst of output for the whole of a session.
+    /// Only a shown bar can be covered; otherwise every output would cause a
+    /// wake-up.
     fn may_have_been_covered(&mut self) {
         self.agreed &= self.shown.is_none();
     }
 }
 
-/// Take the bar off the row it covered.
-///
-/// The shadow's copy of those cells is the only one anywhere once the terminal
-/// has been written over, and at `t = 1.0` a composite is that copy with none of
-/// the overlay left in it — an erase that is exact, local, and costs no round
-/// trip. What it cannot carry is what the grid does not hold: colours, bold,
-/// dim, italic and a plain underline come back, but an undercurl or a
-/// strikethrough on the row comes back plain. For one row that Neovim keeps
-/// mostly blank that is the right trade against asking the server on every
-/// mistyped chord.
-///
-/// Failing a shadow — the fade off, `[effects.fade] session = false`, a terminal that
-/// never said what its colours are — or a shadow whose parser has been retired,
-/// there is nothing here that knows what was underneath. The row is blanked, and
-/// the relay is told to ask the server for the rest.
+/// Restore the row from the shadow, a local erase (undercurl and strikethrough
+/// come back plain). Without a usable shadow or palette, blank the row and
+/// have the relay ask the server.
 fn erase(over: &Over, under: Option<&Shadow>, palette: Option<&Palette>) -> Act {
     match (under.filter(|s| s.is_usable()), palette) {
-        // Fully dissolved: none of the bar is drawn, so the colour it is
-        // given to be drawn in is moot.
+        // At `t = 1.0` none of the bar is drawn, so its colour is moot.
         (Some(shadow), Some(palette)) => Act::Write(shadow.under(over, palette, palette.fg, 1.0)),
         _ => Act::Blanked(announce::plain_bytes(&blank(over), None)),
     }
 }
 
-/// The same rectangle with nothing in it. What a blanked row is written from.
 fn blank(over: &Over) -> Over {
     Over {
         rows: over
@@ -565,34 +308,24 @@ mod tests {
     use crate::test_support::{big, palette, screen, size};
     use crate::ui::test_support::TINY_SIZES;
 
-    /// [`super::text`] with every command on the table's own key, which is
-    /// what almost every test here is about: where each command is is the
-    /// keymap's business, and the one test that moves them says so.
+    /// On the default keys.
     fn text(pending: Pending, go: bool, cols: u16) -> Option<String> {
         super::text(pending, &Keymap::default(), go, cols)
     }
 
-    /// [`super::overlay`], on the table's own keys.
     fn overlay(pending: Pending, go: bool, size: PtySize) -> Option<Over> {
         super::overlay(pending, &Keymap::default(), go, size)
     }
 
-    /// [`super::entries`], on the table's own keys.
     fn entries(go: bool) -> Vec<String> {
         super::entries(&Keymap::default(), go)
     }
 
-    /// The bar's one row of text, as it would be drawn on `size`.
     fn row(pending: Pending, size: PtySize) -> String {
         overlay(pending, true, size).expect("a bar").rows.remove(0)
     }
 
-    /// A bar and the clock it is told, advanced a lull at a time.
-    ///
-    /// The clock has to be the test's, not `Instant::now()`: a lull starts on
-    /// the last pass the child wrote on and has passed by the next one, so two
-    /// calls that read the same clock are indistinguishable from a child that
-    /// has only just stopped talking.
+    /// A bar on the test's clock, advanced a lull per pass.
     struct Driver {
         bar: Bar,
         now: Instant,
@@ -609,8 +342,6 @@ mod tests {
             }
         }
 
-        /// A bar with a screen to put the row back from, and the colours to do
-        /// it in.
         fn restoring(size: PtySize) -> Self {
             let now = Instant::now();
             Self {
@@ -620,14 +351,12 @@ mod tests {
             }
         }
 
-        /// One pass `SETTLE` later on a child with nothing to say, with nothing
-        /// following the terminal's parser.
+        /// A pass `SETTLE` later, the child quiet; parser not followed.
         fn quiet(&mut self, pending: Option<Pending>, size: PtySize) -> Act {
             self.step(false, pending, size)
         }
 
-        /// One pass `SETTLE` later on a child that is talking, with nothing
-        /// following the terminal's parser.
+        /// A pass `SETTLE` later, the child writing; parser not followed.
         fn busy(&mut self, pending: Option<Pending>, size: PtySize) -> Act {
             self.step(true, pending, size)
         }
@@ -643,8 +372,6 @@ mod tests {
             )
         }
 
-        /// One pass `SETTLE` later, with the terminal's parser followed and
-        /// standing where `between` says.
         fn watched(
             &mut self,
             wrote: bool,
@@ -673,9 +400,6 @@ mod tests {
         }
     }
 
-    /// The load-bearing one: the bar is [`keys::BINDINGS`] rendered, so a
-    /// command cannot be added without appearing on it — the guarantee the help
-    /// screen already gives, on the row you see before you have chosen a key.
     #[test]
     fn the_row_lists_every_binding_in_table_order() {
         let text = text(Pending::Command, true, 200).expect("a row");
@@ -693,10 +417,7 @@ mod tests {
         );
     }
 
-    /// Commands moved the ways a config file can move them: onto a capital,
-    /// a letter no command had, and off Enter. Not onto `x`, which is what the
-    /// screen under the bar is made of in these tests (see
-    /// [`crate::test_support::screen`]).
+    /// Not onto `x`, which fills the test screen.
     fn moved() -> Keymap {
         let mut keymap = Keymap::default();
         for (name, key) in [("picker", b'D'), ("detach", b'z'), ("go", b'g')] {
@@ -705,9 +426,6 @@ mod tests {
         keymap
     }
 
-    /// The bar names each command on the key the user put it on — the keymap
-    /// the machine runs on, not the table's defaults — still in the table's
-    /// order, and with nothing offered on a key a command has left.
     #[test]
     fn the_row_names_the_keys_the_commands_were_moved_to() {
         let keymap = moved();
@@ -735,9 +453,6 @@ mod tests {
         );
     }
 
-    /// What the relay builds the bar with is what it draws: the keymap handed
-    /// to [`Bar::new`] reaches the row the bar writes, rather than the table's
-    /// own keys standing in for it somewhere on the way.
     #[test]
     fn the_bar_draws_the_keymap_it_was_given() {
         let size = big();
@@ -756,10 +471,6 @@ mod tests {
         assert!(!painted.contains("d detach"), "{painted:?}");
     }
 
-    /// The prefix is the user's to set, so the bar must not name it: every entry
-    /// is the *second* key, which is the same whatever the chord is. A row that
-    /// said `Ctrl-Space` would be wrong for everyone who has remapped it, and
-    /// wrong in the one place they cannot miss.
     #[test]
     fn the_row_never_spells_the_prefix() {
         let text = text(Pending::Command, true, 200).expect("a row");
@@ -773,10 +484,6 @@ mod tests {
         assert!(!text.contains("Ctrl"), "the bar names a chord: {text:?}");
     }
 
-    /// The space bar is the one key on the row with no character of its own, and
-    /// the picker already settled what to draw for it. A bar that spelled it
-    /// `space` while the picker two keystrokes away spelled it `␣` would be the
-    /// same row contradicting itself.
     #[test]
     fn the_space_bar_is_the_glyph_the_picker_uses() {
         let text = text(Pending::Command, true, 200).expect("a row");
@@ -790,10 +497,6 @@ mod tests {
         );
     }
 
-    /// The help screen has rows for the machine's other two branches — a
-    /// doubled prefix sends a literal, any other key is replayed — and the bar
-    /// deliberately does not. Neither is a next key worth teaching on a row read
-    /// with a command half-typed.
     #[test]
     fn the_row_does_not_offer_a_repeated_prefix_or_a_replay() {
         let text = text(Pending::Command, true, 200).expect("a row");
@@ -810,9 +513,6 @@ mod tests {
         );
     }
 
-    /// Narrow screens drop entries whole. A fragment of one — `1-n sess` — is
-    /// written over somebody's editor and reads as damage rather than as a hint,
-    /// which is why this row does not use `draw::truncate`.
     #[test]
     fn entries_are_dropped_whole_to_fit() {
         let all = entries(true);
@@ -836,8 +536,6 @@ mod tests {
         }
     }
 
-    /// Below the first entry the bar says nothing at all, rather than a word and
-    /// a half of one. The attach notice's answer to the same question.
     #[test]
     fn a_screen_too_narrow_for_one_entry_says_nothing() {
         let first = entries(true).remove(0);
@@ -856,20 +554,13 @@ mod tests {
         .is_some());
     }
 
-    /// One row is never the bar's, however wide: an editor left with nothing but
-    /// nvmux's hints is worse off than one with no hints at all.
     #[test]
     fn the_bar_never_takes_a_sessions_only_row() {
         assert_eq!(overlay(Pending::Command, true, size(200, 1)), None);
         assert!(overlay(Pending::Command, true, size(200, 2)).is_some());
     }
 
-    /// The degenerate screens, where the bar must either decline or stay inside
-    /// the grid — never write a cell the terminal would clamp somewhere else.
-    ///
-    /// Not "always nothing": `␣ picker` is eight columns, so the bar genuinely
-    /// fits some of these, and asserting silence would only pin the width of the
-    /// first entry. What must hold at every size is the rectangle.
+    /// The bar fits some of these; the rectangle must hold at every size.
     #[test]
     fn a_tiny_screen_is_either_declined_or_drawn_inside_itself() {
         for &(cols, rows) in TINY_SIZES {
@@ -904,8 +595,6 @@ mod tests {
         }
     }
 
-    /// The row is the whole of the last row: the cells beside the text are what
-    /// take the editor's own last line out from under it.
     #[test]
     fn the_bar_is_the_last_row_at_full_width() {
         for (cols, rows) in [(80u16, 24u16), (13, 2), (200, 50)] {
@@ -922,9 +611,6 @@ mod tests {
         }
     }
 
-    /// A question the relay asks goes up in place of the commands, prefix or
-    /// none, at full weight, and comes down when the relay takes it down —
-    /// the row put back as the bar's always is.
     #[test]
     fn a_question_takes_the_row_until_it_is_taken_down() {
         let size = big();
@@ -956,7 +642,6 @@ mod tests {
         assert!(!d.bar.is_up());
     }
 
-    /// A question too wide for the screen is cut to it, and centred.
     #[test]
     fn a_question_is_cut_to_the_screen() {
         let over = question_overlay("abcdefghij", size(6, 3)).expect("a row");
@@ -966,8 +651,6 @@ mod tests {
         assert_eq!(question_overlay("ab", size(6, 1)), None, "no room");
     }
 
-    /// Centred, like every other nvmux hint row — on a screen with room either
-    /// side of it, which at eighty columns every entry leaves none of.
     #[test]
     fn the_text_is_centred_on_the_row() {
         let row = row(Pending::Command, size(100, 24));
@@ -980,10 +663,7 @@ mod tests {
         );
     }
 
-    /// The escape-sequence discipline `announce::placed` writes down, asserted
-    /// where it matters most: this row is the *last* one, so a newline or a
-    /// printable byte after its final cell would scroll the session's screen by
-    /// a line rather than merely draw in the wrong place.
+    /// On the last row, a newline or trailing printable byte would scroll.
     #[test]
     fn the_bytes_are_one_synchronized_update_that_cannot_scroll() {
         let over = overlay(Pending::Command, true, big()).expect("a bar");
@@ -1004,21 +684,11 @@ mod tests {
             "not placed absolutely: {text:?}"
         );
         assert!(text.contains(SGR), "not drawn dim: {text:?}");
-        // Nothing printable after the last cell: the pending-wrap flag it sets
-        // is discarded by the restore rather than acted on.
         let tail = text.rsplit_once("\x1b8").expect("a restore").1;
         assert_eq!(tail, "\x1b[?2026l", "something follows the row: {tail:?}");
     }
 
-    /// The bar is not written while the child is talking: the relay parses the
-    /// child's output only while the attach notice is up, so for the bar any
-    /// other moment could be the middle of one of its escape sequences.
-    ///
-    /// And it waits out the lull rather than writing on the first quiet pass
-    /// that comes along: a child whose own write blocked on a full pty buffer
-    /// is momentarily unreadable in the middle of a frame, so a pass that finds
-    /// it silent sooner than [`SETTLE`] after the last pass it wrote on has
-    /// found no lull. The one at the wake-up the bar asked for has.
+    /// Quiet sooner than [`SETTLE`] after the last write is no lull.
     #[test]
     fn the_bar_waits_for_a_lull() {
         let mut d = Driver::new(big());
@@ -1062,17 +732,8 @@ mod tests {
         ));
     }
 
-    /// The lull is counted from the child's last write, so a child that leaves
-    /// one between two writes has the bar go up in it: the wake-up the bar
-    /// asks for after a write comes before the next, and the pass it brings is
-    /// the one that writes.
-    ///
-    /// It used to be counted from the first pass that found the child quiet —
-    /// which is that same wake-up, a lull after the write — so the bar needed
-    /// two lulls of silence, not one. A statusline redrawn every two of them,
-    /// as a language server's progress is, then had the relay waking in step
-    /// with it, each time a moment before the next redraw, and the bar went up
-    /// only when the scheduler happened to drift.
+    /// Regression: counting from the first quiet pass needed two lulls, so a
+    /// statusline redrawn every two lulls kept the bar down.
     #[test]
     fn a_child_writing_every_other_lull_leaves_room_for_the_bar() {
         let size = big();
@@ -1107,9 +768,6 @@ mod tests {
         );
     }
 
-    /// An armed prefix is drawn once, not once per pass: the row does not change
-    /// while it waits, and repainting it every 25 ms would be a write over the
-    /// session for nothing.
     #[test]
     fn the_bar_is_painted_once_while_the_prefix_waits() {
         let mut d = Driver::new(big());
@@ -1123,12 +781,6 @@ mod tests {
         assert_eq!(d.wake_at(), None, "nothing is owed");
     }
 
-    /// The child drawing over the row is the one thing that makes a repaint due,
-    /// and `overdrawn` is the same news from the attach notice. Either way the
-    /// bar goes back up — at the next lull, with nothing following the
-    /// terminal's parser to say it may go up sooner. With the parser followed,
-    /// which the relay does for as long as the bar is up, it goes up on the
-    /// pass itself: see the next test.
     #[test]
     fn a_covered_bar_is_painted_again_at_the_next_lull() {
         for cover in ["the child", "the notice"] {
@@ -1158,9 +810,6 @@ mod tests {
         }
     }
 
-    /// A bar that is down has nothing on the row to be covered, so a chatty
-    /// session must not have it asking to be woken every 25 ms for the whole of
-    /// a relay in which nobody touches the prefix.
     #[test]
     fn a_bar_that_is_down_is_not_woken_by_output() {
         let mut d = Driver::new(big());
@@ -1172,16 +821,6 @@ mod tests {
         assert_eq!(d.wake_at(), None, "woken for a bar that is not up");
     }
 
-    /// The fix for the session's own row showing through the bar: with the
-    /// terminal's parser followed, a pass the session drew on is a pass the bar
-    /// goes back up on, as long as the session has left the terminal between
-    /// its sequences — no lull, which a statusline redrawn faster than one
-    /// would never give, and no moment at which the terminal could present
-    /// the row without the bar, since the relay writes it inside the same
-    /// update as what the session drew.
-    ///
-    /// Every pass, however busy the session: one repaint for each write it
-    /// makes, and nothing on the passes it makes none.
     #[test]
     fn a_watched_bar_goes_back_up_on_the_pass_the_session_drew_over_it() {
         let mut d = Driver::new(big());
@@ -1206,12 +845,6 @@ mod tests {
         }
     }
 
-    /// Except in the middle of one of the session's sequences, however long
-    /// the session has been quiet in it: the parser's word is the whole of
-    /// it, and a lull that would have let the bar in with nothing following
-    /// the parser does not here. Nor does a bar owed a write ask to be woken
-    /// for one — the session's next bytes wake the relay, and a clock already
-    /// past would have it spin until they came.
     #[test]
     fn a_watched_bar_is_never_written_into_a_sequence() {
         let mut d = Driver::new(big());
@@ -1245,9 +878,6 @@ mod tests {
         );
     }
 
-    /// The bar comes down the same way it is kept up: between the session's
-    /// sequences, on the pass the prefix resolves, whether or not the session
-    /// is quiet — and with the session's own row, as the shadow has it.
     #[test]
     fn a_watched_bar_comes_down_without_waiting_for_a_lull() {
         let mut d = Driver::restoring(big());
@@ -1271,10 +901,6 @@ mod tests {
         );
     }
 
-    /// What the relay follows the terminal's parser for: from the prefix,
-    /// before the bar has found its lull, to the erase — and not a pass
-    /// longer, or a chatty session would have its writes held up by a parser
-    /// nobody needs.
     #[test]
     fn the_bar_is_up_from_the_prefix_to_the_erase() {
         let mut d = Driver::restoring(big());
@@ -1287,21 +913,16 @@ mod tests {
         ));
         assert!(d.bar.is_up());
 
-        // Taken down: still up while the erase is owed and the session is in
-        // the middle of a sequence, and down once it has been written.
         assert_eq!(d.watched(true, false, None, big()), Act::Idle);
         assert!(d.bar.is_up(), "down with the bar still on the row");
         assert!(matches!(d.watched(false, true, None, big()), Act::Write(_)));
         assert!(!d.bar.is_up(), "still up once the row was put back");
 
-        // A screen too small for it is down the whole time.
         let mut d = Driver::new(size(6, 24));
         d.quiet(Some(Pending::Command), size(6, 24));
         assert!(!d.bar.is_up(), "up on a screen it cannot draw on");
     }
 
-    /// The prefix resolving before any lull means nothing was ever drawn, so
-    /// there is nothing to put back — and no server to bother about it either.
     #[test]
     fn a_bar_that_never_painted_has_nothing_to_erase() {
         let mut d = Driver::new(big());
@@ -1311,9 +932,6 @@ mod tests {
         assert_eq!(d.wake_at(), None);
     }
 
-    /// What pins the whole erase design: the cells the bar covered come back
-    /// from the shadow, which is the only copy of them once the terminal has been
-    /// written over — so the bar leaves without the server having to be asked.
     #[test]
     fn the_erase_is_the_screen_underneath() {
         let mut d = Driver::restoring(big());
@@ -1341,9 +959,6 @@ mod tests {
         assert_eq!(d.quiet(None, big()), Act::Idle, "restored twice");
     }
 
-    /// With no shadow the row is blanked once and the relay is told to ask the
-    /// server — once, and not on every pass afterwards, which is the difference
-    /// between a repaint and a stall.
     #[test]
     fn with_no_shadow_the_row_is_blanked_exactly_once() {
         let mut d = Driver::new(big());
@@ -1366,13 +981,7 @@ mod tests {
         assert_eq!(d.wake_at(), None);
     }
 
-    /// Each of the erase's three cases, which is the only place they are all
-    /// reachable: only a usable shadow *and* colours to paint it in can put the
-    /// row back, and everything else blanks it and hands the relay the job.
-    ///
-    /// A retired shadow is the one that matters. Its grid can no longer be
-    /// trusted, so a composite from it would paint whatever it last held over a
-    /// row the editor has moved on from, and call the bar erased.
+    /// A retired shadow's grid is stale and must not be used.
     #[test]
     fn only_a_usable_shadow_with_colours_puts_the_row_back() {
         let over = overlay(Pending::Command, true, big()).expect("a bar");
@@ -1393,10 +1002,6 @@ mod tests {
         );
     }
 
-    /// A resize is the client's own repaint, so the bar forgets the row it drew
-    /// instead of putting it back, and draws the new one where the last row now
-    /// is. Restoring the old rectangle after a shrink would clamp every `CUP` in
-    /// it onto a row of the editor's text.
     #[test]
     fn a_resize_forgets_the_row_it_painted_and_draws_the_new_one() {
         let mut d = Driver::restoring(big());
@@ -1423,8 +1028,6 @@ mod tests {
         );
     }
 
-    /// With no card up, `<prefix> Enter` does nothing, so the bar does not
-    /// offer it — and offers everything else just as it would.
     #[test]
     fn go_is_offered_only_with_a_card_to_go_to() {
         let go = format!("{} go", keys::ENTER_GLYPH);
@@ -1441,8 +1044,6 @@ mod tests {
         );
     }
 
-    /// The card going up or coming down while the prefix waits redraws the
-    /// bar: it is a change in what the bar wants, like any other.
     #[test]
     fn a_card_coming_down_redraws_the_bar() {
         let size = big();
@@ -1466,8 +1067,6 @@ mod tests {
         assert!(!painted.contains("go"), "{painted:?}");
     }
 
-    /// A half-typed number is shown, or the bar would look like it had swallowed
-    /// the digit — the reason the picker shows one on its own hint row.
     #[test]
     fn a_pending_number_is_shown() {
         assert_eq!(text(Pending::Number(1), true, 80).as_deref(), Some("#1"));
@@ -1475,10 +1074,6 @@ mod tests {
         assert!(row(Pending::Number(7), big()).contains("#7"));
     }
 
-    /// A screen too narrow to draw on decides that once and stops asking to be
-    /// woken. Without the latch the poll timeout rounds to zero and the relay
-    /// spins on a write it can never make — the hazard `pty::Hold::wake_at`
-    /// steps around for the held first paint.
     #[test]
     fn a_bar_with_nothing_to_draw_asks_for_no_wake_up() {
         let narrow = size(6, 24);
@@ -1494,8 +1089,7 @@ mod tests {
             None,
             "still asking to be woken for a row it cannot draw"
         );
-        // And a number, which does fit six columns, is still drawn: the decision
-        // is about this state on this screen, not about the screen for good.
+        // The decision is per state, not per screen.
         assert!(matches!(
             d.quiet(Some(Pending::Number(3)), narrow),
             Act::Write(_)

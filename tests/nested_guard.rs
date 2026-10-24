@@ -1,11 +1,7 @@
-//! The nested-launch guard, end to end.
-//!
-//! Two halves that have to meet: `scripts/spawn.sh` marks a session's editor,
-//! and nvmux refuses to start when it finds that mark. The first test proves
-//! the mark reaches a real Neovim — which is exactly the environment a
-//! `:terminal` opened inside the session hands to its shell — and the rest
-//! drive the real binary, since a guard that never reached `main` would still
-//! pass every unit test in `nested`.
+//! The nested-launch guard, end to end: `scripts/spawn.sh` marks a session's
+//! editor, and nvmux refuses to start when it finds that mark. The first test
+//! checks a real Neovim gets the mark; the rest drive the real binary, since a
+//! guard not wired into `main` would pass the unit tests.
 
 #[macro_use]
 mod common;
@@ -16,14 +12,10 @@ use std::time::Duration;
 use common::Scratch;
 use nvmux::transport::Transport;
 
-/// Run the real binary with `$NVMUX` set to `marker`, and with the two things
-/// `run` looks at next deliberately sabotaged: no `nvim` on `$PATH`, and a
-/// `$NVMUX_CONFIG` naming a file that is not there.
-///
-/// Both are load-bearing. They keep the run bounded — one that gets *past* the
-/// guard stops at once instead of sitting at a picker no stdin will ever
-/// answer — and they turn the ordering into something a test can see: if
-/// either of their messages comes back, the guard did not go first.
+/// Run the binary with `$NVMUX` set to `marker`, no `nvim` on `$PATH` and a
+/// missing `$NVMUX_CONFIG`. These make a run past the guard exit at once
+/// instead of waiting at the picker, and if either error shows up, the guard
+/// did not run first.
 fn nvmux_with_marker(marker: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_nvmux"))
         .env(nvmux::nested::MARKER, marker)
@@ -34,9 +26,8 @@ fn nvmux_with_marker(marker: &str) -> Output {
         .expect("run nvmux")
 }
 
-/// The marker has to be on the *editor*, not on nvmux: the editor is what
-/// starts a `:terminal` shell, and over ssh it is the only end of the
-/// connection our own environment never reaches.
+/// The marker must be on the editor, not nvmux: the editor starts `:terminal`
+/// shells, and over ssh nvmux's own environment never reaches it.
 #[test]
 fn a_sessions_editor_carries_the_marker() {
     require_nvim!();
@@ -61,8 +52,8 @@ fn a_sessions_editor_carries_the_marker() {
     );
 }
 
-/// Needs no nvim, and that is the point: the guard runs before the version
-/// check, before the config, and so before any first-run prompt.
+/// Needs no nvim: the guard runs before the version check, the config and any
+/// first-run prompt.
 #[test]
 fn a_nested_launch_is_refused_before_anything_else_is_looked_at() {
     let out = nvmux_with_marker("/tmp/nvmux-0/abcdefgh.sock");
@@ -74,7 +65,7 @@ fn a_nested_launch_is_refused_before_anything_else_is_looked_at() {
         "{stderr}"
     );
     assert!(stderr.contains("/tmp/nvmux-0/abcdefgh.sock"), "{stderr}");
-    // The two ways on: the picker from inside, or unsetting the marker.
+    // Both ways out: the picker from inside, or unsetting the marker.
     assert!(stderr.contains("<prefix> Space"), "{stderr}");
     assert!(stderr.contains("$NVMUX"), "{stderr}");
     // Neither sabotage was reached, so nothing ran ahead of the guard.
@@ -82,9 +73,8 @@ fn a_nested_launch_is_refused_before_anything_else_is_looked_at() {
     assert!(!stderr.contains("config file not found"), "{stderr}");
 }
 
-/// The documented override, `NVMUX= nvmux`. It only has to get *past* the
-/// guard; what it runs into next is the ordinary preflight, so the assertion
-/// is deliberately negative rather than pinned to whatever that then says.
+/// The documented override, `NVMUX= nvmux`. The assertion is negative: what
+/// comes after the guard is the ordinary preflight.
 #[test]
 fn an_empty_marker_is_not_a_session() {
     let stderr = String::from_utf8_lossy(&nvmux_with_marker("").stderr).into_owned();

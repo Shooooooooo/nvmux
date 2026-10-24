@@ -9,8 +9,8 @@
 #
 # followed by a literal NVMUX_END line.
 #
-# Batch-shaped: one invocation returns every session, because each ssh round
-# trip costs roughly 230ms even to localhost.
+# One invocation returns every session: each ssh round trip costs ~230ms even
+# to localhost.
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 dir="${1:?usage: list.sh <runtime_dir>}"
@@ -25,11 +25,9 @@ if [ -d "$dir" ]; then
     id=${sock##*/}
     id=${id%.sock}
 
-    # The local end of every SSH forward also lives here, named
-    # `<host_token>-<id>.sock`, and under `nvmux localhost` the remote listing
-    # runs in this very directory. Without this guard the sweep below finds a
-    # forwarded socket, sees nothing `--listen`ing on it, and deletes the live
-    # forward of the session the user is attached to.
+    # SSH forwards' local ends (`<host_token>-<id>.sock`) live here too, and
+    # under `nvmux localhost` the remote listing runs in this directory: without
+    # this guard the sweep would delete the attached session's live forward.
     is_session_id "$id" || continue
 
     json_path="$dir/$id.json"
@@ -38,31 +36,22 @@ if [ -d "$dir" ]; then
     # metadata and let nvmux decide.
     json=''
     if [ -f "$json_path" ]; then
-      # One line, in case someone hand-wrote pretty-printed metadata. Through
-      # `flatten` rather than `tr`, so this costs no process per session.
+      # One line, in case of hand-written pretty-printed metadata.
       flatten "$json_path"
       json=$nvmux_flat
     fi
 
-    # Asked by socket, not by the recorded pid: pids get reused, the socket is
-    # the identity, and a busy session is still found because the process
-    # exists whether or not it is answering.
-    #
-    # `bound` first because it is the cheap question and its "yes" is final;
-    # only its "no" -- which is also every host it cannot answer on -- is worth
-    # reading the process table for. What follows the `||` is therefore the
-    # whole of the old behaviour, reached whenever the new answer is not a yes.
+    # By socket, not recorded pid: pids are reused, and a busy session's
+    # process exists even when it is not answering. `bound` is cheap and its
+    # "yes" final; only a "no" (also any host it cannot answer on) reaches the
+    # process table.
     alive=0
     if bound "$sock" || serving "$sock"; then
       alive=1
     elif can_inspect && [ -S "$sock" ]; then
-      # Stale: nvim unlinks its own socket on a clean exit, so one left behind
-      # means an unclean death.
-      #
-      # Two guards, both required. `can_inspect` because "no process found" is
-      # not evidence when we cannot look. `-S` because this deletes files, and
-      # nothing is "serving" an ordinary file that happens to be named
-      # `<id>.sock` either.
+      # Stale: nvim unlinks its socket on a clean exit. Both guards matter:
+      # "no process found" is no evidence without `can_inspect`, and `-S` keeps
+      # an ordinary file named `<id>.sock` from being deleted.
       purge "$dir" "$id"
       continue
     fi
@@ -71,11 +60,10 @@ if [ -d "$dir" ]; then
   done
 fi
 
-# Sweep metadata whose socket is gone: sessions are discovered through *.sock,
-# so otherwise a self-exited session's <id>.json and unbounded <id>.log sit here
-# forever. Safe because the socket is created before the metadata is written, so
-# a .json with no .sock always means the session is over, never that it is
-# starting.
+# Sweep metadata whose socket is gone; otherwise a self-exited session's
+# <id>.json and unbounded <id>.log stay forever. Safe because the socket is
+# created before the metadata, so a .json without a .sock means the session is
+# over.
 if [ -d "$dir" ]; then
   for meta in "$dir"/*.json; do
     [ -e "$meta" ] || continue

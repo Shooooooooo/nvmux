@@ -1,15 +1,10 @@
-//! The client's picture of the editor: every grid and highlight, where each
-//! window is, the cursor, the mode and the handful of options that change how
-//! the client draws.
+//! The client's model of the editor: grids, highlights, window placement,
+//! cursor, mode and the options that affect drawing.
 //!
-//! Changed a batch at a time. Neovim's events between two `flush`es describe a
-//! screen part way through being redrawn, so `super::App` keeps them until the
-//! `flush` and applies them all at once — and the frames an animation draws in
-//! between come from a picture that is always one Neovim finished.
-//!
-//! Where a change matters to an animation — a window moved, a cursor jumped, a
-//! region scrolled — [`Model::apply`] says so in a [`Changes`], and
-//! [`super::anim`] decides what to make of it.
+//! Events between two `flush`es describe a half-redrawn screen, so
+//! `super::App` buffers them and applies the batch at `flush`; animation
+//! frames always draw from a finished picture. Changes relevant to animation
+//! are reported in [`Changes`] by [`Model::apply`], for [`super::anim`].
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -19,35 +14,29 @@ use super::style::{Attrs, Colors, DefaultColors, Style};
 use super::wide::Tail;
 use crate::palette::Palette;
 
-/// Where a grid goes on the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Place {
-    /// A window in the editor's layout, its top left at `row`, `col`, and
-    /// `width` by `height` cells of the screen its own: its grid's size, but
-    /// where the client asked for a narrower grid, to centre the window's
-    /// text in it (see [`super::wide`]). Nought for a window placed before
-    /// its size was known.
+    /// A window in the layout. `width` x `height` is its screen area: the
+    /// grid's size, unless the client asked for a narrower grid to centre the
+    /// text (see [`super::wide`]). Zero if placed before its size was known.
     Window {
         row: usize,
         col: usize,
         width: usize,
         height: usize,
     },
-    /// A float, over everything in the layout.
     Float {
         row: i64,
         col: i64,
         zindex: i64,
         compindex: i64,
-        /// Whether the mouse can land on it.
         mouse: bool,
-        /// The grid it is anchored to, where Neovim said: one anchored to a
-        /// window goes where that window's text is drawn.
+        /// Anchor grid, if given; a float anchored to a window follows where
+        /// that window's text is drawn.
         anchor: Option<u64>,
     },
-    /// The message area: the full width, from `row` down. `scrolled` is
-    /// messages having pushed it up over the windows, and then the row above
-    /// it is a separator drawn in `sep`.
+    /// Full width from `row` down. `scrolled`: messages pushed it up over the
+    /// windows, and the row above is a separator drawn with `sep`.
     Message {
         row: usize,
         scrolled: bool,
@@ -57,8 +46,7 @@ pub enum Place {
     },
 }
 
-/// The rows and columns of a window's grid that are not its text: a winbar,
-/// a float's border.
+/// Rows and columns of a window's grid outside its text: winbar, border.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Margins {
     pub top: usize,
@@ -67,7 +55,6 @@ pub struct Margins {
     pub right: usize,
 }
 
-/// A grid that has been given somewhere to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     pub place: Place,
@@ -75,7 +62,7 @@ pub struct Placement {
 }
 
 impl Placement {
-    /// Where its top left is on the screen.
+    /// Screen position of the top left.
     pub fn origin(&self) -> (i64, i64) {
         match &self.place {
             Place::Window { row, col, .. } => (*row as i64, *col as i64),
@@ -84,8 +71,8 @@ impl Placement {
         }
     }
 
-    /// Whether it is drawn over the layout rather than in it, and in what
-    /// order: zindex, then the order Neovim composed it in.
+    /// `(zindex, compindex)` for grids drawn over the layout; `None` for
+    /// windows in it.
     pub fn layer(&self) -> Option<(i64, i64)> {
         match &self.place {
             Place::Window { .. } => None,
@@ -99,7 +86,6 @@ impl Placement {
     }
 }
 
-/// Where the cursor is: on which grid, and where on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CursorPos {
     pub grid: u64,
@@ -107,25 +93,23 @@ pub struct CursorPos {
     pub col: usize,
 }
 
-/// What part of its buffer a window shows, as `win_viewport` last said: all
-/// of it zero-based, `botline` as Neovim counts it (see
+/// The last `win_viewport`: zero-based, `botline` as Neovim counts it (see
 /// [`Viewport::one_to_one`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Viewport {
     pub topline: i64,
     pub botline: i64,
     pub curline: i64,
-    /// The cursor's column, in bytes.
+    /// In bytes.
     pub curcol: i64,
     pub line_count: i64,
 }
 
 impl Viewport {
-    /// Whether the window's `rows` rows show its buffer's lines one to a row
-    /// — nothing folded, wrapped, or put between them — as far as its view
-    /// says. A window showing them so has its `botline` one past its last
-    /// line, or `line_count` when it ends on the buffer's last line exactly,
-    /// or one past `line_count` when there are rows past the end.
+    /// Whether `rows` rows show one buffer line each (no folds, wraps or
+    /// virtual lines), judging by `botline`: `topline + rows + 1`,
+    /// `line_count` if the view ends exactly on the last line, or
+    /// `line_count + 1` if there are rows past the end.
     pub fn one_to_one(&self, rows: usize) -> bool {
         let end = self.topline + rows as i64;
         let expected = match end.cmp(&self.line_count) {
@@ -136,14 +120,14 @@ impl Viewport {
         self.topline >= 0 && self.botline == expected
     }
 
-    /// How many of the window's `rows` rows show the buffer's lines, and not
-    /// rows past its end — of a view that is one to one.
+    /// For a one-to-one view, how many of `rows` show buffer lines rather
+    /// than rows past the end.
     pub fn lines_shown(&self, rows: usize) -> usize {
         (self.line_count - self.topline).clamp(0, rows as i64) as usize
     }
 }
 
-/// The options Neovim tells a UI about that change how this one draws.
+/// UI options that affect how the client draws.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub termguicolors: bool,
@@ -165,94 +149,74 @@ impl Default for Options {
     }
 }
 
-/// What a batch changed that something other than the next frame cares about.
+/// What a batch changed that matters beyond the next frame.
 #[derive(Debug, Default)]
 pub struct Changes {
     /// Grid 1 was cleared: the terminal may have been drawn on behind the
-    /// client's back (`:mode`, which nvmux asks for to repaint), so the next
-    /// frame paints every cell rather than the ones that changed.
+    /// client's back (`:mode`, which nvmux sends to repaint), so the next
+    /// frame paints every cell.
     pub repaint: bool,
-    /// Grids whose size changed, or that went: an animation of one is over.
+    /// Grids resized or destroyed; their animations end.
     pub reshaped: Vec<u64>,
-    /// How far each window scrolled, by grid, as `win_viewport` counts it.
+    /// Scroll deltas by grid, from `win_viewport`.
     pub scrolled: HashMap<u64, i64>,
-    /// The same by window handle, which is all a `win_viewport` names without
-    /// `ext_multigrid`.
+    /// The same by window handle: without `ext_multigrid`, the only way
+    /// `win_viewport` tells windows apart.
     pub scrolled_win: HashMap<i64, i64>,
-    /// Every `grid_scroll`, as it came: grid, top, bot, left, right, rows.
+    /// Each `grid_scroll`: grid, top, bot, left, right, rows.
     pub region_scrolls: Vec<(u64, usize, usize, usize, usize, i64)>,
-    /// The bell, as many times as it rang.
     pub bells: usize,
     pub visual_bell: bool,
-    /// Bytes for the terminal (`ui_send`), in order.
+    /// `ui_send` bytes for the terminal, in order.
     pub sent: Vec<Vec<u8>>,
-    /// The window title changed.
     pub title: bool,
-    /// The mouse was turned on or off.
     pub mouse: bool,
-    /// The server is going, with this status.
+    /// The server is exiting with this status.
     pub exit: Option<i64>,
 }
 
-/// What [`Highlights::ids`] holds for one of Neovim's ids it has yet to
-/// define.
+/// [`Highlights::ids`] entry for a Neovim id not yet defined.
 const UNDEFINED: u32 = u32::MAX;
 
-/// How many of the client's ids are retired (see [`Highlights`]) past those
-/// the last sweep found still held before the next sweep is made. A sweep
-/// reads every cell the client keeps, and a `:terminal` playing an animation
-/// in truecolour has Neovim give out thousands of ids again a frame.
+/// Retired ids, beyond those the last sweep found held, that trigger the next
+/// sweep. A sweep reads every kept cell, and a truecolour `:terminal`
+/// animation can make Neovim reissue thousands of ids a frame.
 const RECLAIM_AT: usize = 4096;
 
-/// The highlights Neovim has defined, under the ids the client's cells hold
-/// them by.
+/// Neovim's highlights, keyed by the client's own ids.
 ///
-/// That is Neovim's own id for each, until Neovim gives the id to another
-/// highlight. It keeps 65 535 of them, and a `:terminal` drawing in truecolour
-/// fills that fast — every pair of colours its cells are in is a highlight of
-/// its own, thousands a frame for an animation — after which it clears the
-/// table and gives the same ids out again: part way through drawing a frame as
-/// often as not, the cells it drew before that still naming them until it
-/// draws them again, in a later flush. Neovim's own TUI writes a cell's
-/// colours out as the cell comes, so what it has written keeps them. This
-/// client resolves its cells once a batch is whole (see `super::App`), and
-/// keeps them besides in what its animations show of a moment ago: so an id
-/// Neovim defines anew is given another of the client's own, and a cell drawn
-/// before keeps the id it had, and what that meant. Left to mean the new
-/// highlight, every such cell took its colours for a flush — a flash of wrong
-/// colours over a truecolour animation in a `:terminal`, several times a
-/// second.
-///
-/// The client's id a highlight had before is retired, and given out again
-/// once nothing holds it: see [`Model::reclaim`].
+/// A client id equals Neovim's until Neovim reuses it. A truecolour
+/// `:terminal` exhausts Neovim's 65 535 ids fast, and Neovim then reissues
+/// them, often mid-frame, while earlier cells still name them. Since this
+/// client resolves cells per batch and keeps old cells for animations, a
+/// redefined id gets a fresh client id so old cells keep their colours.
+/// Replaced ids are retired and reused once unheld (see [`Model::reclaim`]).
 #[derive(Debug, Default)]
 struct Highlights {
-    /// Every highlight by the client's id for it; none for an id never used.
+    /// By client id; `None` if never used.
     defs: Vec<Option<(Attrs, Attrs)>>,
-    /// The client's id for each of Neovim's, by Neovim's: its own until
-    /// Neovim defines it anew, and [`UNDEFINED`] until it defines it at all.
+    /// Client id per Neovim id; [`UNDEFINED`] until defined.
     ids: Vec<u32>,
-    /// Retired: the client's ids for highlights whose ids Neovim has since
-    /// given to others, which cells drawn before may still hold.
+    /// Client ids whose Neovim ids were reissued; old cells may still hold
+    /// them.
     retired: Vec<u32>,
-    /// How many of those the last sweep found still held.
+    /// How many retired ids the last sweep found still held.
     kept: usize,
-    /// Ids nothing holds, to be given out again.
+    /// Unheld ids, to reuse.
     free: Vec<u32>,
-    /// Ids defined since the styles were last resolved.
+    /// Ids defined since styles were last resolved.
     fresh: Vec<u32>,
-    /// The editor's highlight groups the client colours its own rows with,
-    /// by group id, as the agent sends them: see [`syntax_hl`].
+    /// Editor highlight groups by group id, sent by the agent, for rows the
+    /// client draws itself (see [`syntax_hl`]).
     groups: HashMap<u32, (Attrs, Attrs)>,
-    /// Highlights made of others (see [`Derive`]), by index, and the index
-    /// of each.
+    /// Derived highlights (see [`Derive`]) by index, and the reverse map.
     derived: Vec<(u32, Derive)>,
     derivations: HashMap<(u32, Derive), u32>,
 }
 
 impl Highlights {
-    /// The client's id for Neovim's highlight `id`. One never defined is its
-    /// own, as a cell in it is drawn: in the default colours.
+    /// Client id for Neovim id `id`; an undefined id maps to itself and draws
+    /// in the default colours.
     fn client(&self, id: u32) -> u32 {
         match self.ids.get(id as usize) {
             Some(&k) if k != UNDEFINED => k,
@@ -260,19 +224,18 @@ impl Highlights {
         }
     }
 
-    /// Neovim defines its highlight `id` as `def`, for the first time or
-    /// anew.
+    /// Neovim (re)defines its highlight `id` as `def`.
     fn define(&mut self, id: u32, def: (Attrs, Attrs)) {
         let i = id as usize;
         if self.ids.len() <= i {
             self.ids.resize(i + 1, UNDEFINED);
         }
         let k = match self.ids[i] {
-            // The default, whatever is sent for it: not a cell's to keep.
+            // The default is never remapped.
             _ if id == 0 => 0,
             UNDEFINED if self.unused(id) => id,
             UNDEFINED => self.take(),
-            // Sent again as it was: a UI attaching is sent every highlight.
+            // Unchanged resend, e.g. every highlight on UI attach.
             k if self.defs[k as usize].as_ref() == Some(&def) => return,
             k => {
                 self.retired.push(k);
@@ -288,14 +251,12 @@ impl Highlights {
         self.fresh.push(k);
     }
 
-    /// Whether the client has never used id `k`, which Neovim's id of the
-    /// same number may then have.
+    /// Whether client id `k` is unused, so Neovim's id `k` can take it.
     fn unused(&self, k: u32) -> bool {
         self.defs.get(k as usize).is_none_or(Option::is_none)
     }
 
-    /// An id for a highlight Neovim defines anew: one nothing holds any
-    /// more, or one past every id used.
+    /// A free id, or a new one past every id used.
     fn take(&mut self) -> u32 {
         self.free.pop().unwrap_or_else(|| {
             self.defs.push(None);
@@ -304,14 +265,13 @@ impl Highlights {
     }
 }
 
-/// The highlight ids something holds: a cell, a highlight group, a mode's
-/// cursor — what a sweep may not give out again (see [`Model::reclaim`]).
+/// Bitset of highlight ids still referenced (by cells, groups, mode cursors),
+/// which a sweep must not free (see [`Model::reclaim`]).
 #[derive(Debug)]
 pub struct Held(Vec<u64>);
 
 impl Held {
-    /// Highlight `hl` is held — the one under it, for a group laid over one
-    /// (see [`syntax_hl`]).
+    /// Mark `hl` held; for a [`syntax_hl`] id, its base.
     pub fn mark(&mut self, hl: u32) {
         let hl = if hl & SYNTAX != 0 { hl & 0xffff } else { hl };
         if let Some(word) = self.0.get_mut(hl as usize / 64) {
@@ -319,7 +279,6 @@ impl Held {
         }
     }
 
-    /// Every one of `cells`' highlights is held.
     pub fn cells<'a>(&mut self, cells: impl IntoIterator<Item = &'a Cell>) {
         for cell in cells {
             self.mark(cell.hl);
@@ -333,16 +292,14 @@ impl Held {
     }
 }
 
-/// Set in a cell's highlight id that is not Neovim's: a highlight group of
-/// the editor's laid over one of Neovim's, as the client draws the rows it
-/// draws itself (see `super::predict`) in the colours the editor's syntax
-/// highlighting gives them — or, with a group of nought, a highlight made
-/// of one of Neovim's (see [`Derive`]).
+/// Flag on a client-made highlight id: an editor group laid over a Neovim
+/// highlight, for rows the client draws itself with syntax colours (see
+/// `super::predict`); or, with group 0, a derived highlight (see [`Derive`]).
 const SYNTAX: u32 = 1 << 31;
 
-/// The highlight id of group `group` laid over Neovim's highlight `base`, as
-/// Neovim lays a syntax group over a window's text: what the group sets, and
-/// what it does not from under it. Ids too big to fit are left as `base`.
+/// Id for `group` laid over `base` as Neovim layers syntax groups: the
+/// group's attributes, falling back to `base`'s. Ids too large to pack
+/// return `base`.
 pub fn syntax_hl(base: u32, group: u32) -> u32 {
     if base > 0xffff || group == 0 || group > 0x7fff {
         return base;
@@ -350,28 +307,21 @@ pub fn syntax_hl(base: u32, group: u32) -> u32 {
     SYNTAX | group << 16 | base
 }
 
-/// A highlight of Neovim's with `'cursorline'`'s bar laid under it, or
-/// taken off: what a cell of a row the client moves the cursor onto, or off,
-/// is drawn in till Neovim draws the row again (see `super::App::repaint`).
-/// Laid under, as Neovim lays a `CursorLine` with no colour in front of its
-/// own under a cell: the cell's own, and the bar's background where the
-/// cell has none. Taken off, the cell's own background let go where it is
-/// the bar's. Wrong, for as long as Neovim takes to draw the row, of a cell
-/// whose own background is the bar's, and of virtual text Neovim draws in
-/// its own colours alone (`hl_mode` `replace`, which diagnostics do not
-/// use) and leaves out of the bar.
+/// A Neovim highlight with the `'cursorline'` bar's background added (where
+/// the cell has none) or removed (where it equals the bar's), for rows the
+/// client moves the cursor onto or off until Neovim redraws them (see
+/// `super::App::repaint`). Briefly wrong for cells whose own background is
+/// the bar's, and for `hl_mode` `replace` virtual text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Derive {
     CursorLineOn,
     CursorLineOff,
 }
 
-/// How many highlights [`Model::derived`] makes at most: as many as the low
-/// half of an id numbers.
+/// Max derived highlights: the range of an id's low 16 bits.
 const DERIVED: usize = 1 << 16;
 
-/// `over` laid over `under`: its colours where it has them, and every
-/// attribute either has.
+/// `over`'s colours where set, else `under`'s; attributes from both.
 fn laid(under: &Attrs, over: &Attrs) -> Attrs {
     Attrs {
         fg: over.fg.or(under.fg),
@@ -396,68 +346,56 @@ fn laid(under: &Attrs, over: &Attrs) -> Attrs {
     }
 }
 
-/// The editor, as the client knows it.
 #[derive(Debug)]
 pub struct Model {
     pub grids: BTreeMap<u64, Grid>,
     pub layout: BTreeMap<u64, Placement>,
-    /// The window each window's grid shows, as `win_viewport` and the
-    /// placements name it.
+    /// Window handle by grid.
     pub wins: BTreeMap<u64, i64>,
-    /// What each window shows of its buffer, by grid.
     pub viewports: HashMap<u64, Viewport>,
-    /// The rows and columns of a window's grid that are not its text, by
-    /// grid. Their own map rather than part of a placement: Neovim sends them
-    /// before it places a window, and not again when it places it anew.
+    /// By grid. Separate from placements: Neovim sends margins before placing
+    /// a window and not again when it re-places it.
     pub margins: HashMap<u64, Margins>,
     pub cursor: CursorPos,
-    /// `mode_info_set`'s modes, each cursor's highlight by the client's id
-    /// for it.
+    /// From `mode_info_set`, with cursor highlights as client ids.
     pub modes: Vec<ModeInfo>,
     pub mode: usize,
     pub mode_name: String,
-    /// `mode_info_set`'s `enabled`: whether the cursor's shape is the client's
-    /// to set at all.
+    /// `mode_info_set`'s `enabled`: whether the client sets cursor shape.
     pub cursor_styled: bool,
     pub options: Options,
     pub busy: bool,
     pub mouse: bool,
     pub title: String,
     pub defaults: DefaultColors,
-    /// `hl_group_set`: the highlights of the groups the UI draws itself, by
-    /// the client's ids for them (see [`Highlights`]).
+    /// `hl_group_set`: client id of each UI-drawn group, by name (see
+    /// [`Highlights`]).
     pub groups: HashMap<String, u32>,
-    /// `'laststatus'`, as the editor's measure says it (see
-    /// [`super::wide::MEASURE_LUA`]): which windows have a status line of
-    /// their own. `None` until it has said.
+    /// `'laststatus'` as reported by the editor's measure (see
+    /// [`super::wide::MEASURE_LUA`]); `None` until reported.
     pub laststatus: Option<i64>,
-    /// What Neovim draws after the line's end on rows of window grids
-    /// narrower than their windows, where the grid has no room for all of
-    /// it, by grid and row, as the editor says it (see [`super::wide`]):
-    /// kept with each row as its grid scrolls, till the editor says again.
+    /// Past-end-of-line text that does not fit in a narrowed window grid, by
+    /// grid and row (see [`super::wide`]).
     pub tails: HashMap<u64, BTreeMap<usize, Tail>>,
     highlights: Highlights,
-    /// Every highlight resolved for drawing, by id, and its blend: each as it
-    /// is defined, and all of them again when the defaults or
+    /// Resolved styles and blends by id; all re-resolved when the defaults or
     /// `'termguicolors'` change (see [`Model::colors`]).
     styles: Vec<Style>,
     blends: Vec<u8>,
-    /// The defaults or `'termguicolors'` have changed since.
     styles_stale: bool,
     term: Palette,
-    /// Every hyperlink a highlight has named, in the order they came: link
-    /// `n` (see [`Style::link`]) is `links[n - 1]`.
+    /// Hyperlinks in arrival order: link `n` (see [`Style::link`]) is
+    /// `links[n - 1]`.
     links: Vec<Box<str>>,
     link_numbers: HashMap<Box<str>, u32>,
-    /// When anything a frame is put together from last changed but the cells
-    /// of a grid, which each grid stamps its rows with itself: a window
-    /// placed, a highlight defined, an option set. By the grids' clock (see
+    /// Last change to frame inputs other than grid cells (which grids stamp
+    /// themselves): placements, highlights, options. On the grids' clock (see
     /// [`super::grid::tick`]).
     changed: u64,
 }
 
 impl Model {
-    /// An empty editor, with the terminal's own colours to fall back on.
+    /// `term` supplies fallback colours.
     pub fn new(term: Palette) -> Self {
         Self {
             grids: BTreeMap::new(),
@@ -493,14 +431,12 @@ impl Model {
         }
     }
 
-    /// Whether nothing a frame is put together from has changed since the
-    /// moment `since`, by the grids' clock, but the cells of rows each grid
-    /// says changed (see [`Grid::changed_since`]).
+    /// Whether nothing but cell contents (tracked per row, see
+    /// [`Grid::changed_since`]) changed since `since`.
     pub fn unchanged_since(&self, since: u64) -> bool {
         self.changed <= since && self.grids.values().all(|g| !g.shaped_since(since))
     }
 
-    /// What resolves a style's colours, as things stand.
     pub fn colors(&self) -> Colors {
         Colors {
             rgb: self.options.termguicolors,
@@ -509,9 +445,8 @@ impl Model {
         }
     }
 
-    /// Highlight `id` resolved for drawing, by the client's id for it, as a
-    /// cell holds it (see [`Highlights`]); an id never defined is the
-    /// default.
+    /// Resolved style for client id `id` (see [`Highlights`]); undefined ids
+    /// get the default.
     pub fn style(&self, id: u32) -> Style {
         if id & SYNTAX != 0 && (id >> 16) & 0x7fff == 0 {
             return self.derived_style(id & 0xffff);
@@ -525,9 +460,7 @@ impl Model {
             .unwrap_or_else(|| self.styles.first().copied().unwrap_or_default())
     }
 
-    /// A highlight group laid over one of Neovim's (see [`syntax_hl`]),
-    /// resolved for drawing: as the one under it where the group is not
-    /// known.
+    /// Style for a [`syntax_hl`] id; the base's if the group is unknown.
     fn syntax_style(&self, id: u32) -> Style {
         let (base, group) = (id & 0xffff, (id >> 16) & 0x7fff);
         let Some((rgb, cterm)) = self.highlights.groups.get(&group) else {
@@ -539,11 +472,9 @@ impl Model {
             .style(&laid(under_rgb, rgb), &laid(under_cterm, cterm))
     }
 
-    /// The id of highlight `base` — the client's id for one of Neovim's,
-    /// as a cell of a grid holds it — made as `d` says (see [`Derive`]):
-    /// `SYNTAX` and an index under 2^16, a group of nought, which
-    /// [`syntax_hl`] never makes. `None` for a highlight not Neovim's, or
-    /// once [`DERIVED`] have been made.
+    /// Id of client highlight `base` derived by `d`: `SYNTAX` plus an index
+    /// below 2^16 with group 0, which [`syntax_hl`] never produces. `None`
+    /// if `base` is not a Neovim highlight or [`DERIVED`] are already made.
     pub fn derived(&mut self, base: u32, d: Derive) -> Option<u32> {
         if base & SYNTAX != 0 {
             return None;
@@ -560,12 +491,9 @@ impl Model {
         Some(SYNTAX | i)
     }
 
-    /// Whether `'cursorline'`'s bar, as the editor's `CursorLine` group is
-    /// (see `hl_group_set`), gives a cell no more than a background — no
-    /// colour in front, no attribute — which a [`Derive`] lays under a cell
-    /// and takes off as Neovim does: a `CursorLine` with a colour in front of
-    /// its own is laid over the cell instead. And whether highlights can
-    /// still be made of others. Not where the editor has not said the group.
+    /// Whether [`Derive`] can model the bar: `CursorLine` is known (via
+    /// `hl_group_set`) and sets only a background (one with a foreground is
+    /// laid over cells instead), and fewer than [`DERIVED`] exist.
     pub fn bar_derivable(&self) -> bool {
         let Some(&id) = self.groups.get("CursorLine") else {
             return false;
@@ -583,8 +511,7 @@ impl Model {
                 .is_none_or(|(rgb, cterm)| plain(rgb) && plain(cterm))
     }
 
-    /// A highlight made of another (see [`Model::derived`]), by its index,
-    /// resolved for drawing: the default, for one never made.
+    /// Style for derived index `i`; the default if never made.
     fn derived_style(&self, i: u32) -> Style {
         let Some(&(base, d)) = self.highlights.derived.get(i as usize) else {
             return self.style(0);
@@ -612,15 +539,12 @@ impl Model {
         }
     }
 
-    /// The editor's highlight group `group` has these attributes, in both
-    /// forms: see [`syntax_hl`].
+    /// Define editor highlight group `group` (see [`syntax_hl`]).
     pub fn set_group(&mut self, group: u32, rgb: Attrs, cterm: Attrs) {
         self.highlights.groups.insert(group, (rgb, cterm));
         self.changed = super::grid::tick();
     }
 
-    /// `'laststatus'` is `laststatus`, as the editor's measure says it (see
-    /// [`Model::laststatus`]).
     pub fn set_laststatus(&mut self, laststatus: Option<i64>) {
         if laststatus != self.laststatus {
             self.laststatus = laststatus;
@@ -628,9 +552,8 @@ impl Model {
         }
     }
 
-    /// The rows of window grid `grid` end in `tails`, all that run past its
-    /// edge, as the editor says it (see [`Model::tails`]). Says whether that
-    /// is any different.
+    /// Replace `grid`'s row tails (see [`Model::tails`]); returns whether
+    /// they changed.
     pub fn set_tails(&mut self, grid: u64, tails: BTreeMap<usize, Tail>) -> bool {
         if self
             .tails
@@ -648,29 +571,25 @@ impl Model {
         true
     }
 
-    /// Forget what the rows of grid `grid` end in: it is no longer the width
-    /// it was said of.
+    /// Drop `grid`'s tails, e.g. after its width changed.
     pub fn forget_tails(&mut self, grid: u64) {
         if self.tails.remove(&grid).is_some() {
             self.changed = super::grid::tick();
         }
     }
 
-    /// Highlight `id` as Neovim defined it, in both its forms, by the
-    /// client's id for it.
+    /// `(rgb, cterm)` of client highlight `id`.
     pub fn attrs(&self, id: u32) -> Option<&(Attrs, Attrs)> {
         self.highlights.defs.get(id as usize)?.as_ref()
     }
 
-    /// The hyperlinks the styles name, link `n` at `n - 1`.
+    /// Link `n` is at index `n - 1`.
     pub fn links(&self) -> &[Box<str>] {
         &self.links
     }
 
-    /// A hyperlink's number, given it the first time it is seen. Anything in
-    /// it that is not text is left out: it is written inside an OSC 8, and a
-    /// control character there would end the sequence early and write the
-    /// rest to the screen as something else.
+    /// Number for a hyperlink, assigned on first sight. Control characters
+    /// are stripped: inside OSC 8 they would end the sequence early.
     fn link_number(&mut self, url: &str) -> u32 {
         let url: Box<str> = url.chars().filter(|c| !c.is_control()).collect();
         if let Some(n) = self.link_numbers.get(&url) {
@@ -682,20 +601,18 @@ impl Model {
         n
     }
 
-    /// How much highlight `id` lets through of what is under it, 0 to 100.
+    /// Transparency of highlight `id`, 0 to 100.
     pub fn blend(&self, id: u32) -> u8 {
         self.blends.get(id as usize).copied().unwrap_or(0)
     }
 
-    /// The mode the editor is in, as `'guicursor'` describes its cursor.
     pub fn mode_info(&self) -> Option<&ModeInfo> {
         self.modes.get(self.mode)
     }
 
-    /// Where the cursor is on the screen, as the editor has laid it out — no
-    /// animation of a window's moving counted. No further right than its
-    /// grid: one the client has made narrower before Neovim has (see
-    /// [`super::wide`]) may have it past that until Neovim moves it.
+    /// Cursor screen position, ignoring animations. Clamped to its grid,
+    /// which the client may have narrowed before Neovim did (see
+    /// [`super::wide`]).
     pub fn cursor_on_screen(&self) -> (i64, i64) {
         let c = self.cursor;
         let (r, k) = self.drawn_origin(c.grid);
@@ -706,11 +623,9 @@ impl Model {
         (r + c.row as i64, k + col as i64)
     }
 
-    /// How far in from where the editor put it grid `grid` is drawn: a
-    /// window's grid narrower than the window in the middle of it, and a
-    /// float anchored to that window as far in as its text, but no further
-    /// than keeps the float on the screen (see [`super::wide`]). Nought for
-    /// anything else.
+    /// Horizontal offset at which `grid` is drawn (see [`super::wide`]): a
+    /// window grid narrower than its window is centred, and a float anchored
+    /// to it shifts by as much, but not off the screen. Zero otherwise.
     pub fn inset(&self, grid: u64) -> usize {
         let window = |grid: u64| match self.layout.get(&grid).map(|p| &p.place) {
             Some(Place::Window { width, .. }) => self
@@ -721,11 +636,9 @@ impl Model {
         };
         match self.layout.get(&grid).map(|p| &p.place) {
             Some(Place::Window { .. }) => window(grid),
-            // Neovim fitted the float to the screen where it put it, beside
-            // the window's grid as it has it, at the window's edge. As far
-            // in as the text, one near the right of the screen — a
-            // diagnostic's, hover's, the completion menu — would be past
-            // the screen's edge, its end and its border cut off.
+            // Neovim fitted the float to the screen relative to the
+            // unshifted grid; shifting it fully would push floats near the
+            // right edge (diagnostics, hover, completion) off screen.
             Some(Place::Float {
                 anchor: Some(anchor),
                 col,
@@ -740,17 +653,14 @@ impl Model {
         }
     }
 
-    /// Where grid `grid`'s top left is drawn: where the editor put it, and
-    /// [`Model::inset`] in from there.
+    /// Layout origin plus [`Model::inset`].
     pub fn drawn_origin(&self, grid: u64) -> (i64, i64) {
         let (r, c) = self.layout.get(&grid).map_or((0, 0), Placement::origin);
         (r, c + self.inset(grid) as i64)
     }
 
-    /// The cells window grid `grid` has of the screen — its top row, its
-    /// first column, and how many of each — as wide as Neovim made the
-    /// window, whatever its grid; `None` for a grid that is no window in the
-    /// layout.
+    /// `(row, col, width, height)` of a layout window's screen area, at the
+    /// window's width whatever its grid's; `None` if not a layout window.
     pub fn window_cells(&self, grid: u64) -> Option<(usize, usize, usize, usize)> {
         let Some(Place::Window {
             row,
@@ -771,12 +681,11 @@ impl Model {
         ))
     }
 
-    /// Take one event into the picture, noting in `changes` what an animation
-    /// might want to know.
+    /// Apply one event, recording in `changes` what animations need.
     pub fn apply(&mut self, event: Event, changes: &mut Changes) {
-        // What changes the cells of a grid alone — which the grid stamps
-        // itself — or nothing a frame is put together from. Anything else
-        // is a change to all of it, an event not named here among them.
+        // Events that change only grid cells (which grids stamp themselves)
+        // or nothing drawn. Anything else, including unlisted events, bumps
+        // `changed`.
         let cells_alone = matches!(
             event,
             Event::GridLine { .. }
@@ -809,9 +718,8 @@ impl Model {
                 if (g.width(), g.height()) != (width, height) {
                     changes.reshaped.push(grid);
                 }
-                // A row's tail starts where the editor said for the width
-                // the grid had then: made wider or narrower, Neovim draws
-                // every row again, and the editor says again.
+                // Tails depend on the width; on a width change Neovim redraws
+                // every row and the editor reports them again.
                 if g.width() != width {
                     self.tails.remove(&grid);
                 } else if let Some(tails) = self.tails.get_mut(&grid) {
@@ -935,9 +843,8 @@ impl Model {
                     compindex,
                 },
             ),
-            // A grid hidden before the client knew where it went — one the
-            // layout was asked about, on another tab page — is placed hidden:
-            // known, and not drawn until Neovim places it.
+            // A grid hidden before it was placed (e.g. on another tab page)
+            // is recorded hidden until Neovim places it.
             Event::WinHide { grid } => {
                 self.layout
                     .entry(grid)
@@ -1041,10 +948,9 @@ impl Model {
         }
     }
 
-    /// A `grid_scroll` of the rectangle `rect` by `rows`, as it moves the
-    /// tails of the rows it moves (see [`Model::tails`]): a row's goes with
-    /// it, across the grid's whole width; one the scroll takes out of the
-    /// rectangle goes, and so does one of a row moved only in part.
+    /// Move tails (see [`Model::tails`]) with a `grid_scroll` of `rect`.
+    /// Tails move only with full-width scrolls; those scrolled out of the
+    /// rectangle or on partly moved rows are dropped.
     fn scroll_tails(&mut self, grid: u64, rect: (usize, usize, usize, usize), rows: i64) {
         let (top, bot, left, right) = rect;
         let whole = left == 0 && self.grids.get(&grid).is_some_and(|g| right >= g.width());
@@ -1063,8 +969,7 @@ impl Model {
             .collect();
     }
 
-    /// Give a grid somewhere to be. Being placed is what makes it seen again
-    /// after a `win_hide`.
+    /// Placing also unhides a grid after `win_hide`.
     fn place(&mut self, grid: u64, win: Option<i64>, place: Place) {
         self.layout.insert(
             grid,
@@ -1078,14 +983,13 @@ impl Model {
         }
     }
 
-    /// A grid's margins: none, for a grid Neovim has not said has any.
     pub fn margins(&self, grid: u64) -> Margins {
         self.margins.get(&grid).copied().unwrap_or_default()
     }
 
-    /// The windows Neovim has named that it has not said where to put, with
-    /// their grids. A UI attaching to a session that another UI has drawn is
-    /// sent no placement for any window already there — see `super::App`.
+    /// `(grid, win)` of windows named but never placed: a UI attaching to a
+    /// session another UI drew gets no placement for existing windows (see
+    /// `super::App`).
     pub fn unplaced(&self) -> Vec<(u64, i64)> {
         self.wins
             .iter()
@@ -1094,11 +998,9 @@ impl Model {
             .collect()
     }
 
-    /// The window grids that are to be seen — placed and showing, or named
-    /// and not yet placed — and that Neovim has not drawn every cell of since
-    /// the client made them: grids it kept from a UI before this one, which
-    /// it thinks the client has as that UI did, or has but for what a resize
-    /// added. See `super::App`.
+    /// Shown or named-but-unplaced window grids Neovim has not fully drawn
+    /// since the client created them: kept from an earlier UI, which Neovim
+    /// assumes this one has. See `super::App`.
     pub fn lacking(&self) -> Vec<u64> {
         let undrawn = |grid: &u64| !self.grids.get(grid).is_some_and(Grid::whole);
         let shown = self.layout.iter().filter(|(grid, p)| {
@@ -1140,14 +1042,9 @@ impl Model {
         }
     }
 
-    /// Resolve the highlights defined since — or every one again, if what
-    /// they all depend on changed. Says whether it did: cells may look
-    /// different now.
-    ///
-    /// One by one otherwise: Neovim defines thousands a frame for a
-    /// `:terminal` playing an animation in truecolour (see [`Highlights`]),
-    /// and resolving the whole table again for each frame of them took the
-    /// client longer than drawing the frame.
+    /// Resolve new highlights, or all if colours or `'termguicolors'`
+    /// changed; returns whether any were. Incremental because a truecolour
+    /// `:terminal` defines thousands a frame (see [`Highlights`]).
     pub fn refresh_styles(&mut self) -> bool {
         let fresh = std::mem::take(&mut self.highlights.fresh);
         if !self.styles_stale && fresh.is_empty() {
@@ -1176,31 +1073,28 @@ impl Model {
         true
     }
 
-    /// Resolve highlight `id` for drawing, as `colors` say. Id 0 is never
-    /// defined, and is the default whatever is sent for it.
+    /// Id 0 is always the default, whatever is sent for it.
     fn resolve(&mut self, id: usize, colors: &Colors) {
         let Some(Some((rgb, cterm))) = self.highlights.defs.get(id).filter(|_| id > 0) else {
             return;
         };
         let style = colors.style(rgb, cterm);
         let blend = if colors.rgb { rgb.blend } else { cterm.blend };
-        // A hyperlink comes with the GUI form only, and is one whichever form
-        // is drawn.
+        // Hyperlinks come only in the GUI form but apply to both.
         let link = rgb.url.clone().map_or(0, |url| self.link_number(&url));
         self.styles[id] = Style { link, ..style };
         self.blends[id] = blend;
     }
 
-    /// Whether enough of the client's ids are retired that a sweep is due:
-    /// see [`Model::reclaim`].
+    /// Whether a sweep is due (see [`Model::reclaim`]).
     pub fn reclaiming(&self) -> bool {
         let h = &self.highlights;
         h.retired.len() >= h.kept + RECLAIM_AT
     }
 
-    /// The highlights the model holds itself — in its grids, its highlight
-    /// groups and its modes' cursors — to which whatever else keeps cells
-    /// across a flush adds its own before a sweep: see [`Model::reclaim`].
+    /// Highlights the model itself holds (grids, tails, groups, mode
+    /// cursors). Anything else keeping cells across a flush must add its own
+    /// before [`Model::reclaim`].
     pub fn held(&self) -> Held {
         let mut held = Held(vec![0; self.highlights.defs.len().div_ceil(64)]);
         for g in self.grids.values() {
@@ -1220,9 +1114,7 @@ impl Model {
         held
     }
 
-    /// Give out again every retired id nothing in `held` holds: no cell, in
-    /// the model or in anything that keeps cells across a flush, can be drawn
-    /// in it any more. See [`Highlights`].
+    /// Free every retired id not in `held` (see [`Highlights`]).
     pub fn reclaim(&mut self, held: &Held) {
         let h = &mut self.highlights;
         let (kept, free): (Vec<u32>, Vec<u32>) = h.retired.iter().partition(|k| held.holds(**k));
@@ -1256,11 +1148,8 @@ mod tests {
         changes
     }
 
-    /// The cells of a grid change by its own rows alone; anything else a
-    /// frame is put together from — a window placed, a highlight defined,
-    /// `'laststatus'`, a highlight group, a grid resized — changes the
-    /// model, and an event the model does not know to be of cells alone
-    /// does too.
+    /// Cell-only events leave `changed` alone; everything else, including
+    /// unknown events, bumps it.
     #[test]
     fn only_a_grids_cells_change_without_changing_the_model() {
         let mut m = model();
@@ -1354,8 +1243,7 @@ mod tests {
         assert!(!m.unchanged_since(since), "a grid the client cut");
     }
 
-    /// What Neovim sends for a 22-row window over 30 lines, scrolled to
-    /// each kind of place, and for views that are not one line to a row.
+    /// Values Neovim sends for a 22-row window over 30 lines.
     #[test]
     fn a_view_one_to_one_is_told_by_its_botline() {
         let v = |topline, botline| Viewport {
@@ -1375,7 +1263,6 @@ mod tests {
         assert_eq!(v(0, 23).lines_shown(22), 22);
     }
 
-    /// The cursor's place on the screen is its grid's place plus its own.
     #[test]
     fn the_cursor_is_where_its_grid_is() {
         let mut m = model();
@@ -1405,8 +1292,6 @@ mod tests {
         assert_eq!(m.cursor_on_screen(), (3, 34));
     }
 
-    /// A window's margins can arrive before the window is placed, and are
-    /// kept for it; hiding and placing again shows it.
     #[test]
     fn margins_and_hiding_survive_a_placement() {
         let mut m = model();
@@ -1449,7 +1334,6 @@ mod tests {
         assert_eq!(m.margins(2).top, 1);
     }
 
-    /// A `grid_line` of `n` cells from `col`.
     fn cells(grid: u64, row: usize, col: usize, n: usize) -> Event {
         Event::GridLine {
             grid,
@@ -1463,10 +1347,9 @@ mod tests {
         }
     }
 
-    /// What a UI attaching to a session another UI drew is sent: its windows'
-    /// grids resized and named, but neither placed nor drawn on. Both are
-    /// noticed; drawing every cell of a grid, or hiding it, settles the
-    /// question — and a cell is not every cell.
+    /// A UI attaching to a session another UI drew gets window grids resized
+    /// and named, but not placed or drawn. Drawing every cell, or hiding the
+    /// grid, settles it.
     #[test]
     fn windows_never_placed_or_drawn_are_noticed() {
         let mut m = model();
@@ -1523,7 +1406,7 @@ mod tests {
         assert_eq!(m.lacking(), vec![2], "a cell drawn of forty");
         apply(&mut m, (0..4).map(|r| cells(2, r, 0, 10)).collect());
         assert!(m.lacking().is_empty(), "drawn whole, or hidden");
-        // Shown again, with nothing ever drawn on it: lacking again.
+        // Shown again, never drawn on: lacking again.
         apply(
             &mut m,
             vec![Event::WinPos {
@@ -1536,8 +1419,7 @@ mod tests {
             }],
         );
         assert_eq!(m.lacking(), vec![4]);
-        // A window placed on a tab page the client has never seen has no
-        // grid at all.
+        // A window on a tab page the client never saw has no grid at all.
         apply(
             &mut m,
             vec![Event::WinPos {
@@ -1552,10 +1434,9 @@ mod tests {
         assert_eq!(m.lacking(), vec![4, 7]);
     }
 
-    /// What a UI attaching to a session another UI drew on a smaller terminal
-    /// is sent: its windows' grids resized and placed, and drawn on only where
-    /// the resize added to them — under the rows a grid kept, or to the right
-    /// of every one of them. Each is noticed until the rest of it is drawn.
+    /// Attaching after a UI on a smaller terminal: Neovim draws only what the
+    /// resize added (below or right of the kept cells), so each grid stays
+    /// lacking until fully drawn.
     #[test]
     fn windows_drawn_only_where_a_resize_added_are_noticed() {
         let mut m = model();
@@ -1595,8 +1476,6 @@ mod tests {
         assert!(m.lacking().is_empty(), "and the wider");
     }
 
-    /// Scrolls are added up per window over a batch, and only grid 1 being
-    /// cleared asks for every cell to be painted again.
     #[test]
     fn a_batch_adds_up_its_scrolls() {
         let mut m = model();
@@ -1629,11 +1508,9 @@ mod tests {
         assert!(changes.repaint);
     }
 
-    /// What runs past a window grid's edge goes with its row as the grid
-    /// scrolls across its whole width, and goes with a row scrolled out of
-    /// the rectangle, or moved only in part; and with every row, as the grid
-    /// is made wider or narrower or is cleared. Made shorter, it keeps what
-    /// the rows left have. Each new say changes the model.
+    /// Tails move with full-width scrolls. They are dropped for rows scrolled
+    /// out or partly moved, and all of them on a width change or clear; a
+    /// shorter grid keeps the remaining rows'. Each update bumps `changed`.
     #[test]
     fn what_runs_past_a_grids_edge_goes_with_its_row() {
         let mut m = model();
@@ -1695,10 +1572,6 @@ mod tests {
         assert!(m.tails.is_empty(), "gone");
     }
 
-    /// A highlight group of the editor's laid over one of Neovim's: its
-    /// colours where it has them, the one under it's where not, and every
-    /// attribute either has; in the form `'termguicolors'` says; as the one
-    /// under it while the group is not known.
     #[test]
     fn a_group_is_laid_over_the_text_it_colours() {
         use crate::client::style::Color;
@@ -1753,11 +1626,6 @@ mod tests {
         assert_eq!(syntax_hl(3, 0), 3, "no group");
     }
 
-    /// `'cursorline'`'s bar, a background alone, laid under a highlight of
-    /// Neovim's — its colours, and the bar's background where it has none of
-    /// its own — and taken off one it was laid under, the cell's own
-    /// background kept where it differs from the bar's; in both forms. Ids
-    /// made once each, and none of a highlight not Neovim's.
     #[test]
     fn cursorline_laid_on_and_taken_off() {
         use crate::client::style::Color;
@@ -1812,7 +1680,6 @@ mod tests {
         let bare = m.derived(6, Derive::CursorLineOff).expect("made");
         assert_eq!(m.style(bare), m.style(0));
         assert_eq!(m.derived(syntax_hl(3, 400), Derive::CursorLineOn), None);
-        // The cterm form alike.
         apply(
             &mut m,
             vec![Event::OptionSet {
@@ -1823,8 +1690,7 @@ mod tests {
         m.refresh_styles();
         assert_eq!(m.style(on).bg, Color::Index(0x30));
         assert_eq!(m.style(off), m.style(3));
-        // A bar with a colour in front, or an attribute, is laid over the
-        // cell by Neovim, not under it.
+        // Neovim lays a bar with a foreground or attribute over the cell.
         apply(
             &mut m,
             vec![
@@ -1838,7 +1704,6 @@ mod tests {
         assert!(!m.bar_derivable());
     }
 
-    /// Highlights resolve lazily, and `'termguicolors'` decides which form.
     #[test]
     fn highlights_resolve_in_the_form_the_option_says() {
         let mut m = model();
@@ -1875,9 +1740,6 @@ mod tests {
         assert_eq!(m.style(99), m.style(0), "an unknown id is the default");
     }
 
-    /// A highlight's hyperlink gets a number, the same one for the same
-    /// target, whichever form of the highlight is drawn — and nothing in it
-    /// that could end the OSC 8 it is written in.
     #[test]
     fn hyperlinks_are_numbered_by_target() {
         let mut m = model();
@@ -1944,7 +1806,7 @@ mod tests {
         assert!(changes.reshaped.contains(&4));
     }
 
-    /// Neovim's highlight `id`, its foreground `0xRRGGBB`.
+    /// Neovim highlight `id` with foreground `0xRRGGBB`.
     fn coloured(id: u32, fg: u32) -> Event {
         Event::HlAttr {
             id,
@@ -1956,8 +1818,7 @@ mod tests {
         }
     }
 
-    /// Row `row` of grid 1, all three cells of it, in Neovim's highlight
-    /// `hl`.
+    /// All three cells of grid 1's row `row` in Neovim highlight `hl`.
     fn row_in(row: usize, hl: u32) -> Event {
         Event::GridLine {
             grid: 1,
@@ -1971,7 +1832,7 @@ mod tests {
         }
     }
 
-    /// A model drawing in RGB, its grid 1 three cells by two.
+    /// RGB model with a 3x2 grid 1.
     fn in_rgb() -> Model {
         let mut m = model();
         apply(
@@ -1991,7 +1852,6 @@ mod tests {
         m
     }
 
-    /// The foreground each of `cells` is drawn in.
     fn fgs(m: &Model, cells: &[Cell]) -> Vec<Color> {
         cells.iter().map(|c| m.style(c.hl).fg).collect()
     }
@@ -2000,11 +1860,8 @@ mod tests {
         Color::Rgb(crate::client::style::rgb(n))
     }
 
-    /// Neovim's table of highlights full, it clears it part way through
-    /// drawing a frame and gives the same ids out again, the cells it drew
-    /// before still naming them until it draws them again. They keep the
-    /// colours their id had when they were drawn — and so does a copy of
-    /// them kept of a moment ago, as an animation keeps one.
+    /// Neovim reissues ids mid-frame after its table fills. Cells drawn
+    /// before keep their old colours, as do copies an animation keeps.
     #[test]
     fn a_cell_keeps_the_colours_its_highlight_had_when_it_was_drawn() {
         let (red, blue, green) = (fg(0xff0000), fg(0x0000ff), fg(0x00ff00));
@@ -2029,8 +1886,7 @@ mod tests {
         assert_eq!(fgs(&m, m.grids[&1].row(1)), vec![blue; 3]);
     }
 
-    /// A highlight sent again as it was — every one is, to a UI attaching —
-    /// keeps its id, and gives none up.
+    /// An unchanged resend (as on attach) keeps its id and retires none.
     #[test]
     fn a_highlight_sent_again_as_it_was_keeps_its_id() {
         let mut m = in_rgb();
@@ -2048,8 +1904,6 @@ mod tests {
         assert!(m.highlights.retired.is_empty());
     }
 
-    /// What names a highlight as it is now — a group the client draws its
-    /// own rows in, a mode's cursor — names what Neovim last defined.
     #[test]
     fn groups_and_cursors_are_in_the_highlight_last_defined() {
         let mut m = in_rgb();
@@ -2078,15 +1932,11 @@ mod tests {
         assert_eq!(m.style(m.grids[&1].row(0)[0].hl).fg, fg(0xff0000));
     }
 
-    /// A session whose table of highlights is cleared and filled again every
-    /// few frames, for good, holds no more ids than its table has and its
-    /// cells hold: one Neovim has given out again is given back once nothing
-    /// holds it, and out again. One a cell holds — or anything else that
-    /// keeps cells, as an animation does — is not.
+    /// Ids stay bounded under endless table refills: a reissued id is freed
+    /// once nothing holds it, and kept while cells (or animation copies) do.
     #[test]
     fn an_id_is_given_out_again_once_nothing_holds_it() {
-        // Neovim's table cleared and filled again: ids 1 to 4 given to
-        // highlights in colours of the `n`th time.
+        // Neovim's table refilled: ids 1 to 4 in the `n`th set of colours.
         fn refill(n: u32) -> Vec<Event> {
             (1..=4).map(|id| coloured(id, n << 8 | id)).collect()
         }
@@ -2107,9 +1957,8 @@ mod tests {
             m.highlights.defs.len()
         );
 
-        // Given out again with cells still drawn in them, and given out again
-        // once more after they are drawn anew — but kept, as an animation
-        // keeps them: they keep their colours through a third time.
+        // Reissued twice while an animation keeps the old cells: they keep
+        // their colours.
         let kept = m.grids[&1].lines(0, 2, 0, 3);
         let shown: Vec<Vec<Color>> = kept.iter().map(|row| fgs(&m, row)).collect();
         apply(&mut m, refill(200));
@@ -2129,9 +1978,8 @@ mod tests {
         assert_eq!(now, shown);
     }
 
-    /// A sweep waits for [`RECLAIM_AT`] ids to be given out again past those
-    /// the last one found still held; a group laid over a highlight holds
-    /// the highlight.
+    /// A sweep waits for [`RECLAIM_AT`] retirements beyond those last found
+    /// held; a group laid over a highlight holds it.
     #[test]
     fn a_sweep_waits_for_enough_ids_to_have_been_given_out_again() {
         let mut m = in_rgb();
@@ -2157,8 +2005,6 @@ mod tests {
         assert!(m.reclaiming());
     }
 
-    /// Highlights resolved one by one as they come resolve as they would all
-    /// at once: their colours, blends and links.
     #[test]
     fn highlights_resolved_as_they_come_are_as_resolved_all_at_once() {
         let mut m = in_rgb();

@@ -1,188 +1,111 @@
 //! Where nvmux may write over a session.
 //!
-//! [`crate::pty`] copies the client's bytes to the terminal without looking at
-//! them, and [`crate::announce`] has to put a box on top of that stream.
-//! Between two of the client's escape sequences that is safe; inside one it is
-//! corruption — a `CUP` cut in half by a colour of nvmux's own paints neither
-//! thing. The old answer was a clock: 25 ms with the child quiet, on the
-//! reasoning that nothing can be half-written when nothing has been written at
-//! all. It is a true test and the wrong one. A session with a window
-//! repainting at sixty frames a second never goes quiet for 25 ms, so the box
-//! either blinked — up at each lull, wiped by the next frame — or, at full
-//! rate, never appeared at all.
+//! [`crate::pty`] copies the client's bytes to the terminal unparsed, and
+//! [`crate::announce`] draws a box over that stream. That is only safe between
+//! the client's escape sequences. A quiet-period heuristic (25 ms) failed: a
+//! session repainting at 60 fps is never quiet, so the box blinked or never
+//! appeared. A [`Boundary`] instead tracks the terminal's parser state over
+//! the bytes written to it (a decoder, not an emulator: no grid or cursor)
+//! and reports [`Boundary::between_sequences`].
 //!
-//! So this module answers the question directly. A [`Boundary`] is the
-//! terminal's own parser as far as the bytes nvmux has written to it: enough
-//! state to say whether the next byte starts something new. It is a decoder
-//! rather than an emulator — it has no grid, no cursor and no idea what any
-//! sequence *means* — and the one thing it reports is
-//! [`Boundary::between_sequences`].
+//! # The tail
 //!
-//! # And the tail
+//! The relay reads 8 KiB at a time, and only about one read in six ends on a
+//! sequence boundary. So [`Boundary::relay`] holds back any incomplete tail
+//! until the rest arrives (usually microseconds later), leaving the terminal
+//! always between sequences. Kept bytes are never dropped, reordered or
+//! changed, and go out unfinished after [`KEPT_FOR`] or at [`KEPT_MAX`]
+//! bytes, since a client stopped mid-sequence may be waiting for the
+//! terminal's answer.
 //!
-//! Knowing is not quite enough. The relay reads the master in 8 KiB bites, and
-//! a bite of a screenful of output almost never ends where a sequence does —
-//! measured on a real flight, about one in six. A notice repainted only on
-//! those would still blink.
+//! `pty` keeps a `Boundary` only while something is drawn: the prefix's hint
+//! bar ([`crate::hint`]), or the notice ([`crate::announce`], not armed at
+//! present).
 //!
-//! So a [`Boundary`] also holds the last few bytes back. [`Boundary::relay`]
-//! hands out everything up to the last point that leaves the parser between
-//! sequences and keeps the rest until the bytes that finish it arrive — which
-//! for a client mid-frame is microseconds later, on the next pass of the same
-//! loop. The terminal is then *always* left between sequences, so the notice
-//! can go back up straight after every write rather than once in six.
+//! # Non-sequences that also block a write
 //!
-//! A kept byte is never dropped, reordered or changed: it goes out at the
-//! front of the next call, ahead of everything that came after it. And it is
-//! never kept long — [`KEPT_FOR`], or [`KEPT_MAX`] bytes, whichever comes
-//! first — because a client that has stopped in the middle of a sequence may
-//! be one waiting for the terminal's answer to it, and no picture is worth a
-//! session that cannot ask its terminal a question.
+//! A **synchronized update** (`CSI ? 2026 h` … `CSI ? 2026 l`): nvmux's box
+//! opens its own span and terminals do not nest them, so writing inside the
+//! client's would present a half-drawn frame. No boundary is reported inside
+//! one, except at its close, which is the best moment (see
+//! [`Boundary::holding_the_sessions_close`]).
 //!
-//! None of this is on while there is nothing to draw: `pty` keeps a
-//! `Boundary` only for the life of a notice, which is a second and a bit at
-//! the start of a relay, and of the hint bar the prefix puts up
-//! ([`crate::hint`]), from the lull it goes up at to the key that takes it
-//! down — the one row of nvmux's that a session's busiest row, its
-//! statusline, is drawn under.
+//! A **`DECSC`** (`ESC 7`): the notice uses the terminal's single cursor save
+//! slot too, so it must not write between the client's `DECSC` and `DECRC`.
 //!
-//! # Two things that are not sequences and still say "not here"
-//!
-//! A **synchronized update** (`CSI ? 2026 h` … `CSI ? 2026 l`) is the client
-//! asking the terminal to present nothing until the frame is whole. nvmux's
-//! own box opens a span of its own, and terminals do not nest them: dropped in
-//! the middle of the client's, it would end the span early and present a frame
-//! drawn half way. So a `Boundary` counts the client's spans and reports no
-//! boundary inside one — except at the very end of one, which is the best
-//! moment there is rather than the worst. See
-//! [`Boundary::holding_the_sessions_close`].
-//!
-//! A **`DECSC`** (`ESC 7`) is the client putting the cursor and its attributes
-//! in the terminal's one save slot, to take them back later with `DECRC`. The
-//! notice uses that slot too. Between the two the slot is the client's, and
-//! writing there would hand it back somebody else's cursor.
-//!
-//! Both refuse *nvmux* and neither holds the session up: its own bytes pass
-//! through either, cut where its sequences end, because it is only a write of
-//! nvmux's that must not land there.
-//!
-//! Neither is hypothetical, and the first is the ordinary case rather than
-//! the exotic one — which took a while to find out, because it is a fact
-//! about somebody else's terminal rather than about nvmux. `nvim --remote-ui`
-//! asks the terminal whether it knows the mode, with `CSI ? 2026 $ p`, and
-//! brackets every frame of its own once the answer comes back. Every terminal
-//! in ordinary use answers. A reproduction that does not is measuring a
-//! different program: on one that left the query unanswered the client sent
-//! not one span, nor a single `ESC 7`, and every measurement taken there was
-//! of the branch almost nobody runs. nvmux's own client does not ask: it
-//! brackets every frame from the first, unless `'termsync'` is off.
+//! Both block only nvmux's writes; the session's own bytes pass through.
+//! Both occur in practice: `nvim --remote-ui` queries `CSI ? 2026 $ p` and
+//! brackets every frame once a terminal answers, which nearly all do. To a
+//! terminal that does not answer, it sends neither, so test with one that
+//! does. nvmux's own client brackets every frame unless `'termsync'` is off.
 
 use std::time::{Duration, Instant};
 
-/// How long a tail is kept back before it goes to the terminal anyway.
-///
-/// One frame of a sixty-a-second terminal. A client that has stopped in the
-/// middle of a sequence is either about to write the rest of it — in which
-/// case this is never reached, the rest having turned up microseconds later —
-/// or it is waiting for the terminal to answer the sequence it has not
-/// finished, in which case this is how long that costs it.
+/// How long a tail is held before it goes out anyway: one 60 Hz frame. A
+/// client waiting for the terminal's answer to an unfinished sequence pays
+/// this much.
 pub const KEPT_FOR: Duration = Duration::from_millis(16);
 
-/// The most that is ever kept back, after which it goes out unfinished.
-///
-/// A ceiling rather than a budget: a sequence is a few dozen bytes and a
-/// screenful of them is a few tens of KiB, so nothing ordinary comes near it.
-/// What it bounds is the one sequence that has no length limit — an OSC 52
-/// clipboard write can be a megabyte — which must not be accumulated here
-/// while the session waits for it.
+/// The most ever held back. Ordinary output never comes near it; it bounds
+/// unlimited sequences such as an OSC 52 clipboard write (up to megabytes).
 const KEPT_MAX: usize = 64 * 1024;
 
-/// The terminal's own parser as far as nvmux has written to it, and the tail
-/// of the session's output kept back so that it is never left mid-sequence.
+/// The terminal's parser state over what nvmux has written, plus the held-back
+/// tail of the session's output.
 ///
-/// Every byte written to the terminal while one of these exists must be shown
-/// to it exactly once, and said whose it is: [`Boundary::relay`] hands back
-/// the session's after taking account of them, [`Boundary::saw_session`]
-/// takes the session's that went out by another route, and
-/// [`Boundary::saw_own`] takes nvmux's. A byte shown twice moves the parser
-/// twice, one not shown at all leaves it describing a terminal that no longer
-/// exists, and one shown under the wrong name teaches it something about the
-/// session that is really about nvmux.
+/// Every byte written to the terminal while one exists must be fed exactly
+/// once, attributed correctly: [`Boundary::relay`] for relayed session bytes,
+/// [`Boundary::saw_session`] for session bytes sent another way, and
+/// [`Boundary::saw_own`] for nvmux's.
 ///
-/// The one exception is the synchronized update nvmux opens around a relayed
-/// write (see `Attachment::write_session_frame` in [`crate::pty`]). Its two
-/// sequences are balanced across a pass of the relay and are nvmux's own, and
-/// a `sync` depth raised by them would read as *the session* holding the
-/// terminal — shutting the notice out of the very frame the span was opened
-/// to put it in.
+/// Exception: the synchronized update nvmux opens around a relayed write (see
+/// `Attachment::write_session_frame` in [`crate::pty`]) is not fed. It is
+/// balanced, and counting it would look like the session holding the
+/// terminal, shutting the notice out of the frame it was opened for.
 #[derive(Debug, Default)]
 pub struct Boundary {
     parser: Parser,
-    /// The tail, waiting for the bytes that finish it.
+    /// The incomplete tail.
     kept: Vec<u8>,
-    /// When the oldest kept byte was kept, or `None` when nothing is.
+    /// When `kept` last became non-empty.
     since: Option<Instant>,
-    /// The length of the session's frame close, while it is being held at the
-    /// front of `kept` for the notice to be written in front of.
+    /// Length of the session's frame close held at the front of `kept` so
+    /// the notice can be written before it.
     closing: Option<usize>,
 }
 
 impl Boundary {
-    /// A terminal between sequences, which is where every relay starts: what
-    /// came before it — the hand-off, the clear, a dissolve — is nvmux's own
-    /// and complete.
+    /// Starts between sequences: everything before a relay is nvmux's own and
+    /// complete.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// What may go to the terminal now, given that `chunk` has just been read
-    /// from the client.
+    /// Feed `chunk` read from the client and return what may go to the
+    /// terminal now: everything up to the last sequence boundary. The rest is
+    /// kept and prepended next call.
     ///
-    /// Everything up to the last point that leaves the parser between
-    /// sequences; the rest is kept for the next call, which puts it back at
-    /// the front. Nothing is dropped, reordered or changed.
+    /// A tail older than [`KEPT_FOR`] or longer than [`KEPT_MAX`] goes out
+    /// unfinished: the session's output matters more than the notice.
     ///
-    /// Once the tail is older than [`KEPT_FOR`] or longer than [`KEPT_MAX`] it
-    /// all goes out regardless, unfinished — the session's output matters more
-    /// than the notice does, and this is the only way that trade is ever made.
+    /// **A frame close is held ahead of that timeout check.** The tail's age
+    /// counts from when `kept` last became non-empty, so on a busy session the
+    /// deadline has nearly always passed, and the relay flushes before
+    /// offering the notice its turn. Without this, the close (the notice's
+    /// only chance on a bracketing session) was flushed and the box missing in
+    /// 3 runs of 8.
     ///
-    /// **A frame close is taken ahead of that clock rather than behind it**,
-    /// and without that the rest of this does not work. The tail is dated
-    /// from the first time anything was kept rather than from the last, so on
-    /// a busy session the deadline is nearly always past — and the relay
-    /// flushes an impatient tail *before* it offers the notice its turn. The
-    /// close therefore went out on the pass that held it, every time, and on
-    /// a session that brackets its frames that close is the notice's only
-    /// moment: three flights in eight showed no box at all. A session closing
-    /// a frame has said the one thing patience is waiting to hear, so the
-    /// close is worth more than the clock. The buffer shrinks either way and
-    /// nothing accumulates.
-    ///
-    /// What is left of the flicker lives in the reads with no close in them.
-    /// Those still go out unfinished every [`KEPT_FOR`], which leaves the
-    /// parser mid-sequence for a pass — and on a terminal that does not know
-    /// `?2026`, where there is no close to prefer, it is the only shape there
-    /// is. Dating the tail from the last hand-out instead was tried, and
-    /// backed out for reasons that stood up at the time and have since been
-    /// explained: it measured better, 188 relayed chunks out of 188 leaving
-    /// the terminal writable, and yet lost the notice altogether on two runs.
-    /// That is the same silence as above, arrived at from the other side —
-    /// the repair changed which reads flushed without changing that a flush
-    /// could take the close with it.
+    /// Reads without a close still flush unfinished every [`KEPT_FOR`], as on
+    /// terminals without `?2026`. Counting age from the last hand-out instead
+    /// was tried and reverted: it still let a flush take the close.
     pub fn relay(&mut self, chunk: &[u8], now: Instant) -> Vec<u8> {
         self.kept.extend_from_slice(chunk);
         self.closing = None;
         let scan = self.parser.scan(&self.kept);
         let cut = match scan.close.filter(|_| scan.brackets) {
-            // The session is about to close a frame of its own. Stop in front
-            // of it and keep the close: written after the notice, it presents
-            // the session's frame with the notice already in it. See
-            // [`Boundary::holding_the_sessions_close`].
-            //
-            // Ahead of the patience test rather than behind it, because a
-            // frame close is the session saying it has finished — which is
-            // the one thing patience is waiting to hear. The buffer shrinks
-            // either way, so nothing accumulates.
+            // Stop before the session's frame close and hold it, so the
+            // notice lands inside that frame. Checked before patience; the
+            // buffer shrinks either way.
             Some(close) => {
                 self.parser
                     .take(close.starts, close.counters, scan.brackets);
@@ -207,30 +130,21 @@ impl Boundary {
         ready
     }
 
-    /// What may go to the terminal now, given that `chunk` has just been read
-    /// from the client — as [`Boundary::relay`] hands it out, but with no
-    /// patience, and no frame close kept: everything up to the last point
-    /// that leaves the parser between sequences, and a tail that would leave
-    /// it inside a character or a sequence kept for the bytes that finish it,
-    /// however long they take, short of [`KEPT_MAX`].
+    /// Like [`Boundary::relay`] but with no timeout and no held frame close:
+    /// an incomplete tail is kept however long it takes, up to [`KEPT_MAX`].
     ///
-    /// For a caller that holds the session's output back anyway, and writes
-    /// it only in front of a frame of its own, in one synchronized update
-    /// with it: the settings floating over a session (see `crate::pty::panel`).
-    /// A tail handed out unfinished would leave no place to put that frame,
-    /// and the session's bytes would go out without it — drawn over the panel
-    /// until the next frame came. Nothing these bytes wait for is helped by
-    /// patience: they reach the terminal with the next frame either way, and
-    /// a client cannot be waiting for the answer to a question it has not
-    /// finished asking.
+    /// For the settings panel over a session (see `crate::pty::panel`), which
+    /// writes session output only in front of its own frame in one
+    /// synchronized update. An unfinished tail would leave nowhere to put that
+    /// frame and the session would draw over the panel. Waiting costs nothing:
+    /// the bytes go out with the next frame anyway.
     pub fn relay_whole(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.kept.extend_from_slice(chunk);
         self.closing = None;
         self.since = None;
         let scan = self.parser.scan(&self.kept);
         let cut = if self.kept.len() - scan.rest >= KEPT_MAX {
-            // A string with no end in sight, an OSC 52 clipboard write: out it
-            // goes, unfinished, rather than be gathered here as it runs.
+            // An unbounded string such as OSC 52: flush unfinished.
             self.parser.feed(&self.kept);
             self.kept.len()
         } else {
@@ -240,33 +154,23 @@ impl Boundary {
         self.kept.drain(..cut).collect()
     }
 
-    /// Whether anything the session wrote is kept back here, still to go to
-    /// the terminal: after [`Boundary::relay_whole`], a tail waiting for the
-    /// rest of its character or sequence.
+    /// Whether session bytes are held back (after [`Boundary::relay_whole`],
+    /// an incomplete tail).
     pub fn keeping(&self) -> bool {
         !self.kept.is_empty()
     }
 
-    /// Whether what is kept back begins with the session's own frame close,
-    /// which is the moment nvmux's box belongs in.
+    /// Whether the held bytes start with the session's frame close, where
+    /// nvmux's box belongs.
     ///
-    /// A session that brackets its frames takes the terminal's choice of when
-    /// to present away from it: nothing goes on the glass until the closing
-    /// `CSI ? 2026 l`. So a box written *after* that sequence is a box the
-    /// terminal has already presented one frame without — once per frame of
-    /// the session's, for as long as the notice is up. Measured against a
-    /// terminal that answers the synchronized-update query, which is nearly
-    /// all of them: the box went up once in its whole second and stayed on
-    /// the screen for 15 ms of it.
-    ///
-    /// So the close is held back for exactly as long as it takes to write the
-    /// box, and goes out immediately after. Delayed by one write and by
-    /// nothing else; never dropped, reordered or changed.
+    /// A bracketing session's frame is presented only at `CSI ? 2026 l`, so a
+    /// box written after it misses every frame (measured: visible 15 ms of
+    /// its second). The close is held for just the box's write, then sent.
     fn holding_the_sessions_close(&self) -> bool {
         self.closing.is_some()
     }
 
-    /// The session's frame close, to write once the notice is in front of it.
+    /// The held frame close, to write after the notice.
     pub fn release_the_sessions_close(&mut self) -> Vec<u8> {
         let Some(len) = self.closing.take() else {
             return Vec::new();
@@ -279,95 +183,59 @@ impl Boundary {
         close
     }
 
-    /// Bytes of the *session's* that reached the terminal by some route other
-    /// than [`Boundary::relay`] — the first paint, let out of its hold.
-    ///
-    /// Shown for the same reason the relayed ones are: the parser is the
-    /// terminal's, and these moved it. And read as the session's, which is
-    /// the difference from [`Boundary::saw_own`]: a client that brackets its
-    /// first paint is a client that brackets, and it says so here.
+    /// Session bytes sent other than through [`Boundary::relay`] (the held
+    /// first paint). Unlike [`Boundary::saw_own`], these count towards
+    /// [`Boundary::session_brackets_its_own_frames`].
     pub fn saw_session(&mut self, bytes: &[u8]) {
         self.parser.feed(bytes);
     }
 
-    /// Bytes nvmux wrote over the session itself: the notice's own frames,
-    /// and the hint bar.
+    /// Bytes nvmux wrote over the session (notice frames, hint bar). They are
+    /// balanced, but still fed, as they move the terminal's parser.
     ///
-    /// Shown for the same reason again — the parser is the terminal's, not
-    /// the client's, and what nvmux writes moves it too. Everything nvmux
-    /// writes over a session is balanced and ends between sequences, so in
-    /// practice this leaves the parser where it found it, which is exactly
-    /// why it must be said rather than assumed.
-    ///
-    /// What it must *not* do is answer
-    /// [`Boundary::session_brackets_its_own_frames`]. Every frame of the
-    /// notice, and every write of the bar, is bracketed in a synchronized
-    /// update of its own, so a parser that learned from these would conclude
-    /// after the first box that the session brackets its frames — and stand
-    /// the whole mechanism down on the strength of nvmux's own handwriting.
-    /// That is not a hypothetical:
-    /// it is what this did for its first measurement, which came back at 13%
-    /// instead of 100% and was the only reason anybody looked.
+    /// They must not set [`Boundary::session_brackets_its_own_frames`]: each
+    /// is wrapped in its own synchronized update, which would otherwise
+    /// disable the mechanism after the first box (once measured: 13% instead
+    /// of 100%).
     pub fn saw_own(&mut self, bytes: &[u8]) {
         let session_syncs = self.parser.seen_sync;
         self.parser.feed(bytes);
         self.parser.seen_sync = session_syncs;
     }
 
-    /// Whether the terminal is half way through reading something — a
-    /// character or an escape sequence — so a byte of nvmux's written now
-    /// would land inside it.
+    /// Whether the terminal is mid-character or mid-sequence.
     ///
-    /// Weaker than [`Boundary::between_sequences`], which also refuses a
-    /// write that would *overwrite* something of the session's: a span or the
-    /// cursor save slot. This one asks only whether the bytes would come
-    /// apart, which is the question for the sequences nvmux wraps a relayed
-    /// write in — they change nothing on the screen and cannot overwrite
-    /// anything, but dropped between a lead byte and its continuation they
-    /// leave the terminal a character it cannot read.
+    /// Weaker than [`Boundary::between_sequences`], which also refuses inside
+    /// a session span or saved cursor. This is the check for the sequences
+    /// nvmux wraps a relayed write in: they overwrite nothing, but must not
+    /// split a UTF-8 character or sequence.
     pub fn mid_sequence(&self) -> bool {
         !self.parser.at_sequence_boundary()
     }
 
-    /// Whether the terminal is between sequences, so a write of nvmux's own
-    /// would land beside one of the session's rather than inside it.
-    ///
-    /// True of the held frame close as well, and that is the *better* of the
-    /// two moments rather than an exception to be tolerated: there the write
-    /// lands inside the frame the session is about to present, so the
-    /// terminal never shows one without it. See
-    /// [`Boundary::holding_the_sessions_close`].
+    /// Whether nvmux may write now without landing inside a session sequence,
+    /// span or saved cursor. Also true at a held frame close, the best moment
+    /// (see [`Boundary::holding_the_sessions_close`]).
     pub fn between_sequences(&self) -> bool {
         self.parser.at_rest() || self.holding_the_sessions_close()
     }
 
-    /// Whether the session has ever bracketed anything in a synchronized
-    /// update of its own.
+    /// Whether the session has ever opened or closed a synchronized update.
     ///
-    /// What it decides is whether nvmux may open one *around* a relayed
-    /// write, which is how the notice is kept on the screen rather than
-    /// merely put back on it (see `Attachment::write_session_frame` in
-    /// [`crate::pty`]). Terminals hold `?2026` as a mode rather than as a
-    /// count, so a span of nvmux's around a span of the session's would end
-    /// at the session's reset and present the frame early — exactly the tear
-    /// the span was opened to prevent. One sighting is enough to stand down
-    /// for the rest of the relay: a client that brackets one frame brackets
-    /// them all, and its frames are already whole without help.
+    /// If so, nvmux must not wrap relayed writes in its own (see
+    /// `Attachment::write_session_frame` in [`crate::pty`]): terminals treat
+    /// `?2026` as a mode, not a count, so the session's reset would end
+    /// nvmux's span early and tear the frame. A client that brackets once
+    /// brackets every frame.
     pub fn session_brackets_its_own_frames(&self) -> bool {
         self.parser.seen_sync
     }
 
-    /// When the kept tail goes out whether or not the rest of it has arrived,
-    /// or `None` while nothing is kept.
+    /// When the kept tail is flushed regardless, or `None` if nothing is kept.
     ///
-    /// Also `None` while a frame close is being held, and that is the whole
-    /// of what stopped this working. The relay flushes an impatient tail
-    /// *before* it offers the notice its turn, so a deadline already past
-    /// took the held close away on the same pass that held it — and the
-    /// notice's only moment on a session that brackets its frames is that
-    /// close. Three flights in eight showed no box at all. Nothing is being
-    /// waited for here: the close goes out a few microseconds later, on this
-    /// same pass, as soon as the notice has had its chance at it.
+    /// Also `None` while a frame close is held: otherwise a past deadline
+    /// flushes the close before the notice gets its turn (see
+    /// [`Boundary::relay`]). The close goes out on the same pass anyway.
     pub fn due(&self) -> Option<Instant> {
         if self.holding_the_sessions_close() {
             return None;
@@ -375,19 +243,12 @@ impl Boundary {
         self.since.map(|since| since + KEPT_FOR)
     }
 
-    /// Everything kept back, complete or not: what the relay writes when the
-    /// wait is over, and what it writes on the way out so that no byte the
-    /// client produced is lost with the notice that caused it to be held.
+    /// Return everything kept, complete or not, when the wait is over or on
+    /// exit, so no client byte is lost.
     ///
-    /// A frame close being held goes out in that, so the hold on it is
-    /// dropped here too. Leaving it set is the one way this type can lie:
-    /// [`Boundary::between_sequences`] would go on saying the terminal is
-    /// waiting at a frame boundary that has already gone past it, and the
-    /// notice would be written wherever the flush happened to end — which on
-    /// a busy session is the middle of a character or a CSI. Measured before
-    /// it was found: two of a flight's frames had the box laid down inside
-    /// the session's own `\xe2\x94\x8c`, and the session's next 41 KiB went
-    /// to the terminal with no span around it at all.
+    /// Clears any held close too. Leaving it set made
+    /// [`Boundary::between_sequences`] report a boundary that had passed, and
+    /// the box was written mid-character (seen inside a `\xe2\x94\x8c`).
     pub fn give_up(&mut self) -> Vec<u8> {
         self.parser.feed(&self.kept);
         self.since = None;
@@ -395,8 +256,6 @@ impl Boundary {
         std::mem::take(&mut self.kept)
     }
 
-    /// Whether the tail has waited long enough, or grown large enough, to go
-    /// out unfinished.
     fn out_of_patience(&self, now: Instant) -> bool {
         self.kept.len() >= KEPT_MAX
             || self
@@ -405,81 +264,70 @@ impl Boundary {
     }
 }
 
-/// How many of a CSI's parameter and intermediate bytes are remembered.
+/// How many CSI parameter and intermediate bytes are kept.
 ///
-/// Only one sequence is ever recognised by its parameters, and it is
-/// `? 2026`. Generous for that: a terminfo entry that sets the synchronized
-/// update alongside every other mode it wants — `? 1049 ; 1002 ; 1006 ; 2026
-/// h` — still fits. A CSI longer than this is read as an ordinary sequence
-/// and the rest of its parameters are thrown away rather than grown a buffer
-/// for, which is the safe direction for everything but that one mode.
+/// Only `? 2026` is recognised by its parameters; 32 fits combined forms like
+/// `? 1049 ; 1002 ; 1006 ; 2026 h`. Longer parameters are discarded and the
+/// CSI is treated as ordinary.
 const PARAMS: usize = 32;
 
-/// Where the terminal's parser stands.
-///
-/// Plain data and `Copy`, which is what lets [`Parser::scan`]
-/// run a scan ahead of itself and keep the answer.
+/// The terminal's parser state. `Copy`, so [`Parser::scan`] can scan ahead on
+/// a copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Parser {
     state: State,
-    /// Continuation bytes a UTF-8 character still owes.
+    /// Continuation bytes the current UTF-8 character still needs.
     owed: u8,
     params: [u8; PARAMS],
-    /// How much of `params` is filled, or `PARAMS + 1` once it has overflowed
-    /// and the sequence can no longer be the one that matters.
+    /// Bytes used in `params`, or `PARAMS + 1` once overflowed.
     used: usize,
-    /// How deep the session is inside its own synchronized updates.
+    /// Nesting depth of the session's synchronized updates.
     sync: u32,
-    /// Whether the session has ever opened or closed one at all.
+    /// Whether the session has ever opened or closed one.
     seen_sync: bool,
-    /// How many `DECSC`s the session has not taken back with a `DECRC`.
+    /// `DECSC`s not yet matched by a `DECRC`.
     saved: u32,
 }
 
-/// Where a scan of some bytes got to, and what it passed on the way.
+/// Result of [`Parser::scan`].
 #[derive(Debug, Clone, Copy)]
 struct Scan {
     /// Index just past the last byte that ends a sequence.
     rest: usize,
-    /// The two counters as they stood there.
+    /// `(sync, saved)` at `rest`.
     counters: (u32, u32),
-    /// The session's last frame close, if it made one.
+    /// The first frame close in the scan, if any.
     close: Option<Close>,
     /// Whether the session has ever bracketed a frame, this scan included.
     brackets: bool,
 }
 
-/// A synchronized update of the session's, ending.
+/// The session's closing `CSI ? 2026 l`.
 #[derive(Debug, Clone, Copy)]
 struct Close {
-    /// Index of the first byte of the closing sequence.
     starts: usize,
     /// Index just past its last byte.
     ends: usize,
-    /// The counters as they stood in front of it — still inside the frame.
+    /// `(sync, saved)` just before it, still inside the frame.
     counters: (u32, u32),
 }
 
-/// What the parser is in the middle of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// Between sequences: the next byte starts something new.
+    /// Between sequences.
     Ground,
-    /// Inside a UTF-8 character.
     Utf8,
     /// An `ESC` with nothing after it yet.
     Escape,
-    /// An `ESC` and its intermediate bytes, waiting for the final one:
-    /// `ESC ( B` and its kind.
+    /// `ESC` plus intermediate bytes awaiting a final byte, as in `ESC ( B`.
     Intermediate,
-    /// `ESC [`: parameters and intermediates until a final byte.
     Csi,
-    /// `ESC ]`: an operating-system command, until `BEL` or `ST`.
+    /// Until `BEL` or `ST`.
     Osc,
-    /// `ESC P`, `ESC X`, `ESC ^`, `ESC _`: a control string, until `ST`.
+    /// `ESC P`, `ESC X`, `ESC ^`, `ESC _`: until `ST`.
     String,
-    /// An `ESC` inside a string: the first half of `ST`, or the start of
-    /// something new that abandons the string where it stands.
+    /// `ESC` inside a string: half of `ST`, or a new sequence that ends the
+    /// string.
     StringEscape,
 }
 
@@ -498,15 +346,13 @@ impl Default for Parser {
 }
 
 impl Parser {
-    /// Watch these bytes go to the terminal.
     fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.byte(byte);
         }
     }
 
-    /// Run over `bytes` without moving, and say where the interesting places
-    /// in them are.
+    /// Scan `bytes` without advancing `self`.
     fn scan(&self, bytes: &[u8]) -> Scan {
         let mut scan = *self;
         let mut found = Scan {
@@ -515,8 +361,7 @@ impl Parser {
             close: None,
             brackets: self.seen_sync,
         };
-        // Where the sequence being read began, so a span close can be cut in
-        // front of rather than behind.
+        // Start of the current sequence, so a close can be cut before it.
         let mut started = 0;
         for (i, &byte) in bytes.iter().enumerate() {
             let was_ground = scan.at_sequence_boundary();
@@ -528,14 +373,10 @@ impl Parser {
             if scan.at_sequence_boundary() {
                 found.rest = i + 1;
                 found.counters = (scan.sync, scan.saved);
-                // The session closing a frame of its own: the one place
-                // nvmux's box can be put *into* that frame rather than after
-                // it. Recorded in front of the sequence rather than behind
-                // it — and the *first* in the read rather than the last,
-                // because a close handed out with nothing in front of it is a
-                // frame the terminal presents without the box. One read can
-                // hold several; stopping at the first costs a pass of the
-                // relay and gives each of them its own turn.
+                // A frame close, where the box can go into the frame. Record
+                // the first, not the last: any close handed out unheld is a
+                // frame presented without the box. Later ones get their turn
+                // on later relay passes.
                 if inside_a_frame == 1 && scan.sync == 0 && found.close.is_none() {
                     found.close = Some(Close {
                         starts: started,
@@ -549,7 +390,7 @@ impl Parser {
         found
     }
 
-    /// Move to `at`, with the two counters as they stood there.
+    /// Advance to a ground position `at` from a scan, with its counters.
     fn take(&mut self, at: usize, counters: (u32, u32), brackets: bool) {
         if at == 0 {
             return;
@@ -557,21 +398,19 @@ impl Parser {
         *self = Parser {
             sync: counters.0,
             saved: counters.1,
-            // Not a counter and never unlearned: a session that brackets its
-            // frames once brackets them always.
+            // Never unlearned.
             seen_sync: brackets,
             ..Parser::default()
         };
     }
 
-    /// Whether the next byte would start something new: nothing is half-read.
-    /// Where the stream may be cut.
+    /// Nothing is half-read; the stream may be cut here.
     fn at_sequence_boundary(&self) -> bool {
         self.state == State::Ground
     }
 
-    /// Where nvmux may write: between sequences, and with nothing the session
-    /// opened still open.
+    /// Where nvmux may write: at a boundary with no session span or saved
+    /// cursor open.
     fn at_rest(&self) -> bool {
         self.at_sequence_boundary() && self.sync == 0 && self.saved == 0
     }
@@ -586,8 +425,7 @@ impl Parser {
                         self.state = State::Ground;
                     }
                 } else {
-                    // Not the continuation it was promised: the character is
-                    // malformed and this byte starts something of its own.
+                    // Malformed character; this byte starts afresh.
                     self.state = State::Ground;
                     self.ground(byte);
                 }
@@ -596,7 +434,7 @@ impl Parser {
             State::Intermediate => match byte {
                 0x20..=0x2f => {}
                 0x1b => self.state = State::Escape,
-                // The final byte, and the end of the sequence.
+                // Final byte.
                 _ => self.state = State::Ground,
             },
             State::Csi => match byte {
@@ -608,8 +446,7 @@ impl Parser {
                 0x1b => self.state = State::Escape,
                 0x18 | 0x1a => self.state = State::Ground,
                 0x20..=0x3f => self.parameter(byte),
-                // A C0 control inside a CSI is executed and the sequence goes
-                // on; anything else here cannot happen in a byte's range.
+                // A C0 control inside a CSI is executed and the CSI goes on.
                 _ => {}
             },
             State::Osc | State::String => match byte {
@@ -620,11 +457,10 @@ impl Parser {
             },
             State::StringEscape => {
                 if byte == b'\\' {
-                    // `ESC \`, the string terminator.
+                    // `ESC \` (ST).
                     self.state = State::Ground;
                 } else {
-                    // Not a terminator, so the `ESC` was the start of
-                    // something new and the string ended where it stood.
+                    // The `ESC` began a new sequence, ending the string.
                     self.escape(byte);
                 }
             }
@@ -634,9 +470,8 @@ impl Parser {
     fn ground(&mut self, byte: u8) {
         match byte {
             0x1b => self.state = State::Escape,
-            // A UTF-8 lead byte, and how many continuations it owes. `0xf8`
-            // and above lead nothing: they are not UTF-8 at all, and are left
-            // to pass as the single stray byte they are.
+            // UTF-8 lead byte. `0xf8` and above are not UTF-8 and pass as
+            // single stray bytes.
             0xc0..=0xf7 => {
                 self.owed = if byte < 0xe0 {
                     1
@@ -658,15 +493,13 @@ impl Parser {
                 self.state = State::Csi;
             }
             b']' => self.state = State::Osc,
-            // DCS, SOS, PM, APC: all run to a string terminator.
+            // DCS, SOS, PM, APC: all run to ST.
             b'P' | b'X' | b'^' | b'_' => self.state = State::String,
             0x1b => self.state = State::Escape,
             0x20..=0x2f => self.state = State::Intermediate,
             _ => {
-                // `ESC 7` and `ESC 8`: the terminal's one cursor save slot,
-                // which the notice writes to as well. Saturating rather than
-                // wrapping, and a restore with nothing saved is the terminal's
-                // own business and not a negative depth here.
+                // `ESC 7` / `ESC 8` (DECSC/DECRC). Saturating: a restore with
+                // nothing saved is not a negative depth.
                 if byte == b'7' {
                     self.saved = self.saved.saturating_add(1);
                 } else if byte == b'8' {
@@ -682,14 +515,13 @@ impl Parser {
             self.params[self.used] = byte;
             self.used += 1;
         } else {
-            // Past what is remembered: this is not `? 2026` and cannot become
-            // it. Marked so, rather than left looking like a full buffer.
+            // Overflowed: cannot be `? 2026`. Marked distinct from a full
+            // buffer.
             self.used = PARAMS + 1;
         }
     }
 
-    /// A CSI has ended. The only one worth recognising is the synchronized
-    /// update, whose span nvmux must not write inside.
+    /// A CSI ended; only synchronized update set/reset is tracked.
     fn csi_final(&mut self, byte: u8) {
         if byte != b'h' && byte != b'l' {
             return;
@@ -715,9 +547,8 @@ impl Parser {
 mod tests {
     use super::*;
 
-    /// A screenful as `nvim --remote-ui` writes one when the session is a
-    /// starfield: a truecolour pair per cell and a half block to paint it in.
-    /// What every test here is cut up and fed.
+    /// A screenful like `nvim --remote-ui` writes for a starfield: a
+    /// truecolour pair and a half block per cell.
     fn frame() -> Vec<u8> {
         let mut out = Vec::new();
         for row in 1..=24u32 {
@@ -732,16 +563,14 @@ mod tests {
         out
     }
 
-    /// Where the terminal has been left, having been shown `bytes` — which is
-    /// what [`Boundary::saw_session`] answers and what a tail given up on produces.
+    /// A boundary that has been shown `bytes` as the session's.
     fn shown(bytes: &[u8]) -> Boundary {
         let mut boundary = Boundary::new();
         boundary.saw_session(bytes);
         boundary
     }
 
-    /// Where a stream is between sequences, byte by byte: `true` at index `i`
-    /// means the parser rests after `bytes[..=i]`.
+    /// `true` at index `i` means the parser rests after `bytes[..=i]`.
     fn rests(bytes: &[u8]) -> Vec<bool> {
         let mut parser = Parser::default();
         bytes
@@ -753,8 +582,7 @@ mod tests {
             .collect()
     }
 
-    /// The whole of what a boundary hands out for `chunks`, plus whatever it
-    /// was still keeping at the end.
+    /// Everything handed out for `chunks`, plus what is kept at the end.
     fn through(chunks: &[&[u8]]) -> Vec<u8> {
         let mut boundary = Boundary::new();
         let now = Instant::now();
@@ -766,7 +594,6 @@ mod tests {
         out
     }
 
-    /// Nothing of an escape sequence is a place to write except its end.
     #[test]
     fn a_cut_escape_sequence_is_not_a_place_to_write() {
         for seq in [
@@ -789,8 +616,6 @@ mod tests {
         }
     }
 
-    /// The bytes of one character are one thing, and a box dropped between
-    /// them paints neither.
     #[test]
     fn a_character_is_never_split_down_the_middle() {
         let text = "aé▀😀z";
@@ -805,10 +630,8 @@ mod tests {
         }
     }
 
-    /// The whole reason for the tail: a read of a screenful almost never ends
-    /// where a sequence does, so a notice repainted only on the reads that do
-    /// would still blink. Measured on a real flight at about one in six; a
-    /// synthetic frame is tighter, and either way it is nowhere near enough.
+    /// Why the tail is kept: few reads end on a sequence boundary (about one
+    /// in six in real output).
     #[test]
     fn a_read_of_a_frame_rarely_ends_between_sequences() {
         let frame = frame();
@@ -830,8 +653,6 @@ mod tests {
         );
     }
 
-    /// And what the tail buys: whatever the read was cut at, what reaches the
-    /// terminal ends between sequences.
     #[test]
     fn what_is_handed_out_always_ends_between_sequences() {
         let frame = frame();
@@ -848,8 +669,6 @@ mod tests {
         }
     }
 
-    /// A kept byte is never dropped, reordered or changed, however the reads
-    /// fell.
     #[test]
     fn everything_kept_back_comes_out_in_the_order_it_arrived() {
         let frame = frame();
@@ -859,8 +678,6 @@ mod tests {
         }
     }
 
-    /// The parser is the terminal's, so nvmux's own writes move it too — and
-    /// what nvmux writes leaves it where it found it.
     #[test]
     fn what_nvmux_writes_over_a_session_leaves_the_parser_where_it_was() {
         let mut boundary = Boundary::new();
@@ -873,8 +690,7 @@ mod tests {
         );
     }
 
-    /// Terminals do not nest synchronized updates, so a box dropped inside the
-    /// client's would end it early and present a frame drawn half way.
+    /// Terminals do not nest synchronized updates.
     #[test]
     fn nothing_is_written_inside_the_sessions_own_synchronized_update() {
         let mut boundary = shown(b"\x1b[?2026h");
@@ -888,8 +704,7 @@ mod tests {
         assert!(boundary.between_sequences(), "the span closed");
     }
 
-    /// The same mode set with its neighbours, which is how a terminfo entry
-    /// spells one.
+    /// As terminfo entries spell it.
     #[test]
     fn a_synchronized_update_is_recognised_among_other_modes() {
         let mut boundary = shown(b"\x1b[?1049;2026h");
@@ -898,8 +713,7 @@ mod tests {
         assert!(boundary.between_sequences());
     }
 
-    /// Modes that merely look like it are not it. `20268` is not `2026`, and
-    /// the public `CSI 2026 h` is a different sequence from the private one.
+    /// `20268`, the public `CSI 2026 h`, and the DECRQM query.
     #[test]
     fn a_mode_that_is_not_the_synchronized_update_is_left_alone() {
         for set in [&b"\x1b[?20268h"[..], b"\x1b[2026h", b"\x1b[?2026$p"] {
@@ -910,10 +724,6 @@ mod tests {
         }
     }
 
-    /// One frame of the session's own is enough to stand down for the rest of
-    /// the relay: what nvmux does with the answer is stop wrapping its own
-    /// span around a write, and a client that brackets one frame brackets
-    /// them all.
     #[test]
     fn a_session_that_brackets_a_frame_is_remembered_for_having_done_it() {
         let mut boundary = Boundary::new();
@@ -929,13 +739,8 @@ mod tests {
         );
     }
 
-    /// Every frame of the notice is bracketed in a synchronized update of its
-    /// own, so a parser that learned from those would decide, on the strength
-    /// of nvmux's own handwriting, that the session brackets its frames — and
-    /// stand the whole mechanism down after the first box.
-    ///
-    /// Not hypothetical: that is what it did, and the duty cycle came back at
-    /// 13% instead of 100%, which is the only reason anybody looked.
+    /// Regression: learning from the notice's own spans disabled the
+    /// mechanism after the first box (13% duty cycle instead of 100%).
     #[test]
     fn the_notices_own_brackets_are_not_the_sessions() {
         let mut boundary = Boundary::new();
@@ -948,17 +753,9 @@ mod tests {
         assert!(boundary.between_sequences());
     }
 
-    /// **The moment that matters on a terminal anybody actually has.** A
-    /// session that brackets its frames has taken the terminal's choice of
-    /// when to present away from it, so a box written after its closing
-    /// `CSI ? 2026 l` is a box the terminal has already shown one frame
-    /// without. The close is therefore held back, the box goes in front of
-    /// it, and the frame the session presents is the frame with the box.
-    ///
-    /// Measured against a terminal that answers the synchronized-update
-    /// query — which is nearly all of them, and which the reproduction did
-    /// not until it was made to: without this the notice went up once in its
-    /// whole second and was on the screen for 15 ms of it.
+    /// The common case: a bracketing session's close is held so the box goes
+    /// inside its frame. Without this the notice was visible 15 ms of its
+    /// second.
     #[test]
     fn the_notice_goes_inside_the_frame_the_session_is_about_to_present() {
         let mut boundary = Boundary::new();
@@ -983,18 +780,13 @@ mod tests {
             "the one moment the box belongs in is refused"
         );
 
-        // The notice goes in, and the close follows it.
         boundary.saw_own(b"\x1b[?2026h\x1b7box\x1b8\x1b[?2026l");
         assert_eq!(boundary.release_the_sessions_close(), b"\x1b[?2026l");
         assert!(!boundary.holding_the_sessions_close());
     }
 
-    /// A session that is closing a frame is a session that has finished what
-    /// it was saying, which is exactly what the patience clock is waiting to
-    /// hear — so the close is taken whatever the clock says, and nothing is
-    /// due while it is held. Without both halves the relay flushes the close
-    /// away on the pass that held it, since it unsticks a tail before it
-    /// offers the notice a turn, and the box is never written at all.
+    /// A close is held even past the deadline, and nothing is due while it
+    /// is; otherwise the relay flushes it before the notice gets a turn.
     #[test]
     fn a_frame_close_is_worth_more_than_the_clock_that_would_flush_it() {
         let mut boundary = Boundary::new();
@@ -1006,7 +798,7 @@ mod tests {
             "an ordinary tail is on the clock"
         );
 
-        // Long past the deadline, and a frame closing in this read.
+        // Past the deadline, with a frame close in this read.
         let late = t0 + KEPT_FOR + KEPT_FOR;
         let ready = boundary.relay(b"2;1Hmore\x1b[?2026l\x1b[?2026h\x1b[3;1H", late);
         assert_eq!(
@@ -1025,26 +817,20 @@ mod tests {
         assert_eq!(boundary.release_the_sessions_close(), b"\x1b[?2026l");
     }
 
-    /// The relay does not always come back for a held close: a tail that has
-    /// waited long enough goes out on its own, and the close goes with it.
-    /// After that there is no frame boundary to write into any more, and
-    /// saying there is puts the box wherever the flush stopped — measured, in
-    /// the middle of a character the session was half way through.
-    ///
-    /// The run this was found in had `release_kept` firing between the read
-    /// that held a close and the pass that would have released it, which is
-    /// the ordinary order of the relay loop rather than a corner of it.
+    /// Regression: a held close flushed with the tail (as `release_kept` does
+    /// in the normal relay order) must stop counting as a boundary, or the box
+    /// lands wherever the flush ended, e.g. mid-character.
     #[test]
     fn a_close_that_goes_out_with_the_tail_stops_being_a_moment_to_write_in() {
         let mut boundary = Boundary::new();
         let now = Instant::now();
-        // A frame closing, and the next one opening and stopping mid-character.
+        // A frame close, then the next frame stopping mid-character.
         boundary.relay(b"\x1b[?2026h\x1b[1;1Hdrawing", now);
         let held = boundary.relay(b"\x1b[?2026l\x1b[?2026h\x1b[2;3H\xe2\x94", now);
         assert!(held.is_empty(), "the close went out ahead of the notice");
         assert!(boundary.holding_the_sessions_close());
 
-        // The tail runs out of patience before the notice gets its turn.
+        // The tail times out before the notice gets its turn.
         let flushed = boundary.give_up();
         assert_eq!(
             flushed, b"\x1b[?2026l\x1b[?2026h\x1b[2;3H\xe2\x94",
@@ -1060,8 +846,6 @@ mod tests {
         );
     }
 
-    /// Held for one write of nvmux's and no longer: the session's bytes are
-    /// delayed, never dropped, reordered or changed.
     #[test]
     fn a_held_frame_close_is_the_next_thing_out_after_the_notice() {
         let frame = b"\x1b[?2026h\x1b[1;1Hhello\x1b[?2026l\x1b[?2026h\x1b[2;1Hagain\x1b[?2026l";
@@ -1078,8 +862,6 @@ mod tests {
         }
     }
 
-    /// A span the session has opened closes the terminal to nvmux and not to
-    /// the session: its own bytes go on through, cut where its sequences end.
     #[test]
     fn a_synchronized_span_holds_back_nothing_of_the_sessions_own() {
         let mut boundary = Boundary::new();
@@ -1092,8 +874,7 @@ mod tests {
         assert!(boundary.between_sequences());
     }
 
-    /// The terminal has one cursor save slot and the notice writes to it.
-    /// Between a client's `DECSC` and its `DECRC` the slot is the client's.
+    /// The notice also uses the terminal's single cursor save slot.
     #[test]
     fn nothing_is_written_between_the_sessions_save_and_its_restore() {
         let mut boundary = shown(b"\x1b7");
@@ -1104,8 +885,7 @@ mod tests {
         assert!(boundary.between_sequences(), "the client took it back");
     }
 
-    /// A client that has stopped in the middle of a sequence may be waiting
-    /// for the terminal's answer to it, so the wait has an end.
+    /// A client stopped mid-sequence may be waiting for the terminal's answer.
     #[test]
     fn a_tail_that_never_finishes_goes_out_anyway() {
         let mut boundary = Boundary::new();
@@ -1125,9 +905,6 @@ mod tests {
         );
     }
 
-    /// Without patience, a tail is kept however long the rest of it takes,
-    /// and what is handed out always leaves the terminal between sequences:
-    /// there is always a place to put a frame after it.
     #[test]
     fn a_whole_relay_keeps_an_unfinished_tail_for_as_long_as_it_takes() {
         let mut boundary = Boundary::new();
@@ -1148,8 +925,7 @@ mod tests {
         assert_eq!(out, whole, "all of it, in order, once the last piece came");
     }
 
-    /// A frame close is no reason to stop a whole relay short: its caller
-    /// writes the frame of its own after all of what it hands out.
+    /// Its caller writes its own frame after everything handed out.
     #[test]
     fn a_whole_relay_hands_out_a_frame_close_with_the_rest() {
         let mut boundary = Boundary::new();
@@ -1158,9 +934,8 @@ mod tests {
         assert!(boundary.release_the_sessions_close().is_empty());
     }
 
-    /// A string with no end in sight goes out once there is [`KEPT_MAX`] of
-    /// it, unfinished, as it does from a patient relay; and what came before
-    /// it goes out at once, whatever follows it in the read.
+    /// An unterminated string goes out unfinished at [`KEPT_MAX`]; a long
+    /// read of complete sequences is not mistaken for one.
     #[test]
     fn a_whole_relay_lets_a_string_with_no_end_go() {
         let mut boundary = Boundary::new();
@@ -1190,8 +965,7 @@ mod tests {
         assert!(!boundary.mid_sequence());
     }
 
-    /// An OSC 52 clipboard write has no length limit, and accumulating one
-    /// here would hold the session's own output while it ran.
+    /// An OSC 52 clipboard write has no length limit.
     #[test]
     fn a_string_with_no_end_to_it_is_not_kept_for_ever() {
         let mut boundary = Boundary::new();
@@ -1211,11 +985,8 @@ mod tests {
         );
     }
 
-    /// The invariant [`Parser::scan`] throws its scanning copy away on, and
-    /// [`Parser::take`] rebuilds a parser from: at a sequence boundary the
-    /// parser is the one it started as but for its two counters and
-    /// `seen_sync`, so the scan has nothing to carry back but an index and
-    /// those.
+    /// The invariant [`Parser::take`] relies on: at a boundary, only the
+    /// counters and `seen_sync` carry state (`params` is reset per CSI).
     #[test]
     fn a_parser_between_sequences_carries_only_its_counters() {
         let mut parser = Parser::default();
@@ -1233,9 +1004,7 @@ mod tests {
         }
     }
 
-    /// A stray `ESC` abandons whatever was being read rather than being
-    /// swallowed by it, or a session that wrote one inside an OSC would never
-    /// be written over again.
+    /// Otherwise a stray `ESC` inside an OSC would block nvmux forever.
     #[test]
     fn an_escape_abandons_the_string_it_lands_in() {
         let mut boundary = shown(b"\x1b]0;a title");
@@ -1247,14 +1016,11 @@ mod tests {
         );
     }
 
-    /// Plain text is all boundary, which is the common case and the cheap one.
     #[test]
     fn a_run_of_plain_text_is_a_boundary_at_every_byte() {
         assert!(rests(b"the quick brown fox").iter().all(|r| *r));
     }
 
-    /// A boundary starts where a relay does: the terminal has been handed over
-    /// with complete sequences and is waiting for the session's first.
     #[test]
     fn a_new_boundary_is_between_sequences() {
         let boundary = Boundary::new();

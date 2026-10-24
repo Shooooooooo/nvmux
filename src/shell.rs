@@ -1,20 +1,14 @@
 //! Shell quoting, and the scripts that run on the session host.
 //!
-//! Spawning a remote session crosses **two** layers of shell: `ssh host cmd`
-//! joins its arguments with spaces and the remote login shell parses them again.
-//! Getting this wrong is a command injection, not a cosmetic bug.
-//!
-//! So no command *string* is ever built with interpolated values. Scripts are
-//! fixed text delivered on stdin, and every variable part arrives as a
-//! positional argument the remote shell never re-parses. [`quote`] covers the
-//! one place a value is embedded in shell text at all: the `set --` list that
-//! [`crate::proc::Shell`] writes ahead of each script, which one known POSIX
-//! `sh` reads once, as one literal word per value.
+//! A remote spawn crosses two shells: `ssh host cmd` joins its arguments with
+//! spaces and the login shell parses them again, so bad quoting is a command
+//! injection. No command string is built with interpolated values: scripts
+//! are fixed text on stdin and values arrive as positional arguments. The one
+//! place [`quote`] embeds values is the `set --` list [`crate::proc::Shell`]
+//! writes ahead of each script, read once by a known POSIX `sh`.
 
 /// Single-quote a value so a POSIX shell reads it as exactly one literal word.
-///
-/// POSIX single quotes have no escape sequences, so the only case to handle is
-/// the quote itself: close, insert an escaped quote, reopen.
+/// Single quotes have no escapes, so a `'` becomes `'\''`.
 pub fn quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes().all(|b| {
@@ -25,7 +19,7 @@ pub fn quote(s: &str) -> String {
                 )
         })
     {
-        // Nothing a shell would look at twice; bare keeps logs readable.
+        // Safe unquoted; keeps logs readable.
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len() + 2);
@@ -41,7 +35,6 @@ pub fn quote(s: &str) -> String {
     out
 }
 
-/// Join arguments into a single shell word list.
 pub fn quote_all<I, S>(args: I) -> String
 where
     I: IntoIterator<Item = S>,
@@ -53,29 +46,24 @@ where
         .join(" ")
 }
 
-/// Wrap a command so it runs under the user's **login** shell. Used by
-/// `ssh::shell_args` to start the shell every remote script runs in.
+/// Wrap a command so it runs under the user's login shell (for
+/// `ssh::shell_args`).
 ///
-/// sshd runs a command as `<login shell> -c <command>`, so the outermost layer
-/// is parsed by whatever the user's login shell is, and that need not be POSIX:
-/// fish refuses `${`, csh and tcsh refuse the `:-` modifier. So the login shell
-/// is given nothing but `exec sh -c` and one single-quoted word with no `\`,
-/// `'` or `!` in it, which sh, bash, zsh, ksh, fish, csh and tcsh all read as
-/// the same literal. Everything else happens in that `sh`:
+/// sshd runs `<login shell> -c <command>`, and the login shell may not be
+/// POSIX: fish refuses `${`, csh and tcsh refuse `:-`. So it gets only
+/// `exec sh -c` and one single-quoted word without `\`, `'` or `!`, which sh,
+/// bash, zsh, ksh, fish, csh and tcsh all read as the same literal:
 ///
 /// ```text
 /// exec sh -c 'case $SHELL in *csh) exec "$SHELL" -c "<inner>";; *) exec "${SHELL:-/bin/bash}" -l -c "<inner>";; esac'
 /// ```
 ///
-/// `$SHELL` is double-quoted so a value containing a space stays one word. The
-/// csh family is the one exception to `-l`: tcsh refuses `-l` beside any other
-/// flag, and csh accepts it but still skips `.login`. Both read `.cshrc` under
-/// `-c`, which is where their users set `path`.
+/// `$SHELL` is quoted in case it holds a space. The csh family gets no `-l`:
+/// tcsh refuses it beside other flags and csh still skips `.login`; both read
+/// `.cshrc` under `-c`.
 ///
-/// `inner` lands inside double quotes inside that single-quoted word, so it
-/// must be plain words that no shell would read twice; anything else panics,
-/// because it is a bug at the call site rather than a runtime condition.
-/// Values never travel this way anyway: they go down the shell's stdin.
+/// Panics unless `inner` is plain words needing no quoting, since it sits in
+/// double quotes inside that word. Values go on stdin instead.
 pub fn login_shell_wrapper(inner: &str) -> String {
     assert!(
         inner.split(' ').all(|w| quote(w) == w),
@@ -86,63 +74,48 @@ pub fn login_shell_wrapper(inner: &str) -> String {
     )
 }
 
-/// Prepended to every script below, so what reaches the session host is one
-/// self-contained program on stdin. A script run straight from a checkout
-/// sources the same file instead — see `scripts/_prelude.sh`.
+/// Prepends `scripts/_prelude.sh` so each script reaches the host as one
+/// self-contained program. Run from a checkout, a script sources it instead.
 macro_rules! with_prelude {
     ($($tail:expr),+ $(,)?) => {
         concat!(include_str!("../scripts/_prelude.sh"), $($tail),+)
     };
 }
 
-/// A shipped script file with the prelude in front of it.
 macro_rules! script {
     ($file:literal) => {
         with_prelude!(include_str!($file))
     };
 }
 
-/// Lists sessions on the host that owns them.
-///
-/// Batch-shaped on purpose: every session in one invocation, with liveness
-/// already decided. Each `ssh` round trip costs ~230 ms even to localhost, so a
-/// per-session API would feel fine locally and be unusable over a real link.
+/// Lists every session on the host, liveness included, in one invocation:
+/// each `ssh` round trip costs ~230 ms even to localhost.
 pub const LIST_SCRIPT: &str = script!("../scripts/list.sh");
 
 pub const SPAWN_SCRIPT: &str = script!("../scripts/spawn.sh");
 
 pub const KILL_SCRIPT: &str = script!("../scripts/kill.sh");
 
-/// Opens a remote host: the probe *and* the first listing, in one round trip.
-///
-/// Two files joined rather than a third one written, so the listing a
-/// connection opens with comes from the same code every later refresh runs.
-/// `hello.sh` prints what nvmux needs to know about the host and leaves the
-/// runtime directory in `$1`, which is exactly what `list.sh` reads.
+/// Probes a remote host and lists its sessions in one round trip. `hello.sh`
+/// leaves the runtime directory in `$1` for `list.sh`, so the first listing
+/// runs the same code as every refresh.
 pub const HELLO_SCRIPT: &str = with_prelude!(
     include_str!("../scripts/hello.sh"),
     include_str!("../scripts/list.sh")
 );
 
-/// Writes `<id>.json` on the session host. Used by the SSH transport, where
-/// Rust cannot reach the file directly.
+/// Writes `<id>.json` on the session host, for the SSH transport.
 pub const WRITE_META_SCRIPT: &str = script!("../scripts/write_meta.sh");
 
-/// Rewrites the numbers of reordered sessions, every one of them in a single
-/// run. Its own script rather than a variadic `write_meta.sh`, because that one
-/// creates a session's metadata and this one may only edit what is already
-/// there — see the comment it carries about orphans.
+/// Rewrites the numbers of reordered sessions in one run. Separate from
+/// `write_meta.sh` because it may only edit existing metadata, never create
+/// it (see its note on orphans).
 pub const RENUMBER_SCRIPT: &str = script!("../scripts/renumber.sh");
 
-/// Lists the subdirectories of one directory, for the create prompt's
-/// completion.
-///
-/// Batch-shaped like [`LIST_SCRIPT`] and for the same reason: one invocation
-/// answers for a whole directory, so typing a path costs about one round trip
-/// per `/` rather than one per keystroke.
+/// Lists the subdirectories of one directory for the create prompt's
+/// completion: one round trip per `/` typed, not per keystroke.
 pub const DIRS_SCRIPT: &str = script!("../scripts/dirs.sh");
 
-/// Every script, for the tests that check all of them the same way.
 #[cfg(test)]
 const SCRIPTS: &[(&str, &str)] = &[
     ("list.sh", LIST_SCRIPT),
@@ -161,11 +134,7 @@ mod tests {
     use crate::test_support::{scratch_dir, scratch_path, scratch_sock};
     use std::process::{Child, Command};
 
-    /// Ask a real `/bin/sh` what it made of our quoting.
-    ///
-    /// The point of this helper is that the assertions below are not checking
-    /// our idea of shell syntax against itself — they round-trip through the
-    /// actual parser that will see these strings in production.
+    /// Round-trip a word through a real `/bin/sh`.
     fn sh_echo(word: &str) -> String {
         let out = Command::new("/bin/sh")
             .arg("-c")
@@ -250,12 +219,9 @@ mod tests {
         );
     }
 
-    /// The outermost layer is parsed by the user's login shell, which may be
-    /// fish or tcsh. What it sees must mean the same thing to all of them:
-    /// plain words and one single-quoted word, with none of the characters
-    /// that fish (`\`) or csh (`!`) still act on inside single quotes. Every
-    /// `$` — and so every `${` — is inside that word, for `sh` alone. The
-    /// shells themselves are run on this in `ssh`'s tests.
+    /// The login shell may be fish or tcsh: it must see plain words and one
+    /// single-quoted word holding every `$`, without the `\` (fish) or `!`
+    /// (csh) they act on inside single quotes. `ssh`'s tests run the shells.
     #[test]
     fn the_login_shell_sees_plain_words_and_one_literal() {
         let w = login_shell_wrapper("exec sh -s");
@@ -290,12 +256,8 @@ mod tests {
         login_shell_wrapper(r#"printf %s "$HOME""#);
     }
 
-    /// Strip comments and POSIX character classes so the bashism scan below
-    /// looks only at code.
-    ///
-    /// Both exclusions are load-bearing: `[[:space:]]` is a perfectly portable
-    /// character class that contains `[[` and `]]`, and the word "local"
-    /// appears in prose. Without this the scan rejects correct scripts.
+    /// Strip comment lines and POSIX character classes for the bashism scan:
+    /// `[[:space:]]` contains `[[` and `]]`, and comments say "local".
     fn code_only(script: &str) -> String {
         script
             .lines()
@@ -309,8 +271,7 @@ mod tests {
             .replace("[[:alnum:]]", "")
     }
 
-    /// Every shipped script carries the prelude, and carries it once: a script
-    /// delivered without it would die on the first `finish` with "not found".
+    /// Without the prelude a script dies on its first `finish`: "not found".
     #[test]
     fn every_script_ships_with_exactly_one_prelude() {
         for &(name, body) in SCRIPTS {
@@ -326,33 +287,23 @@ mod tests {
         }
     }
 
-    /// Deliver a script the way `ssh` does — on stdin, with `args` as `$1..$n`.
+    /// Run a script as `ssh` delivers it: on stdin, with `args` as `$1..$n`.
     fn run_script(body: &str, args: &[&str]) -> Output {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-s").args(args);
         crate::proc::run_feeding_stdin(&mut cmd, body).expect("run the script")
     }
 
-    /// What a stand-in session runs, in `sh -c <STANDIN> <name> <args...>`: the
-    /// words after it are `$0..$n` and go unread, so the process's command line
-    /// reads like a session's while the process itself does nothing. A session
-    /// is an nvim that was started `--listen`ing on its socket, and that is the
-    /// whole of what these scripts look for, so this stands in for one — and
-    /// then the tests run where there is no Neovim.
+    /// Run as `sh -c <STANDIN> nvim --headless --listen <sock>`: the trailing
+    /// words are unused `$0..$n`, so the command line looks like a session's,
+    /// which is all the scripts check. No Neovim needed.
     ///
-    /// The trailing `:` is what makes it stand in *everywhere*. A shell whose
-    /// `-c` argument is a single simple command may run it by replacing itself
-    /// with it rather than forking, and the argv the stand-in exists to carry
-    /// goes with it: `nvim --headless --listen <sock>` becomes `sleep 30`, and
-    /// every script here then truthfully reports that nothing is serving the
-    /// socket. dash does not do this and bash does — and `/bin/sh` is dash on
-    /// Debian and bash on macOS, which is exactly the split CI showed. A list
-    /// ending in a builtin cannot be exec'd away, so the shell stays, and so
-    /// does its command line.
+    /// The trailing `:` stops bash (`/bin/sh` on macOS; dash does not do this)
+    /// from exec'ing a lone simple command in place of itself, which would
+    /// replace that argv with `sleep 30`.
     const STANDIN: &str = "sleep 30; :";
 
-    /// The command line of a pid, read through the prelude's own reader, so the
-    /// question is asked the way the scripts ask it wherever this runs.
+    /// A pid's command line, read with the prelude's own `cmdline`.
     fn cmdline_of(pid: u32) -> String {
         let script = with_prelude!("cmdline \"$1\"\n");
         crate::proc::run_local(script, &[&pid.to_string()])
@@ -361,12 +312,8 @@ mod tests {
     }
 
     /// A process whose command line reads like a session serving `sock`, with
-    /// `trailing` after it.
-    ///
-    /// The argv is checked here rather than assumed. Without that, a shell that
-    /// optimised it away fails as three separate mysteries — a live session
-    /// listed dead, a session that cannot be found by its socket, a spawn that
-    /// reports the wrong pid — rather than as the one thing that went wrong.
+    /// `trailing` after it. Panics if the shell dropped that argv, which would
+    /// otherwise surface as several unrelated test failures.
     fn spawn_standin(sock: &str, trailing: &[&str]) -> Child {
         let mut child = Command::new("/bin/sh")
             .args(["-c", STANDIN, "nvim", "--headless", "--listen", sock])
@@ -382,20 +329,14 @@ mod tests {
         child
     }
 
-    /// `HELLO_SCRIPT` is three files concatenated, and the join is only correct
-    /// if the result still speaks both halves of the protocol: the greeting
-    /// `parse_probe` reads, then the records `parse_listing` reads, under the
-    /// one terminator that says the whole thing ran.
-    ///
-    /// The obvious way to break this is a `finish` in `hello.sh`: two
-    /// terminators still parse, and the first would then claim a listing had
-    /// completed before `list.sh` had started.
+    /// `HELLO_SCRIPT` is three files concatenated and must read as a probe,
+    /// then a listing, under one terminator. A `finish` in `hello.sh` would
+    /// add a second that claims the listing done before `list.sh` started.
     #[test]
     fn the_greeting_carries_a_listing_under_one_terminator() {
         use crate::transport::protocol;
 
-        // No argument: the point of `hello.sh` is that it works out the runtime
-        // directory itself, which is what saves the extra round trip.
+        // No argument: `hello.sh` finds the runtime directory itself.
         let out = run_script(HELLO_SCRIPT, &[]);
         assert!(
             out.stdout.matches("NVMUX_END").count() == 1,
@@ -412,13 +353,9 @@ mod tests {
         protocol::parse_listing(&out.stdout).expect("reads as a listing");
     }
 
-    /// One run writes every pair, and it never creates a file.
-    ///
-    /// The second half is the point: an orphan is a live socket whose metadata
-    /// was never written, and the picker shows it under a name it synthesised on
-    /// the spot. Writing that here would make the placeholder real, on a session
-    /// the user reordered past rather than named. `write_meta.sh` may create;
-    /// this one may only edit, which is why it is a separate script.
+    /// Must never create a file: an orphan (a live socket without metadata)
+    /// shows under a synthesised name, and writing it here would make that
+    /// placeholder real.
     #[test]
     fn renumber_writes_every_pair_and_never_creates_metadata() {
         use crate::session::Session;
@@ -478,14 +415,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The greeting runs inside the user's *login* shell, which exports
-    /// whatever their profile sets and whatever ssh was asked to send — so no
-    /// name it reads may come from the environment.
-    ///
-    /// `hello.sh` execs one of them, to hand off to `list.sh` when it is run
-    /// straight from a checkout. Read with a `:-` default it would exec an
-    /// inherited path instead, and the greeting would come back with no
-    /// terminator: `nvmux <host>` refusing to connect, blaming the probe.
+    /// The greeting runs in the user's login shell, whose environment is
+    /// arbitrary. From a checkout `hello.sh` execs `list.sh` by a path in a
+    /// variable; read with a `:-` default, an inherited value would be exec'd
+    /// and the greeting would lack its terminator.
     #[test]
     fn the_greeting_reads_nothing_from_the_environment() {
         let mut cmd = Command::new("/bin/sh");
@@ -497,10 +430,6 @@ mod tests {
             .expect("a polluted environment must not stop the greeting");
     }
 
-    /// A listing asks the process table once, not once per session, and the
-    /// answer has to stay the same. Sessions are `--listen`ing processes, so a
-    /// stand-in with the same command line is enough — and this then runs where
-    /// there is no Neovim, which is where the timing regression would land.
     #[test]
     fn a_listing_finds_every_live_session_and_none_of_the_dead() {
         let dir = scratch_dir("shell-listing");
@@ -538,15 +467,11 @@ mod tests {
         );
     }
 
-    /// A command may put its own arguments after the socket, now that the whole
-    /// line is the user's to write — and the snapshot `serving` reads first
-    /// cannot match that shape: `listen_args` takes the argument to the end of
-    /// the line, because a runtime directory may contain a space.
-    ///
-    /// So what has to hold is that `serving_pid`, which both the listing's
-    /// fallback and `kill.sh` fall through to, matches the socket wherever it
-    /// appears. Otherwise a live session reads as stale, its files are swept out
-    /// from under it, and nothing can ever kill it again.
+    /// A user command may put arguments after the socket, which the `serving`
+    /// snapshot cannot match (`listen_args` takes the rest of the line, as a
+    /// runtime directory may contain a space). `serving_pid`, the fallback for
+    /// the listing and `kill.sh`, must match it anywhere, or a live session
+    /// reads as stale, has its files swept, and can never be killed.
     #[test]
     fn a_session_is_found_by_its_socket_wherever_it_sits_on_the_command_line() {
         let sock = scratch_sock("shell-trailing");
@@ -567,14 +492,9 @@ mod tests {
         }
     }
 
-    /// The other half: a socket that is genuinely bound, with nothing in any
-    /// command line to say so. Only the kernel's list can answer for this one,
-    /// and it must — the alternative is the branch that deletes the files of a
-    /// session that is still running.
-    ///
-    /// Linux only, because `/proc/net/unix` is. Everywhere else `serving` is
-    /// asked, finds no process, and the socket reads as stale, which is what
-    /// nvmux has always done there.
+    /// A bound socket no command line names: only the kernel's list can tell,
+    /// and missing it would delete a running session's files. Linux only
+    /// (`/proc/net/unix`); elsewhere such a socket reads as stale.
     #[test]
     fn a_bound_socket_is_a_live_session_even_with_no_process_to_find() {
         if !std::path::Path::new("/proc/net/unix").exists() {
@@ -583,8 +503,7 @@ mod tests {
         }
         let dir = scratch_dir("shell-bound");
         let sock = dir.join("aaaaaaaa.sock");
-        // Held for the length of the test. Nothing anywhere names this path on
-        // a command line — this process's own argv is cargo's.
+        // No command line names this path.
         let held = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
 
         let out = run_script(LIST_SCRIPT, &[&dir.to_string_lossy()]);
@@ -601,9 +520,8 @@ mod tests {
         assert!(survived, "and its files must not be swept");
     }
 
-    /// `scripts/spawn.sh` writes the nested-launch marker and `crate::nested`
-    /// reads it. Two files, one name: renaming it on either side would stop
-    /// every nested launch being caught, and nothing else would fail.
+    /// `spawn.sh` writes the nested-launch marker that `crate::nested` reads;
+    /// a rename on one side would silently stop catching nested launches.
     #[test]
     fn the_spawn_script_exports_the_marker_the_guard_reads() {
         let export = format!("export {}=", crate::nested::MARKER);
@@ -613,13 +531,9 @@ mod tests {
         );
     }
 
-    /// A session's editor inherits the umask of whoever launched nvmux, which
-    /// only holds while `spawn.sh` sets no mask of its own. A mask put back here
-    /// would be silent: every session would still start, and every file one
-    /// wrote would be more private than the user asked for.
-    ///
-    /// Matched on a line of its own, so the comment that explains the absence —
-    /// and says the word — does not satisfy the test that enforces it.
+    /// Sessions inherit the umask nvmux was launched with; a mask set in
+    /// `spawn.sh` would silently make their files more private than asked.
+    /// Matched at line start so the script's comment naming it does not count.
     #[test]
     fn the_spawn_script_imposes_no_umask_on_the_session() {
         assert!(
@@ -628,9 +542,8 @@ mod tests {
         );
     }
 
-    /// What replaced that mask as the socket's own control. The 0700 directory
-    /// is the other one, and `spawn.sh` refuses to spawn without it — see the
-    /// script's own checks and `paths::ensure_dir_secure`.
+    /// `chmod 600` protects the socket, along with the 0700 directory
+    /// `spawn.sh` requires (see `paths::ensure_dir_secure`).
     #[test]
     fn the_spawn_script_makes_the_socket_private_itself() {
         assert!(
@@ -639,18 +552,13 @@ mod tests {
         );
     }
 
-    /// `spawn.sh` runs the argument list it is handed and nothing else — no
-    /// `nvim` of its own, and no string it assembled. A `sleep` whose command
-    /// line ends the way a session's does stands in for one, so this runs where
-    /// there is no Neovim.
     #[test]
     fn the_spawn_script_runs_the_command_it_is_given() {
         let dir = scratch_path("shell-spawn");
         let sock = dir.join("aaaaaaaa.sock");
 
-        // A stand-in session, which binds nothing, so `SOCK` times out. What is
-        // being asserted is the *pid*, which the script only reports after
-        // confirming the process is the one serving this socket.
+        // The stand-in binds nothing, so `SOCK` times out; the pid is only
+        // reported once the script confirms the process serves this socket.
         let out = run_script(
             SPAWN_SCRIPT,
             &[
@@ -683,9 +591,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A command that is not there must say so at once. Waiting for a socket
-    /// that was never going to appear spends five seconds and then blames the
-    /// session for not starting.
+    /// Must fail at once, not wait 5 s for a socket that cannot appear.
     #[test]
     fn a_command_that_is_not_there_is_refused_rather_than_waited_for() {
         let dir = scratch_path("shell-spawn-missing");
@@ -716,8 +622,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The guard the prelude sets is what stops a prepended script sourcing it
-    /// a second time — and what lets the same file still run from a checkout.
     #[test]
     fn a_prepended_script_does_not_source_the_prelude_again() {
         let out = run_script(LIST_SCRIPT, &["/nonexistent-runtime-dir"]);
@@ -734,20 +638,17 @@ mod tests {
         );
     }
 
-    /// Flattening metadata must match the `tr -d '\n'` it replaced, byte for
-    /// byte, including the shapes that made `tr` worth using: a pretty-printed
-    /// file, a CRLF line ending, no trailing newline, and a `*` that must not
-    /// be expanded against the runtime directory. The tabs and carriage
-    /// returns it no longer removes must still parse as the JSON they are in.
+    /// `flatten` must match the `tr -d '\n'` it replaced byte for byte,
+    /// including pretty-printed files, CRLF, no trailing newline, and a `*`
+    /// that must not glob. The tabs and CRs it keeps must still parse as JSON.
     #[test]
     fn flatten_matches_the_tr_it_replaced() {
         let dir = scratch_dir("shell-flatten");
         let cases: &[(&str, &str)] = &[
             ("plain", "{\"a\":1}"),
             ("pretty", "{\n  \"a\": 1\n}\n"),
-            // Tab-indented, as an editor would pretty-print it. A raw tab
-            // *inside* a string is not JSON, and is not made into some by
-            // deleting it any more.
+            // Tab indentation only: a raw tab inside a string is invalid JSON
+            // and is no longer deleted.
             ("tabbed", "{\n\t\"t\": \"a\"\n}\n"),
             ("crlf", "{\r\n\"a\": 1\r\n}\r\n"),
             ("no_newline", "{\"trail\":1}"),
@@ -786,17 +687,11 @@ mod tests {
         for &(name, body) in SCRIPTS {
             assert!(!body.trim().is_empty(), "{name} is empty");
             let code = code_only(body);
-            // These run under whatever /bin/sh the session host has, which on
-            // Debian and Ubuntu is dash.
-            //
-            // `sh -n` does not catch most of these: to dash, `[[` is simply an
-            // unknown command name, so it parses fine and fails at runtime.
-            // That is exactly the bug that works on the developer's mac (where
-            // /bin/sh may be bash) and fails on the user's server.
-            // The last three are GNU/BSD `find` extensions rather than
-            // bashisms, caught here for the same reason: `-perm /mode` is
-            // GNU-only and `-perm +mode` is BSD-only, and either one makes a
-            // permission check silently pass on the other platform.
+            // The host's /bin/sh may be dash (Debian, Ubuntu), and `sh -n`
+            // misses most of these: to dash `[[` is an unknown command that
+            // fails only at runtime. The last three are GNU/BSD `find`
+            // extensions: `-perm /mode` is GNU-only, `-perm +mode` BSD-only,
+            // and either makes a permission check silently pass elsewhere.
             for bashism in [
                 "[[ ",
                 " ]]",
@@ -822,7 +717,6 @@ mod tests {
         }
     }
 
-    /// The scan must actually reject bash, or it is decoration.
     #[test]
     fn the_bashism_scan_would_catch_a_real_bashism() {
         let bash = "#!/bin/sh\nif [[ -n \"$x\" ]]; then :; fi\n";
@@ -841,11 +735,8 @@ mod tests {
         crate::proc::run_feeding_stdin(Command::new("/bin/sh").arg("-n"), text).expect("run sh -n")
     }
 
-    /// As shipped, and as framed for the shell that runs it. The framed form
-    /// matters more: a syntax error in a script fed to a fresh `sh` fails that
-    /// one run, but in the shell every script shares it is the shell that
-    /// exits — dash gives up on a parse error at the top level — and nothing
-    /// after it runs.
+    /// Checked as shipped and as framed: in the shared shell a top-level
+    /// parse error makes dash exit, so nothing after it runs.
     #[test]
     fn scripts_pass_shell_syntax_check() {
         for &(name, body) in SCRIPTS {

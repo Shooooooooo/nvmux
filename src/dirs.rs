@@ -1,39 +1,19 @@
-//! Listing directories on the host that will run the session.
+//! Listing directories on the session host, for the create prompt's
+//! completion.
 //!
-//! The completion half of the local/remote seam.
-//! [`crate::transport::Transport`] answers questions about sessions; this
-//! answers the one question the create prompt asks about the host itself —
-//! what is inside this directory — and it is separate for one reason: it has
-//! to leave the transport behind.
+//! Separate from [`crate::transport::Transport`] because that is not `Send`
+//! and completion runs on a worker thread (see [`crate::ui::complete`]). Each
+//! transport hands out a [`DirSource`]: an owned `Send` handle to reach the
+//! same host (over ssh, the host and the master's `ControlPath`, so the
+//! worker's shell is a new channel on the existing connection).
 //!
-//! [`crate::transport::Transport`] is a `Box<dyn Transport>` held by the picker
-//! and is not `Send`. Completion runs on a worker thread (see
-//! [`crate::ui::complete`], which explains why), and a thread cannot borrow the
-//! picker's transport. So each transport hands out a [`DirSource`] instead: a
-//! small, owned, `Send` handle carrying just enough to reach the same host
-//! again. Locally that is nothing at all; over ssh it is the host and the
-//! `ControlPath` of the master connection the transport already brought up, so
-//! the worker's shell is a new channel on an existing connection rather than a
-//! new connection.
+//! The worker's [`Lister`] keeps its own shell across questions, not the
+//! transport's busy one; over ssh it is unattended, so it never sits on an
+//! invisible prompt.
 //!
-//! The worker turns it into a [`Lister`]: the source plus a shell of its own on
-//! the host, kept across questions. Its own, rather than the transport's,
-//! because the transport's shell is busy with what the user asked for and this
-//! one answers what nvmux asked on its own account — so over ssh it is started
-//! unattended, and can never sit on a prompt nobody can see.
-//!
-//! # One script, both hosts
-//!
-//! Neither arm reimplements directory listing: both run `scripts/dirs.sh`, in
-//! the same kind of shell [`crate::transport::local`] runs every other script
-//! in. So the dotfile rule, the sort order, the cap and the handling of odd
-//! names are one implementation and cannot drift between local and remote —
-//! which they would, silently, if the local side used `read_dir`.
-//!
-//! What makes that affordable is that a listing is a run in a shell already
-//! there, not a process per question: the script itself is what a keystroke
-//! costs the host, and it is not on the keypress path at all, because a worker
-//! thread is what calls this.
+//! Both arms run `scripts/dirs.sh` in a long-lived shell, so sort order, cap
+//! and odd-name handling cannot drift between local and remote (as they would
+//! with `read_dir` locally).
 
 use std::path::PathBuf;
 
@@ -43,10 +23,8 @@ use crate::shell;
 use crate::ssh::Ssh;
 use crate::transport::protocol::{self, Listing};
 
-/// A `Send` handle that can list directories on one session host.
-///
-/// Cheap to make and cheap to hold: the ssh arm is a hostname and a path, not a
-/// connection. Cloneable so a prompt can keep one and give the worker another.
+/// A `Send` handle that can list directories on one session host. Cheap: the
+/// ssh arm is a hostname and a path, not a connection.
 #[derive(Debug, Clone)]
 pub enum DirSource {
     Local,
@@ -54,9 +32,9 @@ pub enum DirSource {
 }
 
 impl DirSource {
-    /// A shell on this host for questions nobody is watching. Over ssh that
-    /// means unattended: it never prompts, and gives up on a host it cannot
-    /// reach — see `ssh::unattended`.
+    /// A shell on this host for questions nobody is watching. Over ssh it is
+    /// unattended: it never prompts and gives up on an unreachable host (see
+    /// `ssh::unattended`).
     pub fn start_shell(&self) -> Result<Shell> {
         Ok(match self {
             DirSource::Local => Shell::local()?,
@@ -68,10 +46,8 @@ impl DirSource {
 }
 
 /// Directory listings from one host, through one shell kept across questions.
-///
-/// Owned by the completion worker, which is the only thing that asks. The
-/// shell is started by the first question, or by [`Lister::warm`] ahead of it,
-/// and replaced if it dies.
+/// Owned by the completion worker. The shell starts on the first question or
+/// [`Lister::warm`], and is replaced if it dies.
 pub struct Lister {
     source: DirSource,
     shell: Option<Shell>,
@@ -85,11 +61,9 @@ impl Lister {
         }
     }
 
-    /// Start the shell before there is a question for it, so what it costs to
-    /// bring up — over ssh, a login shell on the host — is paid while the user
-    /// is still typing rather than by the first keystroke that needs an answer.
-    /// A shell that will not start is not reported here; the first question
-    /// tries again and is where the failure belongs.
+    /// Start the shell early, so its startup (over ssh, a login shell) is paid
+    /// while the user types. Failure is not reported here; the first question
+    /// retries and reports it.
     pub fn warm(&mut self) {
         let _ = self.shell();
     }
@@ -101,28 +75,14 @@ impl Lister {
         Ok(self.shell.as_mut().expect("just started"))
     }
 
-    /// Every subdirectory of `dir`, dotted ones included.
-    ///
-    /// The whole directory rather than a filtered slice of it, because the
-    /// matching is fuzzy and lives in [`crate::ui::complete`]: a subsequence
-    /// match cannot be expressed as a shell pattern, since the first character
-    /// typed need not be the first character of the name. That is also what lets
-    /// one answer serve every keystroke inside a directory rather than only the
-    /// ones that extend the same prefix.
-    ///
-    /// Dotted names come back and are hidden further up, where a query can ask
-    /// for them. The rule is the shell's either way; only the place it is
-    /// applied has moved.
-    ///
-    /// A directory that is not there is an empty listing, not an error: at a
-    /// prompt, half a path is the normal state of the input, and every keystroke
-    /// on the way to a real directory passes through one that is not there yet.
+    /// Every subdirectory of `dir`, dotted ones included (hidden later unless
+    /// the query asks). Unfiltered: matching is fuzzy, in
+    /// [`crate::ui::complete`], so one answer serves every keystroke in the
+    /// directory. A missing directory is an empty listing, not an error: half
+    /// a path is the prompt's normal state.
     pub fn children(&mut self, dir: &str) -> Result<Listing> {
-        // The status goes unread, as it always has: a directory that is not
-        // there is the script's empty answer, and anything else it could say
-        // is not worth more than the empty listing the worker shows for an
-        // error. A shell that died is dropped, and the next question replaces
-        // it.
+        // The status is ignored: the worker shows an empty listing on error
+        // anyway. A dead shell is dropped and replaced on the next question.
         let out = self
             .shell()?
             .run(shell::DIRS_SCRIPT, &[dir])
@@ -134,20 +94,14 @@ impl Lister {
     }
 }
 
-/// Split a typed path into the part that no longer counts and the part that does.
+/// Split a typed path into its inert and live parts.
 ///
-/// `//` means "start again from the root", so everything up to and including the
-/// last one is inert: `/home/shu//etc` is `/etc`, with `/home/shu/` left behind.
-/// It is what the prompt offers instead of making the user delete a path to get
-/// out of it, and the field draws the inert half dim so it reads as what it is.
+/// `//` restarts from the root, so everything up to the last one is inert
+/// (drawn dim): `/home/shu//etc` is `/etc`, with `/home/shu/` left behind.
 ///
-/// **The live half is what must reach the session host.** POSIX reads `a//b` as
-/// `a/b`, so `cd /home/shu//etc` would land in `/home/shu/etc` — a real
-/// directory, the wrong one, and silently. Resolving the convention here, before
-/// anything leaves the prompt, is what makes it safe to offer.
-///
-/// The split falls *between* the two slashes, so the live half keeps a leading
-/// one and is therefore still absolute.
+/// Only the live half may reach the session host: POSIX reads `a//b` as `a/b`,
+/// so `cd /home/shu//etc` would silently land in `/home/shu/etc`. The split
+/// falls between the two slashes, so the live half stays absolute.
 pub fn anchored(input: &str) -> (&str, &str) {
     match input.rfind("//") {
         Some(at) => input.split_at(at + 1),
@@ -155,21 +109,14 @@ pub fn anchored(input: &str) -> (&str, &str) {
     }
 }
 
-/// Split what has been typed into the directory to list and the name to match
-/// inside it.
-///
-/// The split is at the last `/`, which is what makes the listing reusable: every
-/// keystroke inside one directory asks about the same directory, so the answer
-/// can be kept and filtered rather than asked for again.
-///
-/// A path with no `/` at all has no directory to list — the field's rule is that
-/// a directory is absolute, so there is no relative one to resolve against — and
-/// this returns `None` rather than inventing a root to search.
+/// Split what has been typed at the last `/` into the directory to list and
+/// the name to match, so every keystroke within a directory reuses its
+/// listing. `None` without a `/`: directories are absolute, so there is
+/// nothing to list.
 pub fn split(input: &str) -> Option<(&str, &str)> {
     let at = input.rfind('/')?;
     let (dir, rest) = input.split_at(at);
-    // `/etc` splits into `/` and `etc`, not `` and `etc`: the root is a real
-    // directory and `""` is not one.
+    // `/etc` splits into `/` and `etc`, not `""` and `etc`.
     let dir = if dir.is_empty() { "/" } else { dir };
     Some((dir, &rest[1..]))
 }
@@ -180,20 +127,17 @@ mod tests {
 
     #[test]
     fn a_double_slash_starts_again_from_the_root() {
-        // The case the prompt exists to serve: out of home, to somewhere else.
         assert_eq!(anchored("/home/shu//etc"), ("/home/shu/", "/etc"));
-        // Everything discarded is inert, not just the home part of it.
         assert_eq!(
             anchored("/home/shu/projects//etc"),
             ("/home/shu/projects/", "/etc")
         );
-        // The last one wins, so changing your mind twice still works.
+        // The last one wins.
         assert_eq!(anchored("/a//b//c"), ("/a//b/", "/c"));
         // A bare `//` is the root itself.
         assert_eq!(anchored("//"), ("/", "/"));
-        // Three in a row is the same answer: the split is at the last pair.
+        // Three in a row: the split is at the last pair.
         assert_eq!(anchored("///etc"), ("//", "/etc"));
-        // Nothing to discard, so nothing is inert and nothing draws dim.
         assert_eq!(anchored("/home/shu/projects"), ("", "/home/shu/projects"));
         assert_eq!(anchored("/"), ("", "/"));
         assert_eq!(anchored(""), ("", ""));
@@ -201,9 +145,7 @@ mod tests {
         assert_eq!(anchored("/home/shu//"), ("/home/shu/", "/"));
     }
 
-    /// The live half keeps its leading slash, so what comes out of `anchored` is
-    /// still an absolute path — which is the one thing `validate_directory` will
-    /// not accept a substitute for.
+    /// `validate_directory` only accepts absolute paths.
     #[test]
     fn what_a_double_slash_leaves_behind_is_still_absolute() {
         for input in ["/home/shu//etc", "//", "///x", "/a//b//c"] {
@@ -218,14 +160,12 @@ mod tests {
         assert_eq!(split("/home/you/"), Some(("/home/you", "")));
         assert_eq!(split("/etc"), Some(("/", "etc")));
         assert_eq!(split("/"), Some(("/", "")));
-        // Nothing to list, and nothing invented to list instead.
+        // Nothing to list.
         assert_eq!(split("home"), None);
         assert_eq!(split(""), None);
     }
 
-    /// A name with a space in it is one name. The split is on `/` alone, so
-    /// this is only worth pinning because a whitespace-splitting version would
-    /// pass every other test here.
+    /// A whitespace-splitting version would pass every other test here.
     #[test]
     fn a_directory_name_with_a_space_in_it_survives_the_split() {
         assert_eq!(split("/home/you/my pro"), Some(("/home/you", "my pro")));
@@ -235,9 +175,7 @@ mod tests {
         Lister::new(DirSource::Local)
     }
 
-    /// The local arm runs the same script the remote one does, so this is also
-    /// the test that the script's contract holds as embedded rather than as it
-    /// sits in the checkout.
+    /// Also tests the embedded script's contract, which the remote arm shares.
     #[test]
     fn the_local_source_lists_every_child_including_the_dotted_ones() {
         let root = crate::test_support::scratch_path("dirs-listing");
@@ -270,9 +208,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Names a shell would otherwise split on or treat as a pattern. Each one
-    /// is a real directory somebody could have, and each would be a different
-    /// bug in the framing between the host and here.
+    /// Names a shell would otherwise split on or treat as a pattern.
     #[test]
     fn odd_directory_names_survive_the_listing() {
         let root = crate::test_support::scratch_path("dirs-odd");
@@ -291,9 +227,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// One shell answers every question — that is the point of keeping one —
-    /// and a question after the shell has died gets a fresh one rather than an
-    /// error for the rest of the prompt's life.
     #[test]
     fn one_shell_serves_every_question_and_a_dead_one_is_replaced() {
         let root = crate::test_support::scratch_path("dirs-oneshell");

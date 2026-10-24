@@ -1,28 +1,18 @@
-//! A blinking cursor that fades: Neovide's `cursor_smooth_blink`.
+//! A fading cursor blink, like Neovide's `cursor_smooth_blink`.
 //!
-//! `'guicursor'` gives a mode's cursor three times: how long it waits before
-//! it starts to blink, how long it is off, and how long it is on. A terminal
-//! blinks its own cursor on its own clock, if it was asked to at all; this
-//! keeps Neovim's, and instead of switching the cursor off and on it fades it
-//! out and back in over part of each, holding it in between.
-//!
-//! The cursor then has to be the client's own drawing rather than the
-//! terminal's, since a terminal's cursor is either there or not. That is
-//! a block, and only a block: a bar or an underline drawn in cells would take
-//! the place of the character beside it, where the terminal's own sits next
-//! to it, so those keep the terminal's cursor and its blink.
-//!
-//! Any movement starts the wait again, as it does in Neovim's GUIs: a cursor
-//! is never caught faded out by the key that moved it.
+//! Follows `'guicursor'`'s blinkwait/blinkoff/blinkon timings, fading out and
+//! in over part of each phase. The faded cursor is drawn by the client, so
+//! only block cursors fade; a bar or underline drawn in cells would cover the
+//! neighbouring character, so those keep the terminal's cursor and blink.
+//! Any movement restarts the wait, as in Neovim's GUIs.
 
 use std::time::{Duration, Instant};
 
 use crate::client::redraw::ModeInfo;
 
-/// How much of each half of a blink is the fade, the rest holding still.
+/// Fraction of each blink phase spent fading; the rest holds.
 const FADE: f32 = 0.4;
 
-/// Where a blink's clock starts from.
 #[derive(Debug, Clone, Copy)]
 pub struct Blink {
     since: Instant,
@@ -33,12 +23,12 @@ impl Blink {
         Self { since: now }
     }
 
-    /// Start the wait again.
+    /// Restart the wait.
     pub fn reset(&mut self, now: Instant) {
         self.since = now;
     }
 
-    /// How much of the cursor shows at `now`, from 0 to 1.
+    /// Cursor opacity at `now`, 0 to 1.
     pub fn opacity(&self, mode: &ModeInfo, now: Instant) -> f32 {
         let Some((t, off, on)) = self.phase(mode, now) else {
             return 1.0;
@@ -56,9 +46,8 @@ impl Blink {
         }
     }
 
-    /// When the cursor will next look different, if it is going to: a frame
-    /// on from the `last` one drawn while it fades, the start of the next fade
-    /// while it holds.
+    /// When the cursor next changes: one frame after `last` while fading,
+    /// otherwise the start of the next fade.
     pub fn next_change(
         &self,
         mode: &ModeInfo,
@@ -70,14 +59,12 @@ impl Blink {
             return None;
         }
         let Some((t, off, on)) = self.phase(mode, now) else {
-            // Still waiting: the first fade starts when the wait is over.
             return Some(self.since + Duration::from_millis(mode.blinkwait));
         };
         let (fade_out, fade_in) = (off * FADE, on * FADE);
         if t < fade_out || (off..off + fade_in).contains(&t) {
-            // From the last frame rather than from `now`: a frame counted from
-            // whenever it is asked for is a frame away again when that comes,
-            // and is never due at all.
+            // Counted from the last frame: counted from `now`, the frame would
+            // always be one frame away and never come due.
             return Some(last.map_or(now, |last| last + frame));
         }
         let (held, wait) = if t < off {
@@ -85,21 +72,19 @@ impl Blink {
         } else {
             (t - (off + fade_in), off + on - t)
         };
-        // Drawn once more as the hold begins, if the last frame came before
-        // it: a fade's frames seldom land on its end, and the last of them
-        // would otherwise stand, a few percent short, for the whole hold.
+        // Draw once more when the hold begins if the last frame preceded it,
+        // or the fade's last, slightly-short frame would stay for the hold.
         let begun = now.checked_sub(Duration::from_secs_f32(held.max(0.0)));
         if let Some(begun) = begun.filter(|&begun| last.is_none_or(|last| last < begun)) {
             return Some(begun);
         }
-        // To the millisecond the cycle is counted in, so a hold ends on the
-        // tick the fade starts on rather than a rounding error either side.
+        // Round to whole ms, the cycle's unit, so the hold ends exactly where
+        // the fade starts.
         Some(now + Duration::from_millis((wait * 1000.0).round() as u64))
     }
 
-    /// Seconds into the current off-then-on cycle, and the two halves'
-    /// lengths — or `None` before the cursor starts blinking, or for a mode
-    /// whose cursor does not blink.
+    /// Seconds into the current off-then-on cycle and the two phase lengths,
+    /// or `None` while waiting or if the mode does not blink.
     fn phase(&self, mode: &ModeInfo, now: Instant) -> Option<(f32, f32, f32)> {
         if !mode.blinks() {
             return None;
@@ -114,7 +99,7 @@ impl Blink {
     }
 }
 
-/// Smoothstep: eased in and out.
+/// Smoothstep.
 fn smooth(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -161,8 +146,7 @@ mod tests {
         );
     }
 
-    /// Frames while it fades, and none while it holds: an idle cursor costs a
-    /// wake-up per fade, not sixty a second.
+    /// An idle cursor costs a wake-up per fade, not one per frame.
     #[test]
     fn frames_are_wanted_only_while_it_fades() {
         let t0 = Instant::now();
@@ -189,8 +173,6 @@ mod tests {
         assert_eq!(held, Some(at(1100)), "held off until the fade in");
     }
 
-    /// A hold whose fade's last frame came before its end is drawn once more,
-    /// as it begins: whole, or gone, rather than the last step short of it.
     #[test]
     fn a_hold_begins_with_the_fade_finished() {
         let t0 = Instant::now();
@@ -204,15 +186,14 @@ mod tests {
             "{owed:?}"
         );
         assert_eq!(b.opacity(&mode(), at(866)), 0.0, "drawn gone");
-        // The fade in ends at 1200, 40% into the 250 ms it is back for.
+        // The fade in ends at 1200, 40% into the 250 ms on phase.
         let owed = b.next_change(&mode(), at(1206), Some(at(1190)), frame);
         assert!(owed.is_some_and(|due| due <= at(1206)), "{owed:?}");
         assert_eq!(b.opacity(&mode(), at(1206)), 1.0, "drawn whole");
     }
 
-    /// A frame a fade asks for is due when it comes. Waited for as the
-    /// client's loop waits — drawn if due, slept until when it says if not —
-    /// the rest of a fade out, 100 ms of it, is drawn a frame at a time.
+    /// Simulates the client loop (draw if due, else sleep until then) over
+    /// the last 100 ms of a fade out: each requested frame must come due.
     #[test]
     fn a_fades_next_frame_comes_due() {
         let t0 = Instant::now();

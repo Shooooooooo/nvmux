@@ -1,16 +1,8 @@
-//! The naming prompt — the only place a session is named, and the only place
-//! one is created.
+//! The naming prompt: the only place a session is created or named.
 //!
-//! Three ways in: `<prefix> c` from an attached session, and `c` or `r` from the
-//! picker. [`run`] owns a terminal for the first, and [`create_after`] and
-//! [`rename`] for `c` and `r` on the picker floating over a session, which has
-//! none to lend; `run_on` borrows the picker's full screen. A `Task` says
-//! whether a session is being invented or renamed.
-//!
-//! It owns the whole screen rather than replacing a hint line, per the contract
-//! in the parent module. Three weights carry the three kinds of text — dim for
-//! the labels, the defaults and the hint row, plain for what you type, reversed
-//! for the cursor:
+//! Entered by `<prefix> c` from a session ([`run`]) or `c`/`r` from the picker
+//! ([`create_after`] and [`rename`] when floating; `run_on` on the picker's
+//! full screen). A `Task` says whether it creates or renames.
 //!
 //! ```text
 //!     new session name:  session 3
@@ -23,54 +15,24 @@
 //!                                             "selected row"
 //! ```
 //!
-//! # One screen, three fields
+//! # Fields
 //!
-//! Creating asks three questions — what the session is called, how its Neovim is
-//! started, and where it runs — and asks them together rather than one after the
-//! other. Enter submits the whole form from whichever field it is pressed in, so
-//! `<prefix> c` followed by enter still creates a session in one keystroke and
-//! the second and third questions cost nothing to anyone who does not want them.
-//! Renaming puts up the same screen with one field, since a rename starts
-//! nothing.
+//! Create shows name, command and working directory; rename shows only the
+//! name. Enter submits from any field, so `<prefix> c` Enter creates a session
+//! in one keystroke. Command and directory start pre-filled (you usually amend
+//! them). The name starts as a dim placeholder you type over (`→`/`End` take
+//! it); the cursor inverts its first letter so nothing shifts when typing. A
+//! rename starts pre-filled. An emptied field shows its default dimmed, which
+//! is what Enter would submit.
 //!
-//! # One field offers; two start where they are
+//! # Styles
 //!
-//! The command and the working directory are **there** when the prompt opens, as
-//! ordinary text with the cursor after them. Both are things you amend rather
-//! than write — a path to a nightly build, a `--clean` on the end, one directory
-//! further down — so having to take them into the field first was a keystroke
-//! spent arriving at the state you already wanted.
+//! No colours, only modifiers (see [`super::draw`]): **dim** for labels,
+//! untouched defaults, the hint row and a path's discarded part; **plain** for
+//! typed text; **reversed** for the cursor, and reversed+bold for the selected
+//! menu row, as in the picker.
 //!
-//! The session name is the exception, and stays a dimmed placeholder: `session 3`
-//! is a suggestion you replace outright, and typing over it is exactly what
-//! discarding it should cost. It is also the one field `→` and `End` still have
-//! a default to take, for the case where you want to edit the suggestion rather
-//! than replace it.
-//!
-//! Being a placeholder is why the cursor *inverts* the name's first letter rather
-//! than taking a column in front of it: the default then occupies exactly the
-//! columns your own text will, and nothing shifts when you start typing.
-//!
-//! Renaming inverts all of this and the same field serves it: it starts
-//! pre-filled, because a rename edits something that already exists. Clear any of
-//! them and the default reappears dimmed — which is the truth either way, since
-//! the default is always what enter would submit if the field were left empty.
-//!
-//! # Three weights, and what each one means
-//!
-//! Nothing on this screen sets a colour; every distinction is a modifier, for the
-//! reasons [`super::draw`] gives. There are three:
-//!
-//! * **dim** — text that is not deciding anything: every field's label, a
-//!   default nobody has touched, the hint row, and the half of a path a `//` has
-//!   discarded.
-//! * **plain** — what you typed and what enter will use. The labels receded so
-//!   that this, the only text at full weight, is what the eye lands on.
-//! * **reversed** — the cursor, one cell, wherever it is. Paired with bold it
-//!   means something else entirely: the selected row of the menu, which is the
-//!   picker's signal for the same idea.
-//!
-//! # One key, one job
+//! # Keys
 //!
 //! | Key | Job |
 //! |---|---|
@@ -79,86 +41,34 @@
 //! | `Enter` | accept from the menu if one is open, otherwise create the session |
 //! | `Esc` | close the menu if it is open, otherwise leave |
 //!
-//! Two earlier schemes failed here, and both failed the same way: a key that did
-//! one thing or another depending on state nobody could see. So nothing is
-//! conditional on anything invisible now. What the movement keys move through
-//! depends on whether a menu is on screen, which you can see; `Tab` and `Enter`
-//! and `Esc` each mean one thing wherever you press them.
+//! No key depends on invisible state.
 //!
-//! # The working directory has a menu, when you ask for it
+//! # Directory completion
 //!
-//! The third field is the one question with an answer nvmux can look up, so
-//! `Tab` looks it up: a dropdown of the directories the field could become,
-//! ranked fuzzily, so `nvmx` finds `nvmux-rs` and you need not know how a
-//! directory starts to reach it. Nothing else shows it — the prompt opens as
-//! three plain fields — and `Esc` puts it away again.
+//! `Tab` opens a fuzzy-ranked dropdown of directories (`nvmx` finds
+//! `nvmux-rs`). Accepting writes the entry without a trailing slash; the next
+//! `Tab` adds the slash and lists the level below. On an emptied field, `Tab`
+//! first writes the dimmed default. Stepping in is remembered from the accept,
+//! not inferred from the path, so `pro` beside `projects` is not stepped into
+//! just because it exists.
 //!
-//! `Tab` from inside the menu takes what is highlighted and writes it *without* a
-//! trailing slash, so the path reads exactly as it would have been typed. The
-//! next `Tab` appends the slash and opens the level below. That pairing is what
-//! makes one key enough to walk down a tree: `Tab`, choose, `Tab`, `Tab`, choose,
-//! `Tab` — and the `/` is never typed by hand.
+//! The field opens at the home directory, with a trailing `/`, as editable
+//! text. The last `//` discards everything before its second slash
+//! (`/home/shu//etc` is `/etc`), so typing `/` first means the root; in an
+//! empty field a single `/` is the root. The discarded part is drawn dim.
+//! [`crate::dirs::anchored`] resolves this here, because POSIX reads `a//b`
+//! as `a/b` and the session would silently start elsewhere.
 //!
-//! An emptied field is that pairing seen from the other end. Backspace the path
-//! to nothing and home comes back dimmed, because it is still what enter would
-//! submit; `Tab` writes it into the field rather than reaching past it to list
-//! what is inside, and the `Tab` after that opens the menu on it. So the one key
-//! the hint row offers here always acts on the text in front of you.
-//!
-//! Stepping in is remembered from the accept rather than read off the path, and
-//! deliberately: a directory whose name is also a prefix of its siblings — `pro`
-//! beside `projects` — must not be stepped into merely because it exists. Only
-//! having just chosen it means that.
-//!
-//! # Where the field starts, and how to leave
-//!
-//! The directory field opens *at* the home directory: the path is really there,
-//! as ordinary editable text, so `Tab` lists what is inside it before anything is
-//! typed. It is not an anchor — backspace eats it like any other text, and
-//! clearing it is not a one-way door: `Tab` puts it back.
-//!
-//! To go somewhere else, type `//`. Everything up to and including the last one
-//! is discarded, so `/home/shu//etc` is `/etc`. Since the pre-filled path already
-//! ends in a slash, typing one as your first keystroke makes the `//` and means
-//! "from the root" — which is the whole of what the old first-keystroke special
-//! case used to arrange by hand. A field cleared to nothing has no path left to
-//! discard, so there a single `/` is already the root and lists it.
-//!
-//! The discarded half draws dim, and that is the only thing dim means on this
-//! line: grey is the part that no longer decides where the session starts. An
-//! ordinary path has none of it.
-//!
-//! [`crate::dirs::anchored`] resolves the convention, and it is resolved *here*
-//! rather than left to the host for a reason worth knowing: POSIX reads `a//b` as
-//! `a/b`, so submitting the raw line would start the session one directory away
-//! from the one on screen, silently.
-//!
-//! # Enter
-//!
-//! With a menu open it takes what is highlighted, which is the reflex after
-//! choosing one; accepting closes the menu, so the second enter creates.
-//! Otherwise it creates, from any field — so `<prefix> c` then enter is still a
-//! session in one keystroke, in the home directory.
-//!
-//! # Nothing waits for a keystroke
-//!
-//! The listing runs on a worker thread and reaches this loop through a channel;
-//! [`super::complete`] is where that lives and why. It starts the moment the
-//! prompt opens, so the first `Tab` is instant rather than paying a round trip to
-//! say its first word. One listing serves a whole directory — the host stopped
-//! filtering when the matching became fuzzy, since a subsequence cannot be a glob
-//! — so a path costs about one round trip per `/` and everything in between is
-//! answered from memory.
+//! Listing runs on a worker thread from the moment the prompt opens (see
+//! [`super::complete`]). One listing serves a whole directory (fuzzy matching
+//! cannot be a host-side glob), so a path costs about one round trip per `/`.
 //!
 //! # Floating
 //!
-//! With `[style] float` on, as it is by default, the prompt floats over the
-//! session in a panel the relay draws ([`Panel`]), as the picker, the help and
-//! the settings do: `<prefix> c` over the session itself, and the picker's `c`
-//! and `r` in the picker's place, which comes back once the prompt has been
-//! answered with no session to go to. It is the same prompt, every rule of it;
-//! what changes is where it is drawn, and that it reads the keys the relay
-//! gives it. A session made is gone to, as from the prompt full screen.
+//! With `[style] float` (the default) the prompt is drawn in a relay [`Panel`]
+//! over the session, or in the picker's place for its `c` and `r` (the picker
+//! returns if no session results). Behaviour is identical; only drawing and
+//! key input differ.
 
 use std::time::Instant;
 
@@ -183,85 +93,71 @@ use crate::session::Session;
 use crate::state;
 use crate::transport::{Shared, Transport};
 
-/// What the prompt returned.
 #[derive(Debug)]
 pub enum Outcome {
-    /// Created; the caller attaches to it.
+    /// The caller attaches to it.
     Created(Session),
-    /// Renamed, to this; the caller relists, or puts the name in the rows it
-    /// has — a rename changes nothing else.
+    /// The new name; a rename changes nothing else.
     Renamed(String),
-    /// Backed out.
     Cancelled,
 }
 
 impl Outcome {
-    /// Whether the caller attaches next, and so needs the terminal given back
-    /// cleared — see [`super::Screen::close_for_attach`].
+    /// Whether the caller attaches next and so needs the terminal cleared
+    /// (see [`super::Screen::close_for_attach`]).
     fn attaches(&self) -> bool {
         matches!(self, Self::Created(_))
     }
 }
 
-/// Where a session made on the prompt goes in the list.
+/// Where a new session goes in the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
-    /// At the end, where a session made from inside another goes: `<prefix>
-    /// c`.
+    /// At the end (`<prefix> c`).
     Last,
-    /// After the row the picker's cursor was on, as the picker puts one: its
-    /// `c`. `None` where it had no rows: first.
+    /// After the picker's highlighted row (the picker's `c`); `None` (no
+    /// rows) means first.
     After(Option<Id>),
 }
 
-/// Which question is being asked. The two differ in how many fields there are,
-/// what they start as, and what enter finally calls.
 #[derive(Clone, Copy)]
 pub(super) enum Task<'a> {
     Create {
-        /// The listing the caller already has — the picker's rows — so the
-        /// default name costs no second script run. `None` re-lists.
+        /// The caller's listing, to compute the default name without another
+        /// script run. `None` re-lists.
         listed: Option<&'a [Session]>,
-        /// The number the session will be given once it is listed, which its
-        /// default name is numbered after (see [`default_name`]): the
-        /// picker's, which puts it after the highlighted row (see
-        /// [`super::app::App::new_number`]). `None` for the end of the list,
-        /// where a session made from inside another goes.
+        /// The number the session will get, used by [`default_name`]: the
+        /// picker's slot after its highlighted row (see
+        /// [`super::app::App::new_number`]). `None` for the end of the list.
         number: Option<u32>,
     },
     Rename(&'a Session),
 }
 
-/// Where the name lives in [`Prompt::fields`]. Both tasks have one.
+/// Indices into [`Prompt::fields`]; only [`Task::Create`] has `COMMAND` and
+/// `DIRECTORY`.
 const NAME: usize = 0;
-/// Where the command lives. Only [`Task::Create`] has one.
 const COMMAND: usize = 1;
-/// Where the working directory lives. Only [`Task::Create`] has one.
 const DIRECTORY: usize = 2;
 
-/// The tallest the dropdown gets. Enough to choose from without the form
-/// climbing to the top of the screen to make room for it.
+/// Maximum dropdown height, so the form need not climb far to fit it.
 const MENU_ROWS: u16 = 6;
 
-/// The highlighted row's marker, and the column the rest line up in — the
-/// picker's, so the two lists read the same way.
+/// Same marker and indent as the picker.
 const MARKER: &str = "▸ ";
 const INDENT: &str = "  ";
 
-/// The cursor: plain REVERSED, not the picker's REVERSED|BOLD — that pairing
-/// means "the selected row", and a one-cell cursor wants the crisper form.
+/// Plain REVERSED; REVERSED|BOLD means "selected row".
 const CURSOR: Style = Style::new().add_modifier(Modifier::REVERSED);
 
-/// Text that is not deciding anything — see the module docs on weights.
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
-/// What enter asked for.
 #[derive(Debug, PartialEq, Eq)]
 struct Submission {
     name: String,
-    /// `None` when renaming, which starts nothing.
+    /// `None` when renaming.
     command: Option<String>,
-    /// `None` when renaming, for the same reason.
+    /// `None` when renaming.
     directory: Option<String>,
 }
 
@@ -273,20 +169,14 @@ enum Step {
     Cancel,
 }
 
-/// One labelled field: what has been typed in it, where the cursor is, and what
-/// enter would submit if nothing had been.
-///
-/// The settings screen types its values in one too ([`super::settings`]),
-/// with no label and no default.
+/// One labelled text field with a default submitted when it is empty. Also
+/// used, without label or default, by [`super::settings`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Field {
-    /// What the field is for, in front of it. A `label: value` line rather than
-    /// a heading, because this screen covers whatever you were looking at and
-    /// has to say both what is happening and what to type.
     label: String,
     input: String,
-    /// A **character** index into `input`, from 0 to its length inclusive.
-    /// Characters rather than bytes so arithmetic on it cannot land mid-glyph.
+    /// A **character** index into `input`, 0 to its length inclusive, so
+    /// arithmetic cannot land mid-glyph.
     cursor: usize,
     default: String,
 }
@@ -302,18 +192,16 @@ impl Field {
         }
     }
 
-    /// A field with `input` in it and the cursor at its end: no label, and
-    /// no default to stand in for nothing typed.
+    /// A field holding `input`, cursor at the end, with no label or default.
     pub(super) fn with(input: String) -> Self {
         Self::new(String::new(), input, String::new())
     }
 
-    /// What has been typed.
     pub(super) fn input(&self) -> &str {
         &self.input
     }
 
-    /// Where the cursor is, in characters.
+    /// Cursor position in characters.
     pub(super) fn cursor(&self) -> usize {
         self.cursor
     }
@@ -355,20 +243,16 @@ impl Field {
         self.cursor = self.len();
     }
 
-    /// Is the dim default sitting in this field's columns — the state `→`,
-    /// `End`, and in the working directory `Tab`, take it out of?
-    ///
-    /// `field_line` draws the placeholder on exactly this, so what those keys
-    /// act on is what you are looking at. A field with nothing to show is not in
-    /// it: a host that could not say where home is leaves the working
-    /// directory's default empty — see [`default_directory`] — and there is
-    /// nothing there to take.
+    /// Whether the dim default is shown, which `→`, `End` and (in the
+    /// directory field) `Tab` adopt. `field_line` draws the placeholder on the
+    /// same condition. The directory default can be empty if the host could not
+    /// say where home is (see [`default_directory`]).
     fn showing_default(&self) -> bool {
         self.input.is_empty() && !self.default.is_empty()
     }
 
-    /// Take the placeholder into the field so it can be edited. Only ever from
-    /// an empty field: with anything typed there is a cursor to move instead.
+    /// Copy the shown default into the empty field for editing. Returns
+    /// whether it did.
     fn adopt_default(&mut self) -> bool {
         if !self.showing_default() {
             return false;
@@ -378,8 +262,7 @@ impl Field {
         true
     }
 
-    /// What this field submits: the trimmed text, or the default when there is
-    /// none — which is exactly what the placeholder was showing.
+    /// The trimmed text, or the default if empty.
     fn value(&self) -> String {
         let text = self.input.trim();
         if text.is_empty() {
@@ -397,52 +280,38 @@ fn byte_at(s: &str, chars: usize) -> usize {
         .map_or(s.len(), |(offset, _)| offset)
 }
 
-/// What has been typed, and what enter would do if nothing had been. Split from
-/// the terminal so the state machine is testable without one.
+/// The prompt's state, separate from the terminal so it is testable.
 struct Prompt {
     fields: Vec<Field>,
     focus: usize,
     message: Option<String>,
-    /// The dropdown under the fields. `None` on a prompt that has no directory
-    /// to complete — a rename — and otherwise always present, empty or not,
-    /// because the rows it occupies are reserved either way.
+    /// `None` for a rename; otherwise always present, since its rows are
+    /// reserved whether or not it is open.
     menu: Option<Menu>,
 }
 
-/// The dropdown: the directories the working directory field could become, and
-/// which of them is under the cursor.
-///
-/// The matches are kept rather than a finished block, because how many rows fit
-/// is a question about the terminal, and the terminal is not known until the
-/// frame is drawn.
+/// The directory dropdown. Holds matches rather than rendered rows, since the
+/// row count depends on the terminal size at draw time.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Menu {
-    /// What the query could mean, best first, as the scorer ranked it.
+    /// Best first.
     matches: Vec<String>,
-    /// The highlighted row. Always in range while `matches` is non-empty.
+    /// In range while `matches` is non-empty.
     selected: usize,
-    /// Whether the menu is on screen. Nothing opens it but `Tab`, so the prompt
-    /// is three plain fields until asked for suggestions.
+    /// Only `Tab` opens it.
     open: bool,
-    /// The last thing `Tab` did was accept, so the next one steps *into* what it
-    /// accepted rather than reopening on the same query. Cleared by every other
-    /// key.
-    ///
-    /// A flag rather than a look at the path, because a directory whose name is
-    /// also a prefix of its siblings — `pro` beside `projects` — must not be
-    /// stepped into merely because it happens to exist. Only having just chosen
-    /// it means that.
+    /// The last key accepted from the menu, so the next `Tab` steps into the
+    /// accepted directory. Cleared by any other key. A flag, not inferred
+    /// from the path (see the module docs).
     stepped: bool,
-    /// The host stopped short of listing the directory, so these are part of an
-    /// answer rather than all of one.
+    /// The host's listing was truncated.
     partial: bool,
-    /// Said instead of the rows: waiting for an answer, or nothing matched.
+    /// Shown instead of rows: waiting, or no match.
     message: String,
 }
 
 impl Menu {
-    /// Wrapping, like every other list in nvmux: one key reaches the far end of
-    /// a short list rather than stopping dead at it.
+    /// Wraps, like every list in nvmux.
     fn move_by(&mut self, delta: isize) {
         let len = self.matches.len();
         if len == 0 {
@@ -463,16 +332,9 @@ impl Prompt {
         Self {
             fields: vec![
                 Field::new(labels[0].clone(), String::new(), default_name),
-                // Pre-filled like the directory below it: a command line is a
-                // thing you edit — a path to a nightly build, a `--clean` on the
-                // end — not one you write out. The name above is the exception
-                // and stays a placeholder, because `session 3` is a suggestion
-                // you replace outright rather than amend.
+                // Command and directory are pre-filled (see module docs); the
+                // default only matters once a field is emptied.
                 Field::new(labels[1].clone(), default_command.clone(), default_command),
-                // Pre-filled rather than offered: home is where this field
-                // starts, so `Tab` lists what is in it before anything is typed
-                // and there is no placeholder to displace. The default is the
-                // same string, which only matters if the field is emptied.
                 Field::new(
                     labels[2].clone(),
                     default_directory.clone(),
@@ -485,7 +347,6 @@ impl Prompt {
         }
     }
 
-    /// Pre-filled: a rename edits something that already exists.
     fn rename(session: &Session) -> Self {
         Self {
             fields: vec![Field::new(
@@ -499,9 +360,7 @@ impl Prompt {
         }
     }
 
-    /// The bottom row, and the only thing on screen that says which keys are
-    /// live. Every key here has one job; what changes is whether the movement
-    /// keys are moving through fields or through suggestions.
+    /// The hint row: the only on-screen list of live keys.
     fn hints(&self) -> &'static str {
         if self.menu.is_none() {
             return "⏎ rename   esc cancel";
@@ -511,25 +370,19 @@ impl Prompt {
         } else if self.completes() {
             "⏎ create   ↑↓ field   ⇥ complete   esc cancel"
         } else {
-            // No `⇥ complete` here: there is nothing in this field to complete,
-            // and a row promising a key that does nothing where you are standing
-            // is worse than a shorter row.
+            // No `⇥ complete`: nothing to complete in this field.
             "⏎ create   ↑↓ field   esc cancel"
         }
     }
 
-    /// Does `Tab` complete anything from where the cursor is?
-    ///
-    /// Only the working directory field has completions, which is why the hint
-    /// row offers `⇥ complete` only there. Asked in one place so the row cannot
-    /// come to promise a key the handler does not answer — and so a second field
-    /// gaining completions is one edit rather than two that have to agree.
+    /// Whether `Tab` completes in the focused field. Used by both the hint row
+    /// and the key handler so they cannot disagree.
     fn completes(&self) -> bool {
         self.menu.is_some() && self.focus == DIRECTORY
     }
 
-    /// Is the menu on screen? Then it owns the movement keys, and `Tab` accepts
-    /// from it rather than opening it.
+    /// Whether the menu is open; it then owns the movement keys and `Tab`
+    /// accepts.
     fn choosing(&self) -> bool {
         self.focus == DIRECTORY && self.menu.as_ref().is_some_and(|m| m.open)
     }
@@ -538,17 +391,14 @@ impl Prompt {
         &mut self.fields[self.focus]
     }
 
-    /// Wrapping, like the picker's list: the create prompt has three fields, so
-    /// a key pressed once too often comes back round to the top rather than
-    /// stopping dead. (A rename has one field, where this is a no-op.)
+    /// Wraps; a no-op for a rename's single field.
     fn move_focus(&mut self, delta: usize) {
         let n = self.fields.len();
         self.focus = (self.focus + delta) % n;
     }
 
-    /// Report a rejected submission, keeping what was typed — a duplicate is
-    /// usually one character from a good name. `default_name` is refreshed only
-    /// when creating; a rename's default has not moved.
+    /// Report a rejected submission, keeping the input (a duplicate is usually
+    /// one character off). `default_name` is `Some` only when creating.
     fn fail(&mut self, message: String, default_name: Option<String>) {
         self.message = Some(message);
         if let Some(name) = default_name {
@@ -560,10 +410,7 @@ impl Prompt {
         Submission {
             name: self.fields[NAME].value(),
             command: self.fields.get(COMMAND).map(Field::value),
-            // The half of the line that counts, never the raw text. POSIX reads
-            // `a//b` as `a/b`, so submitting `/home/shu//etc` verbatim would
-            // start the session in `/home/shu/etc` — a real directory, the wrong
-            // one, and with nothing on screen to say so.
+            // Resolve `//`: POSIX reads `/home/shu//etc` as `/home/shu/etc`.
             directory: self
                 .fields
                 .get(DIRECTORY)
@@ -572,26 +419,15 @@ impl Prompt {
     }
 
     fn on_key(&mut self, key: Key) -> Step {
-        // A stale message must not linger over an unrelated action.
         self.message = None;
 
-        // Whatever is open owns the movement keys. That is the whole of the
-        // scheme: `Tab` completes, the movement keys move through whichever list
-        // is in front of you, enter creates, Esc backs out of one thing at a
-        // time. No key here does two jobs depending on state nobody can see.
         let choosing = self.choosing();
 
         match key {
             Key::Char(c) => {
-                // No special case for the directory field any more. Its text is
-                // really there rather than behind a placeholder, so typing just
-                // inserts — and a `/` typed at the end of the home path makes the
-                // `//` that means "from the root", which is what the special case
-                // used to arrange by hand.
                 self.focused().insert(c);
-                // An open menu narrows rather than closing: filtering it is what
-                // the query is for. `show` puts the selection back on the best
-                // match when the matches change.
+                // An open menu stays open and narrows; `show` reselects the
+                // best match.
                 self.stayed_put();
                 Step::None
             }
@@ -621,18 +457,12 @@ impl Prompt {
                 Step::None
             }
 
-            // `Tab` is for completion and for nothing else — it does not move
-            // between fields, and in the two fields with nothing to complete it
-            // does nothing at all.
+            // `Tab` only completes; elsewhere it does nothing.
             Key::Tab if self.completes() => {
                 if choosing {
                     self.accept();
                 } else if self.fields[DIRECTORY].adopt_default() {
-                    // The dim path is a real answer, not decoration: an emptied
-                    // field gets it back before it is offered what is inside it.
-                    // The next `Tab` opens the menu on it — the same pairing an
-                    // accept already has, write the name and then step into it,
-                    // seen from the other end.
+                    // Write the dim default first; the next `Tab` lists it.
                     self.stayed_put();
                 } else if self.complete_bare_tilde() {
                     self.stayed_put();
@@ -661,43 +491,28 @@ impl Prompt {
                 Step::None
             }
 
-            // With a menu in front of you, enter takes what is highlighted — the
-            // reflex after choosing one with the movement keys. Accepting closes
-            // the menu, so the second enter creates.
-            //
-            // This does give enter two meanings. The rule the last rewrite set
-            // out to remove was one conditional on state nobody could see; this
-            // one turns on whether a menu is on the screen in front of you,
-            // which is what the movement keys already key off.
+            // Accepting closes the menu, so a second Enter creates.
             Key::Enter if choosing => {
                 self.accept();
                 Step::None
             }
-            // Otherwise the one thing enter means, from any field: `c` then
-            // enter is still a session in one keystroke.
             Key::Enter => Step::Submit(self.submission()),
 
-            // One thing at a time on the way out: the menu you opened, then the
-            // prompt. The picker's filter mode sets the same precedent, and
-            // without it a menu opened by accident could only be dismissed by
-            // choosing something out of it.
+            // Esc closes the menu first, then the prompt, like the picker's
+            // filter mode.
             Key::Esc if choosing => {
                 self.close_menu(false);
                 Step::None
             }
-            // Not a quit here: it would tear the user out of a live session
-            // they only meant to leave a prompt in.
+            // Cancel, not quit: quitting would pull the user out of a live
+            // session.
             Key::Esc | Key::CtrlC => Step::Cancel,
             _ => Step::None,
         }
     }
 
-    /// Open the menu on whatever the field is pointing at.
-    ///
-    /// After an accept, that means *inside* the directory just chosen, so the
-    /// `/` is appended here rather than typed. This is the second half of the
-    /// pairing that lets `Tab` walk down a tree: accept writes the name, and the
-    /// next `Tab` steps into it.
+    /// Open the menu on the field's path. Right after an accept, first append
+    /// `/` to step into the chosen directory.
     fn open_menu(&mut self) {
         let stepped = self.menu.as_ref().is_some_and(|m| m.stepped);
         if stepped {
@@ -715,9 +530,8 @@ impl Prompt {
         }
     }
 
-    /// Take the menu off the screen. `stepped` is whether this close is an
-    /// accept, so the next `Tab` steps into what was chosen rather than
-    /// reopening on it; an `Esc` passes false.
+    /// `stepped` is true for an accept (the next `Tab` steps in), false for
+    /// `Esc`.
     fn close_menu(&mut self, stepped: bool) {
         if let Some(menu) = self.menu.as_mut() {
             menu.open = false;
@@ -727,45 +541,28 @@ impl Prompt {
         }
     }
 
-    /// Any key that was not an accept. `stepped` is only ever true for the one
-    /// keystroke that follows one.
+    /// Called on every key but an accept, so `stepped` lasts one keystroke.
     fn stayed_put(&mut self) {
         if let Some(menu) = self.menu.as_mut() {
             menu.stepped = false;
         }
     }
 
-    /// The menu, which every caller here has already established is there.
+    /// Callers have already checked the menu exists.
     fn menu(&mut self) -> &mut Menu {
         self.menu.as_mut().expect("a menu the caller checked for")
     }
 
-    /// `Tab` on a `~` alone: write the `/` that makes it a directory to look
-    /// inside. Whether it did.
+    /// `Tab` on a lone `~`: write `~/` and return true; the next `Tab` lists
+    /// home.
     ///
-    /// Every other path completes by being matched against its siblings — `/hom`
-    /// is ranked among everything in `/`. A lone `~` cannot be: it is not a name
-    /// in a directory, it is a whole directory named in one character, and
-    /// [`crate::dirs::split`] has no `/` in it to cut at, so the menu would open
-    /// on nothing and say so. The only completion it has is the slash, which is
-    /// therefore what `Tab` writes — and the next `Tab` opens the menu on the
-    /// home directory's children, the same "write it, then step into it" pairing
-    /// that `accept` and `adopt_default` both already have.
-    ///
-    /// A shell does something else here, and deliberately not copied: `~` alone
-    /// completes *usernames* in fish, bash and zsh alike — `~root`, `~ubuntu`,
-    /// one per passwd entry. nvmux has no `~user` to offer, because
-    /// [`crate::session::expand_tilde`] refuses one: somebody else's home is a
-    /// question only the host can answer, and asking it would cost a round trip
-    /// and turn the one expansion nvmux *knows* into one it has to go and look
-    /// up. With `~user` gone, the slash is the only completion a lone `~` has
-    /// left, which is why it is the one written here.
+    /// `~` has no `/` for [`crate::dirs::split`] to cut at, so it cannot be
+    /// matched against siblings. Shells complete `~user` here, but
+    /// [`crate::session::expand_tilde`] refuses `~user` (it would need a host
+    /// round trip), so the slash is the only completion.
     fn complete_bare_tilde(&mut self) -> bool {
         let field = &mut self.fields[DIRECTORY];
-        // Against the value, so this is about what enter would take, not about
-        // whether the `~` is typed or still a placeholder. The default is `~/`
-        // and so already has its slash, which is why this is only ever reached
-        // by a `~` somebody typed.
+        // The default is `~/`, so only a typed `~` gets here.
         if field.value() != "~" {
             return false;
         }
@@ -774,11 +571,8 @@ impl Prompt {
         true
     }
 
-    /// Take the highlighted directory into the field, and close the menu.
-    ///
-    /// The name alone, with no trailing `/`: the path then reads exactly as it
-    /// would if it had been typed, and the slash is the next `Tab`'s job — which
-    /// is what makes one key both "complete this" and "now go inside it".
+    /// Write the highlighted directory into the field, without a trailing `/`
+    /// (the next `Tab` adds it), and close the menu.
     fn accept(&mut self) {
         let Some(name) = self
             .menu
@@ -789,12 +583,9 @@ impl Prompt {
             return;
         };
         let field = &mut self.fields[DIRECTORY];
-        // Against the value, not the input: an emptied field is showing its
-        // default, and choosing from it means choosing inside that.
+        // The value, not the input: an emptied field means its default.
         let current = field.value();
-        // The inert half is left exactly as it is, so a line that says
-        // `/home/shu//etc` goes on saying it — the discarded prefix is still
-        // what the user typed, and still what the dim half of the line explains.
+        // Keep the discarded prefix before `//` as typed.
         let (inert, live) = crate::dirs::anchored(&current);
         let parent = crate::dirs::split(live).map_or(live, |(d, _)| d);
         let parent = parent.trim_end_matches('/');
@@ -805,9 +596,7 @@ impl Prompt {
     }
 }
 
-/// `label: ` for each, padded so every field's value starts in the same column.
-/// Labels of different lengths would otherwise stagger the fields and put the
-/// cursor somewhere different on each row.
+/// `label: ` for each, padded so all values start in the same column.
 fn aligned(labels: &[&str]) -> Vec<String> {
     let width = labels.iter().map(|l| l.width()).max().unwrap_or(0);
     labels
@@ -816,15 +605,13 @@ fn aligned(labels: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Ask for a new session, owning the terminal while it does — for `<prefix> c`,
-/// which arrives from an attached session with none to borrow.
+/// Ask for a new session on a terminal of its own, for `<prefix> c`.
 ///
-/// [`Outcome::Created`] leads straight to a client spawn, exactly as the picker's
-/// attach does, so the terminal goes back cleared on that one outcome and the
-/// session being left is not what fills the spawn. A cancelled prompt goes back
-/// to the same client, which is repainted, so it takes the ordinary close.
+/// On [`Outcome::Created`] a client is spawned next, so the terminal is
+/// returned cleared; on cancel the old client is repainted, so the ordinary
+/// close is used.
 pub fn run(transport: &dyn Transport) -> Result<Outcome> {
-    // Reached from a session that has just dissolved out, so dissolve in.
+    // The session just dissolved out, so dissolve in.
     super::owning_for_attach(Outcome::attaches, true, |terminal| {
         run_on(
             terminal,
@@ -838,14 +625,10 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
     })
 }
 
-/// Ask for a new session as the picker full screen asks for one, owning the
-/// terminal while it does — for `c` on the picker floating over a session,
-/// which goes out with the session and leaves none to borrow (see
-/// [`super::picker`]). On `rows`, the picker's, with its cursor on `after`,
-/// the session is named and placed as the picker full screen names and
-/// places it, after that row (see [`super::settle`]): what comes back is the
-/// session and the rows it is among, or `None` where the prompt was
-/// cancelled.
+/// Ask for a new session on a terminal of its own, for `c` on the floating
+/// picker (see [`super::picker`]). Named and placed after row `after` of
+/// `rows` as the full-screen picker would (see [`super::settle`]). Returns the
+/// session and its rows, or `None` if cancelled.
 pub fn create_after(
     transport: &dyn Transport,
     rows: &[Session],
@@ -855,8 +638,7 @@ pub fn create_after(
     if let Some(id) = after {
         picker.select_session(id);
     }
-    // Reached from a session that has just gone out to the background, so
-    // dissolve in, as for `<prefix> c`.
+    // The session just went to the background, so dissolve in.
     let outcome = super::owning_for_attach(Outcome::attaches, true, |terminal| {
         run_on(
             terminal,
@@ -874,15 +656,11 @@ pub fn create_after(
     })
 }
 
-/// Ask for a new name for `session`, owning the terminal while it does — for
-/// `r` on the picker floating over a session, which goes out with the session
-/// and leaves none to borrow (see [`super::picker`]).
-///
-/// Renamed or not, the same client comes back next, with the picker up over
-/// it again, so it takes the ordinary close, as a create cancelled does.
+/// Ask for a new name on a terminal of its own, for `r` on the floating
+/// picker (see [`super::picker`]). The same client returns either way, so the
+/// ordinary close is used.
 pub fn rename(transport: &dyn Transport, session: &Session) -> Result<Outcome> {
-    // Reached from a session that has just gone out to the background, so
-    // dissolve in, and out again either way.
+    // Dissolve in, and out again either way.
     super::owning(|terminal| {
         run_on(
             terminal,
@@ -893,69 +671,59 @@ pub fn rename(transport: &dyn Transport, session: &Session) -> Result<Outcome> {
     })
 }
 
-/// The least of the session the floating prompt leaves showing round it:
-/// columns either side, and rows above and below. The picker's and the help's.
+/// Minimum session margin around the floating prompt, per side (as the
+/// picker and help).
 const SESSION_COLS: u16 = 2;
 const SESSION_ROWS: u16 = 1;
 
-/// How much wider than its opening lines the floating prompt is, for what is
-/// typed past them; and the narrowest and the widest it is, the settings'
-/// width.
+/// Extra width beyond the opening lines for typing, and the width bounds
+/// (the settings panel's).
 const PANEL_ROOM: u16 = 24;
 const PANEL_NARROWEST: u16 = 48;
 const PANEL_WIDEST: u16 = 72;
 
-/// How tall the floating prompt is: its body, and the panel's last row, where
-/// the prompt has its hint row full screen — blank here, the hint row being
-/// along the bottom of the screen (see [`float::inside`]). A create's form,
-/// three fields and a message, is centred in the body as full screen, with
-/// its menu hanging under it: the body is as tall as the form and twice the
-/// menu, less the row centring puts above rather than below. A rename's is
-/// its line and its message, with three rows round them.
+/// Panel heights: the body plus the last row, where the prompt has its hint
+/// row full screen, left blank ([`float::inside`]). A create's form (three
+/// fields and a message) is centred with the menu below it, so the body is
+/// the form plus twice the menu, less the one row centring puts above. A
+/// rename has its line and message plus three rows.
 const CREATE_ROWS: u16 = (3 + 1) + 2 * MENU_ROWS - 1 + 1;
 const RENAME_ROWS: u16 = (1 + 1) + 3 + 1;
 
-/// The prompt floating over a session (see the module docs and
-/// `crate::pty::panel`), on the relay's keys.
+/// The prompt floating over a session (see `crate::pty::panel`), fed the
+/// relay's keys.
 pub struct Panel {
     prompt: Prompt,
     job: Job,
     completer: Option<complete::Completer>,
-    /// What makes and renames sessions: lent once as nvmux starts (see
-    /// [`super::picker::lend`]), and so missing only where nothing lent it.
+    /// Lent at startup (see [`super::picker::lend`]); `None` only if nothing
+    /// lent it.
     transport: Option<Shared>,
-    /// Where it goes once it is down: to the session made, if one was.
+    /// The session to switch to after closing, if one was made.
     leave: Option<Leave>,
-    /// When it was last moved on: what the completer's answers are waited for
-    /// from.
+    /// Last tick or key; the next completer poll is scheduled from it.
     ticked: Instant,
 }
 
-/// What the floating prompt is for.
 enum Job {
-    /// A new session, to go at `place` among the rows in hand, which the
-    /// picker holds, its cursor where it was: what the session is named and
-    /// placed by, as from the picker full screen (see [`super::settle`]).
+    /// Create at `place`. The picker holds the current rows and cursor, used
+    /// for naming and placement (see [`super::settle`]).
     Create { place: Place, picker: Box<App> },
-    /// A new name for this session, as the rows in hand have it — or `None`
-    /// where they no longer do.
+    /// Rename this session; `None` if it is no longer in the rows.
     Rename(Option<Session>),
 }
 
 impl Panel {
-    /// The create prompt, for a session to go at `place`, on the rows in hand.
     pub fn create(place: Place) -> Self {
         Self::create_on(place, super::picker::rows(), super::picker::transport())
     }
 
-    /// The rename prompt, for session `id` as the rows in hand have it.
     pub fn rename(id: Id) -> Self {
         Self::rename_on(id, super::picker::rows(), super::picker::transport())
     }
 
-    /// The create prompt on `rows`, offering the name the picker full screen
-    /// offers for the place the session will go — and asking the completer
-    /// about the default directory before a key is pressed, as full screen.
+    /// Offers the same default name as the full-screen picker would and
+    /// starts listing the default directory right away.
     fn create_on(place: Place, rows: Vec<Session>, transport: Option<Shared>) -> Self {
         let mut picker = App::new(rows);
         let number = match place {
@@ -990,7 +758,6 @@ impl Panel {
         }
     }
 
-    /// The rename prompt on `rows`, for session `id`.
     fn rename_on(id: Id, rows: Vec<Session>, transport: Option<Shared>) -> Self {
         let session = rows.into_iter().find(|s| s.id == id.as_str());
         let prompt = match &session {
@@ -1007,8 +774,8 @@ impl Panel {
         }
     }
 
-    /// The number a session made here will be given, which its name is
-    /// numbered after: the slot after the picker's row, or past every row's.
+    /// The new session's number (for its default name): after the picker's
+    /// row, or `None` for the end.
     fn number(&self) -> Option<u32> {
         match &self.job {
             Job::Create {
@@ -1022,10 +789,8 @@ impl Panel {
         }
     }
 
-    /// What enter asked for, done, as the prompt full screen does it: a
-    /// session made is put in its place and gone to, a rename leaves the
-    /// rows renamed for the picker to come back on, and a refusal stays up,
-    /// saying why.
+    /// Carry out a submission as the full-screen prompt does; on refusal the
+    /// panel stays up with the reason.
     fn submit(&mut self, submission: Submission) -> Did {
         let Some(transport) = self.transport.clone() else {
             self.prompt.fail("nothing to make it with".into(), None);
@@ -1049,9 +814,7 @@ impl Panel {
             Ok(Outcome::Renamed(name)) => self.renamed(transport, &name),
             Ok(Outcome::Cancelled) => Did::Close,
             Err(e) => {
-                // As full screen: what was just refused is the one thing the
-                // rows in hand cannot know about, so the name offered again
-                // is a listing's.
+                // The rows in hand may be stale, so re-list for the default.
                 let refreshed = match self.job {
                     Job::Create { .. } => next_free_name(transport, None, number).ok(),
                     Job::Rename(_) => None,
@@ -1062,9 +825,8 @@ impl Panel {
         }
     }
 
-    /// The session made, put where the picker full screen puts it — after
-    /// the picker's row, or at the end — and gone to: its rows left for the
-    /// session loop to take back, so the switch finds it.
+    /// Place the new session (after the picker's row, or last), leave the
+    /// rows for the session loop, and switch to it.
     fn made(&mut self, transport: &dyn Transport, session: Session) -> Did {
         let (session, rows) = match &self.job {
             Job::Create {
@@ -1086,9 +848,8 @@ impl Panel {
         Did::Close
     }
 
-    /// Renamed, to `name`: the rows listed again, as the picker full screen
-    /// lists them after a rename — or, where that fails, the name put in the
-    /// rows in hand — and left for the picker to come back on.
+    /// Re-list (or, failing that, patch the rows in hand) and leave the rows
+    /// for the picker.
     fn renamed(&mut self, transport: &dyn Transport, name: &str) -> Did {
         let rows = transport.list_sessions().unwrap_or_else(|e| {
             tracing::debug!(error = %e, "could not list the sessions after a rename");
@@ -1106,10 +867,8 @@ impl Panel {
 }
 
 impl Floating for Panel {
-    /// In the middle of the room above the hint row: wide enough for its
-    /// opening lines and what is typed past them, and tall enough for the
-    /// form and a create's menu under it; nowhere where that leaves too
-    /// little of the session round it, which has the prompt full screen.
+    /// Centred above the hint row; `None` if too little session would show
+    /// around it, which means full screen.
     fn area(&self, screen: Rect) -> Option<Rect> {
         let (room, _) = float::split(screen);
         let opening = self
@@ -1137,14 +896,13 @@ impl Floating for Panel {
         ))
     }
 
-    /// A key, as the prompt takes it full screen; releases are no keys.
+    /// Key releases are ignored.
     fn on_key(&mut self, key: KeyEvent, now: Instant) -> Did {
         if key.kind == KeyEventKind::Release {
             return Did::Stay;
         }
         self.ticked = now;
         let step = self.prompt.on_key(super::translate(key));
-        // After the key, not before, as full screen.
         refresh(&mut self.prompt, self.completer.as_mut());
         match step {
             Step::None => Did::Stay,
@@ -1153,14 +911,12 @@ impl Floating for Panel {
         }
     }
 
-    /// Nothing on it to point at, as full screen. A press on the session
-    /// takes it down, which is the relay's to see.
+    /// Nothing clickable; the relay handles presses on the session.
     fn on_mouse(&mut self, _mouse: MouseEvent, _now: Instant) -> Did {
         Did::Stay
     }
 
-    /// Soon, while an answer from the completer is outstanding, as full
-    /// screen; otherwise never on its own.
+    /// Only while the completer owes an answer.
     fn wake_at(&self) -> Option<Instant> {
         self.completer
             .as_ref()
@@ -1168,7 +924,7 @@ impl Floating for Panel {
             .map(|_| self.ticked + super::BUSY_TICK)
     }
 
-    /// What the completer has answered since, shown.
+    /// Show any new completer answers.
     fn tick(&mut self, now: Instant) -> bool {
         self.ticked = now;
         if self
@@ -1186,16 +942,14 @@ impl Floating for Panel {
         false
     }
 
-    /// The prompt drawn into `area`: as it draws itself on a terminal of the
-    /// panel's inside, in the theme's colour, and laid into a buffer of
-    /// `area` — all but its hint row.
+    /// Draw on an in-memory terminal the size of the panel's inside, themed,
+    /// then copy all but the hint row into a buffer of `area`.
     fn draw(&mut self, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         let inside = float::inside(area);
         if inside.width == 0 || inside.height == 0 {
             return buf;
         }
-        // A terminal of the inside's size, in memory, as the picker draws on.
         let Ok(mut terminal) = Terminal::new(TestBackend::new(inside.width, inside.height));
         let prompt = &self.prompt;
         let Ok(_) = terminal.draw(|f| {
@@ -1206,8 +960,6 @@ impl Floating for Panel {
         buf
     }
 
-    /// The prompt's hint row drawn into `row`, as full screen, in the
-    /// theme's colour.
     fn draw_hints(&self, row: Rect) -> Buffer {
         let mut buf = Buffer::empty(row);
         draw::hint_row_on(&mut buf, row, self.prompt.hints(), true);
@@ -1222,40 +974,28 @@ impl Floating for Panel {
     }
 }
 
-/// How the prompt comes up — and so whether it goes back out on a cancel, for
-/// whatever was behind it to come back up.
+/// How the prompt appears, and so whether it fades out on cancel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Arrival {
-    /// Cut to, over a screen that is still up: the picker's `r`, and its `c`
-    /// with `[effects.create]` off or no fade to close the picker onto its gap
-    /// with. Cut away from on a cancel too, the picker simply coming back.
+    /// Cut in and out over a screen still up: the picker's `r`, and its `c`
+    /// with `[effects.create]` off or no fade available.
     Cut,
-    /// Dissolved in, out of the background a session has just dissolved into:
-    /// `<prefix> c`, and `c` or `r` on the picker floating over a session,
-    /// which goes out with it. Dissolved out again on a cancel.
+    /// Dissolve in from the background a session just dissolved into
+    /// (`<prefix> c`, or `c`/`r` on the floating picker), and out on cancel.
     Dissolve,
-    /// Opened out of the name field's row, the picker having closed in onto
-    /// the gap it made for the session (see [`super::app::App::make_room`]):
-    /// the name the gap showed is the first thing back. Dissolved out on a
-    /// cancel, for the picker to come back up.
+    /// Open out of the name row after the picker closed onto the gap it made
+    /// (see [`super::app::App::make_room`]); dissolve out on cancel.
     FromName,
 }
 
-/// Ask on a terminal the caller already owns — how the picker drives this
-/// screen for `c` and `r`.
+/// Run on a terminal the caller owns (the picker's `c` and `r`).
 ///
-/// Not `run`: a second terminal inside the picker's would enter the alternate
-/// screen twice and leave it once. Sharing it also makes the handover
-/// invisible, since `Terminal::draw` resets the frame each pass.
+/// Not `run`: a nested terminal would enter the alternate screen twice and
+/// leave once. Sharing it also hides the handover, since `Terminal::draw`
+/// resets the frame each pass.
 ///
-/// `arrival` is how the prompt comes up, and whether it dissolves out on a
-/// cancel: every way but [`Arrival::Cut`] does. A create dissolves out
-/// *whichever* way it came — a client spawn follows, and this is the screen
-/// that is up when it does.
-///
-/// A create takes the caller's listing, when it has one, for its default name
-/// — see [`Task::Create`] — so the picker's `c` costs no script run on the way
-/// in.
+/// Every `arrival` but [`Arrival::Cut`] fades out on cancel; a completed
+/// create always fades out, since a client spawn follows.
 pub(super) fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
     transport: &dyn Transport,
@@ -1272,9 +1012,8 @@ pub(super) fn run_on(
         Task::Rename(session) => Prompt::rename(session),
     };
 
-    // Only a create has a directory to complete, and only a create pays for the
-    // worker. Dropped with the prompt, which is what ends it — see
-    // `super::complete`.
+    // Only a create starts the worker; dropping the completer ends it (see
+    // `super::complete`).
     let mut completer = match task {
         Task::Create { .. } => Some(complete::Completer::new(
             transport.dir_source(),
@@ -1282,9 +1021,7 @@ pub(super) fn run_on(
         )),
         Task::Rename(_) => None,
     };
-    // Ask about the default before a key is pressed. The answer is then usually
-    // already in hand when the first one is, which is the difference between the
-    // field feeling instant and it paying a round trip to say its first word.
+    // List the default up front so the first `Tab` is usually instant.
     refresh(&mut prompt, completer.as_mut());
 
     match arrival {
@@ -1303,8 +1040,7 @@ pub(super) fn run_on(
             crate::theme::paint(f.buffer_mut());
         })?;
 
-        // A shorter wait only while an answer is outstanding: an idle prompt is
-        // back on the ordinary tick and costs nothing.
+        // Poll faster only while an answer is outstanding.
         let waiting = completer.as_ref().is_some_and(complete::Completer::waiting);
         let tick = if waiting {
             super::BUSY_TICK
@@ -1313,8 +1049,7 @@ pub(super) fn run_on(
         };
 
         let Some(key) = super::poll_key_for(tick)? else {
-            // Nothing was typed, so nothing new is being asked. What may have
-            // arrived is an answer to what was.
+            // No key; check for a completer answer.
             if completer.as_mut().is_some_and(complete::Completer::poll) {
                 show(&mut prompt, completer.as_mut());
             }
@@ -1322,8 +1057,8 @@ pub(super) fn run_on(
         };
 
         let step = prompt.on_key(key);
-        // After the key, not before: `→` may have taken the suggestion, which
-        // makes the input a new question.
+        // After the key: it may have changed the query (e.g. `→` adopting the
+        // default).
         refresh(&mut prompt, completer.as_mut());
 
         let submission = match step {
@@ -1339,19 +1074,16 @@ pub(super) fn run_on(
 
         match commit(transport, task, submission) {
             Ok(outcome) => {
-                // Out through the background on the way to a client spawn,
-                // whoever called; a rename only comes back to a picker that
-                // is about to redraw, so it dissolves only if it dissolved in.
+                // Always fade before a client spawn; a rename returns to the
+                // picker, so it fades only if it faded in.
                 if outcome.attaches() || animate {
                     crate::fade::fade_out(terminal, |f| draw(f, &prompt))?;
                 }
                 return Ok(outcome);
             }
             Err(e) => {
-                // A name that was free when the prompt opened may not be now.
-                // The picker's listing is trusted on the way in, never on a
-                // retry: what was just refused is the one thing it cannot
-                // know about.
+                // The default may have been taken since; re-list rather than
+                // trust the picker's listing on a retry.
                 let refreshed = match task {
                     Task::Create { number, .. } => Some(next_free_name(transport, None, number)?),
                     Task::Rename(_) => None,
@@ -1362,14 +1094,11 @@ pub(super) fn run_on(
     }
 }
 
-/// What enter asked for, done: the session made, or renamed — or why not, in
-/// the transport's words.
+/// Create or rename the session.
 ///
-/// The name is not validated here: `session::validate_name` and the
-/// transport's duplicate check are the rule, and a UI copy would drift from
-/// them. The command is parsed here only because the transport takes a
-/// `Launch` and cannot be handed a line that is not one; the rules still live
-/// in `launch`.
+/// Names are validated only by `session::validate_name` and the transport's
+/// duplicate check, so no UI copy can drift. The command is parsed here only
+/// because the transport takes a `Launch`.
 fn commit(transport: &dyn Transport, task: Task, submission: Submission) -> Result<Outcome> {
     match task {
         Task::Create { .. } => {
@@ -1378,16 +1107,12 @@ fn commit(transport: &dyn Transport, task: Task, submission: Submission) -> Resu
             Launch::parse(&line)
                 .map_err(Into::into)
                 .and_then(|launch| {
-                    // Absolute by here, with any leading `~` already expanded
-                    // against the *session host's* home — see
-                    // `session::validate_directory`. Whether it exists is the
-                    // spawn script's question.
+                    // Absolute, `~` expanded against the session host's home.
+                    // Existence is checked by the spawn script.
                     let directory = crate::session::validate_directory(&typed, transport.home())?;
                     transport
                         .create_session(&submission.name, &launch, &directory)
-                        // Only once a session has really started with it:
-                        // offering back a command that never worked would make
-                        // the same failure the default.
+                        // Remember only a command that started a session.
                         .inspect(|_| state::remember(transport.location(), launch.line()))
                 })
                 .map(Outcome::Created)
@@ -1398,39 +1123,28 @@ fn commit(transport: &dyn Transport, task: Task, submission: Submission) -> Resu
     }
 }
 
-/// Put the directory field's current text to the completer, and show whatever
-/// it can already answer.
+/// Ask the completer about the directory field's value (so an emptied field
+/// completes its default) and show what it has.
 ///
-/// Called after every key. It does no I/O: [`complete::Completer::ask`] looks in
-/// memory and, failing that, posts a question for the worker — which is the
-/// whole reason a keystroke is never slower than a keystroke.
-///
-/// What is offered follows the *value*, not the input, so an untouched field
-/// completes inside the home directory it is showing rather than inside nothing.
+/// Called after every key and does no I/O: [`complete::Completer::ask`]
+/// answers from memory or queues the question for the worker.
 fn refresh(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     let Some(completer) = completer else {
         return;
     };
-    // The live half, so a `//` re-points the listing at the root rather than
-    // leaving it in the directory the user has just walked away from.
+    // Only the part after any `//`.
     let typed = prompt.fields[DIRECTORY].value();
     completer.ask(crate::dirs::anchored(&typed).1);
     show(prompt, Some(completer));
 }
 
-/// Copy what the completer is offering onto the screen: the suggestion after
-/// the cursor, and the alternatives on the row below.
-///
-/// The ghost goes on the field only while that field is where the keystrokes
-/// are going. Offering to extend a field the cursor is not in would be offering
-/// something `→` would not do.
+/// Copy the completer's matches into the menu.
 fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     let Some(completer) = completer else {
         return;
     };
-    // Nothing is matched, ranked or drawn until `Tab` has asked for it. The
-    // listing still runs in the background regardless, so that first `Tab` is
-    // instant rather than paying a round trip to say its first word.
+    // Nothing is matched until `Tab` opens the menu, though listing runs
+    // in the background regardless.
     if !prompt.choosing() {
         if let Some(menu) = prompt.menu.as_mut() {
             menu.matches.clear();
@@ -1439,9 +1153,7 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
         return;
     }
 
-    // Against the value rather than the input, matching what was asked: an
-    // untouched field is showing its default, and completing it means completing
-    // inside that.
+    // The value, as in `refresh`.
     let typed = prompt.fields[DIRECTORY].value();
     let live = crate::dirs::anchored(&typed).1;
     let query = crate::dirs::split(live).map_or("", |(_, q)| q);
@@ -1451,14 +1163,10 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     let matches = completer.matches(query);
 
     let message = if waiting && matches.is_empty() {
-        // Only when there is nothing to show. A cached listing answers instantly
-        // while a fresh one is still in flight, and replacing real matches with
-        // an ellipsis would be a step backwards.
+        // Only with nothing to show: cached matches beat an ellipsis.
         "…".to_string()
     } else if matches.is_empty() {
-        // Said plainly rather than left blank: an open menu showing nothing
-        // looks broken, and a query that matches nothing looks exactly like one
-        // still being typed.
+        // An empty open menu would look broken.
         if query.is_empty() {
             "nothing here to choose from".to_string()
         } else {
@@ -1469,9 +1177,8 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     };
 
     let menu = prompt.menu.as_mut().expect("checked by `choosing`");
-    // The best match, whenever the set of matches changes. Holding the index
-    // still would point it at a different directory each keystroke, which is a
-    // worse kind of stable.
+    // Reselect the best match when the matches change; a fixed index would
+    // point at a different directory each keystroke.
     if menu.matches != matches {
         menu.selected = 0;
     }
@@ -1480,15 +1187,10 @@ fn show(prompt: &mut Prompt, completer: Option<&mut complete::Completer>) {
     menu.message = message;
 }
 
-/// The name a session gets when the user just presses enter: `session N`, `N`
-/// the number the session will be given, so the name says where it went in.
-/// Made between the sessions numbered 2 and 3, it is `session 3`, and the
-/// one that was 3 moves down to be 4.
-///
-/// Names are unique, so when that one is taken the next free number above it
-/// is offered instead, and failing every one of those, the first free number
-/// below it. Compared case-insensitively, because that is how the transports
-/// reject duplicates.
+/// `session N`, where `N` is the number the session will get (made between
+/// 2 and 3, it is `session 3`). If taken, the next free number above, else
+/// the first free one below. Case-insensitive, like the transports'
+/// duplicate check.
 fn next_name(taken: &[String], number: u32) -> String {
     let number = number.max(1);
     for n in (number..number.saturating_add(1000)).chain(1..number) {
@@ -1500,8 +1202,7 @@ fn next_name(taken: &[String], number: u32) -> String {
     "session".to_string()
 }
 
-/// The default name, against `listed` when the caller has a listing in hand
-/// and against a fresh one otherwise. See [`default_name`].
+/// [`default_name`] against `listed`, or a fresh listing if `None`.
 fn next_free_name(
     transport: &dyn Transport,
     listed: Option<&[Session]>,
@@ -1513,45 +1214,19 @@ fn next_free_name(
     }
 }
 
-/// The name a create offers against the listing `listed`, for a session that
-/// will be given `number` — or, with `None`, the number one past every row's,
-/// for a session going at the end. See [`next_name`].
-///
-/// What the prompt opens with when it is handed that listing and number, and
-/// so what the picker stands in the gap it makes before asking (see
-/// [`super::app::App::make_room`]). One function, so the row in the gap and
-/// the field it hands over to can never disagree.
+/// The default name for a session numbered `number` (`None`: last). Also
+/// shown by the picker in the gap it makes (see
+/// [`super::app::App::make_room`]), so the two always agree.
 pub(super) fn default_name(listed: &[Session], number: Option<u32>) -> String {
     let taken: Vec<String> = listed.iter().map(|s| s.name.clone()).collect();
     let last = listed.iter().map(|s| s.state.num).max().unwrap_or(0) + 1;
     next_name(&taken, number.unwrap_or(last))
 }
 
-/// The directory a session gets when the user just presses enter: the session
-/// host's home, written `~/`.
-///
-/// The tilde rather than the path spelled out, because `~/` is what someone
-/// would have typed, and it is one short thing to read instead of a path whose
-/// length is somebody else's decision. It costs nothing to resolve:
-/// [`crate::session::expand_tilde`] turns it back into the same absolute path
-/// on the way out, against the *session host's* home — so this is the one
-/// default that is already right on a machine whose home is not the shape this
-/// one's is.
-///
-/// The slash is not decoration. It is what makes the field's text mean "inside
-/// this directory" rather than "this directory, among its siblings" — so the
-/// menu opens listing the home directory's children, which is what someone
-/// tabbing into the field wants to see, and choosing one descends rather than
-/// stepping sideways. It is also what keeps enter submitting: with nothing after
-/// the slash there is no half-typed name for the menu to resolve.
-///
-/// Empty stays empty. A host that could not say where home is has no `~` to
-/// offer either — `expand_tilde` refuses one it cannot resolve, so `~/` would
-/// be a default that fails on enter, and `/` alone would be a confident wrong
-/// answer.
-///
-/// Takes the home rather than the transport so that this is a question about a
-/// string, which is what it is.
+/// `~/`, which [`crate::session::expand_tilde`] resolves against the session
+/// host's home. The slash makes the menu list home's children. Empty if the
+/// host has no known home: `~/` would then fail on Enter, and `/` would be
+/// wrong.
 fn default_directory(home: &str) -> String {
     if home.trim_end_matches('/').is_empty() {
         String::new()
@@ -1560,12 +1235,8 @@ fn default_directory(home: &str) -> String {
     }
 }
 
-/// The command a session gets when the user just presses enter: what was last
-/// used on this host, else what the config says.
-///
-/// Per host, because the answer is about a machine — a path to a nightly build
-/// on one box means nothing on another, and `nvmux myhost` is a different
-/// machine's `$PATH`.
+/// The command last used on this host, else the configured one. Per host,
+/// since paths and `$PATH` differ between machines.
 fn default_command(transport: &dyn Transport) -> String {
     state::remembered(transport.location())
         .unwrap_or_else(|| crate::config::get().session.command.clone())
@@ -1577,21 +1248,10 @@ fn draw(frame: &mut Frame, prompt: &Prompt) {
     });
 }
 
-/// Where the form is drawn within the body `area`: centred as it reads the
-/// moment the prompt opens, then held.
-///
-/// The anchor deliberately ignores what has been typed: sizing it to the current
-/// contents would shuffle the block half a cell on every keystroke, and
-/// anchoring on the labels alone would leave it right of centre. Measuring the
-/// *opening* lines gets both, and keeps each field's first column where its
-/// placeholder sits.
-///
-/// It counts the fields and the message and *not* the menu, so the form sits
-/// in exactly the same place whether the menu is open or shut. A block sized
-/// to include it would jump up the screen on every `Tab`, and one that
-/// reserved its rows against that would leave a permanent blank gap under a
-/// closed menu. Neither is worth having when the menu can simply hang in the
-/// space below.
+/// The form's rect in `area`, centred on the opening lines (labels plus
+/// defaults) rather than the current input, so it does not shift while
+/// typing. The menu is excluded so the form stays put when it opens; the menu
+/// hangs below.
 fn anchor(prompt: &Prompt, area: Rect) -> Rect {
     let height = prompt.fields.len() as u16 + u16::from(prompt.message.is_some());
     let opening = prompt
@@ -1603,8 +1263,7 @@ fn anchor(prompt: &Prompt, area: Rect) -> Rect {
     draw::centre(area, opening, height)
 }
 
-/// The screen row the name field is drawn on, on a frame of `area`: what
-/// [`Arrival::FromName`] opens the prompt out of.
+/// The name field's screen row, for [`Arrival::FromName`].
 fn name_row(prompt: &Prompt, area: Rect) -> u16 {
     let (body, _) = draw::split_hint_row(area);
     anchor(prompt, body).y + NAME as u16
@@ -1637,10 +1296,8 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
 
     let mut y = anchor.y + rows;
 
-    // Routinely wider than the fields, so it gets the full width and its own
-    // centring rather than hanging off the anchor. Drawn before the menu because
-    // it belongs to the form: a rejected create must not be what a tall menu
-    // pushes off the screen.
+    // Full width and centred, as it is often wider than the fields. Drawn
+    // before the menu so a tall menu cannot push it off screen.
     if let Some(msg) = prompt.message.as_deref() {
         frame.render_widget(
             Paragraph::new(Line::from(draw::truncate(msg, area.width as usize)))
@@ -1655,14 +1312,12 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     }
 
     if let Some(menu) = prompt.menu.as_ref().filter(|m| m.open) {
-        // Indented to where the field values start, so the menu reads as hanging
-        // from the directory field rather than floating under the form.
+        // Aligned with the field values.
         let indent = prompt
             .fields
             .get(DIRECTORY)
             .map_or(0, |f| f.label.width() as u16);
-        // Whatever room is left under the form, capped so the menu cannot fill a
-        // tall terminal end to end.
+        // The room left below, capped at `MENU_ROWS`.
         let block = Rect {
             x: anchor.x.saturating_add(indent).min(area.x + area.width),
             y,
@@ -1673,12 +1328,8 @@ fn draw_body(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     }
 }
 
-/// The dropdown, one directory per row, the highlighted one reversed.
-///
-/// `REVERSED | BOLD` is already what "the selected row in a list" means in the
-/// picker, and it is deliberately not the field cursor's plain `REVERSED` — two
-/// reversed things on one screen have to be told apart, and this is how the rest
-/// of nvmux tells them apart.
+/// The selected row is `REVERSED | BOLD`, as in the picker, distinct from the
+/// cursor's plain `REVERSED`.
 fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -1718,10 +1369,7 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
         })
         .collect();
 
-    // The host stopped short, so the last row says so rather than letting a
-    // partial list read as a complete one. It costs a match to say it, which is
-    // the right trade: a list that is quietly missing entries is worse than a
-    // list that is one shorter.
+    // A truncated listing gives up its last row to say so.
     if menu.partial && lines.len() == height && height > 0 {
         lines.pop();
         lines.push(Line::from(Span::styled(
@@ -1733,29 +1381,18 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// One field's whole line: dim label, then either what was typed or the dim
-/// default. Derived from state rather than tracked, so backspacing to nothing
-/// brings the placeholder back with nothing to keep in sync.
+/// One field's line: dim label, then the input or the dim default.
 fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
-    // The cursor is the only feedback that typing is doing anything, so it gets
-    // a column before the label does — a long rename label on a narrow terminal
-    // would otherwise fill the line and push it off the right edge.
+    // Reserve a column for the cursor so a long label cannot push it off.
     let label = draw::truncate(&field.label, width.saturating_sub(1));
     let room = width.saturating_sub(label.width() + 1);
-    // Dim, not bold: a label is the least interesting thing on its line, and
-    // every one of them says the same thing on every prompt. What changes — what
-    // you typed, what enter would take — leads by being the only text at full
-    // weight.
     let mut spans = vec![Span::styled(label, DIM)];
 
-    // How much of the line no longer counts, in characters. Everything a `//`
-    // discarded is drawn dim, which is the whole of what dim means here — an
-    // ordinary path has none of it.
+    // Characters discarded by a `//`, drawn dim.
     let inert = crate::dirs::anchored(&field.input).0.chars().count();
 
     match (field.input.is_empty(), focused) {
-        // The placeholder, with the cursor on its first letter so the default
-        // sits in exactly the columns a typed value will.
+        // Cursor on the placeholder's first letter.
         (true, true) => match split_first(&field.default) {
             Some((first, rest)) => {
                 spans.push(Span::styled(first, CURSOR));
@@ -1763,13 +1400,11 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
             }
             None => spans.push(Span::styled(" ", CURSOR)),
         },
-        // Nothing typed and not where the keystrokes are going: no cursor, or
-        // there would be two on screen and no telling which is live.
+        // Unfocused: no cursor.
         (true, false) => spans.push(Span::styled(draw::truncate(&field.default, room), DIM)),
         (false, true) => spans.extend(windowed(field, room, inert)),
         (false, false) => {
-            // Unfocused, so no cursor to keep in view: the line is simply cut to
-            // fit, but the dim half still has to read as dim.
+            // No cursor to keep in view: truncate, keeping the dim prefix.
             let text = draw::truncate(&field.input, room);
             let shown = text.chars().count();
             let cut = inert.min(shown);
@@ -1794,31 +1429,21 @@ fn split_first(s: &str) -> Option<(String, &str)> {
     Some((first.to_string(), &s[first.len_utf8()..]))
 }
 
-/// The window of `input` to draw, as character indices: where it starts, the
-/// cell the cursor is on, and where it ends.
+/// The visible window of `input` as character indices `(start, cursor, end)`.
+/// Indices, not strings, so `windowed` can place the dim/plain boundary.
 ///
-/// Bounds rather than ready-made strings, because the line carries a style
-/// boundary — the part a `//` has discarded is drawn dim — and a string cannot
-/// say where that boundary fell after the window moved.
-///
-/// The opposite choice from `draw::truncate`, and for a reason: a field has to
-/// keep the cursor visible, so when a path outgrows it the text scrolls rather
-/// than the part being edited disappearing. The cursor may sit one past the end,
-/// so the line is treated as the input plus a trailing blank — which is the cell
-/// it inverts there.
+/// Unlike `draw::truncate`, it scrolls to keep the cursor visible. The input
+/// gets a trailing blank cell for a cursor past the end.
 fn around_cursor(field: &Field, max: usize) -> (usize, usize, usize) {
     let cells: Vec<char> = field.input.chars().chain([' ']).collect();
     let at = field.cursor.min(cells.len() - 1);
     let width = |c: char| c.to_string().width().max(1);
 
-    // The cursor's own cell first, and it is kept even when `max` is 0: a field
-    // squeezed to nothing by a long label still has to show where the keystrokes
-    // are going, which is why `field_line` reserves it a column.
+    // The cursor cell is kept even when `max` is 0.
     let mut used = width(cells[at]).min(max);
     let (mut start, mut end) = (at, at + 1);
 
-    // Then backwards, so the text scrolls off the left as it grows past the
-    // field, and only then forwards with whatever room is left.
+    // Extend left first, so long text scrolls off the left, then right.
     while start > 0 && used + width(cells[start - 1]) <= max {
         start -= 1;
         used += width(cells[start]);
@@ -1831,19 +1456,14 @@ fn around_cursor(field: &Field, max: usize) -> (usize, usize, usize) {
     (start, at, end)
 }
 
-/// The windowed text, in as few spans as the styles allow.
-///
-/// Two things decide a cell's style and they are independent: whether it is the
-/// cursor, and whether it sits in the half of the line a `//` has discarded. So
-/// the cells are walked and runs sharing a style are coalesced, rather than the
-/// line being cut into a fixed set of pieces that could not express both.
+/// The windowed text as spans, coalescing runs of equal style (cursor and
+/// dim prefix vary independently).
 fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
     let cells: Vec<char> = field.input.chars().chain([' ']).collect();
     let (start, at, end) = around_cursor(field, max);
 
     let style = |i: usize| match (i == at, i < inert) {
-        // The cursor keeps its own weight wherever it lands, dim half included:
-        // there is only one of it and it has to be findable.
+        // The cursor wins, even in the dim prefix.
         (true, _) => CURSOR,
         (false, true) => DIM,
         (false, false) => Style::default(),
@@ -1874,10 +1494,8 @@ mod tests {
     const COMMAND_DEFAULT: &str = "nvim --headless --listen {sock}";
     const DIRECTORY_DEFAULT: &str = "~/";
 
-    /// Only a created session is attached to next. A rename relists and a
-    /// cancel resumes the client that is still running, and both of those are
-    /// drawn over by whatever comes next — clearing for them would put a blank
-    /// screen in front of a picker that was about to paint anyway.
+    /// Clearing after a rename or cancel would flash a blank screen before the
+    /// picker or client repaints.
     #[test]
     fn only_a_created_session_hands_the_terminal_over() {
         let session = Session::new("id000000".into(), "a".into(), 100, 1);
@@ -1926,8 +1544,7 @@ mod tests {
         }
     }
 
-    /// One rendered cell. `render` throws the modifier away, and the modifier is
-    /// the point of most of these tests.
+    /// A rendered cell with its modifier, which `render` drops.
     type Cell = (String, Modifier);
 
     fn cells_of(p: &Prompt, w: u16, h: u16) -> Vec<Vec<Cell>> {
@@ -1944,10 +1561,8 @@ mod tests {
             .collect()
     }
 
-    /// The row holding the cursor, as cells, trimmed to its content. The right
-    /// edge is the last cell that shows something *or* is the cursor — the
-    /// cursor can be an inverted blank, which trimming on symbol alone would
-    /// discard.
+    /// The cursor's row, trimmed to content; an inverted blank cursor counts
+    /// as content.
     fn line_cells(p: &Prompt, w: u16, h: u16) -> Vec<Cell> {
         let rows = cells_of(p, w, h);
         let row = rows
@@ -1961,13 +1576,11 @@ mod tests {
         row[first..=last].to_vec()
     }
 
-    /// The buffer column the focused field starts in — where the next character
-    /// typed will land, and where the default has to be sitting before it does.
+    /// The buffer column where the focused field's value starts.
     fn field_column(p: &Prompt, w: u16, h: u16) -> usize {
         let rows = cells_of(p, w, h);
         for row in &rows {
             if let Some(x) = row.iter().position(|(_, m)| m.contains(Modifier::REVERSED)) {
-                // The cursor trails what has been typed before it.
                 let typed: usize = p.fields[p.focus]
                     .input
                     .chars()
@@ -2015,8 +1628,7 @@ mod tests {
         );
     }
 
-    /// The zero-keystroke path `<prefix> c` used to be has to survive every
-    /// field added since: enter on an untouched form means "every placeholder".
+    /// `<prefix> c` Enter must still create with every default.
     #[test]
     fn enter_on_an_untouched_form_submits_every_default() {
         let mut p = prompt();
@@ -2030,8 +1642,6 @@ mod tests {
         );
     }
 
-    /// And from the other field too, so tabbing over to look at the command
-    /// does not cost an extra keystroke to get back.
     #[test]
     fn enter_submits_the_whole_form_from_either_field() {
         let mut p = at_command("nvim -u NONE --listen {sock}");
@@ -2063,7 +1673,6 @@ mod tests {
         assert_eq!(p.on_key(Key::Esc), Step::Cancel);
     }
 
-    /// Cancels like esc, rather than exiting nvmux out from under a live session.
     #[test]
     fn ctrl_c_cancels_rather_than_quitting() {
         let mut p = prompt();
@@ -2095,8 +1704,6 @@ mod tests {
 
     // --- moving between fields ---------------------------------------------
 
-    /// A rename has one field; moving within it must be a no-op rather than an
-    /// index off the end.
     #[test]
     fn moving_focus_on_a_one_field_prompt_stays_put() {
         let mut p = renaming("dotfiles");
@@ -2122,9 +1729,6 @@ mod tests {
 
     // --- editing within a field --------------------------------------------
 
-    /// A command line is long and usually wants a small change in the middle,
-    /// which append-and-backspace could only reach by deleting everything after
-    /// it.
     #[test]
     fn the_cursor_moves_and_text_is_inserted_where_it_is() {
         let mut p = prompt();
@@ -2160,8 +1764,6 @@ mod tests {
         assert_eq!(p.fields[NAME].cursor, 2);
     }
 
-    /// Cursor arithmetic is in characters, so a multi-byte name cannot put an
-    /// insertion mid-glyph and panic.
     #[test]
     fn editing_a_multibyte_name_does_not_split_a_character() {
         let mut p = prompt();
@@ -2172,12 +1774,9 @@ mod tests {
         assert_eq!(p.fields[NAME].input, "日🎉語");
     }
 
-    /// The affordance the long command line needs: one keypress to edit the
-    /// default rather than retype it. Typing anything else still replaces it.
     #[test]
     fn right_or_end_takes_the_default_into_an_empty_field() {
-        // The session name, which is the only field left with a placeholder to
-        // take: the other two start at their defaults as real text.
+        // Only the name has a placeholder.
         for key in [Key::Right, Key::End] {
             let mut p = prompt();
             p.on_key(key);
@@ -2185,7 +1784,6 @@ mod tests {
             assert_eq!(field.input, "session 3", "{key:?}");
             assert_eq!(field.cursor, field.len(), "{key:?}: cursor at the end");
 
-            // …and now it is ordinary text, editable from the end.
             press(&mut p, &[Key::Backspace]);
             type_in(&mut p, "9");
             assert_eq!(p.fields[NAME].input, "session 9");
@@ -2207,8 +1805,6 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
 
-    /// The default is numbered where the session goes, whatever the other
-    /// sessions are called.
     #[test]
     fn the_default_is_numbered_where_the_session_goes() {
         assert_eq!(next_name(&[], 1), "session 1");
@@ -2219,8 +1815,6 @@ mod tests {
         assert_eq!(next_name(&[], 0), "session 1", "there is no session 0");
     }
 
-    /// A name already taken is passed over for the next free number above it,
-    /// and only once there are none above, the first free one below.
     #[test]
     fn a_taken_default_gives_way_to_the_next_free_number_up() {
         let taken = names(&["session 1", "session 2", "session 3"]);
@@ -2230,8 +1824,7 @@ mod tests {
         assert_eq!(next_name(&taken, 5), "session 1", "every one above taken");
     }
 
-    /// Duplicates are rejected case-insensitively, so a default differing only
-    /// in case would be offered and then refused.
+    /// Duplicates are rejected case-insensitively.
     #[test]
     fn the_default_avoids_names_that_differ_only_in_case() {
         assert_eq!(next_name(&names(&["Session 1"]), 1), "session 2");
@@ -2259,8 +1852,7 @@ mod tests {
 
     // --- layout ------------------------------------------------------------
 
-    /// The bug this layout exists to avoid: if the default starts one column
-    /// over from where typing lands, the field jumps on the first keystroke.
+    /// Otherwise the field jumps on the first keystroke.
     #[test]
     fn the_default_sits_where_the_first_keystroke_will_land() {
         let mut typed = prompt();
@@ -2273,8 +1865,6 @@ mod tests {
         );
     }
 
-    /// Both fields' values start in the same column, so the cursor does not
-    /// jump sideways when focus moves between them.
     #[test]
     fn the_three_fields_line_up() {
         let base = field_column(&prompt(), 60, 9);
@@ -2287,12 +1877,8 @@ mod tests {
         }
     }
 
-    /// A prompt on the directory field with the menu open and filled in — the
-    /// state every dropdown test below wants, without a worker to fill it.
-    ///
-    /// The focus moves with the movement keys and the menu is opened with `Tab`,
-    /// which is the real route in: a helper that reached past them could pass
-    /// while the keys that get you here were broken.
+    /// The directory field with the menu opened by `Tab` (the real route, so
+    /// broken keys fail tests) and filled with `matches`.
     fn menuing(typed: &str, matches: &[&str]) -> Prompt {
         let mut p = at_directory(typed);
         p.on_key(Key::Tab);
@@ -2301,11 +1887,8 @@ mod tests {
         p
     }
 
-    /// The command field, focused, holding exactly `line`.
-    ///
-    /// Set rather than typed for the reason `at_directory` gives: the field
-    /// starts pre-filled with the default now, so typing a command would append
-    /// to it rather than be it.
+    /// The command field, focused, holding exactly `line` (set, since typing
+    /// would append to the pre-filled default).
     fn at_command(line: &str) -> Prompt {
         let mut p = prompt();
         p.on_key(Key::Down);
@@ -2316,24 +1899,15 @@ mod tests {
         p
     }
 
-    /// The line's cells with the label's columns dropped.
-    ///
-    /// The label used to be findable by its bold, and is dim now — the same
-    /// weight the discarded half of a path is drawn in. Counting its columns is
-    /// what keeps the two apart, and a test that went on skipping bold would
-    /// quietly measure the label as if it were part of the value.
+    /// The line's cells after the label, skipped by width since the label
+    /// is dim like a discarded path prefix.
     fn after_label(p: &Prompt, w: u16, h: u16) -> Vec<Cell> {
         let width = p.fields[p.focus].label.width();
         line_cells(p, w, h).into_iter().skip(width).collect()
     }
 
-    /// The directory field, focused, holding exactly `path`, with no menu.
-    ///
-    /// The focus moves the real way, with the movement keys, because that is the
-    /// route in and a helper that reached past it could pass while the keys were
-    /// broken. The text is *set* rather than typed: the field starts pre-filled
-    /// at home now, so typing a path would append to it and make a `//` — which
-    /// is right, and is its own test, but is not what these fixtures want.
+    /// The directory field, focused via the movement keys, holding exactly
+    /// `path` (set, since typing would append to the pre-filled home).
     fn at_directory(path: &str) -> Prompt {
         let mut p = prompt();
         p.on_key(Key::Down);
@@ -2345,15 +1919,13 @@ mod tests {
         p
     }
 
-    /// What the completer would have put there.
+    /// Stand in for the completer.
     fn fill(p: &mut Prompt, matches: &[&str]) {
         let menu = p.menu.as_mut().expect("a create prompt has a menu");
         menu.matches = matches.iter().map(|m| m.to_string()).collect();
         menu.selected = 0;
     }
 
-    /// Three roles on one line, told apart by modifier alone since nothing here
-    /// sets a colour — and the cursor is the only one of them at full weight.
     #[test]
     fn the_label_leads_the_cursor_marks_the_field_and_the_default_recedes() {
         let label = "new session name:  ".width();
@@ -2403,8 +1975,6 @@ mod tests {
         );
     }
 
-    /// Every label on every prompt. They say the same thing on every screen and
-    /// are the least interesting text on it, so none of them is at full weight.
     #[test]
     fn the_labels_recede_so_the_values_lead() {
         for focus in [NAME, COMMAND, DIRECTORY] {
@@ -2423,7 +1993,6 @@ mod tests {
             );
         }
 
-        // The rename prompt draws through the same code and recedes with them.
         let p = renaming("dotfiles");
         let width = p.fields[NAME].label.width();
         let cells = line_cells(&p, 70, 14);
@@ -2436,10 +2005,7 @@ mod tests {
         );
     }
 
-    /// A command line is a thing you edit — a path to a nightly build, a
-    /// `--clean` on the end — so it is there to be edited rather than offered.
-    /// That it then takes keystrokes appended to the default, with no adopt
-    /// step in the way, is pinned by `typing_goes_to_the_focused_field_only`.
+    /// Appending to it is covered by `typing_goes_to_the_focused_field_only`.
     #[test]
     fn the_command_field_starts_at_its_default_rather_than_offering_it() {
         let p = prompt();
@@ -2451,10 +2017,6 @@ mod tests {
         );
     }
 
-    /// The one field of the three that still offers rather than starts, and
-    /// deliberately: `session 3` is a suggestion you replace outright, where a
-    /// command and a directory are starting points you amend. Pinned so that if
-    /// it ever changes it changes on purpose.
     #[test]
     fn only_the_session_name_is_still_a_placeholder() {
         let p = prompt();
@@ -2465,13 +2027,11 @@ mod tests {
         assert!(!p.fields[COMMAND].input.is_empty());
         assert!(!p.fields[DIRECTORY].input.is_empty());
 
-        // And it is the only field `→` still has a default to adopt into.
         let mut p = prompt();
         p.on_key(Key::Right);
         assert_eq!(p.fields[NAME].input, p.fields[NAME].default);
     }
 
-    /// Two cursors would leave no way to tell which field a keystroke reaches.
     #[test]
     fn only_the_focused_field_shows_a_cursor() {
         for p in [
@@ -2481,13 +2041,10 @@ mod tests {
                 p.on_key(Key::Down);
                 p
             },
-            // With a menu on screen too: its highlight is reversed as well, and
-            // the two must still be told apart.
+            // The menu's highlight is reversed too.
             menuing("/home/", &["alpha", "beta"]),
         ] {
-            // The field cursor is plain REVERSED; a selected row is
-            // REVERSED|BOLD. That is the distinction `field_line` documents, and
-            // it is what keeps two reversed things on one screen legible.
+            // Cursor: REVERSED; selected row: REVERSED|BOLD.
             let cursors: usize = cells_of(&p, 60, 9)
                 .iter()
                 .map(|row| {
@@ -2502,8 +2059,6 @@ mod tests {
         }
     }
 
-    /// A menu with more matches than rows keeps the selection on screen, the
-    /// same rule the picker's list follows and through the same function.
     #[test]
     fn a_menu_longer_than_its_rows_scrolls_to_keep_the_selection_visible() {
         let names: Vec<String> = (0..30).map(|i| format!("dir-{i:02}")).collect();
@@ -2520,7 +2075,6 @@ mod tests {
             "the selection scrolled out of view: {lines:#?}"
         );
 
-        // And wrapping to the end brings the far end into view.
         p.on_key(Key::Up);
         p.on_key(Key::Up);
         let lines = render(&p, 60, 14);
@@ -2530,9 +2084,6 @@ mod tests {
         );
     }
 
-    /// A partial listing must not read as a complete one. It costs a row to say
-    /// so, which is the right trade: a list quietly missing entries is worse
-    /// than a list one shorter.
     #[test]
     fn a_partial_listing_says_so_rather_than_ending_quietly() {
         let names: Vec<String> = (0..30).map(|i| format!("dir-{i:02}")).collect();
@@ -2547,9 +2098,6 @@ mod tests {
         );
     }
 
-    /// A query matching nothing is said plainly. Left blank it looks exactly
-    /// like a path still being typed, and the difference is otherwise only
-    /// discovered by pressing enter.
     #[test]
     fn a_query_that_matches_nothing_says_so() {
         let mut p = menuing("/home/zzz", &[]);
@@ -2561,8 +2109,7 @@ mod tests {
         );
     }
 
-    /// A rename has no directory to complete, so it has no menu and no rows
-    /// reserved for one — a blank block under a one-field prompt would be odd.
+    /// No rows reserved for a menu either.
     #[test]
     fn a_rename_has_no_menu_at_all() {
         assert!(renaming("notes").menu.is_none());
@@ -2571,9 +2118,6 @@ mod tests {
         assert_eq!(filled, 2, "just the field and the hint row: {lines:#?}");
     }
 
-    /// The prompt opens as three plain fields. Nothing conjures a list of
-    /// directories — not focusing the field, not typing in it — until it is
-    /// asked for.
     #[test]
     fn nothing_shows_the_menu_but_tab() {
         let mut p = at_directory("/home/pro");
@@ -2589,8 +2133,6 @@ mod tests {
         assert!(p.choosing());
     }
 
-    /// `Tab` opens the menu, and `Tab` again takes what is highlighted. One key,
-    /// one job, in sequence.
     #[test]
     fn tab_opens_the_menu_then_accepts_from_it() {
         let mut p = menuing("/home/pro", &["projects", "prototypes"]);
@@ -2600,8 +2142,6 @@ mod tests {
         assert_eq!(p.fields[DIRECTORY].input, "/home/prototypes");
     }
 
-    /// The name alone, so the path reads exactly as it would if it had been
-    /// typed. The slash is the next `Tab`'s job.
     #[test]
     fn an_accept_writes_the_name_without_a_trailing_slash() {
         let mut p = menuing("/home/pro", &["projects"]);
@@ -2614,8 +2154,6 @@ mod tests {
         );
     }
 
-    /// The `/` nobody types. Accepting writes the name; the next `Tab` steps
-    /// into it, so walking down a tree never leaves the keyboard's home row.
     #[test]
     fn tab_after_an_accept_steps_into_what_it_accepted() {
         let mut p = menuing("/home/pro", &["projects"]);
@@ -2630,16 +2168,13 @@ mod tests {
         );
     }
 
-    /// Only ever for the one keystroke after an accept. A directory whose name
-    /// is also a prefix of its siblings must not be stepped into merely because
-    /// it exists — only because it was just chosen.
+    /// `pro` beside `projects` must not be stepped into just because it exists.
     #[test]
     fn anything_but_tab_after_an_accept_forgets_the_step() {
         let mut p = menuing("/home/pro", &["pro", "projects"]);
         p.on_key(Key::Tab);
         assert_eq!(p.fields[DIRECTORY].input, "/home/pro");
 
-        // A cursor move is enough to mean "I am not stepping in".
         p.on_key(Key::Left);
         p.on_key(Key::Tab);
         assert!(p.choosing());
@@ -2649,10 +2184,7 @@ mod tests {
         );
     }
 
-    /// The property, rather than the coincidence: the row advertises `⇥` in
-    /// exactly the fields where pressing it does something. Written to fail if
-    /// either half moves without the other, which is the drift the two of them
-    /// sharing one predicate exists to prevent.
+    /// Fails if the hint row and the key handler drift apart.
     #[test]
     fn the_hint_row_offers_tab_only_where_tab_completes() {
         for focus in [NAME, COMMAND, DIRECTORY] {
@@ -2669,8 +2201,7 @@ mod tests {
             }
             let before = pressed.fields[focus].input.clone();
             pressed.on_key(Key::Tab);
-            // Opening the menu or taking the dim default in: both are `Tab`
-            // answering, and an emptied working directory gets the second.
+            // Opening the menu or adopting the default both count.
             let did_something = pressed.choosing() || pressed.fields[focus].input != before;
 
             assert_eq!(
@@ -2681,8 +2212,7 @@ mod tests {
         }
     }
 
-    /// The directory field, focused the real way and backspaced down to
-    /// nothing, so that only the dim home path is left showing under it.
+    /// The directory field, backspaced to empty, showing the dim default.
     fn emptied_directory() -> Prompt {
         let mut p = prompt();
         press(&mut p, &[Key::Down, Key::Down]);
@@ -2694,10 +2224,8 @@ mod tests {
         p
     }
 
-    /// The state this field could not be got out of: backspace the path away
-    /// and home comes back dimmed, and the one key the hint row offers used to
-    /// reach straight past it — listing its children under a field that still
-    /// looked empty. It takes the path first now.
+    /// Regression: `Tab` listed home's children under a field that still
+    /// looked empty.
     #[test]
     fn tab_takes_the_home_path_back_into_an_emptied_field() {
         let mut p = emptied_directory();
@@ -2711,7 +2239,6 @@ mod tests {
             "and no menu: this `Tab` was the one that filled the field"
         );
 
-        // The next one is the ordinary `Tab`, on a path that is really there.
         p.on_key(Key::Tab);
         assert!(p.choosing());
         assert_eq!(
@@ -2720,10 +2247,6 @@ mod tests {
         );
     }
 
-    /// A lone `~` has no `/` for `dirs::split` to cut at, so the menu would open
-    /// on nothing. Its one completion is the slash, and `Tab` writes it — then
-    /// the next `Tab` opens the menu on what is inside, which is the same
-    /// pairing an emptied field and an accept both have.
     #[test]
     fn tab_on_a_bare_tilde_writes_the_slash_that_steps_into_it() {
         let mut p = emptied_directory();
@@ -2746,9 +2269,7 @@ mod tests {
         );
     }
 
-    /// The slash is written once. A second one would make the `//` that means
-    /// "start again from the root", so a `Tab` that kept appending would walk
-    /// the field out of the home directory it had just entered.
+    /// A second slash would make `//`, meaning the root.
     #[test]
     fn tab_never_adds_a_second_slash_to_a_tilde() {
         let mut p = prompt();
@@ -2764,8 +2285,7 @@ mod tests {
         );
     }
 
-    /// Only a `~` exactly. `~r` is `~root` half typed — a name, which the menu
-    /// handles as it handles any other, and not something to put a slash after.
+    /// `~r` is a half-typed name for the menu, not a lone `~`.
     #[test]
     fn tab_writes_no_slash_after_a_tilde_with_anything_on_it() {
         let mut p = emptied_directory();
@@ -2776,10 +2296,7 @@ mod tests {
         assert!(p.choosing(), "the ordinary `Tab`, which opens the menu");
     }
 
-    /// A host that could not say where home is has no default to offer, so
-    /// there is nothing for `Tab` to take and it does what it always did. The
-    /// row goes on saying `⇥ complete` either way, and this is what keeps that
-    /// from being a promise the key declines.
+    /// The hint row still offers `⇥ complete`, so `Tab` must do something.
     #[test]
     fn tab_still_opens_the_menu_when_there_is_no_home_to_take() {
         let mut p = Prompt::create(
@@ -2795,17 +2312,13 @@ mod tests {
         assert!(p.choosing(), "nothing to take, so the menu opens");
     }
 
-    /// The way out of home, now that clearing the field is a route that leads
-    /// somewhere: with nothing left to discard there is no `//` to make, so one
-    /// slash is the root itself and the listing is pointed at it.
     #[test]
     fn a_slash_in_an_emptied_field_is_the_root_itself() {
         let mut p = emptied_directory();
         type_in(&mut p, "/");
         assert_eq!(p.fields[DIRECTORY].input, "/");
 
-        // Nothing inert, so nothing draws dim — and what `refresh` asks about
-        // is the root rather than a directory inside home.
+        // Nothing dim, and `refresh` asks about the root.
         let value = p.fields[DIRECTORY].value();
         let (inert, live) = crate::dirs::anchored(&value);
         assert_eq!((inert, live), ("", "/"));
@@ -2817,8 +2330,6 @@ mod tests {
         }
     }
 
-    /// `Tab` is for completion, and the other two fields have nothing to
-    /// complete. It does not move between fields any more either.
     #[test]
     fn tab_does_nothing_in_the_name_and_command_fields() {
         for focus in [NAME, COMMAND] {
@@ -2836,7 +2347,6 @@ mod tests {
         }
     }
 
-    /// All four movement keys, both states. Whatever is open owns them.
     #[test]
     fn the_movement_keys_change_field_until_the_menu_is_open() {
         for (down, up) in [(Key::Down, Key::Up), (Key::CtrlN, Key::CtrlP)] {
@@ -2851,7 +2361,6 @@ mod tests {
             p.on_key(up);
             assert_eq!(p.focus, DIRECTORY);
 
-            // Open the menu and the same keys move through it instead.
             let mut p = menuing("/home/", &["alpha", "beta", "gamma"]);
             let at = |p: &Prompt| p.menu.as_ref().expect("a menu").selected;
             p.on_key(down);
@@ -2866,9 +2375,6 @@ mod tests {
         }
     }
 
-    /// With a menu in front of you, enter takes what is highlighted — the reflex
-    /// after choosing one with the movement keys. Accepting closes the menu, so
-    /// the second enter creates.
     #[test]
     fn enter_accepts_from_the_menu_and_a_second_enter_creates() {
         let mut p = menuing("/home/nvmx", &["nvmux-rs"]);
@@ -2884,8 +2390,7 @@ mod tests {
         }
     }
 
-    /// The two accept keys are the same key as far as the field is concerned,
-    /// including the step that the next `Tab` takes.
+    /// Including the step the next `Tab` takes.
     #[test]
     fn enter_and_tab_accept_the_same_way() {
         let mut by_tab = menuing("/home/pro", &["projects"]);
@@ -2906,8 +2411,6 @@ mod tests {
         assert_eq!(by_enter.fields[DIRECTORY].input, "/home/projects/");
     }
 
-    /// Enter still creates from any field with no menu in front of it, which is
-    /// what keeps `c` then enter a session in one keystroke.
     #[test]
     fn enter_creates_when_no_menu_is_open() {
         let mut p = at_directory("/home/you/");
@@ -2915,7 +2418,6 @@ mod tests {
         assert!(matches!(p.on_key(Key::Enter), Step::Submit(_)));
     }
 
-    /// One thing at a time on the way out: the menu you opened, then the prompt.
     #[test]
     fn esc_closes_the_menu_before_it_cancels_the_prompt() {
         let mut p = menuing("/home/pro", &["projects"]);
@@ -2935,8 +2437,6 @@ mod tests {
         assert_eq!(p.on_key(Key::Esc), Step::Cancel, "the second leaves");
     }
 
-    /// Narrowing is what the query is for, so typing filters an open menu rather
-    /// than dismissing it.
     #[test]
     fn typing_narrows_an_open_menu_and_leaves_it_open() {
         let mut p = menuing("/home/", &["alpha", "beta"]);
@@ -2948,9 +2448,6 @@ mod tests {
         assert_eq!(p.fields[DIRECTORY].input, "/home/a");
     }
 
-    /// The form must sit in exactly the same place whether the menu is open or
-    /// shut. Sized to include it, the block would jump up the screen on every
-    /// `Tab`; reserving its rows against that would leave a permanent gap.
     #[test]
     fn the_fields_do_not_move_when_the_menu_opens() {
         let row_of = |p: &Prompt| {
@@ -2975,8 +2472,6 @@ mod tests {
         }
     }
 
-    /// The hint row is the only thing on screen that says which list the
-    /// movement keys are moving through.
     #[test]
     fn the_hint_row_is_on_the_last_row_and_follows_the_menu() {
         let closed = render(&prompt(), 60, 14);
@@ -3012,8 +2507,6 @@ mod tests {
         );
     }
 
-    /// Home is where this field starts, not something it offers. The text is
-    /// really there, so `Tab` lists what is inside it before anything is typed.
     #[test]
     fn the_directory_field_starts_at_home_rather_than_offering_it() {
         let p = prompt();
@@ -3026,7 +2519,7 @@ mod tests {
             p.fields[DIRECTORY].len(),
             "with the cursor after it, ready to type"
         );
-        // And it is ordinary editable text, not an anchor: backspace eats it.
+        // Ordinary editable text.
         let mut p = prompt();
         p.on_key(Key::Down);
         p.on_key(Key::Down);
@@ -3037,8 +2530,7 @@ mod tests {
         );
     }
 
-    /// The keystroke that replaces the deleted special case: the pre-filled text
-    /// ends in a slash, so typing one makes the `//` that means "from the root".
+    /// The pre-filled text ends in `/`, so typing one makes `//`.
     #[test]
     fn a_slash_at_the_end_of_the_home_path_means_the_root() {
         let mut p = prompt();
@@ -3050,16 +2542,12 @@ mod tests {
             format!("{DIRECTORY_DEFAULT}/etc")
         );
 
-        // And what is submitted is the half that counts, not the raw line.
         match p.on_key(Key::Enter) {
             Step::Submit(s) => assert_eq!(s.directory, Some("/etc".to_string())),
             other => panic!("expected a create, got {other:?}"),
         }
     }
 
-    /// The default is `~/`, not the home path spelled out — one short thing to
-    /// read, and already right on a host whose home is not the shape this
-    /// machine's is.
     #[test]
     fn the_default_directory_is_the_tilde() {
         assert_eq!(default_directory("/home/you"), "~/");
@@ -3070,8 +2558,7 @@ mod tests {
         );
     }
 
-    /// A host that never said where home is has no `~` to offer: the expansion
-    /// would refuse it on enter, so offering it would be a default that fails.
+    /// `~` would be refused on Enter.
     #[test]
     fn a_host_with_no_home_gets_no_default_directory() {
         assert!(default_directory("").is_empty());
@@ -3081,10 +2568,8 @@ mod tests {
         );
     }
 
-    /// What the shortened default is worth only holds if enter still lands in
-    /// the same place. Checked against the real expansion rather than restated,
-    /// because this is the one change a user would not see until a session had
-    /// already started somewhere else.
+    /// Uses the real expansion: a mistake here would be invisible until a
+    /// session started elsewhere.
     #[test]
     fn pressing_enter_on_the_default_still_creates_in_the_home_directory() {
         const HOME: &str = "/home/them";
@@ -3105,10 +2590,8 @@ mod tests {
         );
     }
 
-    /// The one that would be silent if it were wrong. POSIX reads `a//b` as
-    /// `a/b`, so a raw `/home/you//etc` would start the session in
-    /// `/home/you/etc` — a real directory, the wrong one, with nothing on screen
-    /// to say so.
+    /// POSIX reads `a//b` as `a/b`, so a raw submission would silently start
+    /// in the wrong directory.
     #[test]
     fn what_is_submitted_is_the_path_that_counts() {
         for (typed, expected) in [
@@ -3127,8 +2610,6 @@ mod tests {
         }
     }
 
-    /// Accepting inside a `//` leaves the discarded prefix alone: it is still
-    /// what the user typed, and still what the dim half of the line explains.
     #[test]
     fn accepting_after_a_double_slash_keeps_the_discarded_prefix() {
         let mut p = menuing("/home/you//e", &["etc"]);
@@ -3141,13 +2622,8 @@ mod tests {
         }
     }
 
-    /// Grey means "no longer counts", and nothing else — so an ordinary path has
-    /// none of it, and a `//` dims everything it discarded rather than just the
-    /// home part of it.
     #[test]
     fn the_part_that_no_longer_counts_is_dim_and_the_rest_is_not() {
-        // Past the label, which is dim too now: what is being measured here is
-        // the part of the *path* that no longer counts.
         let dim_text = |p: &Prompt| -> String {
             after_label(p, 60, 14)
                 .iter()
@@ -3156,15 +2632,13 @@ mod tests {
                 .collect()
         };
 
-        // Nothing discarded, so nothing recedes.
         assert_eq!(
             dim_text(&at_directory("/home/you/projects")),
             "",
             "an ordinary path is all live text"
         );
 
-        // The cursor sits at the end, outside the dim half, so the whole of the
-        // discarded prefix is accounted for.
+        // The cursor is at the end, outside the dim prefix.
         assert_eq!(dim_text(&at_directory("/home/you//etc")), "/home/you/");
         assert_eq!(
             dim_text(&at_directory("/home/you/projects//etc")),
@@ -3173,15 +2647,12 @@ mod tests {
         );
     }
 
-    /// The boundary is a property of the text, so it has to survive the window
-    /// the field scrolls — including the cursor landing inside the dim half.
+    /// Including with the cursor inside the dim prefix.
     #[test]
     fn a_dim_prefix_survives_a_field_too_narrow_for_it() {
         for width in [24u16, 30, 40, 60] {
             let mut p = at_directory("/home/you/a-long-directory-name//etc");
-            // Past the label: after it, every dim cell must come before every
-            // live one. The boundary is one place in the text, so it has to be
-            // one place on the screen however the window moved.
+            // After the label, every dim cell precedes every live one.
             let value: Vec<_> = after_label(&p, width, 14);
             let last_dim = value.iter().rposition(|(_, m)| m.contains(Modifier::DIM));
             let first_live = value.iter().position(|(_, m)| !m.contains(Modifier::DIM));
@@ -3202,8 +2673,7 @@ mod tests {
                 "the live half should be on screen at {width}: {live:?}"
             );
 
-            // With the cursor dragged back into the discarded half, it keeps its
-            // own weight and everything around it stays dim.
+            // Cursor inside the dim prefix.
             p.on_key(Key::Home);
             let cells = after_label(&p, width, 14);
             let cursors = cells
@@ -3214,8 +2684,6 @@ mod tests {
         }
     }
 
-    /// Two reversed things on one screen have to be told apart, or the eye reads
-    /// the highlighted row as the place keystrokes are going.
     #[test]
     fn a_selected_row_is_not_mistaken_for_the_field_cursor() {
         let p = menuing("/home/", &["alpha", "beta"]);
@@ -3261,8 +2729,6 @@ mod tests {
             .iter()
             .position(|l| l.contains("new session name:  notes"))
             .expect("the field should still show what was typed");
-        // Counted off the last field rather than a fixed offset, so this keeps
-        // saying "below the fields" however many of them there come to be.
         let below = first + p.fields.len();
         assert!(
             lines[below..].iter().any(|l| l.contains("already exists")),
@@ -3283,7 +2749,6 @@ mod tests {
             "the end being edited must stay on screen: {cells:?}"
         );
 
-        // …and moving back through it scrolls the other way.
         press(&mut p, &[Key::Home]);
         let cells = line_cells(&p, 40, 9);
         assert!(
@@ -3304,9 +2769,7 @@ mod tests {
             Some("session 3".to_string()),
         );
 
-        // A menu taller and wider than any of these terminals, drawn from
-        // lengths the screen never agreed to — which is exactly where an
-        // off-by-one becomes a panic.
+        // A menu larger than any of these terminals, where off-by-ones panic.
         let offering = menuing(
             "/home/you/a-very-long-directory/su",
             &[
@@ -3342,8 +2805,7 @@ mod tests {
 
     // --- renaming ----------------------------------------------------------
 
-    /// Renaming hides the list the session was selected in, so the label has to
-    /// say which session is being renamed.
+    /// The picker list is hidden, so the label must name the session.
     #[test]
     fn the_rename_prompt_names_the_session_and_starts_from_its_name() {
         let p = renaming("dotfiles");
@@ -3356,7 +2818,6 @@ mod tests {
         );
     }
 
-    /// A rename starts nothing, so it must not ask how to start it.
     #[test]
     fn the_rename_prompt_has_no_command_field() {
         let mut p = renaming("dotfiles");
@@ -3379,8 +2840,6 @@ mod tests {
         );
     }
 
-    /// A pre-filled field has no placeholder to show — until you clear it, at
-    /// which point the current name is exactly what enter would keep.
     #[test]
     fn clearing_a_rename_offers_the_current_name_back() {
         let mut p = renaming("dotfiles");
@@ -3409,8 +2868,7 @@ mod tests {
         );
     }
 
-    /// A rejected rename must not move the default the way a rejected create
-    /// does — the name the session already has has not changed.
+    /// Unlike a rejected create, the default does not change.
     #[test]
     fn a_rejected_rename_keeps_offering_the_current_name() {
         let mut p = renaming("dotfiles");
@@ -3418,8 +2876,6 @@ mod tests {
         assert_eq!(p.fields[NAME].default, "dotfiles");
     }
 
-    /// The cursor is the only sign a keystroke landed, so a label long enough to
-    /// fill the line must not push it off the edge.
     #[test]
     fn the_cursor_survives_a_label_wider_than_the_terminal() {
         for w in [1u16, 2, 8, 20, 30] {
@@ -3447,15 +2903,13 @@ mod tests {
         p.fail("nope".to_string(), Some("session 3".to_string()));
         test_support::assert_no_colour(60, 9, |f| draw(f, &p));
 
-        // The menu is the newest thing on this screen, and its highlight is the
-        // strongest — reversed and bold, which are modifiers, not colours.
         let offering = menuing("/home/you/pro", &["projects", "prototypes"]);
         test_support::assert_no_colour(60, 9, |f| draw(f, &offering));
     }
 
     // --- out of the gap the picker makes -------------------------------------
 
-    /// `names` as a listing, numbered from 1 as a listing resolves them.
+    /// `names` as a listing, numbered from 1.
     fn listing(names: &[&str]) -> Vec<Session> {
         names
             .iter()
@@ -3469,9 +2923,6 @@ mod tests {
             .collect()
     }
 
-    /// The name the gap shows is the one the prompt opens with: one function
-    /// answers both, against the same listing. Given a number, it is that
-    /// one's; given none, the session goes at the end, one past every row.
     #[test]
     fn the_default_name_is_numbered_where_the_session_goes_in_the_listing() {
         let listed = listing(&["api-server", "dotfiles", "notes"]);
@@ -3488,8 +2939,7 @@ mod tests {
 
     // --- floating -----------------------------------------------------------
 
-    /// Sessions of these names, with ids such as nvmux gives them, numbered
-    /// from 1 as a listing resolves them.
+    /// Like `listing`, but with valid nvmux ids.
     fn hosted(names: &[&str]) -> Vec<Session> {
         const IDS: [&str; 5] = ["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee"];
         names
@@ -3512,8 +2962,7 @@ mod tests {
         rows.iter().map(|s| s.name.clone()).collect()
     }
 
-    /// A host of sessions in memory, which renames, renumbers and lists them
-    /// as one on disk does.
+    /// An in-memory host that lists, renames and renumbers.
     struct Host {
         location: crate::transport::Location,
         rows: std::sync::Mutex<Vec<Session>>,
@@ -3585,9 +3034,6 @@ mod tests {
         }
     }
 
-    /// Floating, the create prompt offers the name the picker full screen
-    /// offers for where the session will go: after the picker's row from its
-    /// `c`, and at the end from `<prefix> c`.
     #[test]
     fn the_floating_create_prompt_offers_the_name_for_where_the_session_goes() {
         let rows = hosted(&["one", "two", "three"]);
@@ -3597,10 +3043,7 @@ mod tests {
         assert_eq!(last.prompt.fields[NAME].default, "session 4");
     }
 
-    /// It floats where there is room for it and a session round it — above
-    /// the hint row, a row of the session between them — smaller for a
-    /// rename than for a create, and nowhere on a terminal too small, where
-    /// the prompt takes the screen instead.
+    /// The panel ends at least a row of the session above the hint row.
     #[test]
     fn the_floating_prompt_fits_where_it_can() {
         let rows = hosted(&["one", "two"]);
@@ -3624,9 +3067,6 @@ mod tests {
         assert_eq!(create.area(Rect::new(0, 0, 80, 18)), None);
     }
 
-    /// Drawn where it floats, the create prompt has its three fields, as full
-    /// screen, and its last row clear; and its hint row is the full screen's,
-    /// cell for cell, on the screen's last row.
     #[test]
     fn the_floating_create_prompt_draws_its_form_and_its_hints() {
         let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
@@ -3656,8 +3096,6 @@ mod tests {
         assert!(said.contains("⏎ create"), "{said:?}");
     }
 
-    /// Keys go to the prompt as full screen, and `Esc` takes it down going
-    /// nowhere: back to the session, or to the picker it came from.
     #[test]
     fn the_floating_prompt_takes_keys_and_esc_takes_it_down() {
         let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
@@ -3670,10 +3108,6 @@ mod tests {
         assert_eq!(panel.leave(), None);
     }
 
-    /// A session made floating goes where the picker full screen puts it —
-    /// after the picker's row — and is gone to: the panel goes out with the
-    /// session to switch to it, leaving the rows that have it for the session
-    /// loop to find it among.
     #[test]
     fn a_session_made_floating_goes_after_the_row_and_is_gone_to() {
         let _turn = super::super::test_support::PANELS
@@ -3692,7 +3126,6 @@ mod tests {
         assert_eq!(named(&left), ["one", "blog", "two", "three"]);
     }
 
-    /// From `<prefix> c`, the session goes at the end, nothing renumbered.
     #[test]
     fn a_session_made_floating_from_a_session_goes_at_the_end() {
         let _turn = super::super::test_support::PANELS
@@ -3716,8 +3149,6 @@ mod tests {
         assert_eq!(numbers, [1, 2], "nothing renumbered");
     }
 
-    /// A rename floating renames, through the host, and leaves the rows
-    /// listed again for the picker to come back on; the panel goes nowhere.
     #[test]
     fn a_rename_floating_leaves_the_rows_renamed() {
         let _turn = super::super::test_support::PANELS
@@ -3739,8 +3170,6 @@ mod tests {
         assert_eq!(named(&left), ["one", "blog"]);
     }
 
-    /// A session no longer among the rows is not renamed: enter says so, and
-    /// the prompt stays up.
     #[test]
     fn a_rename_of_a_session_gone_says_so() {
         let rows = hosted(&["one"]);
@@ -3756,8 +3185,6 @@ mod tests {
         );
     }
 
-    /// The row the prompt opens out of is the one its name field is drawn on,
-    /// on any screen tall enough to draw it.
     #[test]
     fn the_name_row_is_where_the_name_field_is_drawn() {
         let p = Prompt::create("session 4".into(), "nvim".into(), "~/".into());

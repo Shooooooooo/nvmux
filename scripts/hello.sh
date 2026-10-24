@@ -1,6 +1,6 @@
 #!/bin/sh
-# Open a session host: everything nvmux needs to know about it, and its
-# sessions, in ONE round trip.
+# Open a session host: what nvmux needs to know about it, and its sessions, in
+# one round trip.
 #
 # Usage: sh hello.sh
 #
@@ -12,46 +12,32 @@
 # followed by everything list.sh prints for the directory just named, that
 # script's NVMUX_END included.
 #
-# Two files rather than one, joined by src/shell.rs and delivered as a single
-# program: the listing a connection opens with is then produced by exactly the
-# code every later refresh runs, rather than by a copy of it. There is
-# deliberately no `finish` here -- list.sh's terminator is the one that says the
-# whole thing ran, and a second one printed halfway would say a listing had
-# completed when it had not even started.
+# src/shell.rs joins this with list.sh, so the first listing runs the same code
+# as every refresh. No `finish` here: list.sh's terminator must be the only
+# one, or the listing would read as complete before it started.
 #
-# This runs through the user's LOGIN shell, which is the whole point of asking
-# rather than assuming: `ssh host nvim` finds nothing on most real setups,
-# because nvim was put on $PATH by .zprofile or .bash_profile.
+# Runs in the user's login shell, which is what puts nvim on $PATH
+# (.zprofile, .bash_profile).
 #
-# Assigned before it can be read, and never with a `:-` default. This script
-# runs inside the user's login shell, which exports whatever their profile sets
-# and whatever ssh was asked to send, so a name this script *execs* must not be
-# one the environment can supply. Namespaced for the same reason.
+# Assigned before use and never with a `:-` default: the login shell's
+# environment is arbitrary, and this name is exec'd. Namespaced for the same
+# reason.
 NVMUX_STANDALONE=
 
 if [ -z "${NVMUX_PRELUDE:-}" ]; then
   . "$(dirname -- "$0")/_prelude.sh"
-  # Run from a checkout the two files are still two files, so finish the job by
-  # hand; delivered over ssh they are one stream and list.sh simply follows.
+  # From a checkout the two files are separate, so run list.sh by hand.
   NVMUX_STANDALONE="$(dirname -- "$0")/list.sh"
 fi
 
-# Matches the Rust side's rule exactly; see src/paths.rs for why
-# $XDG_RUNTIME_DIR is not consulted.
+# Matches the Rust side; see src/paths.rs for why $XDG_RUNTIME_DIR is unused.
 dir="/tmp/nvmux-$(id -u)"
 printf 'DIR %s\n' "$dir"
 
-# Where a new session starts unless the user says otherwise, and what a leading
-# `~` at the prompt expands to. Asked of the host rather than assumed, because
-# `nvmux myhost` is a different machine's accounts: our own $HOME says nothing
-# about theirs.
-#
-# `$HOME` rather than a lookup in the password database: this runs inside the
-# user's login shell, so it is the same answer their own shell would give, and it
-# honours a home directory that shell chose to change. Printed empty rather than
-# guessed at if it is unset or relative -- the Rust side treats an empty answer as
-# "no default to offer", which is honest, where a guess would be a wrong path
-# offered as if nvmux knew it.
+# The default cwd for new sessions and what a leading `~` expands to, asked of
+# the host since its accounts are not ours. `$HOME`, not the password database,
+# so it matches the user's own shell. Empty if unset or relative: the Rust side
+# then offers no default rather than a guessed path.
 case "${HOME:-}" in
   /*) printf 'HOME %s\n' "$HOME" ;;
   *) printf 'HOME\n' ;;

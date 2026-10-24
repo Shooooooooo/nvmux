@@ -1,21 +1,16 @@
-//! What the other sessions report while you are in one, told as it happens: a
-//! notification a program in one of their terminal buffers asked for (`∗`), a
-//! command there that failed (`!`) or finished (`✓`) — the picker's signs,
-//! while the picker is down — as cards in the margin of the session in front
-//! (see [`crate::card`]). Of the session in front, only what a terminal of its
-//! own off the screen says: the rest it was showing.
+//! Live cards in the front session's margin (see [`crate::card`]) for news
+//! from other sessions' terminal buffers: a notification (`∗`), or a command
+//! that failed (`!`) or finished (`✓`), as the picker's signs. For the front
+//! session itself, only news from its terminals not on screen.
 //!
-//! What a session keeps until it is opened stays as its mark, the sign the
-//! picker has beside it, once the card's words have gone; and a session
-//! brought to the front while another still keeps something is told that
-//! session's mark alone, the words having been said already.
+//! After a card's text goes, unopened news stays as the session's mark (its
+//! picker sign). After a switch, sessions with pending news show only their
+//! mark, the text having been shown already.
 //!
-//! The news is read off each session's watcher ([`crate::notes`]), and its
-//! cards are posted for the relay in front ([`crate::card::board`]), which has
-//! its client draw them. Nothing is asked of the session in front to show
-//! them, so they are up as soon as the news is read, whatever the editor is
-//! doing and however far away it is; and they are nvmux's, with nothing of
-//! them left in the editor once they go.
+//! News is read from each session's watcher ([`crate::notes`]) and posted to
+//! the front relay ([`crate::card::board`]), whose client draws it. Nothing is
+//! asked of the front editor, so cards appear whatever it is doing and leave
+//! nothing behind in it.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -27,36 +22,31 @@ use crate::notes::{self, Heard, Kind, News, Pushed};
 use crate::ui::note;
 use crate::{ids, keys, rpc};
 
-/// How long the notifier waits, once a session is in front, before its first
-/// round of reads: long enough for the sessions handed to it at the same
-/// moment to be read in that round. And how long it waits to read a session
-/// that has said its news changed: long enough for the rest of what one event
-/// brings — a command's end, said by its shell and by its terminal closing —
-/// to be read with it.
+/// Delay before the first round after a session comes to the front, so
+/// sessions handed over together share it; and before reading after a push,
+/// so the rest of one event (a command's end, reported by its shell and by
+/// its terminal closing) is read with it.
 const SETTLE: Duration = Duration::from_millis(30);
 
-/// How long a session that tells the notifier its news goes between reads all
-/// the same: for what a push could miss, over a connection gone quiet without
-/// closing.
+/// Read interval for sessions that push their news, to catch what a push
+/// missed on a connection that went quiet without closing.
 const SAFETY: Duration = Duration::from_secs(30);
 
-/// The least time between two reads of a session that its pushes bring on: a
-/// program that sends notification after notification has its session read
-/// four times a second, not as often as it sends.
+/// Minimum gap between push-triggered reads of one session, so a flood of
+/// notifications reads it at most four times a second.
 const SPACING: Duration = Duration::from_millis(250);
 
-/// How long a session whose listener stopped, though the session may still be
-/// there, waits for another: it is read every [`notes::POLL`] meanwhile.
+/// Wait before restarting a stopped listener; the session is read every
+/// [`notes::POLL`] meanwhile.
 const RELISTEN: Duration = Duration::from_secs(10);
 
-/// The card that tells `news`, from the session with this id and name — or,
-/// with `None`, from the session in front itself — and where acting on it
-/// goes: that session, or the terminal it came from. `settings` are the keys
-/// as the user has them, of which the card names the two that go there:
-/// `<prefix> Enter` by default. `None` for what is not news: what is busy.
+/// The card for `news` from session `(id, name)`, or from the front session
+/// if `from` is `None`, and where acting on it goes (that session, or the
+/// terminal). The footer names the user's `go` key (`<prefix> Enter` by
+/// default). `None` for non-news (busy).
 ///
-/// It is about the session, or the terminal, it came from (see
-/// [`Card::about`]), and leaves its own sign — or, going nowhere, none.
+/// The card is about its session or terminal (see [`Card::about`]) and
+/// leaves its own sign as a mark, or none if it goes nowhere.
 pub fn card_for(
     news: &News,
     from: Option<(&str, &str)>,
@@ -64,8 +54,7 @@ pub fn card_for(
 ) -> Option<(Card, Option<Go>)> {
     let kind = sign(news.kind)?;
     let what = note::what(news.kind, &news.title, &news.text);
-    // The prefix, and the key `go` is on — which every row of the table has,
-    // so the second is never missing.
+    // Every row of the bind table has a key, so `go`'s is never missing.
     let key = format!(
         "{} {}",
         keys::prefix_label(settings.prefix),
@@ -101,7 +90,7 @@ pub fn card_for(
         (None, Some(buf)) => card.about(&format!("here {buf}")),
         (None, None) => card,
     };
-    // Nowhere to go is nothing to open, and a mark would wait for that.
+    // With nowhere to go nothing would ever clear a mark, so leave none.
     let card = if go.is_some() {
         card
     } else {
@@ -110,7 +99,7 @@ pub fn card_for(
     Some((card, go))
 }
 
-/// The sign on a card for news of `kind`; none for what is not news.
+/// `None` for non-news.
 fn sign(kind: Kind) -> Option<card::Kind> {
     match kind {
         Kind::Notified => Some(card::Kind::Notified),
@@ -120,9 +109,8 @@ fn sign(kind: Kind) -> Option<card::Kind> {
     }
 }
 
-/// Of what a session keeps, what its mark says: a notification or a failure,
-/// which wait for you, over a command that has finished — the sign the picker
-/// has beside it, and the news that sign is for.
+/// The news a session's mark (its picker sign) shows: a notification or
+/// failure outranks a finished command.
 fn marking(news: &[News]) -> Option<&News> {
     let rank = |n: &&News| match n.kind {
         Kind::Notified | Kind::Failed => 0,
@@ -134,11 +122,10 @@ fn marking(news: &[News]) -> Option<&News> {
         .min_by_key(rank)
 }
 
-/// Of what a session said, what to tell, oldest first: what it numbered past
-/// `heard` — the highest it had said by the last read — and nothing while
-/// `heard` is `None`, a first read, which is there to find out how far the
-/// session had got. Of the session in front, `here`, only what came from a
-/// terminal that was off the screen: the rest it was showing.
+/// News to tell, oldest first: entries numbered past `heard` (the highest
+/// seq at the last read). Nothing on a first read (`heard` is `None`), which
+/// only sets the baseline. For the front session (`here`), only news from
+/// terminals not on screen.
 fn to_tell(heard: Option<u64>, news: &[News], here: bool) -> Vec<&News> {
     let Some(heard) = heard else {
         return Vec::new();
@@ -149,50 +136,45 @@ fn to_tell(heard: Option<u64>, news: &[News], here: bool) -> Vec<&News> {
         .collect()
 }
 
-/// What the notifier is handed.
+/// Messages to the notifier thread.
 enum Command {
-    /// Read this session, called this, through this socket, from now on.
     Watch {
         id: String,
         name: String,
         sock: PathBuf,
     },
-    /// This session is in front now; `None`, one of nvmux's own screens is.
+    /// `None` when one of nvmux's own screens is up.
     Front(Option<String>),
-    /// What the listener with this number heard from its session.
+    /// From the listener with this number.
     Pushed(u64, Pushed),
-    /// The listener with this number has stopped: its session went, or its
-    /// connection did, or the session could not be listened to.
+    /// That listener stopped: session or connection gone, or it could not
+    /// listen.
     Stopped(u64),
-    /// The notifier was dropped: stop, and every listener with it.
+    /// The notifier was dropped: stop, with every listener.
     Quit,
 }
 
-/// One session the notifier reads.
 struct Watched {
     id: String,
     name: String,
     sock: PathBuf,
-    /// The highest number among what it has said, by the last read; `None`
-    /// until it has been read since nvmux's own screens were last up.
+    /// Highest seq at the last read; `None` until read since nvmux's own
+    /// screens were last up.
     heard: Option<u64>,
-    /// Whether a card about it is up in front, which leaves its mark: to be
-    /// let go of once it has nothing to say.
+    /// Whether it has a mark up in front, to forget once it has no news.
     marked: bool,
-    /// When it is to be read next, while a session is in front.
+    /// Next read, while a session is in front.
     next: Instant,
-    /// When it was last read: a read a push brings on comes no sooner than
-    /// [`SPACING`] after.
+    /// Push-triggered reads wait [`SPACING`] after this.
     last: Option<Instant>,
-    /// The listener on it.
     ear: Option<Ear>,
-    /// Whether its watcher tells the listener its news, by the last read, and
-    /// has not been found to have missed any: read every [`SAFETY`] while it
-    /// does, and every [`notes::POLL`] otherwise.
+    /// Whether, at the last read, its watcher pushed to the listener and has
+    /// not been caught missing news: read every [`SAFETY`] if so, otherwise
+    /// every [`notes::POLL`].
     told: bool,
-    /// Whether it has said its news changed since it was last read.
+    /// Whether it pushed news since the last read.
     pushed: bool,
-    /// When a listener may be started on it again, after one stopped.
+    /// When a listener may be restarted after one stopped.
     relisten: Option<Instant>,
 }
 
@@ -214,17 +196,16 @@ impl Watched {
     }
 }
 
-/// A listener on a session ([`notes::listen`]), on a thread of its own, and
-/// numbered: what an earlier one on the session says is not taken for what
-/// this one does. Dropped, it stops.
+/// A listener thread ([`notes::listen`]). Numbered so reports from an
+/// earlier listener on the same session are ignored. Stops when dropped.
 struct Ear {
     number: u64,
-    /// Its channel, and the way to stop it, once it is connected.
+    /// Its channel and stop handle, once connected.
     on: Option<(u64, rpc::Interrupt)>,
 }
 
 impl Ear {
-    /// The channel a read names for the watcher to tell this listener.
+    /// The channel a read passes so the watcher pushes to this listener.
     fn chan(&self) -> Option<u64> {
         self.on.as_ref().map(|(chan, _)| *chan)
     }
@@ -232,47 +213,36 @@ impl Ear {
 
 impl Drop for Ear {
     fn drop(&mut self) {
-        // One still connecting stops as soon as it says it is listening, to
-        // a notifier that no longer has it.
+        // One still connecting has no stop handle yet; `run` stops it when
+        // it reports listening and is not found.
         if let Some((_, stop)) = &self.on {
             stop.fire();
         }
     }
 }
 
-/// Posts, as it happens, cards with what the other sessions have to report —
-/// and of the session in front, what its terminals off the screen do — for
-/// the relay in front to have its client draw.
+/// Posts cards with other sessions' news (and the front session's
+/// off-screen terminals) for the front relay's client to draw.
 ///
-/// It reads every session it is handed every [`notes::POLL`] while a session
-/// is in front, and none while one of nvmux's own screens is: the picker has
-/// a reader of its own, and shows it all. So coming back from one of those,
-/// what was said meanwhile counts as told, and the first round only finds out
-/// how far each session has got.
+/// While a session is in front, every session is read on a timer;
+/// while nvmux's own screens are up, none are (the picker has its own
+/// reader). So on return, news from meanwhile counts as told and the first
+/// round only sets each session's baseline. Reads use [`notes::hear`], which
+/// asks nothing of an editor waiting for a key.
 ///
-/// The reads are [`notes::hear`]'s, which ask nothing of an editor waiting for
-/// a key — this runs for as long as nvmux does, and a session may wait for its
-/// key all night.
+/// Each session also gets a listener thread ([`notes::listen`]); a push
+/// triggers a read, at most once per [`SPACING`]. A session whose watcher is
+/// found pushing to its listener is polled only every [`SAFETY`]; the rest
+/// every [`notes::POLL`]. Each read passes the listener's channel to the
+/// watcher. A timer read finding news the listener missed restarts it.
 ///
-/// It listens to every session as well ([`notes::listen`]), each on a thread
-/// of its own, and reads one as soon as
-/// it says its news has changed, though no sooner than [`SPACING`] after the
-/// last read of it. A session whose watcher a read has found telling its
-/// listener is read every [`SAFETY`] besides, rather than every
-/// [`notes::POLL`]: the rest — one not listened to yet, or whose listener
-/// stopped, or whose watcher was put in afresh — are read as often as ever,
-/// and a read names the listener to the watcher. A read the timer brought on
-/// that finds news a told listener never heard of starts the listener again.
-///
-/// With `[client] ui = "nvim"` there is no client to draw a card, and nothing
-/// is read. Dropping it stops the thread without waiting for it, as with
-/// [`notes::Poller`]: a read in flight finishes to nobody.
+/// Does nothing with `[client] ui = "nvim"` (no client to draw cards).
+/// Dropping it stops the thread without waiting, as with [`notes::Poller`].
 pub struct Notifier {
     commands: Option<Sender<Command>>,
 }
 
 impl Notifier {
-    /// Start reading, with no session handed over yet and none in front.
     pub fn start() -> Self {
         if crate::config::get().client.ui == crate::config::Ui::Nvim {
             return Self { commands: None };
@@ -291,8 +261,8 @@ impl Notifier {
         }
     }
 
-    /// Read session `id`, called `name`, through `sock` from now on — or, if it
-    /// is read already, by this name and through this socket.
+    /// Read session `id` through `sock` from now on, or update its name and
+    /// socket if already read.
     pub fn watch(&self, id: &str, name: &str, sock: PathBuf) {
         self.send(Command::Watch {
             id: id.to_string(),
@@ -301,8 +271,8 @@ impl Notifier {
         });
     }
 
-    /// Session `id` is in front now — handed over already, with [`watch`] —
-    /// or, with `None`, one of nvmux's own screens is.
+    /// Session `id` (already passed to [`watch`]) is now in front; `None` when
+    /// one of nvmux's own screens is.
     ///
     /// [`watch`]: Notifier::watch
     pub fn front(&self, id: Option<&str>) {
@@ -317,15 +287,14 @@ impl Notifier {
 }
 
 impl Drop for Notifier {
-    /// The thread hands its listeners what to say back on, so it never finds
-    /// itself alone on its channel: it is told to stop.
+    /// The thread holds a sender to its own inbox (for its listeners), so the
+    /// channel never disconnects: it must be told to stop.
     fn drop(&mut self) {
         self.send(Command::Quit);
     }
 }
 
-/// The notifier's thread: `inbox` is what it is handed, and `ears` where its
-/// listeners say what they hear.
+/// The notifier thread. Listeners report on `ears`.
 fn run(inbox: &Receiver<Command>, ears: &Sender<Command>, settings: KeySettings) {
     let mut watched: Vec<Watched> = Vec::new();
     let mut front: Option<String> = None;
@@ -346,8 +315,8 @@ fn run(inbox: &Receiver<Command>, ears: &Sender<Command>, settings: KeySettings)
                     Some(w) => {
                         w.name = name;
                         if w.sock != sock {
-                            // A listener on the old socket hears nothing of
-                            // the new one.
+                            // A listener on the old socket hears nothing
+                            // from the new one.
                             w.sock = sock;
                             w.ear = None;
                             w.told = false;
@@ -362,9 +331,8 @@ fn run(inbox: &Receiver<Command>, ears: &Sender<Command>, settings: KeySettings)
                 if id == front {
                     continue;
                 }
-                // Back from one of nvmux's own screens: what was said while it
-                // was up was on it, or is old by now. And whatever is in front
-                // now has come up with nothing on it.
+                // Back from nvmux's own screens: news from meanwhile was shown
+                // there or is stale. The new front starts with no cards up.
                 for w in &mut watched {
                     if front.is_none() {
                         w.heard = None;
@@ -389,8 +357,7 @@ fn run(inbox: &Receiver<Command>, ears: &Sender<Command>, settings: KeySettings)
                         let spaced = w.last.map_or(now, |at| at + SPACING);
                         w.next = w.next.min((now + SETTLE).max(spaced));
                     }
-                    // An earlier listener's, or one on a session no longer
-                    // read.
+                    // From an earlier listener, or a session no longer read.
                     (None, Pushed::Listening { stop, .. }) => stop.fire(),
                     (None, Pushed::News) => {}
                 }
@@ -403,7 +370,7 @@ fn run(inbox: &Receiver<Command>, ears: &Sender<Command>, settings: KeySettings)
                     w.ear = None;
                     w.told = false;
                     w.relisten = Some(now + RELISTEN);
-                    // Gone, perhaps: read soon, to let go of its mark.
+                    // Maybe gone: read soon to forget its mark.
                     w.next = w.next.min(now + SETTLE);
                 }
             }
@@ -418,9 +385,8 @@ fn run(inbox: &Receiver<Command>, ears: &Sender<Command>, settings: KeySettings)
     }
 }
 
-/// A listener on every session without one, but for one whose listener
-/// stopped a moment ago. Each is numbered from `numbered`, and says what it
-/// hears on `ears`.
+/// Start a listener on each session lacking one, unless its last stopped
+/// within [`RELISTEN`].
 fn listeners(watched: &mut [Watched], ears: &Sender<Command>, numbered: &mut u64, now: Instant) {
     for w in watched {
         if w.ear.is_some() || w.relisten.is_some_and(|at| at > now) {
@@ -438,9 +404,8 @@ fn listeners(watched: &mut [Watched], ears: &Sender<Command>, numbered: &mut u64
     }
 }
 
-/// Start listener `number` on the session on `sock`, on a thread of its own,
-/// saying what it hears, and when it stops, on `ears`. Whether there was a
-/// thread for it.
+/// Spawn listener `number` on `sock`, reporting news and its stop on `ears`.
+/// Returns whether the thread spawned.
 fn listen(number: u64, sock: PathBuf, ears: Sender<Command>) -> bool {
     let spawned = std::thread::Builder::new()
         .name("nvmux-listener".into())
@@ -457,14 +422,11 @@ fn listen(number: u64, sock: PathBuf, ears: Sender<Command>) -> bool {
     spawned.is_ok()
 }
 
-/// Read every session due by `now`, all at a time, and post a card for the
-/// session in front, `front`, of what is news — oldest first, whichever
-/// session said it ([`oldest_first`]). On a first read, which says only how
-/// far a session has got, what another keeps is its mark alone; and of one
-/// that keeps nothing any more, or is gone, the mark is let go of. One gone
-/// for good, its socket with it ([`vanished`]), is read no more. Each read
-/// names the session's listener, where it has one, and says when it is to be
-/// read next.
+/// Read every session due by `now` in parallel and post cards for new news to
+/// `front`, oldest first across sessions ([`oldest_first`]). On a first read,
+/// another session's pending news posts only its mark; a session with none
+/// left, or gone, has its mark forgotten. One whose socket is gone too
+/// ([`vanished`]) is dropped.
 fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings, now: Instant) {
     let heard: Vec<(usize, Heard)> = std::thread::scope(|s| {
         let reads: Vec<_> = watched
@@ -505,8 +467,7 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings, now: In
                 continue;
             }
             Heard::Unknown => {
-                // What it said it has is still to be read, and soon: it will
-                // not say so again.
+                // Keep the push pending: it will not be sent again.
                 w.pushed = pushed;
                 let wait = if w.told && !pushed {
                     SAFETY
@@ -517,9 +478,8 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings, now: In
                 continue;
             }
         };
-        // News that a listener being told since the last read never heard
-        // of: its connection is not bringing what the watcher says. Started
-        // again, in `listeners`.
+        // News the listener should have been pushed but was not: its
+        // connection is broken. Restarted in `listeners`.
         let missed =
             listening && !pushed && w.heard.is_some_and(|h| news.iter().any(|n| n.seq > h));
         if missed {
@@ -542,8 +502,8 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings, now: In
             cards.extend(card_for(n, from, settings).map(|(c, go)| (n.age, c, go)));
         }
         for (age, card, go) in cards {
-            // What another session keeps leaves the one sign the picker has
-            // for it, whichever news came last.
+            // Another session's cards leave its picker sign as the mark,
+            // whichever news came last.
             let card = if here || card.mark.is_none() {
                 card
             } else {
@@ -567,14 +527,10 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings, now: In
     watched.retain(|w| !ended.contains(&w.id));
 }
 
-/// Whether nothing is at `sock` any more, which of a session read as gone
-/// means gone for good, and not worth a connect every two seconds for as long
-/// as nvmux runs. A socket goes only with its session: the editor's own as it
-/// quits or is reaped, and a forward as nvmux takes it down, for a session
-/// killed or no longer listed. One still there that refuses may yet answer:
-/// a forward that a dropped link left behind does, once it is made again,
-/// and the picker floating over a session makes it again for its own reads
-/// of notes, without handing the session here.
+/// Whether `sock` no longer exists, so a session read as gone is gone for
+/// good and not worth polling. Sockets vanish only with their session. One
+/// that exists but refuses may answer again: a forward left by a dropped link
+/// does once remade, which the floating picker may do without telling us.
 fn vanished(sock: &Path) -> bool {
     matches!(
         std::fs::symlink_metadata(sock),
@@ -582,10 +538,8 @@ fn vanished(sock: &Path) -> bool {
     )
 }
 
-/// What a round tells, `(age, post)` as the sessions were read, in the order
-/// to post it: oldest first, so that the newest card lands on top whichever
-/// session said it. What one session said, and what several said the same
-/// second, keeps the order it came in.
+/// Sort oldest first, so the newest card lands on top whichever session
+/// said it. Stable: equal ages keep their order.
 fn oldest_first(mut told: Vec<(u64, Post)>) -> Vec<Post> {
     told.sort_by_key(|&(age, _)| std::cmp::Reverse(age));
     told.into_iter().map(|(_, post)| post).collect()
@@ -595,7 +549,6 @@ fn oldest_first(mut told: Vec<(u64, Post)>) -> Vec<Post> {
 mod tests {
     use super::*;
 
-    /// The keys a card names, as they are by default but for the prefix.
     fn prefixed(prefix: u8) -> KeySettings {
         KeySettings {
             prefix,
@@ -616,9 +569,6 @@ mod tests {
         }
     }
 
-    /// A card with news from another session: its sign, its name, what
-    /// happened in the picker's words, how long ago, and the key that goes
-    /// there — which goes there.
     #[test]
     fn a_card_from_another_session_names_it_and_goes_there() {
         let finished = news(Kind::Finished, "cargo test", "exited with code 0", 1, None);
@@ -653,9 +603,6 @@ mod tests {
         assert!(card_for(&news(Kind::Busy(None), "", "", 4, None), None, prefixed(0)).is_none());
     }
 
-    /// A card is about the session it came from, which a newer one about it
-    /// replaces; of the session in front, about the terminal; and leaves its
-    /// own sign.
     #[test]
     fn a_card_is_about_where_it_came_from() {
         let finished = news(Kind::Finished, "cargo test", "exited with code 0", 1, None);
@@ -669,9 +616,6 @@ mod tests {
         assert_eq!(card.about.as_deref(), Some("here 5"));
     }
 
-    /// What a session's mark says is what the picker's sign does: a
-    /// notification or a failure, waiting, over a command that has finished
-    /// since; and nothing, where it keeps nothing.
     #[test]
     fn a_mark_is_the_pickers_sign() {
         let finished = news(Kind::Finished, "cargo test", "exited with code 0", 2, None);
@@ -686,8 +630,6 @@ mod tests {
         );
     }
 
-    /// Of the session in front: `here`, and where its terminal is, and the
-    /// key that shows it — where it can be shown.
     #[test]
     fn a_card_from_the_session_in_front_is_here() {
         let mut own = news(Kind::Failed, "sh", "exited with code 3", 1, Some(false));
@@ -708,9 +650,6 @@ mod tests {
         assert_eq!((card.footer, go), (None, None));
     }
 
-    /// A card names the key that goes there as the user has it: with `go`
-    /// moved off Enter, the key it was moved to, drawn the way the hint bar
-    /// draws it.
     #[test]
     fn a_card_names_the_key_go_was_moved_to() {
         let mut settings = prefixed(0);
@@ -731,8 +670,6 @@ mod tests {
         assert_eq!(card.footer.as_deref(), Some("Ctrl-Space ␣ go there"));
     }
 
-    /// The first read only finds out how far a session has got; after it,
-    /// what is numbered past that is news, oldest first, once.
     #[test]
     fn news_is_what_is_numbered_past_the_last_read() {
         let said = [
@@ -748,9 +685,8 @@ mod tests {
         assert!(to_tell(Some(7), &said, false).is_empty(), "told already");
     }
 
-    /// In front, a session is told only what came from a terminal off the
-    /// screen: not one it was showing, and not a progress message, which it
-    /// shows itself.
+    /// Not news from a terminal on screen, nor a progress message, which the
+    /// session shows itself.
     #[test]
     fn the_session_in_front_is_told_only_of_a_terminal_off_the_screen() {
         let said = [
@@ -770,9 +706,8 @@ mod tests {
         );
     }
 
-    /// A session read as gone with its socket gone too is read no more. One
-    /// whose socket is still there, refusing, is kept: so is a forward that a
-    /// dropped link left behind, which answers again once it is made anew.
+    /// One whose socket remains (refusing) is kept: a forward left by a
+    /// dropped link answers again once remade.
     #[test]
     fn a_session_gone_with_its_socket_is_read_no_more() {
         let left = crate::test_support::scratch_sock("tell-left");
@@ -789,9 +724,7 @@ mod tests {
         let _ = std::fs::remove_file(&left);
     }
 
-    /// What a round tells is posted oldest first, so that the newest card is
-    /// the one on top, though another session was read before the one that
-    /// said it; and what one session said in a second keeps its order.
+    /// Equal ages keep their order.
     #[test]
     fn what_a_round_tells_is_posted_oldest_first_whichever_session_said_it() {
         let told = |name: &str, text: &str, age: u64| {

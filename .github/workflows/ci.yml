@@ -7,9 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The integration tests skip when there is no usable nvim. In CI that would
-  # be a silent no-op, so a missing nvim is a failure here. `ssh` is not
-  # listed: the SSH tests need a host that answers, which a runner has not.
+  # Fail rather than skip the integration tests when nvim is missing. Not
+  # `ssh`: runners have no host to connect to.
   NVMUX_TEST_REQUIRE: nvim
 
 jobs:
@@ -29,10 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # The dependencies, built optimised in a debug build (see Cargo.toml),
-      # once for every change of toolchain or Cargo.lock rather than every
-      # run. Saved from main alone, which every branch can restore from, so
-      # that branches do not crowd main's out of the repository's cache.
+      # Saved from main only, so branches don't evict main's cache.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -47,32 +43,20 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install neovim
       - run: nvim --version | head -1
-      # The remote command is parsed by the user's login shell first, and the
-      # test that runs it under each shell skips any it cannot find. fish and
-      # tcsh are the ones that do not speak POSIX sh, and zsh is macOS's
-      # default; macOS ships the last two, a Linux runner none of them.
+      # The remote command is tested under each login shell found; fish and
+      # tcsh are not POSIX. macOS ships tcsh and zsh.
       - name: Install login shells (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y fish tcsh zsh
-      # rustfmt's output does not vary by platform; clippy's findings do
-      # (see the cfg-divergent waitid in src/pty.rs), so that stays on both.
+      # rustfmt is platform-independent; clippy is not (see waitid in
+      # src/pty.rs).
       - run: cargo fmt --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
-      # The unit tests compute, and run one at a time per core, the default:
-      # 4 on a Linux runner, 3 on a macOS one. The integration tests spend
-      # their time waiting — on Neovim, on links made slow on purpose, on
-      # frames — not computing: tests/client.rs adds up to the same 1,520
-      # test-seconds run 4, 8, 16 or 32 at a time, and is done in 394, 202,
-      # 111 or 61, its longest test 57, keeping four cores 19% busy at 32. So
-      # they run thirty-two at a time on Linux, and twelve on macOS: there,
-      # thirty-two at once — up to 34 ptys open, where twelve have 14 — had
-      # one of them fail to open a pty at all (ENXIO).
-      #
-      # Thirty-two tests at once have more files open than a soft limit of
-      # 256, a stock macOS shell's, allows, and fewer than 512: under 256,
-      # tests/client.rs fails with EMFILE. Raised where it is lower, as it may
-      # be on macOS; a Linux runner allows 65536.
+      # Integration tests mostly wait (on Neovim, slowed links, frames), so
+      # they run 32 at a time on Linux. macOS runs 12: at 32 it ran out of
+      # ptys (ENXIO). 32 at once need more than macOS's default 256 open
+      # files (EMFILE), hence the raised ulimit.
       - name: cargo test
         run: |
           if [ "$(ulimit -n)" != unlimited ] && [ "$(ulimit -n)" -lt 4096 ]; then

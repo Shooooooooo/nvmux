@@ -1,29 +1,12 @@
-//! The terminal's input read as keys and mouse reports, for the settings
-//! when they float over a session (see `crate::pty::panel`).
+//! Decodes terminal input into crossterm key and mouse events for the
+//! settings floating over a session (see `crate::pty::panel`).
 //!
-//! nvmux's own screens read the terminal through crossterm, which has it to
-//! itself while they are up. Over a session the relay has it instead, a read
-//! at a time (see [`crate::pty`]), and the terminal goes on spelling keys the
-//! way the session's client asked it to: as legacy control bytes, in the
-//! kitty keyboard protocol, or in xterm's `modifyOtherKeys` (see
-//! [`crate::keyseq`]). So this reads all three into crossterm's own events,
-//! which the settings take as they take them from crossterm on their own
-//! screen — and the mouse reports nvmux asks the terminal for while the
-//! settings are up, in SGR's spelling or X10's.
-//!
-//! Not everything that arrives is for the settings. The terminal answers the
-//! questions the session's client asks it — its attributes, a colour, the
-//! cursor's position, a mode — and tells the client its size and when it
-//! gains or loses focus; and the client goes on asking while the settings are
-//! up, since it goes on drawing behind them. All of that goes on to the
-//! client untouched ([`Input::Client`]). A paste goes nowhere: typed into the
-//! settings, a `w` in it would save them and a `q` take them down.
-//!
-//! nvmux's own client reads the same spellings (see
-//! [`crate::client::input`]), into Neovim's notation for its server, with the
-//! answers reshaped as the server's handlers take them. This is the other
-//! direction's need: crossterm's events for a screen of nvmux's own, and the
-//! answers passed on as they came, for a client that asked for them.
+//! Over a session the relay owns the terminal, not crossterm, and keys come
+//! in whatever encoding the client enabled: legacy, kitty or
+//! `modifyOtherKeys` (see [`crate::keyseq`]). Terminal replies go to the
+//! client unchanged ([`Input::Client`]), as it keeps querying while it draws
+//! behind the settings. Pastes are dropped: a `w` or `q` in one would save or
+//! close the settings.
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
@@ -33,32 +16,26 @@ use ratatui::crossterm::event::{
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 
-/// Longer than this and a sequence is not one anything sends a screen: what
-/// is kept of it so far is dropped rather than waited on.
+/// A pending sequence longer than this is dropped rather than waited on.
 const MAX_SEQUENCE: usize = 4096;
 
-/// What a piece of the terminal's input turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    /// For the session's client, as it came: the terminal answering one of
-    /// its questions, or telling it its size or its focus.
+    /// For the session's client, unchanged.
     Client(Vec<u8>),
 }
 
-/// The terminal's input as it arrives, a read at a time: a sequence cut off
-/// by the end of one read waits here for the rest of it.
+/// Buffers a sequence split across reads.
 #[derive(Debug, Default)]
 pub struct Decoder {
     pending: Vec<u8>,
-    /// Inside a bracketed paste, which goes nowhere.
+    /// Inside a bracketed paste, which is dropped.
     pasting: bool,
 }
 
-/// One piece of input, read or not yet.
 enum Parsed {
-    /// More bytes are needed to tell what this is.
     Need,
     /// The first `len` bytes are one piece.
     Done(usize, Piece),
@@ -68,8 +45,7 @@ enum Piece {
     Input(Input),
     PasteStart,
     PasteEnd,
-    /// Read, and for nobody: a key the settings have no use for, a paste, or
-    /// something no terminal should have sent.
+    /// Consumed and discarded: an unused key, pasted text, or garbage.
     Nothing,
 }
 
@@ -78,8 +54,8 @@ impl Decoder {
         Self::default()
     }
 
-    /// What `bytes`, read after whatever came before, make: every piece that
-    /// is whole, in order. A piece cut off at the end waits for the rest.
+    /// Decode `bytes` after any pending ones; an incomplete tail stays
+    /// pending.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Input> {
         self.pending.extend_from_slice(bytes);
         let mut out = Vec::new();
@@ -109,13 +85,12 @@ impl Decoder {
         out
     }
 
-    /// Whether a piece is waiting for the rest of itself.
+    /// Whether an incomplete sequence is pending.
     pub fn waiting(&self) -> bool {
         !self.pending.is_empty()
     }
 
-    /// The rest of what is waiting never came: a lone `ESC` is the Escape
-    /// key, and anything else cut off is dropped.
+    /// Stop waiting: a lone `ESC` is Escape; anything else pending is dropped.
     pub fn flush(&mut self) -> Vec<Input> {
         let lone_esc = self.pending == [ESC] && !self.pasting;
         self.pending.clear();
@@ -144,13 +119,13 @@ fn done(len: usize, input: Input) -> Parsed {
     Parsed::Done(len, Piece::Input(input))
 }
 
-/// Inside a paste: everything up to its end, which is dropped.
+/// Inside a paste: consume everything up to and including its end.
 fn pasted(bytes: &[u8]) -> Parsed {
     const END: &[u8] = b"\x1b[201~";
     if let Some(at) = bytes.windows(END.len()).position(|w| w == END) {
         return Parsed::Done(at + END.len(), Piece::PasteEnd);
     }
-    // All but what could be the start of the end.
+    // Hold back a possible prefix of the end marker.
     let keep = (1..END.len())
         .rev()
         .find(|&n| bytes.len() >= n && bytes.ends_with(&END[..n]))
@@ -176,8 +151,7 @@ fn parse(bytes: &[u8]) -> Parsed {
     }
 }
 
-/// A character typed, in UTF-8: an upper-case letter is shifted, as
-/// crossterm has it.
+/// One UTF-8 character; upper case gets Shift, as in crossterm.
 fn text(bytes: &[u8]) -> Parsed {
     let len = match bytes[0] {
         0x00..=0x7f => 1,
@@ -210,13 +184,12 @@ fn escape(bytes: &[u8]) -> Parsed {
     match second {
         b'[' => csi(bytes),
         b'O' => ss3(bytes),
-        // OSC, ended by `BEL` or `ST`; and the strings ended by `ST` alone:
-        // DCS, APC, PM and SOS. All of them replies, for the client.
+        // OSC, DCS, APC, PM and SOS: replies for the client.
         b']' => string(bytes, true),
         b'P' | b'_' | b'^' | b'X' => string(bytes, false),
-        // The Escape key, and the start of whatever follows it.
+        // The Escape key; the second `ESC` starts the next piece.
         ESC => done(1, key(KeyCode::Esc, KeyModifiers::NONE)),
-        // `Alt` and a key, which the settings have no use for.
+        // Alt+key, unused by the settings.
         _ => match text(&bytes[1..]) {
             Parsed::Need => Parsed::Need,
             Parsed::Done(len, _) => Parsed::Done(1 + len, Piece::Nothing),
@@ -224,7 +197,7 @@ fn escape(bytes: &[u8]) -> Parsed {
     }
 }
 
-/// A string sequence, up to its terminator: `ST`, or for an OSC `BEL` too.
+/// A string sequence up to `ST` (or `BEL` for an OSC).
 fn string(bytes: &[u8], bel: bool) -> Parsed {
     for (i, &b) in bytes.iter().enumerate().skip(2) {
         if bel && b == BEL {
@@ -237,8 +210,7 @@ fn string(bytes: &[u8], bel: bool) -> Parsed {
     Parsed::Need
 }
 
-/// `ESC O` and one byte: the arrows and the rest of the cursor keys in
-/// application mode, and F1 to F4.
+/// `ESC O` + one byte: application-mode cursor keys and F1-F4.
 fn ss3(bytes: &[u8]) -> Parsed {
     let Some(&fin) = bytes.get(2) else {
         return Parsed::Need;
@@ -259,7 +231,7 @@ fn ss3(bytes: &[u8]) -> Parsed {
 
 /// A `CSI` sequence: a key, a mouse report, or a reply for the client.
 fn csi(bytes: &[u8]) -> Parsed {
-    // X10's mouse report: `CSI M` and three bytes, each a value plus 32.
+    // X10 mouse report: `CSI M` + three bytes, each value + 32.
     if bytes.get(2) == Some(&b'M') {
         let Some(&[cb, cx, cy]) = bytes.get(3..6).and_then(|b| <&[u8; 3]>::try_from(b).ok()) else {
             return Parsed::Need;
@@ -279,7 +251,7 @@ fn csi(bytes: &[u8]) -> Parsed {
                 end = Some(i);
                 break;
             }
-            // Not a sequence after all: what came of it so far is dropped.
+            // Not a valid sequence: drop what was read.
             _ => return Parsed::Done(i, Piece::Nothing),
         }
     }
@@ -295,10 +267,9 @@ fn csi(bytes: &[u8]) -> Parsed {
             Some(m) => done(len, Input::Mouse(m)),
             None => Parsed::Done(len, Piece::Nothing),
         },
-        // A private marker first: a reply, which no key ever has.
+        // A leading private marker means a reply; no key has one.
         (Some(b'?' | b'>' | b'='), _) => done(len, whole()),
-        // The cursor's position; focus in and out; the size, in band or
-        // asked for; a status report; the attributes; a mode.
+        // Cursor position, focus, size, status, attributes, mode.
         (_, b'R' | b'I' | b'O' | b't' | b'n' | b'c' | b'y') => done(len, whole()),
         (_, b'u') => match kitty(params) {
             Some(input) => done(len, input),
@@ -326,7 +297,7 @@ fn csi(bytes: &[u8]) -> Parsed {
     }
 }
 
-/// A sequence's parameters, each its sub-parameters: `1;5:3` is `[[1], [5, 3]]`.
+/// Parameters split into sub-parameters: `1;5:3` is `[[1], [5, 3]]`.
 fn fields(params: &[u8]) -> Vec<Vec<u32>> {
     let text = std::str::from_utf8(params).unwrap_or_default();
     text.split(';')
@@ -334,8 +305,7 @@ fn fields(params: &[u8]) -> Vec<Vec<u32>> {
         .collect()
 }
 
-/// A modifier field — one plus a mask, and after a colon the event — as
-/// crossterm's modifiers and the kind of key event.
+/// A modifier field: 1 + bitmask, then `:event`.
 fn modifiers(field: Option<&Vec<u32>>) -> (KeyModifiers, KeyEventKind) {
     let mask = field
         .and_then(|f| f.first())
@@ -363,7 +333,7 @@ fn modifiers(field: Option<&Vec<u32>>) -> (KeyModifiers, KeyEventKind) {
     (m, kind)
 }
 
-/// The kitty protocol's spelling: `CSI key[:shifted[:base]] ; modifiers[:event] u`.
+/// Kitty protocol: `CSI key[:shifted[:base]] ; modifiers[:event] u`.
 fn kitty(params: &[u8]) -> Option<Input> {
     let fields = fields(params);
     let code = *fields.first()?.first()?;
@@ -386,9 +356,8 @@ fn kitty(params: &[u8]) -> Option<Input> {
     Some(key_as(code, modifiers, kind))
 }
 
-/// `CSI number [; modifiers] ~`: the editing keys and the function keys, a
-/// paste's two ends, and xterm's `modifyOtherKeys` (`CSI 27 ; modifiers ;
-/// key ~`).
+/// `CSI number [; modifiers] ~`: editing and function keys, paste start/end,
+/// and `modifyOtherKeys` (`CSI 27 ; modifiers ; key ~`).
 fn tilde(params: &[u8], len: usize) -> Parsed {
     let fields = fields(params);
     let number = fields.first().and_then(|f| f.first()).copied().unwrap_or(0);
@@ -417,8 +386,7 @@ fn tilde(params: &[u8], len: usize) -> Parsed {
     done(len, key_as(code, modifiers, kind))
 }
 
-/// SGR's mouse report, after its `<`: `button ; column ; row`, 1-based,
-/// pressed (`M`) or let go (`m`).
+/// SGR mouse report after `<`: `button ; column ; row`, 1-based; `M`/`m`.
 fn sgr_mouse(params: &[u8], pressed: bool) -> Option<MouseEvent> {
     let fields = fields(params);
     let value = |i: usize| fields.get(i).and_then(|f| f.first()).copied();
@@ -428,7 +396,7 @@ fn sgr_mouse(params: &[u8], pressed: bool) -> Option<MouseEvent> {
     mouse(cb, pressed, column, row)
 }
 
-/// A report's button byte, read as crossterm reads it.
+/// Decode a report's button byte as crossterm does.
 fn mouse(cb: u16, pressed: bool, column: u16, row: u16) -> Option<MouseEvent> {
     let button = (cb & 0b11) | ((cb & 0b1100_0000) >> 4);
     let dragging = cb & 0b10_0000 != 0;
@@ -487,7 +455,6 @@ mod tests {
     const NONE: KeyModifiers = KeyModifiers::NONE;
     const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 
-    /// The plain spelling: text, and the control bytes the screens' keys are.
     #[test]
     fn plain_bytes_are_the_keys_they_spell() {
         assert_eq!(
@@ -508,7 +475,6 @@ mod tests {
         );
     }
 
-    /// The arrows in both their spellings, with a modifier, and Shift-Tab.
     #[test]
     fn the_cursor_keys_in_either_mode() {
         assert_eq!(
@@ -524,8 +490,6 @@ mod tests {
         );
     }
 
-    /// The kitty protocol's keys, a release and a repeat among them, and
-    /// `modifyOtherKeys`'s prefix chord.
     #[test]
     fn the_kitty_protocol_and_modify_other_keys() {
         assert_eq!(
@@ -548,8 +512,6 @@ mod tests {
         );
     }
 
-    /// SGR's mouse reports, 0-based where they land: a press, its release,
-    /// plain motion, and the wheel; and X10's.
     #[test]
     fn the_mouse_in_sgr_and_x10() {
         let at = |kind, column, row| {
@@ -572,7 +534,6 @@ mod tests {
         );
     }
 
-    /// What the terminal tells the client goes to the client, as it came.
     #[test]
     fn replies_and_reports_are_the_clients() {
         let replies: [&[u8]; 7] = [
@@ -593,8 +554,6 @@ mod tests {
         }
     }
 
-    /// A paste goes nowhere, however it is cut up, and what follows it is
-    /// read as ever.
     #[test]
     fn a_paste_goes_nowhere() {
         assert_eq!(
@@ -607,8 +566,6 @@ mod tests {
         assert_eq!(d.feed(b"1~k"), vec![pressed(KeyCode::Char('k'), NONE)]);
     }
 
-    /// A piece cut off by the end of a read waits for the rest of itself; a
-    /// lone `ESC` that nothing follows is the Escape key.
     #[test]
     fn a_piece_cut_off_waits_for_the_rest() {
         let mut d = Decoder::new();
@@ -627,8 +584,6 @@ mod tests {
         assert!(d.flush().is_empty(), "an unfinished reply is dropped");
     }
 
-    /// Two escapes in a row are the Escape key and then whatever the second
-    /// one starts; Alt and a key is nobody's.
     #[test]
     fn escape_then_a_sequence_and_alt_keys() {
         assert_eq!(

@@ -3,21 +3,15 @@
 #
 # Usage: sh spawn.sh <runtime_dir> <id> <cwd> <cmd> [args...]
 #
-# The command is the caller's, one word per argument, already carrying this
-# session's socket path -- src/launch.rs is what validated and split it, and
-# nothing here re-parses it. It is run as-is: no shell, so no expansion, and no
-# string this script assembled.
-#
-# The working directory is the caller's too, and arrives already absolute:
-# src/session.rs refused a relative one and expanded any leading `~` against the
-# home directory hello.sh reported, so there is nothing here to expand either.
+# The command is one word per argument, with the socket path already in it
+# (validated and split by src/launch.rs). It runs as-is: no shell, no
+# expansion. <cwd> arrives absolute with `~` already expanded (src/session.rs).
 #
 # Output:
 #   PID <pid>        the *validated* pid of the new nvim, or empty if we could
-#                    not confirm it (see the safety note below)
+#                    not confirm it (see the note on `pid` below)
 #   SOCK ok|timeout  whether the listen socket appeared
 #   NVMUX_END
-#
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
 
 usage='usage: spawn.sh <runtime_dir> <id> <cwd> <cmd> [args...]'
@@ -30,26 +24,20 @@ shift 3
 sock="$dir/$id.sock"
 log="$dir/$id.log"
 
-# No `umask` here, deliberately. The session's editor writes the user's files,
-# so it runs under the umask the user launched nvmux with -- locally that is
-# the mask src/proc.rs puts back on this shell, remotely the one this host
-# gives its own logins. Neovim does create its listen socket with
-# `0777 & ~umask`, which is what a mask here once guarded: what guards it now
-# is the 0700 runtime directory, checked just below before anything is
-# spawned, so a socket is unreachable for as long as it exists whatever mode
-# it is born with -- and the `chmod 600` that follows the socket's appearance.
+# No `umask` here, deliberately: the editor writes the user's files, so it
+# keeps the mask nvmux was launched with (locally the one src/proc.rs restores,
+# remotely the host's login default). Neovim creates its socket with
+# `0777 & ~umask`; the 0700 directory checked below and the later `chmod 600`
+# protect it instead.
 
 if [ -e "$dir" ] || [ -L "$dir" ]; then
-  # An existing directory must be OURS and private. Over ssh this script is the
-  # only check there is, and /tmp is world-writable, so another user could have
-  # created it first.
+  # An existing directory must be ours and private: over ssh this is the only
+  # check, and in world-writable /tmp another user could have created it.
   #
-  # `ls -ldn` for both tests: POSIX `test` has no "-owned-by-me" operator,
-  # `stat` is spelled differently on macOS and Linux, and `find -perm /mode`
-  # (GNU) and `-perm +mode` (BSD) are not both accepted anywhere. `-n` gives
-  # the owner as a uid, so it compares with `id -u` without a name lookup. A
-  # check that cannot be made fails CLOSED: an empty answer is a refusal, not
-  # a pass.
+  # `ls -ldn` for both tests: `test` cannot check ownership, `stat` differs
+  # between macOS and Linux, and `find -perm /mode` (GNU) and `-perm +mode`
+  # (BSD) are not portable. `-n` gives a numeric uid to compare with `id -u`.
+  # Fails closed: an empty answer is a refusal.
   info=$(ls -ldn "$dir" 2>/dev/null)
   [ -n "$info" ] || fail "could not inspect runtime directory $dir"
   mode=$(printf '%s\n' "$info" | cut -c1-10)
@@ -59,8 +47,7 @@ if [ -e "$dir" ] || [ -L "$dir" ]; then
     *) fail "runtime directory $dir is not a directory (or is a symlink)" ;;
   esac
   [ "$owner" = "$(id -u)" ] || fail "runtime directory $dir is not owned by us"
-  # Columns 5-10 are the group and other permissions; anything but dashes there
-  # is a bit we would never have set.
+  # Columns 5-10 are the group and other bits; all must be unset.
   case "$(printf '%s\n' "$mode" | cut -c5-10)" in
     ------) ;;
     *) fail "runtime directory $dir is accessible to other users" ;;
@@ -72,56 +59,42 @@ else
   chmod 700 "$dir" 2>/dev/null || true
 fi
 
-# MANDATORY. `nvim --listen` refuses to start if *anything* exists at the path
-# -- live socket, stale socket or plain file -- all with the same misleading
-# `address already in use` message. In the script rather than in Rust because
-# std::fs cannot unlink over ssh.
+# Required: `nvim --listen` refuses to start if anything exists at the path,
+# with a misleading `address already in use`. Done here because std::fs cannot
+# unlink over ssh.
 rm -f "$sock"
 
-# The nested-launch marker. Exported here it reaches the editor and every job
-# the editor starts -- a `:terminal` shell included, which is exactly where
-# someone would type `nvmux` again. src/nested.rs is what reads it.
-#
-# Here rather than over RPC once the session answers, which would reach both
-# transports just as well: this is in place before nvim's first line runs, it
-# cannot quietly fail the way a best-effort post-spawn call does, and it does
-# not build a command out of a path -- see src/shell.rs on why that matters.
+# The nested-launch marker read by src/nested.rs; exported, it reaches every
+# job the editor starts, `:terminal` shells included. Set here rather than over
+# RPC after spawn: it is in place before nvim starts and cannot fail silently.
 export NVMUX="$sock"
 
-# Where the session runs. Before the `command -v` below, not after: that resolves
-# a *relative* command path against the current directory, so `./nvim` would
-# otherwise be looked for in the directory nvmux happened to be started in rather
-# than the one the session is about to run in. Everything else this script names
-# -- $dir, $sock, $log -- is absolute and does not care.
+# Enter <cwd> before `command -v` below, which resolves a relative command
+# like `./nvim` against the current directory.
 #
-# Two steps rather than one `cd`, because their failures are different questions:
-# a path that is not a directory (a typo, or a file) and one that is but cannot be
-# entered (a mode of 000, or a component we may not traverse). Both refuse rather
-# than launch somewhere else, which would be far worse than not launching: the
-# session would come up, look right, and be wrong.
+# Two steps, for two errors: not a directory, or one we cannot enter. Both
+# refuse rather than launch somewhere else, which would look right and be
+# wrong.
 [ -d "$cwd" ] || fail "$cwd: not a directory"
 cd -- "$cwd" || fail "$cwd: could not enter it"
 
-# A command that is not there would otherwise be a five-second wait for a socket
-# that was never going to appear, and a timeout message blaming the session. The
-# shell writes its own "not found" to the log, but only the caller reads that,
-# and only after giving up. `command -v` accepts a path as readily as a name.
+# Fail at once on a missing command rather than wait five seconds for a socket
+# and blame the session; the shell's own "not found" only reaches the log.
+# `command -v` accepts a path as well as a name.
 command -v -- "$1" >/dev/null 2>&1 || fail "$1: not found"
 
-# The redirections below create the log under the caller's mask, so its mode is
-# set here rather than left to that mask. Like the socket it sits in the 0700
-# directory, which is what keeps it unreadable; this keeps it private in its own
-# right as well, and keeps the mode the same on every host.
+# The redirections below would create the log under the caller's mask; set
+# its mode so it is private on its own (not only via the 0700 directory) and
+# the same on every host.
 : >>"$log" 2>/dev/null || true
 chmod 600 "$log" 2>/dev/null || true
 
-# Detach from the ssh session's process group, which the kernel SIGHUPs when the
-# connection closes. `setsid` is cleanest but is util-linux and does not exist
-# on macOS, so probe for it and fall back to `nohup`.
+# Detach from the ssh session's process group, which gets SIGHUP when the
+# connection closes. `setsid` (util-linux) is missing on macOS, so fall back
+# to `nohup`.
 #
-# All three file descriptors are redirected in both branches, and that is not
-# hygiene: `ssh host 'cmd &'` with stdout still attached hangs the ssh client
-# until its timeout. Measured at 12s versus 0.23s.
+# All three fds are redirected in both branches: `ssh host 'cmd &'` with
+# stdout attached hangs the client until its timeout (12s versus 0.23s).
 if command -v setsid >/dev/null 2>&1; then
   setsid "$@" </dev/null >>"$log" 2>&1 &
   guess=$!
@@ -132,16 +105,15 @@ else
   disown 2>/dev/null || true
 fi
 
-# Wait for the socket to appear, for five seconds counted in hundredths: every
-# hundredth for the first tenth, which is when Neovim usually binds it, and
-# every twentieth after. Readiness is a *separate* question the caller settles
-# with a deferred RPC call -- see src/rpc.rs.
+# Wait up to five seconds for the socket: every hundredth of a second for the
+# first tenth (when Neovim usually binds it), then every twentieth. Readiness
+# is checked separately by the caller over RPC (src/rpc.rs).
 sock_state=timeout
 i=0
 while [ "$i" -lt 500 ]; do
   if [ -S "$sock" ]; then
-    # The socket's own control, and now the only one it has besides the
-    # directory: never trust the caller's mask.
+    # Its only protection besides the directory; never trust the caller's
+    # mask.
     chmod 600 "$sock" 2>/dev/null || true
     sock_state=ok
     break
@@ -156,12 +128,9 @@ while [ "$i" -lt 500 ]; do
   fi
 done
 
-# Confirm the pid really is the nvim serving *this* socket before reporting it.
-#
-# `$!` is not necessarily nvim's pid: `setsid` execs directly only when the
-# caller is not already a process group leader, and otherwise forks, leaving $!
-# pointing at setsid. The pid is what a later `kill -KILL` targets, and pids get
-# reused, so an unvalidated one could name an unrelated process.
+# Report the pid only once confirmed as the nvim serving this socket: a later
+# `kill -KILL` targets it, and pids are reused. `$!` may be setsid's own pid,
+# as it forks when the caller already leads a process group.
 pid=''
 if [ -n "$guess" ] && kill -0 "$guess" 2>/dev/null; then
   if owns_socket "$guess" "$sock"; then
@@ -169,8 +138,7 @@ if [ -n "$guess" ] && kill -0 "$guess" 2>/dev/null; then
   fi
 fi
 
-# If the guess did not check out, find the process actually serving this socket
-# rather than report something unsafe to kill.
+# Otherwise find the process actually serving this socket.
 if [ -z "$pid" ]; then
   pid=$(serving_pid "$sock")
 fi

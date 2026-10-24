@@ -1,24 +1,19 @@
-//! Typed errors: `anyhow::Result` at boundaries, these where callers branch.
-//! Every variant exists because some caller makes a decision on it — a stale
-//! socket gets reaped and a busy one does not, a kill that did not take effect
-//! must not delete files.
+//! Typed errors: `anyhow::Result` at boundaries, these where callers branch
+//! (e.g. a stale socket is reaped, a busy one is not).
 //!
-//! A variant that wraps another error says it in its own message, and does not
-//! also hand it out as its `source()`: `main` prints through anyhow's `{:#}`,
-//! which follows a message with each of its sources, so a variant that did both
-//! said its cause twice. The message is the one that has to carry it, since
-//! [`NvmuxError::one_line`] prints the message alone. The wrapped field is
-//! called `error` because thiserror takes a field called `source` as the source
-//! whether it is marked or not.
+//! Wrapping variants include the inner error in their message and do not
+//! expose it as `source()`: `main` prints with anyhow's `{:#}`, which appends
+//! every source, so doing both repeats the cause, and
+//! [`NvmuxError::one_line`] prints only the message. The field is named
+//! `error` because thiserror treats any field named `source` as the source.
 
 use std::path::PathBuf;
 
-/// Failures constructing or validating paths. Separate from `io::Error` because
-/// the length rule is ours, not the kernel's.
+/// Path construction and validation failures.
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
-    /// A composed socket path exceeded the `sun_path` budget. Must be caught
-    /// before anyone calls `bind()` — see [`crate::paths`] for why.
+    /// A socket path exceeds the `sun_path` limit. Must be caught before
+    /// `bind()`; see [`crate::paths`].
     #[error(
         "unix socket path is {len} bytes, max {max}: {}\n\
          hint: nvmux composes paths under {}. A longer path would be silently \
@@ -31,13 +26,12 @@ pub enum PathError {
         max: usize,
     },
 
-    /// The runtime directory exists but is not a directory. Checked on `lstat`,
-    /// not `stat` — see [`crate::paths`].
+    /// Checked with `lstat`, not `stat`.
     #[error("{}: not a directory (or is a symlink to one, which we refuse)", .0.display())]
     NotADirectory(PathBuf),
 
-    /// Someone else owns our runtime directory. `/tmp` is mode 1777: the sticky
-    /// bit stops another user deleting it, not creating it first.
+    /// Another user owns the runtime directory. `/tmp`'s sticky bit stops
+    /// others deleting it, not creating it first.
     #[error("{}: owned by uid {owner}, expected {expected}", .path.display())]
     BadOwner {
         path: PathBuf,
@@ -45,13 +39,12 @@ pub enum PathError {
         expected: u32,
     },
 
-    /// The runtime directory is group- or world-accessible — a code-execution
-    /// control, not a privacy nicety. See [`crate::paths`].
+    /// The runtime directory is group- or world-accessible. This is a
+    /// code-execution control, not just privacy.
     #[error("{}: mode is {mode:04o}, refusing to use a directory accessible to other users", .path.display())]
     BadMode { path: PathBuf, mode: u32 },
 
-    /// A session id that is not 8 base32 characters. Ids become paths, so this
-    /// is a containment check.
+    /// Ids become paths, so this is a containment check.
     #[error("malformed session id {0:?}: expected 8 lowercase base32 characters")]
     MalformedId(String),
 
@@ -62,33 +55,28 @@ pub enum PathError {
     },
 }
 
-/// Failures talking msgpack-RPC to a Neovim server.
+/// msgpack-RPC failures talking to Neovim.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
-    /// Nothing is listening. Locally this means the session is dead and the
-    /// socket file is stale; through an SSH forward it means the *master* died,
-    /// because ssh accepts first and resets later.
+    /// Locally: the session is dead and the socket stale. Through an SSH
+    /// forward: the *master* died, since ssh accepts first and resets later.
     #[error("connection refused: {}", .0.display())]
     ConnectionRefused(PathBuf),
 
-    /// The peer went away mid-conversation. Through an SSH forward this is the
-    /// remote nvim dying, as distinct from `ConnectionRefused`.
+    /// Through an SSH forward this means the remote nvim died.
     #[error("connection reset by peer")]
     Reset,
 
-    /// The call did not answer in time. This does *not* mean the session is
-    /// dead — see the note on [`crate::rpc`] about `nvim_list_bufs` blocking for
-    /// the entire duration of any `system()` call.
+    /// Does *not* mean the session is dead: e.g. `nvim_list_bufs` blocks for
+    /// the whole of any `system()` call (see [`crate::rpc`]).
     #[error("timed out after {0:?}")]
     Timeout(std::time::Duration),
 
-    /// Neovim answered with an error object.
     #[error("nvim returned an error: {0}")]
     Nvim(String),
 
-    /// We could not make sense of the bytes on the wire. This poisons the
-    /// connection: rmpv has already consumed a partial frame, so the next read
-    /// would decode garbage from the tail of this one.
+    /// Poisons the connection: rmpv has consumed a partial frame, so the next
+    /// read would decode garbage.
     #[error("malformed msgpack from nvim: {0}")]
     Protocol(String),
 
@@ -97,14 +85,13 @@ pub enum RpcError {
 }
 
 impl RpcError {
-    /// "There is definitely no server here", as opposed to "it did not answer in
-    /// time". Reaping on a timeout would delete sessions that are merely busy.
+    /// True only when no server is there; a timeout is not enough, since
+    /// reaping on one would delete busy sessions.
     pub fn is_definitely_dead(&self) -> bool {
         matches!(self, RpcError::ConnectionRefused(_) | RpcError::Reset)
     }
 }
 
-/// Failures about sessions as entities.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("no session named {0:?}")]
@@ -113,39 +100,32 @@ pub enum SessionError {
     #[error("a session named {0:?} already exists")]
     Exists(String),
 
-    /// A session-host script did not run, or reported its own refusal. The
-    /// message is the script's, and is rendered bare: wrapping it in a sentence
-    /// of ours produced things like `no session named "runtime directory
-    /// /tmp/nvmux-1000 is not owned by us"`.
+    /// A session-host script failed or refused. Its message is shown bare;
+    /// wrapping it read badly.
     #[error("{0}")]
     ScriptFailed(String),
 
-    /// Session names are display metadata, but they still end up in shell
-    /// commands and terminal output, so they are validated at the boundary.
+    /// Names reach shell commands and terminal output, so are validated.
     #[error("invalid session name {name:?}: {reason}")]
     InvalidName { name: String, reason: &'static str },
 
-    /// The command a session's Neovim is launched with. Validated at the same
-    /// boundary and for the same reasons, plus one of its own: it has to carry
-    /// the socket, which is how every later listing and kill finds the session.
+    /// The Neovim launch command. It must also carry the socket, which is how
+    /// listing and kill find the session.
     #[error("invalid command {command:?}: {reason}")]
     InvalidCommand {
         command: String,
         reason: &'static str,
     },
 
-    /// Where a session's Neovim is started. Validated at the same boundary as a
-    /// name and a command, plus one rule of its own: it has to be absolute. A
-    /// relative path would be resolved against whatever directory the spawning
-    /// shell happened to be in, which is exactly the unpredictability asking the
-    /// question was meant to remove.
+    /// Neovim's start directory. Must be absolute: a relative one would
+    /// resolve against the spawning shell's cwd.
     #[error("invalid working directory {directory:?}: {reason}")]
     InvalidDirectory {
         directory: String,
         reason: &'static str,
     },
 
-    /// The socket appeared but nothing ever answered on it.
+    /// The socket never appeared, or nothing answered on it.
     #[error("session {name:?} did not become ready within {timeout:?}\n--- tail of {} ---\n{log_tail}", .log.display())]
     NotReady {
         name: String,
@@ -154,14 +134,12 @@ pub enum SessionError {
         log_tail: String,
     },
 
-    /// The kill did not take effect, so the files were left alone. Removing them
-    /// anyway would orphan a running Neovim that nothing could ever reach again.
+    /// The files were kept: removing them would orphan a running Neovim.
     #[error("could not kill session {name:?}: {reason}")]
     NotKilled { name: String, reason: &'static str },
 
-    /// Refused before attaching: Neovim aborts — not errors — on its
-    /// seventeenth UI, and nvmux stops well short of that. See
-    /// [`crate::pty`].
+    /// Neovim aborts (not errors) on its 17th UI; nvmux refuses well before.
+    /// See [`crate::pty`].
     #[error("session {id} already has {attached} attached UIs; detach one before attaching again")]
     TooManyUis { id: String, attached: usize },
 
@@ -172,8 +150,7 @@ pub enum SessionError {
     },
 }
 
-/// Problems with the `nvim` binary itself, on either machine. Checked at startup
-/// rather than surfacing later as a mysterious connection failure.
+/// Problems with the `nvim` binary on either machine, checked at startup.
 #[derive(Debug, thiserror::Error)]
 pub enum NvimError {
     #[error("{where_}: `nvim` not found on $PATH\nhint: nvmux needs Neovim >= {min} on {where_}")]
@@ -190,7 +167,6 @@ pub enum NvimError {
     UnparsableVersion { where_: String, raw: String },
 }
 
-/// Problems driving the `ssh` client.
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
     #[error("ssh: no ControlMaster running for {0}")]
@@ -222,46 +198,35 @@ pub enum SshError {
     TooOld { found: String, min: &'static str },
 }
 
-/// Failures loading the user's configuration file.
-///
-/// A missing file is not an error — nvmux runs on its defaults — so there is no
-/// "not found" variant for the default paths. The one exception is a file named
-/// explicitly by `$NVMUX_CONFIG`: an explicit request for a file that is not
-/// there is a mistake worth reporting, not something to paper over with
-/// defaults. Every variant carries the path so the message can point at it.
+/// Config file loading failures. A missing file at a default path is not an
+/// error (defaults apply); one named by `$NVMUX_CONFIG` is.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// `$NVMUX_CONFIG` named a file that does not exist. Only the explicit path
-    /// is fatal when absent; the default paths fall back to the built-in values.
     #[error("{}: config file not found (named by $NVMUX_CONFIG)", .0.display())]
     ExplicitMissing(PathBuf),
 
-    /// The file exists but could not be read (permissions, a broken symlink,
-    /// a directory in its place).
+    /// Exists but unreadable (e.g. permissions, or a directory).
     #[error("{}: {error}", .path.display())]
     Read {
         path: PathBuf,
         error: std::io::Error,
     },
 
-    /// The file was read but is not valid TOML, names an unknown key, or a value
-    /// (e.g. the prefix string) did not parse. A typo is loud, not silent.
+    /// Invalid TOML, an unknown key, or a value (e.g. the prefix) that did
+    /// not parse.
     #[error("{}: {error}", .path.display())]
     Parse {
         path: PathBuf,
         error: toml::de::Error,
     },
 
-    /// The file parsed but a value is out of range — a rule of ours, not the
-    /// deserializer's (e.g. `keys.timeout_ms = 0`, which would spin the relay,
-    /// or `fade.duration_ms = 0`, a fade with no frames).
+    /// A value fails our own range checks (e.g. `keys.timeout_ms = 0` would
+    /// spin the relay).
     #[error("{}: {message}", .path.display())]
     Invalid { path: PathBuf, message: String },
 
-    /// The first-run config file could not be written (create the directory, the
-    /// temp file, or the rename). Non-fatal at the call site — nvmux keeps the
-    /// chosen prefix in memory for the session — but typed so the message names
-    /// the path.
+    /// The first-run config could not be written. Non-fatal: the chosen prefix
+    /// is kept in memory.
     #[error("{}: {error}", .path.display())]
     Write {
         path: PathBuf,
@@ -269,45 +234,40 @@ pub enum ConfigError {
     },
 }
 
-/// Why a save of the settings wrote nothing (see [`crate::config::save`]).
-///
-/// Each is one line, for the hint row it is shown on, with the file named the
-/// way the user would type it — `~/.config/nvmux/config.toml`.
+/// Why a settings save wrote nothing (see [`crate::config::save`]). Messages
+/// are one line, for the hint row, with the path as the user would type it.
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
-    /// No config path can be formed: no `$HOME`, and no `$XDG_CONFIG_HOME`.
+    /// `$NVMUX_CONFIG`, `$XDG_CONFIG_HOME` and `$HOME` are all unset or empty.
     #[error("not saved: there is no $HOME to keep a config file in")]
     Nowhere,
 
-    /// The file is there and could not be read.
     #[error("not saved: could not read {}: {error}", crate::config::shown(.path))]
     Read {
         path: PathBuf,
         error: std::io::Error,
     },
 
-    /// The file no longer reads as a config — edited by hand since nvmux read
-    /// it — so nothing in it is written over. `message` says where and why.
+    /// The file no longer parses (hand-edited since it was read), so it is
+    /// not overwritten.
     #[error("not saved: {} no longer reads: {message}", crate::config::shown(.path))]
     Unreadable { path: PathBuf, message: String },
 
-    /// What is being saved was changed in the file as well, since nvmux read
-    /// it; `settings` names them. Saved anyway when asked again.
+    /// The `settings` being saved were also changed in the file since it was
+    /// read. A second save overwrites them.
     #[error("{}", changed_too(.settings, .path))]
     Changed {
         path: PathBuf,
         settings: Vec<String>,
     },
 
-    /// The new contents could not be written.
     #[error("not saved: could not write {}: {error}", crate::config::shown(.path))]
     Write {
         path: PathBuf,
         error: std::io::Error,
     },
 
-    /// The file could not be edited into one holding what is being saved: a
-    /// layout the edit does not know, which a hand edit can always fix.
+    /// The file's layout is one the editor cannot handle.
     #[error("not saved: {} could not be edited to hold the change", crate::config::shown(.path))]
     Unedited { path: PathBuf },
 }
@@ -326,8 +286,8 @@ fn changed_too(settings: &[String], path: &std::path::Path) -> String {
 }
 
 impl SaveError {
-    /// Whether this is [`SaveError::Changed`]: settings a second save would
-    /// overwrite in the file, rather than a reason it cannot be saved at all.
+    /// For [`SaveError::Changed`], how many settings a second save would
+    /// overwrite.
     pub fn changed_in_file(&self) -> Option<usize> {
         match self {
             SaveError::Changed { settings, .. } => Some(settings.len()),
@@ -354,12 +314,8 @@ pub enum NvmuxError {
 }
 
 impl NvmuxError {
-    /// Collapse the error to something that fits on one line.
-    ///
-    /// The rows it lands on — the picker's bottom row, the attaching screen's
-    /// hint row, a line on the plain terminal — are exactly one row; a
-    /// multi-line error would be truncated at the first newline and lose the
-    /// part that explains itself.
+    /// Join the message's lines, for one-row displays that would otherwise
+    /// cut it at the first newline.
     pub fn one_line(&self) -> String {
         self.to_string().lines().collect::<Vec<_>>().join(" — ")
     }
@@ -367,7 +323,6 @@ impl NvmuxError {
 
 pub type Result<T> = std::result::Result<T, NvmuxError>;
 
-/// `nix` calls surface `Errno`; every one of them is an I/O failure to us.
 impl From<nix::errno::Errno> for NvmuxError {
     fn from(e: nix::errno::Errno) -> Self {
         NvmuxError::Io(std::io::Error::from(e))
@@ -399,9 +354,8 @@ mod tests {
         );
     }
 
-    /// A wrapped error is said once however it is printed: plainly, as
-    /// `one_line` and the first-run write print it, and through anyhow's
-    /// `{:#}`, as `main` does, which follows the message with every source.
+    /// Both `{}` and anyhow's `{:#}` (which appends sources) must show the
+    /// cause once.
     #[test]
     fn a_wrapped_error_is_said_once() {
         let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
@@ -427,8 +381,7 @@ mod tests {
                 }),
                 "/tmp/nvmux-0: permission denied",
             ),
-            // serde_json hands the I/O error out as its own source, so this
-            // one used to say it three times.
+            // serde_json exposes the I/O error as its own source.
             (
                 anyhow::Error::from(SessionError::Metadata {
                     path: "x.json".into(),

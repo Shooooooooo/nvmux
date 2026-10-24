@@ -1,15 +1,7 @@
-//! Every setting the settings screen can change, a row each.
-//!
-//! As [`crate::keys::BINDINGS`] is one row per command, this is one row per
-//! setting: where it is in the file, what the screen calls it and on which
-//! tab, its one line of help, what kind of value it takes and how that is read
-//! from and written to a [`Settings`], and what it has no effect without. The
-//! settings screen ([`crate::ui::settings`]) draws these rows and edits
-//! through them, and a save writes what they say has changed.
-//!
-//! The rows are held to the first-run template's settings by a test, both
-//! ways: a setting cannot be added to the file without appearing on the
-//! screen, nor a row name a key the file does not have.
+//! One row per setting the settings screen ([`crate::ui::settings`]) can
+//! change: its file path, name, tab, help, value kind with accessors into
+//! [`Settings`], and what it needs to take effect. A test keeps the rows and
+//! the first-run template's settings in sync both ways.
 
 use std::sync::LazyLock;
 
@@ -18,9 +10,8 @@ use crate::config::{
 };
 use crate::keys::BINDINGS;
 
-/// The screen's tabs. Each is a table of the file, but for the keys: their
-/// tab holds `[keys]` and then `[keys.bind]`, the prefix and the commands it
-/// leads to.
+/// The screen's tabs, one per table of the file; `Keys` holds both `[keys]`
+/// and `[keys.bind]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     Keys,
@@ -31,7 +22,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// In the file's order, which is the order the tab row draws them in.
+    /// In the file's order, which is the drawing order.
     pub const ALL: [Tab; 5] = [
         Tab::Keys,
         Tab::Session,
@@ -40,7 +31,6 @@ impl Tab {
         Tab::Effects,
     ];
 
-    /// What the tab row calls it: its table's name.
     pub fn name(self) -> &'static str {
         match self {
             Tab::Keys => "keys",
@@ -52,23 +42,21 @@ impl Tab {
     }
 }
 
-/// A setting's value, of whichever kind it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Switch(bool),
     Number(u64),
-    /// One of a fixed few, as the file spells it.
+    /// As the file spells it.
     Choice(&'static str),
     /// The prefix chord's control byte.
     Prefix(u8),
     /// A command's key: the byte typed after the prefix.
     Key(u8),
-    /// The command a new session runs.
     Text(String),
     Colour(ThemeColor),
 }
 
-/// What a setting takes, and how it is read from and written to a
+/// A setting's value type, and how it is read from and written to
 /// [`Settings`].
 #[derive(Debug, Clone, Copy)]
 pub enum Kind {
@@ -76,19 +64,18 @@ pub enum Kind {
         get: fn(&Settings) -> bool,
         set: fn(&mut Settings, bool),
     },
-    /// A whole number from `lo` to `hi`, which `←` and `→` step by `step`.
+    /// `lo..=hi`; `←` and `→` step by `step`.
     Number {
         get: fn(&Settings) -> u64,
         set: fn(&mut Settings, u64),
         lo: u64,
         hi: u64,
         step: u64,
-        /// After the number, as the screen shows it: ` ms`, or nothing.
+        /// Shown after the number: ` ms`, or empty.
         unit: &'static str,
-        /// What 0 means, where it means something other than a number.
+        /// Label for 0, where it means something other than a number.
         zero: Option<&'static str>,
     },
-    /// One of `options`, as the file spells them.
     Choice {
         options: &'static [&'static str],
         get: fn(&Settings) -> &'static str,
@@ -96,7 +83,7 @@ pub enum Kind {
     },
     /// `[keys] prefix`.
     Prefix,
-    /// A command's key under `[keys.bind]`: its row in [`BINDINGS`].
+    /// A `[keys.bind]` key, by its row in [`BINDINGS`].
     Key(usize),
     /// `[session] command`.
     Command,
@@ -104,9 +91,8 @@ pub enum Kind {
     Colour,
 }
 
-/// A switch a setting has no effect without, besides `[effects] enabled` and
-/// nvmux's own client, which [`Setting::inert`] asks after for every row they
-/// govern.
+/// A switch a setting needs to take effect. `[effects] enabled` and nvmux's
+/// own client are checked separately by [`Setting::inert`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Needs {
     Fade,
@@ -115,7 +101,7 @@ pub enum Needs {
 }
 
 impl Value {
-    /// The value as the file spells it: what a save writes after the `=`.
+    /// The value as a save writes it after the `=`.
     pub fn toml(&self) -> toml_edit::Value {
         match self {
             Value::Switch(on) => (*on).into(),
@@ -129,32 +115,29 @@ impl Value {
     }
 }
 
-/// One setting: a key of the file, as the screen shows it.
 #[derive(Debug, Clone, Copy)]
 pub struct Setting {
-    /// Its table in the file, `effects.fade`, and its key there, `enabled`.
+    /// Table and key in the file, e.g. `effects.fade` and `enabled`.
     pub table: &'static str,
     pub key: &'static str,
-    /// What the screen calls it: the key, where that says which setting it
-    /// is, and otherwise enough of the table to — `fade`, `fade.duration_ms`.
+    /// The screen's name: the key, or enough of the table to tell it apart
+    /// (`fade`, `fade.duration_ms`).
     pub name: &'static str,
     pub tab: Tab,
-    /// One line, under the rows, while it is selected.
+    /// Shown under the rows while selected.
     pub help: &'static str,
     pub kind: Kind,
-    /// Whether only nvmux's own client acts on it, so that with `[client] ui
-    /// = "nvim"` it does nothing.
+    /// Only nvmux's own client acts on it; inert with `[client] ui = "nvim"`.
     pub own: bool,
     pub needs: Option<Needs>,
 }
 
 impl Setting {
-    /// Where it is in the file: `effects.fade.enabled`.
+    /// E.g. `effects.fade.enabled`.
     pub fn path(&self) -> String {
         format!("{}.{}", self.table, self.key)
     }
 
-    /// Its value in `settings`.
     pub fn value(&self, settings: &Settings) -> Value {
         match self.kind {
             Kind::Switch { get, .. } => Value::Switch(get(settings)),
@@ -174,13 +157,12 @@ impl Setting {
         }
     }
 
-    /// Its value in the defaults.
     pub fn default_value(&self) -> Value {
         self.value(&Settings::default())
     }
 
-    /// Put `value` in `settings`. A value of another kind than the setting's
-    /// is a mistake of the caller's, and changes nothing.
+    /// Numbers are clamped and unknown choices ignored. A value of the wrong
+    /// kind is a caller bug and changes nothing.
     pub fn set(&self, settings: &mut Settings, value: &Value) {
         match (self.kind, value) {
             (Kind::Switch { set, .. }, Value::Switch(on)) => set(settings, *on),
@@ -202,9 +184,8 @@ impl Setting {
         }
     }
 
-    /// Why the setting has no effect with `settings` as they are, in a few
-    /// words for the end of its row: the master switch is off, the client is
-    /// Neovim's own, or a switch it needs is. `None` when it does what it says.
+    /// A few words for the end of the row saying why the setting has no
+    /// effect under `settings`, or `None` if it does.
     pub fn inert(&self, settings: &Settings) -> Option<&'static str> {
         if self.table.starts_with("effects.") && !settings.effects.enabled {
             return Some("effects are off");
@@ -231,8 +212,7 @@ macro_rules! switch {
     };
 }
 
-/// For which sessions a kind of key is drawn ahead of Neovim, by its field:
-/// `predict!(client.predict_scrolls)`.
+/// A `Predict` choice, by its field: `predict!(client.predict_scrolls)`.
 macro_rules! predict {
     ($($field:ident).+) => {
         Kind::Choice {
@@ -247,7 +227,7 @@ macro_rules! predict {
     };
 }
 
-/// A row with only what every row has; the few with more say so after.
+/// A row with only the common fields; wrap it in `own`, `needs` or `named`.
 const fn row(
     table: &'static str,
     key: &'static str,
@@ -267,7 +247,7 @@ const fn row(
     }
 }
 
-/// One of nvmux's own client's settings.
+/// Marks a setting only nvmux's own client acts on.
 const fn own(setting: Setting) -> Setting {
     Setting {
         own: true,
@@ -283,7 +263,7 @@ const fn needs(needs: Needs, setting: Setting) -> Setting {
     }
 }
 
-/// The setting under a name of its own, for one whose key is not enough.
+/// A setting whose key alone is not a clear enough name.
 const fn named(name: &'static str, setting: Setting) -> Setting {
     Setting { name, ..setting }
 }
@@ -314,8 +294,7 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             },
         ),
     ];
-    // A row a command, from the table rather than written out here, so a
-    // command cannot be added without one.
+    // From the table, so every command gets a row.
     rows.extend(
         BINDINGS
             .iter()
@@ -622,23 +601,22 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
     rows
 });
 
-/// Every setting, in the file's order.
+/// In the file's order.
 pub fn all() -> &'static [Setting] {
     &ROWS
 }
 
-/// The settings on `tab`, in the file's order.
 pub fn on(tab: Tab) -> impl Iterator<Item = &'static Setting> {
     all().iter().filter(move |s| s.tab == tab)
 }
 
-/// The setting at `path` in the file, `effects.fade.enabled`, if there is one.
+/// The setting at `path`, e.g. `effects.fade.enabled`.
 pub fn find(path: &str) -> Option<&'static Setting> {
     all().iter().find(|s| s.path() == path)
 }
 
-/// The settings `ours` differs from `theirs` in, in the file's order: what is
-/// unsaved, with the file's settings for `theirs`.
+/// The settings `ours` differs from `theirs` in, in the file's order; with
+/// the file's settings as `theirs`, what is unsaved.
 pub fn changed(ours: &Settings, theirs: &Settings) -> Vec<&'static Setting> {
     all()
         .iter()
@@ -653,9 +631,8 @@ mod tests {
     use super::*;
     use crate::palette::Rgb;
 
-    /// Every setting the first-run template documents, by its path: each
-    /// commented line uncommented, as the template is meant to be edited, and
-    /// read back as TOML.
+    /// Paths of every setting in the first-run template, read by uncommenting
+    /// each commented setting line and parsing as TOML.
     fn template_paths() -> BTreeSet<String> {
         let rendered = crate::config::render_default_config(crate::keys::PREFIX);
         let is_setting = |rest: &&str| {
@@ -691,8 +668,6 @@ mod tests {
         }
     }
 
-    /// A setting cannot be added to the file without a row on the screen, and
-    /// no row can name a key the file does not have.
     #[test]
     fn every_setting_in_the_file_is_a_row_and_every_row_is_in_the_file() {
         let rows: BTreeSet<String> = all().iter().map(Setting::path).collect();
@@ -700,7 +675,7 @@ mod tests {
         assert_eq!(rows, template_paths());
     }
 
-    /// A value the row does not start at: the next one along.
+    /// A value other than the default.
     fn another(setting: &Setting) -> Value {
         match (setting.kind, setting.default_value()) {
             (_, Value::Switch(on)) => Value::Switch(!on),
@@ -718,8 +693,7 @@ mod tests {
         }
     }
 
-    /// Each row reads and writes its own setting and no other's, and what it
-    /// writes is a setting nvmux would load.
+    /// Also checks that what it writes passes validation.
     #[test]
     fn each_row_reads_and_writes_only_its_own_setting() {
         for setting in all() {
@@ -743,7 +717,6 @@ mod tests {
         }
     }
 
-    /// A number is held to its range on the way in, whatever the caller asks.
     #[test]
     fn a_number_is_held_to_its_range() {
         let timeout = find("keys.timeout_ms").expect("the timeout");
@@ -757,8 +730,6 @@ mod tests {
         assert_eq!(settings.client.window_width, u16::MAX);
     }
 
-    /// The keys tab is the prefix, the timeout, and then every command, each
-    /// under the name `[keys.bind]` knows it by.
     #[test]
     fn the_keys_tab_holds_the_prefix_the_timeout_and_every_command() {
         let names: Vec<&str> = on(Tab::Keys).map(|s| s.name).collect();
@@ -767,8 +738,7 @@ mod tests {
         assert_eq!(names, want);
     }
 
-    /// Every row is on the tab of its table, and the tabs are in the file's
-    /// order: walking the tabs in turn walks the rows in turn.
+    /// Also checks every row is on the tab of its table.
     #[test]
     fn the_tabs_walk_the_rows_in_the_files_order() {
         let walked: Vec<String> = Tab::ALL
@@ -783,7 +753,7 @@ mod tests {
         }
     }
 
-    /// Names are what the screen and its find go by, so no two rows share one.
+    /// The screen and its find go by name.
     #[test]
     fn no_two_rows_share_a_name() {
         let names: BTreeSet<&str> = all().iter().map(|s| s.name).collect();
@@ -797,8 +767,7 @@ mod tests {
             .collect()
     }
 
-    /// At the defaults only what waits on two settings that start off —
-    /// `centre` and the particles — has no effect.
+    /// `centre` and the particles start off.
     #[test]
     fn at_the_defaults_only_what_waits_on_a_switch_that_starts_off_is_silent() {
         assert_eq!(
@@ -810,8 +779,6 @@ mod tests {
         );
     }
 
-    /// The master switch off silences every effect but itself, before
-    /// anything else is asked.
     #[test]
     fn the_master_switch_off_silences_every_effect_but_itself() {
         let mut settings = Settings::default();
@@ -827,7 +794,6 @@ mod tests {
         }
     }
 
-    /// Neovim's own client acts on none of nvmux's client's settings.
     #[test]
     fn neovims_client_silences_nvmuxs_clients_settings() {
         let mut settings = Settings::default();
@@ -841,9 +807,7 @@ mod tests {
             .all(|(_, why)| *why == "nvmux client only"));
     }
 
-    /// A switch a setting needs, off, silences it and only it; and `centre`
-    /// silences `window_width` only off, either way of centring giving it a
-    /// say.
+    /// `centre` silences `window_width` only when off; both other modes use it.
     #[test]
     fn a_switch_a_setting_needs_silences_it() {
         for centre in [Centre::Smart, Centre::Fixed] {
