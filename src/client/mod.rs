@@ -1833,8 +1833,11 @@ pub struct App {
     /// A frame is wanted: something changed.
     dirty: bool,
     last_frame: Option<Instant>,
-    /// When the frame before the last was drawn.
-    frame_before: Option<Instant>,
+    /// When the last two frames that drew a flush of Neovim's were drawn,
+    /// the later first: what [`App::dirty_due`] paces Neovim's frames by.
+    flush_frames: (Option<Instant>, Option<Instant>),
+    /// A flush of Neovim's was taken in since the last frame.
+    flushed_since: bool,
     /// This attach has had its first flush: before it, nothing animates or
     /// is drawn.
     flushed: bool,
@@ -1969,7 +1972,8 @@ impl App {
             mouse: (false, false),
             dirty: false,
             last_frame: None,
-            frame_before: None,
+            flush_frames: (None, None),
+            flushed_since: false,
             flushed: false,
             remaking: false,
             away: false,
@@ -3042,6 +3046,7 @@ impl App {
             })
             .collect();
         self.apply(batch, animate, &switched, now);
+        self.flushed_since = true;
         self.flushed = true;
         self.landed_sideways(now);
         self.take_tails();
@@ -6094,14 +6099,18 @@ impl App {
     }
 
     /// When a frame for something that changed may be drawn, `now` or later:
-    /// [`MIN_FRAME_GAP`] after the last — but at once where the last came
-    /// after a quiet spell, a frame's time or more without one. A key in
-    /// normal mode has Neovim flush twice, a fraction of a millisecond apart
-    /// with `'showcmd'` on, as it is unless turned off: the key shown, and
-    /// what it did. Held apart by the gap, what it did would come those
-    /// milliseconds late, as most keys' would. A burst still comes no more
-    /// often than the gap allows, all but its first two frames. Away, no
-    /// sooner than [`AWAY_FRAME_GAP`] after the last, whatever came before.
+    /// at once for what the user typed, turned or pasted since the last
+    /// frame, which their hand paces — a key drawn ahead of Neovim most of
+    /// all. Otherwise [`MIN_FRAME_GAP`] after the last frame that drew a
+    /// flush of Neovim's — but at once where that one came after a quiet
+    /// spell, a frame's time or more without one. A key in normal mode has
+    /// Neovim flush twice, a fraction of a millisecond apart with
+    /// `'showcmd'` on, as it is unless turned off: the key shown, and what it
+    /// did. Held apart by the gap, what it did would come those milliseconds
+    /// late, as most keys' would; and so it would if the frames drawn for
+    /// keys ahead of Neovim counted. A burst still comes no more often than
+    /// the gap allows, all but its first two frames. Away, no sooner than
+    /// [`AWAY_FRAME_GAP`] after the last, whatever came before.
     fn dirty_due(&self, now: Instant) -> Instant {
         let Some(last) = self.last_frame else {
             return now;
@@ -6109,9 +6118,14 @@ impl App {
         if self.away {
             return (last + AWAY_FRAME_GAP).max(now);
         }
-        let quiet = self
-            .frame_before
-            .is_none_or(|before| last.saturating_duration_since(before) >= anim::FRAME);
+        if self.typed.is_some_and(|typed| typed > last) {
+            return now;
+        }
+        let (Some(last), before) = self.flush_frames else {
+            return now;
+        };
+        let quiet =
+            before.is_none_or(|before| last.saturating_duration_since(before) >= anim::FRAME);
         if quiet {
             return now;
         }
@@ -6196,7 +6210,10 @@ impl App {
             p.partly += 1;
         }
         self.dirty = false;
-        self.frame_before = self.last_frame.replace(now);
+        self.last_frame = Some(now);
+        if std::mem::take(&mut self.flushed_since) {
+            self.flush_frames = (Some(now), self.flush_frames.0);
+        }
         out
     }
 
@@ -7686,6 +7703,53 @@ mod tests {
         redraw(&mut a, vec![line(1, 3, "again")], again);
         assert!(!a.due(again), "and the fourth");
         assert_eq!(a.wake_at(again), Some(third + MIN_FRAME_GAP));
+    }
+
+    /// A key drawn ahead of Neovim is drawn at once, though Neovim's two
+    /// flushes for the key before it came a moment ago; and Neovim's second
+    /// flush for a key is drawn at once after a quiet spell, though a key
+    /// was drawn ahead of Neovim a moment before its first. What the hand
+    /// types is paced by the hand, and Neovim's frames by its flushes alone.
+    #[test]
+    fn frames_drawn_ahead_do_not_pace_neovims_and_are_not_paced_by_them() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.frame(t1);
+        // Neovim's two flushes for a key, after a quiet spell: the key shown,
+        // and what it did, half a millisecond apart.
+        let shown = t1 + Duration::from_millis(100);
+        redraw(&mut a, vec![line(1, 5, "x")], shown);
+        assert!(a.due(shown), "the key shown, at once");
+        a.frame(shown);
+        let did = shown + Duration::from_micros(500);
+        redraw(&mut a, vec![line(1, 5, " ")], did);
+        assert!(a.due(did), "what it did, at once");
+        a.frame(did);
+        // A key a millisecond later, drawn ahead of Neovim: at once.
+        let key = did + Duration::from_millis(1);
+        a.keys(b"l", key);
+        assert_eq!(a.wake_at(key), Some(key), "the key's frame, at once");
+        assert!(a.due(key));
+        a.frame(key);
+        // Neovim's two flushes for it, 15.5 ms after the key's frame and
+        // 16.5 ms after Neovim's last: both at once.
+        let shown = key + Duration::from_micros(15_500);
+        redraw(&mut a, vec![line(1, 5, "l")], shown);
+        assert!(a.due(shown), "the key shown, at once");
+        a.frame(shown);
+        let did = shown + Duration::from_micros(500);
+        ack(&mut a, 1, "l", "n", (0, 1, 1, 0), did);
+        let mut events = cursor_to(0, 1);
+        events.push(line(1, 5, " "));
+        redraw(&mut a, events, did);
+        assert_eq!(a.wake_at(did), Some(did), "what it did, at once");
+        assert!(a.due(did));
+        a.frame(did);
+        // A burst of Neovim's from there is held to the gap, as ever.
+        let more = did + Duration::from_micros(500);
+        redraw(&mut a, vec![line(1, 5, "m")], more);
+        assert!(!a.due(more), "the third, held");
+        assert_eq!(a.wake_at(more), Some(did + MIN_FRAME_GAP));
     }
 
     /// A card is a frame when it comes, and another each time it looks
