@@ -83,6 +83,13 @@ const PAD: &str = " ";
 /// selection's bold never meets it: bold and dim share one reset.
 const SIGN_OUT: u16 = 2;
 
+/// The picker's hints, in the order the row gives them, each ranked by how
+/// much it is needed: on a screen too narrow for all of them the row drops the
+/// least needed whole, one at a time (see [`super::settings::fit`]). The
+/// picker floating over a session has the same row, where this one is: along
+/// the bottom of the screen, under the panel ([`hint_line`], and see
+/// [`super::float`]).
+///
 /// Seventy-nine columns, so it fits the eighty a terminal opens at, and it
 /// used to be sixty exactly — the widest row that still fit a small terminal
 /// without truncation. `␣ order` is what that budget was first spent on:
@@ -91,10 +98,10 @@ const SIGN_OUT: u16 = 2;
 /// rather than these. `, settings` is the rest of it, for the same reason, and
 /// `/ filter` became `/ find` to make room.
 ///
-/// So below seventy-nine columns this row truncates from the right. `q quit` is
-/// therefore the first entry to go, which is the order to want: quitting is the
-/// one thing every user of a full-screen program tries unprompted, and `Ctrl-c`
-/// quits as well.
+/// So below seventy-nine columns this row gives up entries. `q quit` is the
+/// first to go, which is the order to want: quitting is the one thing every
+/// user of a full-screen program tries unprompted, and `Ctrl-c` quits as well.
+/// `r rename` is the next, and `, settings` after it.
 ///
 /// The space bar is `␣` — [`crate::keys::SPACE_GLYPH`], where that decision now
 /// lives — rather than the `Space` that [`crate::keys::key_label`] spells it in
@@ -105,8 +112,25 @@ const SIGN_OUT: u16 = 2;
 /// spells its keys the same way. A test below keeps the two rows agreeing.
 ///
 /// `?` is still not listed, for the reason above.
-const HINTS: &str =
-    "↑↓ move  ⏎ attach  c new  r rename  x kill  ␣ order  / find  , settings  q quit";
+const HINTS: [(&str, u8); 9] = [
+    ("↑↓ move", 0),
+    ("⏎ attach", 1),
+    ("c new", 3),
+    ("r rename", 8),
+    ("x kill", 5),
+    ("␣ order", 6),
+    ("/ find", 4),
+    (", settings", 7),
+    ("q quit", 9),
+];
+
+/// `Esc`'s hint, after the rest, on a picker that came up over a session
+/// ([`App::came_from`]) — floating over it or full screen, `Esc` goes back to
+/// it either way. Ranked under all but moving and attaching: it is how the
+/// picker is put away without doing anything, which is what most of its
+/// openings end in.
+const BACK: (&str, u8) = ("esc back", 2);
+
 const EMPTY: &str = "no sessions — press c to create one";
 
 /// What the hint row says while a session is in flight. Dim, like the hints it
@@ -125,15 +149,23 @@ const EMPTY: &str = "no sessions — press c to create one";
 const REORDER_HINTS: &str = "↑↓ move  ⏎ place  esc cancel";
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    draw_with(frame, app, HINTS);
+    let (text, dim) = hint_line(app, frame.area().width);
+    screen(frame, &text, dim, |frame, body| draw_list(frame, app, body));
 }
 
-/// [`draw`], with `hints` on the hint row where the picker is at rest with
-/// nothing else to say there: the picker floating over a session, in a panel
-/// narrower than [`HINTS`] (see [`super::picker`]).
-pub(super) fn draw_with(frame: &mut Frame, app: &App, hints: &str) {
-    let (text, dim) = hint_line(app, hints);
-    screen(frame, &text, dim, |frame, body| draw_list(frame, app, body));
+/// The hint row where the picker is at rest with nothing else to say there,
+/// on a screen `width` columns wide: as many of [`HINTS`] as fit it, and
+/// [`BACK`] where `Esc` goes back to a session. One row whether the picker
+/// floats or not, on the screen's last row either way, so turning
+/// `[style] float` changes nothing on it.
+fn hints(app: &App, width: u16) -> String {
+    let back = app.came_from().is_some().then_some(&BACK);
+    let entries: Vec<(Option<&str>, u8)> = HINTS
+        .iter()
+        .chain(back)
+        .map(|&(text, rank)| (Some(text), rank))
+        .collect();
+    super::settings::fit(&entries, usize::from(width))
 }
 
 /// Every full-screen view is the same shape: a body, then one hint row on the
@@ -745,9 +777,11 @@ fn draw_trail(frame: &mut Frame, area: Rect, spans: Vec<Span<'static>>) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// What the hint row says, and whether it is dim: a hint when nothing is being
-/// asked or typed, and otherwise the thing being asked or typed, at full weight.
-fn hint_line(app: &App, hints: &str) -> (String, bool) {
+/// What the hint row says on a screen `width` columns wide, and whether it is
+/// dim: a hint when nothing is being asked or typed, and otherwise the thing
+/// being asked or typed, at full weight. The picker floating over a session
+/// says it along the bottom of the screen too (see [`super::picker`]).
+pub(super) fn hint_line(app: &App, width: u16) -> (String, bool) {
     match app.mode() {
         Mode::Confirm { prompt, .. } | Mode::Leave { prompt, .. } => (prompt.clone(), false),
         Mode::Filter => (format!("/{}{CURSOR}", app.filter()), false),
@@ -769,7 +803,7 @@ fn hint_line(app: &App, hints: &str) -> (String, bool) {
                     // Or the list silently looks shorter than it is.
                     (format!("/{}", app.filter()), true)
                 }
-                None => (hints.to_string(), true),
+                None => (hints(app, width), true),
             },
         },
     }
@@ -1036,6 +1070,12 @@ mod tests {
         test_support::render(w, h, |f| draw(f, app))
     }
 
+    /// The picker's hint row with room for all of [`HINTS`], and no session
+    /// behind it to go back to: the row nvmux opens on.
+    fn all_hints() -> String {
+        HINTS.map(|(t, _)| t).join("  ")
+    }
+
     #[test]
     fn the_whole_screen_is_a_centred_list_and_one_hint_line() {
         // Eighty columns because `HINTS` is seventy-nine: narrower and the row
@@ -1232,13 +1272,14 @@ mod tests {
     /// is the literal above agreeing with it.
     #[test]
     fn the_space_bar_is_spelled_the_way_every_hint_row_spells_it() {
+        let hints = all_hints();
         assert!(
-            HINTS.contains(&format!("{} order", crate::keys::SPACE_GLYPH)),
-            "the picker's row has drifted from the shared glyph: {HINTS:?}"
+            hints.contains(&format!("{} order", crate::keys::SPACE_GLYPH)),
+            "the picker's row has drifted from the shared glyph: {hints:?}"
         );
         assert!(
-            !HINTS.contains("space") && !HINTS.contains("Space"),
-            "the space bar is spelled out as well: {HINTS:?}"
+            !hints.contains("space") && !hints.contains("Space"),
+            "the space bar is spelled out as well: {hints:?}"
         );
     }
 
@@ -1287,10 +1328,10 @@ mod tests {
             for c in typed.chars() {
                 a.on_key(Key::Char(c));
             }
-            // Wide enough for the whole of `HINTS`: at sixty columns `quit` no
-            // longer fits either, and the assertion below would pass whether or
-            // not the prompt had replaced anything.
-            let lines = render(&a, 70, 8);
+            // Wide enough for the whole of `HINTS`: at seventy columns `quit`
+            // no longer fits either, and the assertion below would pass whether
+            // or not the prompt had replaced anything.
+            let lines = render(&a, 80, 8);
             assert!(
                 lines[7].contains(expected),
                 "prompt should be on the bottom row: {:?}",
@@ -1334,6 +1375,30 @@ mod tests {
         assert!(row.width() <= 62, "the row overflowed: {row:?}");
     }
 
+    /// Up over a session, `Esc` goes back to it full screen as it does
+    /// floating, and the row says so as the floating one does: after the rest,
+    /// given up only after all but moving and attaching. On eighty columns
+    /// that leaves the eight that matter most, `q quit` and `r rename` going
+    /// first; given the room, every one.
+    #[test]
+    fn over_a_session_the_hint_row_says_esc_goes_back() {
+        let mut a = app(&["one", "two"]);
+        assert!(
+            !render(&a, 120, 6)[5].contains("esc"),
+            "nothing to go back to"
+        );
+
+        a.set_came_from("id000001");
+        assert_eq!(
+            render(&a, 80, 6)[5].trim(),
+            "↑↓ move  ⏎ attach  c new  x kill  ␣ order  / find  , settings  esc back"
+        );
+        assert_eq!(
+            render(&a, 120, 6)[5].trim(),
+            format!("{}  esc back", all_hints())
+        );
+    }
+
     /// The README's picture of the picker reproduces this row byte for byte, and
     /// nothing else ties the two together — so without this the art quietly
     /// describes a program that no longer exists. `keys.rs` pins its own README
@@ -1349,11 +1414,12 @@ mod tests {
     #[test]
     fn the_readme_shows_the_hint_row_the_picker_actually_prints() {
         let readme = include_str!("../../README.md");
+        let hints = all_hints();
         assert_eq!(
             readme.contains(MARKER),
-            readme.contains(HINTS),
+            readme.contains(&hints),
             "the README's picker art is stale — it should carry this row \
-             verbatim, under a `{MARKER}` selection marker, or carry neither:\n{HINTS}"
+             verbatim, under a `{MARKER}` selection marker, or carry neither:\n{hints}"
         );
     }
 
