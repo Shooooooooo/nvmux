@@ -1151,6 +1151,19 @@ if predict then
       queued = true
       vim.schedule(function()
         queued, scrolled = false, false
+        -- Many rows to colour again, as where a parse of the rest of a file
+        -- an edit opened a comment or a string in found them changed: what
+        -- Neovim has to draw goes out first, not after them. In the modes
+        -- where the frame is flushed as a key is taken (see on_key above).
+        local n, m = 0, api.nvim_get_mode()
+        for _, runs in pairs(stale) do
+          for _, r in ipairs(runs) do
+            n = n + r[2] - r[1]
+          end
+        end
+        if n > 100 and judged[m.mode] and not m.blocking then
+          pcall(api.nvim__redraw, { flush = true, cursor = true })
+        end
         push_all()
       end)
     end
