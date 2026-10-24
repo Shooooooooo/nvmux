@@ -1692,17 +1692,6 @@ impl Onward {
     }
 }
 
-/// A row of a window's gutter, as [`App::gutters`] finds it: the row of
-/// the window's grid, the cells Neovim's frame has there, and those Neovim
-/// draws there with the cursor on another line — `None` where the client
-/// cannot say.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Regutter {
-    row: usize,
-    drawn: Vec<Cell>,
-    now: Option<Vec<Cell>>,
-}
-
 /// What the client has asked and not been answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
@@ -4678,20 +4667,15 @@ impl App {
         if !shape.relativenumber && !stepping.cursorline.number {
             return shape.plain_gutter;
         }
-        shape.plain_gutter
-            && !stepping.number_signs
-            && self
-                .gutters(grid, to)
-                .is_some_and(|rows| rows.iter().all(|r| r.now.is_some()))
+        shape.plain_gutter && !stepping.number_signs && self.gutters(grid, to) == Some(true)
     }
 
-    /// Each row of window grid `grid`'s gutter that shows a line, as Neovim's
-    /// frame has it, and as Neovim draws it with the cursor on line `to`
-    /// instead (see [`predict::regutter`]), by row of its grid: `None` for
-    /// one the client cannot say of. `None` for a window whose gutter the
-    /// client has no shape or groups for, or that the `'statuscolumn'`
-    /// draws.
-    fn gutters(&self, grid: u64, to: i64) -> Option<Vec<Regutter>> {
+    /// Whether every row of window grid `grid`'s gutter that shows a line,
+    /// as Neovim's frame has it, can be drawn as Neovim draws it with the
+    /// cursor on line `to` instead (see [`predict::regutter`]). `None` for a
+    /// window whose gutter the client has no shape or groups for, or that
+    /// the `'statuscolumn'` draws.
+    fn gutters(&self, grid: u64, to: i64) -> Option<bool> {
         let (win, view) = (
             self.model.wins.get(&grid)?,
             self.model.viewports.get(&grid)?,
@@ -4705,20 +4689,17 @@ impl App {
         }
         let h = bot - top;
         let cursor = (view.curline, to);
-        let rows = (0..h)
+        let all = (0..h)
             .map(|r| (r, view.topline + r as i64))
             .take_while(|&(_, lnum)| lnum < view.line_count)
-            .filter_map(|(r, lnum)| {
-                let drawn = g.row(top + r).get(left..left + shape.textoff)?;
-                let now = predict::regutter(drawn, lnum, cursor, shape, h as i64, &ids);
-                Some(Regutter {
-                    row: top + r,
-                    drawn: drawn.to_vec(),
-                    now,
-                })
-            })
-            .collect();
-        Some(rows)
+            .all(|(r, lnum)| {
+                g.row(top + r)
+                    .get(left..left + shape.textoff)
+                    .is_none_or(|drawn| {
+                        predict::regutter(drawn, lnum, cursor, shape, h as i64, &ids).is_some()
+                    })
+            });
+        Some(all)
     }
 
     /// Whether Neovim draws line `line` of window grid `grid`, whose text the

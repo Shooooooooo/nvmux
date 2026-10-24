@@ -1054,11 +1054,12 @@ pub fn numbers(
     let width = number_width(shape, rows)?.checked_sub(1)?;
     let rnu = shape.relativenumber;
     let away = (lnum - cursor).abs();
-    let text = match (rnu, shape.number) {
-        (true, _) if away > 0 => format!("{away:>width$} "),
-        (true, true) => format!("{:<width$} ", lnum + 1),
-        (true, false) => format!("{:>width$} ", 0),
-        (false, _) => format!("{:>width$} ", lnum + 1),
+    // The number, and whether it is left-aligned.
+    let (n, left) = match (rnu, shape.number) {
+        (true, _) if away > 0 => (away, false),
+        (true, true) => (lnum + 1, true),
+        (true, false) => (0, false),
+        (false, _) => (lnum + 1, false),
     };
     let numbered = shape.stepping.as_ref().is_some_and(|s| s.cursorline.number);
     let hl = match lnum.cmp(&cursor) {
@@ -1067,15 +1068,38 @@ pub fn numbers(
         std::cmp::Ordering::Equal if numbered => ids.cursor_nr,
         _ => ids.line_nr,
     };
-    Some(
-        text.chars()
+    // As `format!("{n:>width$} ")` — `<` for left — lays it out, cut to
+    // `width + 1` columns: without the `String`.
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut m = n.unsigned_abs();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    let sign: &[u8] = if n < 0 { b"-" } else { b"" };
+    let pad = width.saturating_sub(sign.len() + digits.len() - i);
+    let blanks = || std::iter::repeat_n(&b' ', pad);
+    let (before, after) = if left { (0, pad) } else { (pad, 0) };
+    let mut out = Vec::with_capacity(width + 1);
+    out.extend(
+        blanks()
+            .take(before)
+            .chain(sign)
+            .chain(&digits[i..])
+            .chain(blanks().take(after))
+            .chain(b" ")
             .take(width + 1)
-            .map(|c| Cell {
-                text: Text::Char(c),
+            .map(|&b| Cell {
+                text: Text::Char(char::from(b)),
                 hl,
-            })
-            .collect(),
-    )
+            }),
+    );
+    Some(out)
 }
 
 /// The gutter of a window of `shape`, `rows` rows of text tall, on buffer
