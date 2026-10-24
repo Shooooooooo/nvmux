@@ -1242,7 +1242,7 @@ if predict then
     end
     local blanks = {}
     for i, l in ipairs(api.nvim_buf_get_lines(buf, view.topline - 1, vim.fn.line('w$'), false)) do
-      if #l <= cap and l:find('%s$') then
+      if #l <= cap and l:find('^%s', #l) then
         blanks[#blanks + 1] = { view.topline + i - 2, vim.fn.virtcol({ view.topline + i - 1, #l }) }
       end
     end
