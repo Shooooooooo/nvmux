@@ -1921,6 +1921,10 @@ struct Partial {
     still: bool,
     /// The rows of this frame to put together.
     rows: Vec<bool>,
+    /// The rows of the last frame drawn over (see [`Animator::patch`]): put
+    /// together again, as Neovim drew them, should what was drawn over them
+    /// be gone.
+    patched: Vec<usize>,
     /// How many frames have been put together from only the rows that
     /// changed: for the tests to know it was done at all.
     #[cfg(test)]
@@ -6201,14 +6205,25 @@ impl App {
     /// the last are the editor's
     /// grids and nothing more — nothing moving, held or painted over either,
     /// no card over either — and nothing has changed since the last but the
-    /// cells of rows of grids on show. A row of the frame is changed where a
-    /// row of a grid drawn there is. Notes this frame for the next either
-    /// way.
+    /// cells of rows of grids on show, and what is drawn over rows. A row of
+    /// the frame is changed where a row of a grid drawn there is, or is drawn
+    /// over in this frame or was in the last. Notes this frame for the next
+    /// either way.
     fn changed_rows(&mut self, height: usize) -> bool {
         let Some(partial) = self.partial.as_mut() else {
             return false;
         };
         let since = std::mem::replace(&mut partial.at, grid::tick());
+        // The rows of the frame drawn over, where their grids are drawn as
+        // nothing moves; and those of the last frame.
+        let patched: Vec<usize> = self
+            .anim
+            .patched_rows()
+            .filter_map(|(grid, r)| {
+                usize::try_from(self.model.drawn_origin(grid).0 + r as i64).ok()
+            })
+            .collect();
+        let was_patched = std::mem::replace(&mut partial.patched, patched);
         let still = self.anim.still() && self.cards.is_empty();
         let was_still = std::mem::replace(&mut partial.still, still);
         if !(still && was_still && self.model.unchanged_since(since)) {
@@ -6217,6 +6232,11 @@ impl App {
         let rows = &mut partial.rows;
         rows.clear();
         rows.resize(height, false);
+        for &y in partial.patched.iter().chain(&was_patched) {
+            if let Some(row) = rows.get_mut(y) {
+                *row = true;
+            }
+        }
         let shown = self
             .model
             .layout
@@ -11721,6 +11741,42 @@ mod tests {
             ack_i(a, k as u64, &tail, col, k + 1, now);
             redraw(a, typed_frame(text, col), now);
         }
+    }
+
+    /// What a step draws over Neovim's rows — the line typed into ahead of
+    /// it — stays on those rows: a frame with it is put together from only
+    /// the rows that changed, its own among them, and so is the frame after
+    /// it is gone — Neovim's word come, or the step let go of as the client
+    /// is sent away — each writing what a frame put together whole writes.
+    #[test]
+    fn frames_drawn_over_are_put_together_in_part() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let ms = |n: u64| t1 + Duration::from_millis(n);
+        let mut whole = typing(Duration::from_millis(200)).with_partial_frames(false);
+        let mut part = typing(Duration::from_millis(200));
+        both(&mut whole, &mut part, vec![], b"", t1);
+        let before = both(&mut whole, &mut part, vec![], b"", t1);
+        assert_eq!(
+            both(&mut whole, &mut part, vec![], b"ab", ms(10)),
+            before + 1
+        );
+        assert!(
+            !part.anim.patched().is_empty(),
+            "the line typed into, drawn over"
+        );
+        assert_eq!(composed(&mut part)[0], "abline 0");
+        for a in [&mut whole, &mut part] {
+            neovim_typed(a, 0, &["a"], &["aline 0"], ms(20));
+        }
+        assert_eq!(both(&mut whole, &mut part, vec![], b"", ms(20)), before + 2);
+        // Sent away: the step let go of, and its row put back as Neovim drew it.
+        let away = crate::card::encode(&crate::card::Command::Away);
+        assert_eq!(
+            both(&mut whole, &mut part, vec![], &away, ms(30)),
+            before + 3
+        );
+        assert!(part.anim.patched().is_empty());
+        assert_eq!(composed(&mut part)[0], "aline 0");
     }
 
     /// Characters typed in Insert mode over a slow link go in at once, the
