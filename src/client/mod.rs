@@ -1125,7 +1125,7 @@ if predict then
   end
   local queued, scrolled = false, false
   local function push_all()
-    if not pcall(api.nvim_get_autocmds, { group = group }) then
+    if not pcall(api.nvim_get_autocmds, { group = group, event = 'SafeState' }) then
       return
     end
     flush()
