@@ -1409,10 +1409,22 @@ if predict then
       end
       return false
     end
+    -- Read as Neovim goes to wait for every key (see rehooked): an event at
+    -- a time, as Neovim makes a table of every autocommand it hands back,
+    -- and none past the first that answers.
+    local hookevents = { { 'InsertCharPre', 'TextChangedI', 'CursorMovedI' },
+      { 'InsertEnter', 'ModeChanged' }, { 'InsertLeavePre', 'InsertLeave', 'ModeChanged' } }
     local function hooks(buf)
-      return { unseen(buf, { 'InsertCharPre', 'TextChangedI', 'CursorMovedI' }),
-        unseen(buf, { 'InsertEnter', 'ModeChanged' }),
-        unseen(buf, { 'InsertLeavePre', 'InsertLeave', 'ModeChanged' }) }
+      local h = { false, false, false }
+      for k, events in ipairs(hookevents) do
+        for _, event in ipairs(events) do
+          if unseen(buf, event) then
+            h[k] = true
+            break
+          end
+        end
+      end
+      return h
     end
     local function facts()
       if gone then
