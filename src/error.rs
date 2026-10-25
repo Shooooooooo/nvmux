@@ -58,10 +58,17 @@ pub enum PathError {
 /// msgpack-RPC failures talking to Neovim.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
-    /// Locally: the session is dead and the socket stale. Through an SSH
-    /// forward: the *master* died, since ssh accepts first and resets later.
+    /// Locally: nothing listens and the socket is stale, or, on macOS, a live
+    /// session's accept queue is full, so the local reaper also asks the
+    /// listing script. Through an SSH forward: the *master* died, since ssh
+    /// accepts first and resets later.
     #[error("connection refused: {}", .0.display())]
     ConnectionRefused(PathBuf),
+
+    /// Linux's answer to a full accept queue: a live session whose loop is
+    /// not running (CPU-bound Lua, stopped), so never death.
+    #[error("not accepting connections: {}", .0.display())]
+    Busy(PathBuf),
 
     /// Through an SSH forward this means the remote nvim died.
     #[error("connection reset by peer")]

@@ -109,9 +109,8 @@ impl<S: Read + Write> std::fmt::Debug for Client<S> {
 }
 
 impl Client<UnixStream> {
-    /// `read_timeout` bounds each reply, not the connect (a unix connect finds
-    /// a listener or fails at once); a connect-sized value marks live sessions
-    /// dead.
+    /// `read_timeout` bounds each reply; a connect-sized value marks live
+    /// sessions dead. The connect never waits (see [`connect_now`]).
     pub fn connect(path: &Path, read_timeout: Duration) -> Result<Self, RpcError> {
         Self::connect_with(path, Some(read_timeout))
     }
@@ -120,15 +119,16 @@ impl Client<UnixStream> {
     /// until answered, and only an [`Interrupt`] from another thread ends it
     /// sooner: use it only for waits the user watches and can cancel.
     pub fn connect_with(path: &Path, read_timeout: Option<Duration>) -> Result<Self, RpcError> {
-        // For an overlong path std's error is an `InvalidInput` with no OS
-        // error to match on; check first for a useful message.
+        // For an overlong path the connect's error is an `InvalidInput` with
+        // no OS error to match on; check first for a useful message.
         crate::paths::check_sock_path(path).map_err(|e| RpcError::Protocol(e.to_string()))?;
 
-        let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
+        let stream = connect_now(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::ConnectionRefused => {
                 RpcError::ConnectionRefused(path.to_path_buf())
             }
             std::io::ErrorKind::NotFound => RpcError::ConnectionRefused(path.to_path_buf()),
+            std::io::ErrorKind::WouldBlock => RpcError::Busy(path.to_path_buf()),
             // A non-socket at the path: ECONNREFUSED on Linux, ENOTSOCK on
             // macOS/BSD. Nothing can listen there, so it is dead. Whether it
             // may be deleted is the reaper's call (`lstat`).
@@ -185,6 +185,62 @@ impl Interrupt {
     pub fn fire(&self) {
         let _ = self.0.shutdown(std::net::Shutdown::Both);
     }
+}
+
+/// A unix connect that never waits for the server to accept; the stream it
+/// returns blocks.
+///
+/// A stalled Neovim accepts nothing, and on Linux a blocking connect to its
+/// full accept queue (backlog 32) waits until it does, with no timeout.
+/// Non-blocking, the same connect fails at once with `WouldBlock`.
+pub(crate) fn connect_now(path: &Path) -> std::io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: all zeroes is a valid `sockaddr_un`, and NUL-terminates the
+    // path copied in below.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+        *to = libc::c_char::from_ne_bytes([*from]);
+    }
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+
+    // Close-on-exec atomically on Linux, as std does (macOS has no flag for
+    // it): a child forked in between would hold the connection open.
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: a syscall touching none of our memory.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a new fd that nothing else owns.
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    if !cfg!(target_os = "linux") {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        fcntl(&stream, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    }
+    stream.set_nonblocking(true)?;
+    // SAFETY: `addr` is live for the call and `len` is within it.
+    let connected = unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            (&raw const addr).cast(),
+            len as libc::socklen_t,
+        )
+    };
+    if connected != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
 }
 
 impl<S: Read + Write> Client<S> {
@@ -593,10 +649,11 @@ fn map_io(e: std::io::Error, timeout: Option<Duration>) -> RpcError {
 
 /// Whether a session socket has a live, serving Neovim behind it.
 ///
-/// **Only `Dead` leads to files being deleted, so it must mean "proved nothing
-/// is listening", never "no answer".** Everything else is [`Liveness::Busy`],
-/// which is never reaped. Even `api_info` goes unanswered during CPU-bound Lua
-/// (measured 3.7 s).
+/// **Only `Dead` leads to files being deleted, so it must never mean "no
+/// answer".** Everything else is [`Liveness::Busy`], which is never reaped.
+/// Even `api_info` goes unanswered during CPU-bound Lua (measured 3.7 s). A
+/// refused connect is `Dead`, though macOS also refuses a live session whose
+/// accept queue is full (see [`RpcError::ConnectionRefused`]).
 pub fn probe(path: &Path) -> Liveness {
     probe_within(path, PROBE_TIMEOUT)
 }
@@ -606,6 +663,10 @@ pub fn probe_within(path: &Path, budget: Duration) -> Liveness {
     let mut client = match Client::connect(path, budget) {
         Ok(c) => c,
         Err(e) if e.is_definitely_dead() => return Liveness::Dead,
+        Err(e @ RpcError::Busy(_)) => {
+            tracing::debug!(path = %path.display(), error = %e, "probe not accepted");
+            return Liveness::Busy;
+        }
         Err(e) => {
             // EACCES, EMFILE, a bad path: nothing about the session. Treating
             // fd exhaustion as death would reap every session at once.
@@ -989,6 +1050,41 @@ mod tests {
         assert!(matches!(err, RpcError::Reset), "want Reset, got {err:?}");
         drop(server);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stalled session (CPU-bound Lua, SIGSTOP) accepts nothing, and on
+    /// Linux a blocking connect to its full queue waits until it does. macOS
+    /// refuses it instead (see `LocalTransport::settle`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_accept_queue_is_busy_at_once_not_a_wait() {
+        use std::os::fd::AsRawFd;
+
+        let path = crate::test_support::scratch_sock("rpc-full");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // SAFETY: a syscall on a socket we own. Backlog 0 queues one.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _queued = UnixStream::connect(&path).expect("the one queued connection");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let to = path.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let connected = Client::connect(&to, QUICK_PROBE_TIMEOUT).map(drop);
+            let took = started.elapsed();
+            let _ = tx.send((connected, took, probe_within(&to, QUICK_PROBE_TIMEOUT)));
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(2));
+        // Closing the listener refuses a connect still waiting.
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+
+        let (connected, took, liveness) = outcome.expect("the connect waited for an accept");
+        let err = connected.expect_err("the queue was full");
+        assert!(matches!(err, RpcError::Busy(_)), "want Busy, got {err:?}");
+        assert!(!err.is_definitely_dead());
+        assert!(took < QUICK_PROBE_TIMEOUT, "the connect took {took:?}");
+        assert_eq!(liveness, Liveness::Busy);
     }
 
     #[test]

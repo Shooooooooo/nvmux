@@ -2013,8 +2013,8 @@ pub enum Answer {
 }
 
 impl Probe {
-    /// Connect and start asking. The connect runs here, since a dead unix
-    /// socket is refused at once; only the calls go to the worker.
+    /// Connect and start asking. The connect runs here, since it never waits
+    /// (see [`rpc::Client::connect`]); only the calls go to the worker.
     pub fn start(session_id: &str, sock: &Path) -> Result<Self> {
         let mut client = rpc::Client::connect_with(sock, None)?;
         let interrupt = client.interrupt()?;

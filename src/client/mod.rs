@@ -5956,7 +5956,7 @@ fn refresh(sock: &Path, size: (usize, usize)) {
 
 fn refresh_now(sock: &Path, (w, h): (usize, usize)) -> std::io::Result<()> {
     let deadline = Instant::now() + REFRESH_TIMEOUT;
-    let stream = UnixStream::connect(sock)?;
+    let stream = crate::rpc::connect_now(sock)?;
     stream.set_read_timeout(Some(REFRESH_TIMEOUT))?;
     stream.set_write_timeout(Some(REFRESH_TIMEOUT))?;
     let mut line = Line {
