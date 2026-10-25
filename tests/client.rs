@@ -754,6 +754,12 @@ fn a_yank_reaches_the_terminals_clipboard() {
     require_nvim!();
     let scratch = Scratch::new("client-osc52");
     let (sock, mut rpc, config) = session(&scratch, "client-osc52");
+    // Neovim 0.11 asks the terminal through its own stdout, which for a
+    // headless session is its log, so no client can carry the question.
+    if rpc.eval("has('nvim-0.12')").ok().and_then(|v| v.as_i64()) != Some(1) {
+        eprintln!("skipping: OSC 52 detection through a UI needs Neovim 0.12");
+        return;
+    }
     rpc.command("setlocal noswapfile | call setline(1, 'to the clipboard')")
         .expect("setline");
 
