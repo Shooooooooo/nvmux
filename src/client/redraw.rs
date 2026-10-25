@@ -69,16 +69,14 @@ pub enum Event {
         width: usize,
         height: usize,
     },
-    /// Where a float is, on the screen: Neovim works out the anchoring itself
-    /// and says where that put it (`screen_row`, `screen_col`).
     WinFloatPos {
         grid: u64,
         win: Option<i64>,
         mouse: bool,
         zindex: i64,
-        compindex: i64,
-        row: i64,
-        col: i64,
+        /// `None` from Neovim 0.11, which stacks floats in the order shown.
+        compindex: Option<i64>,
+        at: FloatAt,
         /// The grid it is anchored to, whose text it moves with.
         anchor: Option<u64>,
     },
@@ -138,6 +136,23 @@ pub enum Event {
     UiSend(Vec<u8>),
     /// The server is exiting with this status.
     ErrorExit(i64),
+}
+
+/// Where `win_float_pos` puts a float.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatAt {
+    /// On the screen: Neovim 0.12 on works out the anchoring itself and says
+    /// where that put it (`screen_row`, `screen_col`).
+    Screen { row: i64, col: i64 },
+    /// Neovim 0.11 sends only the anchoring, which `super::model` resolves:
+    /// the float's `south`/`east` corner goes at `row`, `col` of the anchor
+    /// grid.
+    Corner {
+        south: bool,
+        east: bool,
+        row: i64,
+        col: i64,
+    },
 }
 
 /// One run of cells in a `grid_line`: a text, the highlight it is drawn in if
@@ -578,18 +593,20 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
             height: size(a.get(5)?)?,
         },
         // `[grid, win, anchor, anchor_grid, anchor_row, anchor_col,
-        // mouse_enabled, zindex, compindex, screen_row, screen_col]`. The last
-        // four came later; only the screen position is needed, as Neovim
-        // resolves the anchoring. The anchor grid is kept because a window the
-        // client draws further in takes its floats along (see `super::wide`).
+        // mouse_enabled, zindex, compindex, screen_row, screen_col]`, the last
+        // three from Neovim 0.12. The anchor grid is kept with a screen
+        // position too: a window the client draws further in takes its floats
+        // along (see `super::wide`).
         "win_float_pos" => Event::WinFloatPos {
             grid: uint(a.first()?)?,
             win: a.get(1).and_then(handle),
             mouse: a.get(6).and_then(boolean).unwrap_or(true),
             zindex: a.get(7).and_then(int).unwrap_or(50),
-            compindex: a.get(8).and_then(int).unwrap_or(0),
-            row: int(a.get(9)?)?,
-            col: int(a.get(10)?)?,
+            compindex: a.get(8).and_then(int),
+            at: match (a.get(9).and_then(int), a.get(10).and_then(int)) {
+                (Some(row), Some(col)) => FloatAt::Screen { row, col },
+                _ => corner(a)?,
+            },
             anchor: a.get(3).and_then(uint),
         },
         "win_hide" => Event::WinHide {
@@ -661,6 +678,32 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
         | "win_extmark" | "win_external_pos" => return Some(None),
         _ => return None,
     }))
+}
+
+/// A `win_float_pos`'s anchoring.
+fn corner(a: &[ValueRef<'_>]) -> Option<FloatAt> {
+    let (south, east) = match as_str(a.get(2)?)? {
+        "NW" => (false, false),
+        "NE" => (false, true),
+        "SW" => (true, false),
+        "SE" => (true, true),
+        _ => return None,
+    };
+    Some(FloatAt::Corner {
+        south,
+        east,
+        row: truncated(a.get(4)?)?,
+        col: truncated(a.get(5)?)?,
+    })
+}
+
+/// A `Float` toward zero, as Neovim's compositor casts one to a cell.
+fn truncated(v: &ValueRef<'_>) -> Option<i64> {
+    match v {
+        ValueRef::F64(n) => Some(*n as i64),
+        ValueRef::F32(n) => Some(*n as i64),
+        other => int(other),
+    }
 }
 
 /// The cells of a `grid_line`: `[text]`, `[text, hl]` or `[text, hl, repeat]`
@@ -1090,10 +1133,44 @@ mod tests {
                 win: Some(1001),
                 mouse: true,
                 zindex: 50,
-                compindex: 2,
-                row: 3,
-                col: 10,
+                compindex: Some(2),
+                at: FloatAt::Screen { row: 3, col: 10 },
                 anchor: Some(1),
+            }]
+        );
+    }
+
+    /// Neovim 0.11 sends eight: no `compindex`, `screen_row` or `screen_col`.
+    /// Its compositor truncates the anchor row and column toward zero.
+    #[test]
+    fn a_float_from_0_11_is_read() {
+        let call = arr(vec![
+            Value::from(4),
+            win(1001),
+            Value::from("SE"),
+            Value::from(2),
+            Value::F64(3.0),
+            Value::F64(-10.5),
+            Value::from(true),
+            Value::from(50),
+        ]);
+        let (out, dropped) = events(arr(vec![batch("win_float_pos", vec![call])]));
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            out,
+            vec![Event::WinFloatPos {
+                grid: 4,
+                win: Some(1001),
+                mouse: true,
+                zindex: 50,
+                compindex: None,
+                at: FloatAt::Corner {
+                    south: true,
+                    east: true,
+                    row: 3,
+                    col: -10,
+                },
+                anchor: Some(2),
             }]
         );
     }

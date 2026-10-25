@@ -87,7 +87,7 @@ use self::grid::{Cell, Text};
 use self::input::{Input, Mouse, Parser, Reply};
 use self::model::{Changes, Model, Place, Placement};
 use self::predict::{Command, Mode, Pos, Predictor, Proof, Rest, Side, Unseen, Want};
-use self::redraw::Event;
+use self::redraw::{Event, FloatAt};
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
 use crate::config::{Centre, Predictions};
@@ -2715,9 +2715,11 @@ impl App {
                         win: Some(win),
                         mouse: at(8) != 0,
                         zindex: at(7),
-                        compindex,
-                        row: at(1),
-                        col: at(2),
+                        compindex: Some(compindex),
+                        at: FloatAt::Screen {
+                            row: at(1),
+                            col: at(2),
+                        },
                         anchor,
                     });
                     events.push(Event::WinViewportMargins {
