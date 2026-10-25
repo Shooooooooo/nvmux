@@ -1085,6 +1085,144 @@ fn which(tool: &str) -> Result<std::path::PathBuf, ()> {
         .ok_or(())
 }
 
+/// The runtime directory [`hang_up_child`] creates its session in.
+const HANG_UP_DIR: &str = "NVMUX_TEST_HANG_UP_DIR";
+
+/// Comes before the session's socket in [`hang_up_child`]'s report.
+const REPORTED: &str = "NVMUX_TEST_SOCK ";
+
+/// The child half of
+/// [`a_session_outlives_a_hang_up_of_the_terminal_it_was_made_in`]: create a
+/// session, report its socket and wait for the hang-up. Ignored, so only the
+/// parent runs it (`--ignored --exact`); without the environment it does
+/// nothing.
+#[test]
+#[ignore = "the child half of a hang-up test; run by it, not by hand"]
+fn hang_up_child() {
+    let Some(dir) = std::env::var_os(HANG_UP_DIR) else {
+        return;
+    };
+    let t = nvmux::transport::local::LocalTransport::with_dir(dir.into()).expect("build transport");
+    let s = t
+        .create_session("hungup", &common::launch(), common::anywhere())
+        .expect("create");
+    println!(
+        "{REPORTED}{}",
+        t.local_socket_for(&s).expect("socket path").display()
+    );
+    // Keeps the script shell, as nvmux does, until the SIGHUP ends this.
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+/// Reaps its child, hanging it up first if it still runs.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        common::hang_up_and_reap(&mut self.0);
+    }
+}
+
+/// Closing the terminal nvmux runs in must not end its sessions. The PATH
+/// lacks `setsid`, as macOS does, so spawn.sh falls back to `nohup`, whose
+/// SIG_IGN Neovim replaces with a handler that exits.
+#[test]
+fn a_session_outlives_a_hang_up_of_the_terminal_it_was_made_in() {
+    require_nvim!();
+    let scratch = Scratch::new("hangup");
+    let t = scratch.transport();
+
+    // Everything on PATH but `setsid`, the first of each name winning.
+    let bin = scratch.0.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_name() != "setsid" {
+                let _ = std::os::unix::fs::symlink(entry.path(), bin.join(entry.file_name()));
+            }
+        }
+    }
+
+    let (pty, pts) = pty_process::blocking::open().expect("open a pty");
+    let child = pty_process::blocking::Command::new(std::env::current_exe().expect("current exe"))
+        // `--nocapture`, or the report stays in libtest's capture buffer.
+        .args(["--ignored", "--exact", "hang_up_child", "--nocapture"])
+        .env(HANG_UP_DIR, &scratch.0)
+        .env("PATH", &bin)
+        // Runs setsid and TIOCSCTTY in the child, so it leads the pty's
+        // session and is its foreground job.
+        .spawn(pts)
+        .expect("spawn the child");
+    let mut child = Reaped(child);
+
+    // Read here, not on a thread: a second handle on the master would keep
+    // it open past the hang-up.
+    nix::fcntl::fcntl(
+        &pty,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .expect("make the master non-blocking");
+    let mut output = Vec::new();
+    let mut sock = None;
+    common::wait_until(Duration::from_secs(30), || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = std::io::Read::read(&mut &pty, &mut buf) {
+            output.extend_from_slice(&buf[..n]);
+        }
+        sock = String::from_utf8_lossy(&output)
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+            // After libtest's `test hang_up_child ... `, on the same line.
+            .find_map(|line| line.split_once(REPORTED))
+            .map(|(_, path)| std::path::PathBuf::from(path.trim_end()));
+        sock.is_some()
+    });
+    let Some(sock) = sock else {
+        panic!(
+            "the child reported no session: {}",
+            String::from_utf8_lossy(&output)
+        );
+    };
+    let id = sock
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("an id")
+        .to_string();
+    let pid = nix::unistd::Pid::from_raw(scratch.metadata(&id).pid as i32);
+    assert_ne!(
+        nix::unistd::getsid(Some(pid)).expect("getsid"),
+        pid,
+        "spawn.sh used setsid, so the nohup fallback went untested"
+    );
+
+    // As closing a terminal window does: the kernel sends SIGHUP to the
+    // session leader, and on its exit to the foreground process group.
+    drop(pty);
+    assert!(
+        common::wait_until(Duration::from_secs(10), || matches!(
+            child.0.try_wait(),
+            Ok(Some(_))
+        )),
+        "the child outlived the hang-up"
+    );
+
+    let answers = || {
+        nvmux::rpc::Client::connect(&sock, Duration::from_secs(2))
+            .and_then(|mut c| c.eval("1"))
+            .is_ok()
+    };
+    // Neovim takes a moment to act on the signal.
+    common::wait_until(Duration::from_secs(3), || !answers());
+    assert!(
+        answers(),
+        "the session died with the terminal; its log: {}",
+        std::fs::read_to_string(sock.with_extension("log")).unwrap_or_default()
+    );
+
+    let session = common::find_by_id(&t, &id).expect("listed");
+    t.kill_session(&session).expect("kill");
+}
+
 /// The graceful `qa!` goes over the socket, so a stale pid must not turn a
 /// clean shutdown into a "could not kill" error.
 #[test]
