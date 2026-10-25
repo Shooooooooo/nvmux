@@ -160,8 +160,8 @@ const ERASE_LINE: &[u8] = b"\r\x1b[2K";
 /// prints. Neovim restores the terminal (leaving the alternate screen) before
 /// printing it, so it lands on the user's screen. The detach path relays that
 /// restore on purpose (see [`crate::pty::Attachment::drain_until_eof`]): it
-/// carries the kitty keyboard pop and the bracketed paste and title restores,
-/// which nvmux does not send.
+/// carries the kitty keyboard pop and the title restore, which nvmux does not
+/// send.
 ///
 /// Called after the client is gone and [`RESET`] has left the alternate
 /// screen, which puts the cursor back on that line. The client's output is not
