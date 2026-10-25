@@ -4419,7 +4419,8 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
 /// does: single and runs of spaces, leading and trailing, no-break spaces,
 /// leading and inner tabs, the line's end, and `extends`/`precedes` in a
 /// nowrap view. With `'linebreak'`, leading spaces are in `Whitespace` even
-/// with only `leadtab` set. No cell changes when Neovim's rows land.
+/// with only `leadtab` set, which Neovim 0.11 lacks. No cell changes when
+/// Neovim's rows land.
 #[test]
 fn predicted_rows_show_listchars_as_neovim_draws_them() {
     require_nvim!();
@@ -4431,12 +4432,17 @@ fn predicted_rows_show_listchars_as_neovim_draws_them() {
         "client-listchars",
         r"lua local t = {} for i = 1, 200 do local k = i % 4 t[i] = k == 0 and ('  line ' .. i .. '  with  runs   ') or k == 1 and ('\t\tline ' .. i .. '\tend ') or k == 2 and (' \194\160line ' .. i .. '\226\128\175x ') or ('    line ' .. string.format('%-3d', i) .. ' ' .. string.rep('ab  ', 16)) end vim.api.nvim_buf_set_lines(0, 0, -1, false, t)",
     );
-    rpc.command(
+    let leadtab = if rpc.eval("has('nvim-0.12')").ok().and_then(|v| v.as_i64()) == Some(1) {
+        "leadtab:\\|.,"
+    } else {
+        ""
+    };
+    rpc.command(&format!(
         "set termguicolors list \
-         listchars=tab:>-,leadtab:\\|.,space:.,multispace:ab,lead:_,leadmultispace:12,\
+         listchars=tab:>-,{leadtab}space:.,multispace:ab,lead:_,leadmultispace:12,\
          trail:~,nbsp:+,eol:$,extends:>,precedes:< \
          | hi Whitespace guifg=#5f87ff | hi NonText guifg=#87d75f",
-    )
+    ))
     .expect("listchars");
     term.pump_until(4 * SLOW, |_| false);
     let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
@@ -4487,8 +4493,10 @@ fn predicted_rows_show_listchars_as_neovim_draws_them() {
             "no {what} drawn: {seen:#?}"
         );
     }
-    rpc.command("set listchars=tab:>-,leadtab:\\|.,eol:$ linebreak wrap nonumber")
-        .expect("linebreak");
+    rpc.command(&format!(
+        "set listchars=tab:>-,{leadtab}eol:$ linebreak wrap nonumber"
+    ))
+    .expect("linebreak");
     term.pump_until(4 * SLOW, |_| false);
     for (name, keys) in [
         ("<C-f> with linebreak", &b"\x06"[..]),
