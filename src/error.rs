@@ -92,7 +92,8 @@ pub enum RpcError {
 }
 
 impl RpcError {
-    /// True only when no server is there; a timeout is not enough, since
+    /// True when the connect was refused or reset: no server is there, or on
+    /// macOS one with a full accept queue. A timeout is not enough, since
     /// reaping on one would delete busy sessions.
     pub fn is_definitely_dead(&self) -> bool {
         matches!(self, RpcError::ConnectionRefused(_) | RpcError::Reset)

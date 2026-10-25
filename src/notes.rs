@@ -436,7 +436,8 @@ pub enum Reading {
     Said(Option<Note>),
     /// No answer now (blocked on a key, busy, or slow); keep the old note.
     Unknown,
-    /// Nothing listens on its socket.
+    /// Refused or reset: nothing listens on its socket, or on macOS its
+    /// accept queue is full.
     Gone,
 }
 
@@ -488,7 +489,8 @@ pub enum Heard {
     Said { news: Vec<News>, listening: bool },
     /// No answer now; nothing was left queued in the session.
     Unknown,
-    /// Nothing listens on its socket.
+    /// Refused or reset: nothing listens on its socket, or on macOS its
+    /// accept queue is full.
     Gone,
 }
 

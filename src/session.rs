@@ -16,11 +16,12 @@ use crate::error::SessionError;
 pub enum Liveness {
     /// Answered a deferred RPC call.
     Alive,
-    /// Reachable but not serving deferred calls: running something blocking,
-    /// or waiting at a prompt (which [`crate::rpc::probe`] detects at once via
-    /// the mode). Never reaped.
+    /// Not serving deferred calls: running something blocking, waiting at a
+    /// prompt (which [`crate::rpc::probe`] detects at once via the mode), or
+    /// with its accept queue full. Never reaped.
     Busy,
-    /// Nothing is listening; any socket file is stale.
+    /// Refused or reset: nothing is listening, or on macOS its accept queue
+    /// is full, so the local reaper also asks the listing script.
     #[default]
     Dead,
 }
