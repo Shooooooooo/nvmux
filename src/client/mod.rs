@@ -2707,26 +2707,38 @@ impl App {
                     });
                 }
                 2 => {
-                    let compindex = match self.model.layout.get(&grid).map(|p| &p.place) {
-                        Some(Place::Float { compindex, .. }) => *compindex,
-                        _ => 0,
+                    let (compindex, placed) = match self.model.layout.get(&grid).map(|p| &p.place) {
+                        Some(Place::Float {
+                            compindex,
+                            at,
+                            anchor,
+                            ..
+                        }) => (*compindex, Some((*at, *anchor))),
+                        _ => (0, None),
                     };
-                    let anchor = self
-                        .model
-                        .wins
-                        .iter()
-                        .find(|(_, w)| **w == at(9))
-                        .map(|(g, _)| *g);
+                    // Neovim 0.11 sends no screen position, and its position
+                    // here is the anchor point, so its own placement stands.
+                    let (to, anchor) = match placed {
+                        Some(corner @ (FloatAt::Corner { .. }, _)) => corner,
+                        _ => (
+                            FloatAt::Screen {
+                                row: at(1),
+                                col: at(2),
+                            },
+                            self.model
+                                .wins
+                                .iter()
+                                .find(|(_, w)| **w == at(9))
+                                .map(|(g, _)| *g),
+                        ),
+                    };
                     events.push(Event::WinFloatPos {
                         grid,
                         win: Some(win),
                         mouse: at(8) != 0,
                         zindex: at(7),
                         compindex: Some(compindex),
-                        at: FloatAt::Screen {
-                            row: at(1),
-                            col: at(2),
-                        },
+                        at: to,
                         anchor,
                     });
                     events.push(Event::WinViewportMargins {
@@ -6745,6 +6757,40 @@ mod tests {
                 2.into(),
             ],
         )
+    }
+
+    /// Under multigrid, Neovim 0.11's `nvim_win_get_position` is a float's
+    /// anchor point, not its corner, so [`LAYOUT_LUA`] must not move a float
+    /// its `win_float_pos` placed.
+    #[test]
+    fn a_layout_answer_leaves_a_float_where_neovim_0_11_anchored_it() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let anchored = (
+            "win_float_pos",
+            vec![
+                5.into(),
+                1005.into(),
+                "SW".into(),
+                1.into(),
+                Value::F64(5.0),
+                Value::F64(3.0),
+                true.into(),
+                50.into(),
+            ],
+        );
+        redraw(&mut a, vec![resize(5, 4, 2), anchored], t0);
+        let origin = |a: &App| a.model.layout.get(&5).map(Placement::origin);
+        assert_eq!(origin(&a), Some((3, 3)), "its foot on row 5");
+
+        let answer = Value::Array(
+            [2, 5, 3, 0, 0, 0, 0, 50, 1, -1]
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+        );
+        a.placed(&[(5, 1005)], &[answer.as_ref()], t0);
+        assert_eq!(origin(&a), Some((3, 3)));
     }
 
     fn random_batch(w: &mut Walk) -> Vec<(&'static str, Vec<Value>)> {
