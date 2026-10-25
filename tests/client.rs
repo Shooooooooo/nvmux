@@ -4716,6 +4716,68 @@ fn a_session_over_ssh_is_sent_lines_however_fast_the_link() {
     }
 }
 
+/// The buffer is wiped as plugins wipe theirs (`nvim_buf_delete`), then a
+/// scroll, an edit in another buffer and CursorHold each make the agent push.
+/// A push that asks Neovim about the wiped buffer raises `Invalid buffer id`,
+/// whose traceback waits at the hit-enter prompt.
+#[test]
+fn wiping_a_buffer_the_agent_follows_raises_no_error() {
+    require_nvim!();
+    let tag = "client-wiped";
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    rpc.command(
+        "setlocal noswapfile | set updatetime=100 | \
+         call setline(1, map(range(1, 200), '\"local v\" . v:val . \" = \" . v:val')) | \
+         lua vim.treesitter.start(0, 'lua')",
+    )
+    .expect("start tree-sitter");
+    rpc.command(COUNT_SENT).expect("count what the agent sends");
+    let mut term = Terminal::spawn_told(&sock, &config, &over_ssh(""));
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| s.contains("local v1 = 1")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // The push that sends a window's lines follows its buffer's tree.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            sent_by_kind(&mut rpc).get("lines").is_some_and(|&n| n > 0)
+        }),
+        "the agent sent no lines"
+    );
+    rpc.command("let v:errmsg = '' | messages clear")
+        .expect("clear the errors");
+    rpc.command(
+        "enew | setlocal noswapfile | \
+         call setline(1, map(range(1, 200), '\"other \" . v:val')) | \
+         lua vim.api.nvim_buf_delete(vim.fn.bufnr('#'), { force = true })",
+    )
+    .expect("wipe the followed buffer");
+    term.pump_until(Duration::from_secs(5), |s| s.contains("other 1"));
+    for keys in [&b"\x06"[..], b"ox", b"\x1b"] {
+        term.type_bytes(keys);
+        term.pump_until(Duration::from_millis(500), |_| false);
+    }
+    // Asked first: it is fast, and the others wait out a hit-enter prompt.
+    let mode = rpc.get_mode().expect("the mode");
+    assert!(
+        !mode.at_hit_enter(),
+        "an error waits at the hit-enter prompt:\n{}",
+        term.text()
+    );
+    let errmsg = rpc.eval("v:errmsg").expect("v:errmsg");
+    let messages = rpc.eval("execute('messages')").expect(":messages");
+    assert!(
+        errmsg.as_str() == Some("")
+            && !messages
+                .as_str()
+                .is_some_and(|m| m.contains("Invalid buffer id")),
+        "v:errmsg {errmsg}, :messages {messages}"
+    );
+}
+
 /// The agent's autocommand count, and how many listen for the line reach
 /// (only an agent set up to predict has those).
 const AGENT_AUTOCMDS: &str = "local all = vim.tbl_filter(function(a) \

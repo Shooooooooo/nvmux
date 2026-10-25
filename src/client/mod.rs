@@ -758,8 +758,10 @@ if predict then
         soon()
       end,
     }, true)
+    -- Its buffer may be gone: a wipe under :noautocmd skips BufWipeout.
     pushed[buf] = function()
-      if followed[buf] == tree and hearing == api.nvim_buf_get_changedtick(buf) then
+      if followed[buf] == tree and api.nvim_buf_is_valid(buf)
+          and hearing == api.nvim_buf_get_changedtick(buf) then
         heard = hearing
       end
     end
@@ -1003,7 +1005,7 @@ if predict then
     end
     -- Stop hearing reports at this b:changedtick (see follow).
     for _, done in pairs(pushed) do
-      done()
+      pcall(done)
     end
   end
   soon = function()
@@ -1218,6 +1220,11 @@ if predict then
   au('WinClosed', {}, function(ev)
     local win = tonumber(ev.match)
     have[win], shapes[win], looked[win] = nil, nil, nil
+  end)
+  -- `edits` and `attached` go on detach (see attach): every unload detaches.
+  au('BufWipeout', {}, function(ev)
+    local buf = ev.buf
+    followed[buf], pushed[buf], stale[buf], maps[buf], ticks[buf] = nil, nil, nil, nil, nil
   end)
   -- A new reach as the round trip changes; resend what acks depend on.
   au('User', { pattern = 'nvmux_client_reach_' .. chan }, function(ev)
