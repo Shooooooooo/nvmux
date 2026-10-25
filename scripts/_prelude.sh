@@ -28,6 +28,36 @@ fail() {
   exit 1
 }
 
+# Zero if runtime directory $1 is ours and private, nonzero if missing, else
+# `fail`. Once it passes, /tmp's sticky bit keeps it ours; a missing one anyone
+# can create right after, so a caller that reads or writes there must stop.
+#
+# `ls -ldn`: `test` cannot check an owner, and `stat` and `find -perm` differ
+# between macOS and Linux. An empty answer is a refusal.
+require_private_dir() {
+  [ -e "$1" ] || [ -L "$1" ] || return 1
+  nvmux_dir=$1
+  nvmux_info=$(ls -ldn "$nvmux_dir" 2>/dev/null)
+  [ -n "$nvmux_info" ] || fail "could not inspect runtime directory $nvmux_dir"
+  # Split in the shell, not by `cut` and `awk`: this runs on every listing.
+  # `-f`: the name at the end of the line is not a pattern.
+  set -f
+  set -- $nvmux_info
+  set +f
+  case "$1" in
+    d*) ;;
+    *) fail "runtime directory $nvmux_dir is not a directory (or is a symlink)" ;;
+  esac
+  [ "${3:-}" = "$(id -u)" ] || fail "runtime directory $nvmux_dir is not owned by us"
+  # Characters 5-10 are the group and other bits. Only setgid and sticky (S,
+  # T) may show, as in src/paths.rs: they let nobody in. An ACL or xattr
+  # marker may follow.
+  case "$1" in
+    d???--[-S]--[-T]*) ;;
+    *) fail "runtime directory $nvmux_dir is accessible to other users" ;;
+  esac
+}
+
 # Is pid $1 the nvim serving socket $2? `grep -F`: the path is data.
 owns_socket() {
   cmdline "$1" | grep -q -F -- "--listen $2"
@@ -36,9 +66,17 @@ owns_socket() {
 # Replace $1/$2.json with $3 atomically (temp file plus rename), so a
 # concurrent listing never sees a half-written file. Nonzero on failure, with
 # the temp file removed.
+#
+# `$$` shows in `ps`, so the temp name is guessable. `set -C` refuses anything
+# already there except a FIFO or device (or a symlink to one), which only the
+# private directory keeps out.
 write_json() {
   nvmux_tmp="$1/$2.json.tmp$$"
-  printf '%s\n' "$3" > "$nvmux_tmp" || return 1
+  set -C
+  printf '%s\n' "$3" > "$nvmux_tmp"
+  nvmux_rc=$?
+  set +C
+  [ "$nvmux_rc" -eq 0 ] || { rm -f "$nvmux_tmp"; return 1; }
   mv -f "$nvmux_tmp" "$1/$2.json" || { rm -f "$nvmux_tmp"; return 1; }
 }
 

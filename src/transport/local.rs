@@ -354,4 +354,22 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Opened up after the transport checked it. The script's refusal must
+    /// reach the picker, not read as no sessions.
+    #[test]
+    fn a_runtime_directory_others_can_reach_fails_the_listing_with_the_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (t, dir) = transport("opened");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let listed = t.list_sessions();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = listed.expect_err("listed a directory other users can reach");
+        assert!(
+            err.to_string().contains("accessible to other users"),
+            "{err}"
+        );
+    }
 }

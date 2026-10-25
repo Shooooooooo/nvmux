@@ -888,7 +888,7 @@ fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
     let bin = scratch.0.join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
     for tool in [
-        "sh", "tr", "grep", "awk", "rm", "sleep", "kill", "id", "printf", "cut", "dirname",
+        "sh", "tr", "grep", "awk", "rm", "sleep", "kill", "id", "printf", "cut", "dirname", "ls",
     ] {
         if let Ok(real) = which(tool) {
             let _ = std::os::unix::fs::symlink(real, bin.join(tool));

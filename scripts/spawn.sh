@@ -30,34 +30,14 @@ log="$dir/$id.log"
 # `0777 & ~umask`; the 0700 directory checked below and the later `chmod 600`
 # protect it instead.
 
-if [ -e "$dir" ] || [ -L "$dir" ]; then
-  # An existing directory must be ours and private: over ssh this is the only
-  # check, and in world-writable /tmp another user could have created it.
-  #
-  # `ls -ldn` for both tests: `test` cannot check ownership, `stat` differs
-  # between macOS and Linux, and `find -perm /mode` (GNU) and `-perm +mode`
-  # (BSD) are not portable. `-n` gives a numeric uid to compare with `id -u`.
-  # Fails closed: an empty answer is a refusal.
-  info=$(ls -ldn "$dir" 2>/dev/null)
-  [ -n "$info" ] || fail "could not inspect runtime directory $dir"
-  mode=$(printf '%s\n' "$info" | cut -c1-10)
-  owner=$(printf '%s\n' "$info" | awk '{print $3}')
-  case "$mode" in
-    d*) ;;
-    *) fail "runtime directory $dir is not a directory (or is a symlink)" ;;
-  esac
-  [ "$owner" = "$(id -u)" ] || fail "runtime directory $dir is not owned by us"
-  # Columns 5-10 are the group and other bits; all must be unset.
-  case "$(printf '%s\n' "$mode" | cut -c5-10)" in
-    ------) ;;
-    *) fail "runtime directory $dir is accessible to other users" ;;
-  esac
-else
-  mkdir -p "$dir" || fail "could not create runtime directory $dir"
-  # Only a directory we just created; tightening someone else's is worse than
-  # refusing to use it.
-  chmod 700 "$dir" 2>/dev/null || true
+# 0700 from the start: a `chmod` after `mkdir` leaves a window, under the
+# caller's mask, for others to plant files that outlive it. The mask stays in
+# the `$( )`. One another user made since the test fails the check below.
+why=
+if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+  why=$(umask 077 && mkdir "$dir" 2>&1)
 fi
+require_private_dir "$dir" || fail "could not create runtime directory $dir${why:+: $why}"
 
 # Required: `nvim --listen` refuses to start if anything exists at the path,
 # with a misleading `address already in use`. Done here because std::fs cannot

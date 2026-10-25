@@ -4,7 +4,7 @@
 # Usage: sh renumber.sh <runtime_dir> <id> <json> [<id> <json>]...
 #
 # Output:
-#   ERROR <reason>   (on a write that failed)
+#   ERROR <reason>   (on a refused runtime directory or a failed write)
 #   NVMUX_END
 #
 # Batch-shaped: dragging a row down a list would otherwise cost one ssh round
@@ -17,6 +17,12 @@
 
 dir="${1:?usage: renumber.sh <runtime_dir> <id> <json> [<id> <json>]...}"
 shift
+
+# Missing: no metadata to edit, and one created since the check is unchecked.
+if ! require_private_dir "$dir"; then
+  finish
+  exit 0
+fi
 
 while [ "$#" -ge 2 ]; do
   id="$1"
