@@ -17,8 +17,8 @@
 //!
 //! The relay sends commands in the client's input, as it does a size change
 //! made while parked: an APC opened by [`OPEN`], which no terminal sends and
-//! the client keeps for itself (see [`crate::client::input`]). One write,
-//! never inside a paste or a terminal sequence being passed on (see
+//! the client keeps for itself (see [`crate::client::input`]). In order with
+//! the input passed on, never inside a paste or a terminal sequence (see
 //! [`Forwarded`]). The pty holds input untouched until the client reads it,
 //! so an early card waits (see `pty::take_input_as_written`). The payload is
 //! a [`Command`] as hex-encoded JSON, so nothing in it (`ESC`, `BEL`, a lone
