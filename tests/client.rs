@@ -868,6 +868,182 @@ fn a_ui_without_windows_of_its_own_is_made_room_for() {
     );
 }
 
+/// The (row, column) of each place `lines` are drawn one under another.
+fn drawn_at(screen: &str, lines: &[&str]) -> Vec<(usize, usize)> {
+    let rows: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
+    let at = |row: usize, col: usize, text: &str| {
+        let text: Vec<char> = text.chars().collect();
+        rows.get(row)
+            .and_then(|r| r.get(col..col + text.len()))
+            .is_some_and(|cells| cells == text)
+    };
+    let mut found = Vec::new();
+    for (row, cells) in rows.iter().enumerate() {
+        for col in 0..cells.len() {
+            if lines.iter().enumerate().all(|(i, l)| at(row + i, col, l)) {
+                found.push((row, col));
+            }
+        }
+    }
+    found
+}
+
+/// Neovim 0.11's `win_float_pos` says only how a float is anchored, and it
+/// alone places the popup menu. Under `ext_multigrid` 0.11's
+/// `nvim_win_get_position` is a float's anchor point, so the layout read
+/// when another UI comes or goes must not move a float anchored by its foot.
+#[test]
+fn the_popup_menu_and_a_float_moved_are_drawn_where_neovim_puts_them() {
+    require_nvim!();
+    let tag = "client-floats";
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    // Typed into the left window: under `ext_multigrid` 0.11's
+    // `pum_getpos()` counts from the window's corner, 0.12's from the
+    // screen's.
+    rpc.command(
+        "setlocal noswapfile | call setline(1, 'alpha alphabet alpine') | \
+         set splitright | vsplit | let g:right = win_getid() | wincmd p",
+    )
+    .expect("a buffer in two windows");
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s
+            .starts_with("alpha alphabet alpine")),
+        "never drawn:\n{}",
+        term.text()
+    );
+
+    term.type_bytes(b"oso al\x0e");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            rpc.eval("pumvisible()").ok().and_then(|v| v.as_i64()) == Some(1)
+        }),
+        "no popup menu:\n{}",
+        term.text()
+    );
+    let pum = common::lua(
+        &sock,
+        "local p = vim.fn.pum_getpos() \
+         local items = vim.fn.complete_info({ 'items' }).items \
+         return { math.floor(p.row), math.floor(p.col), \
+           vim.tbl_map(function(i) return i.word end, items) }",
+    );
+    let pum = pum.as_array().expect("a list");
+    let cell = |v: &Value| usize::try_from(v.as_i64().expect("a number")).expect("on the screen");
+    let at = (cell(&pum[0]), cell(&pum[1]));
+    let words: Vec<&str> = pum[2]
+        .as_array()
+        .expect("the items")
+        .iter()
+        .map(|w| w.as_str().expect("a word"))
+        .collect();
+    assert_eq!(words, ["alpha", "alphabet", "alpine"], "the matches");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn_at(s, &words) == [at]),
+        "the popup menu is not drawn at {at:?}:\n{}",
+        term.text()
+    );
+    term.type_bytes(b"\x1b");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn_at(s, &words).is_empty()),
+        "the popup menu outlived the completion:\n{}",
+        term.text()
+    );
+
+    let win = common::lua(
+        &sock,
+        "local b = vim.api.nvim_create_buf(false, true) \
+         vim.api.nvim_buf_set_lines(b, 0, -1, false, { 'a float', 'its foot' }) \
+         return vim.api.nvim_open_win(b, false, { relative = 'win', win = vim.g.right, \
+           anchor = 'SE', row = 12, col = 30, width = 10, height = 2, style = 'minimal' })",
+    )
+    .as_i64()
+    .expect("the float");
+    // From its config, as only a layout window's position is right under
+    // `ext_multigrid`.
+    let corner = || {
+        let v = common::lua(
+            &sock,
+            &format!(
+                "local c = vim.api.nvim_win_get_config({win}) \
+                 local at = c.relative == 'win' and vim.api.nvim_win_get_position(c.win) \
+                   or {{ 0, 0 }} \
+                 return {{ \
+                   math.floor(at[1] + c.row - (c.anchor:sub(1, 1) == 'S' and c.height or 0)), \
+                   math.floor(at[2] + c.col - (c.anchor:sub(2) == 'E' and c.width or 0)) }}"
+            ),
+        );
+        let v = v.as_array().expect("a row and column");
+        (cell(&v[0]), cell(&v[1]))
+    };
+    let float = ["a float", "its foot"];
+    let first = corner();
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn_at(s, &float) == [first]),
+        "the float is not drawn at {first:?}:\n{}",
+        term.text()
+    );
+
+    common::lua(
+        &sock,
+        &format!(
+            "vim.api.nvim_win_set_config({win}, \
+               {{ relative = 'editor', anchor = 'SW', row = 21, col = 12 }})"
+        ),
+    );
+    let moved = corner();
+    assert_ne!(moved, first);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn_at(s, &float) == [moved]),
+        "the float moved to {moved:?} is not drawn there:\n{}",
+        term.text()
+    );
+
+    let stays = |term: &mut Terminal,
+                 rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+                 uis: usize,
+                 when: &str| {
+        assert!(
+            common::wait_until(Duration::from_secs(5), || {
+                term.pump_until(Duration::from_millis(20), |_| false);
+                rpc.list_uis().ok() == Some(uis)
+            }),
+            "never {when}"
+        );
+        assert!(
+            settle(term, Duration::from_millis(400), Duration::from_secs(10)),
+            "never settled once {when}"
+        );
+        assert!(
+            drawn_at(&term.text(), &float) == [moved],
+            "the float left {moved:?} once {when}:\n{}",
+            term.text()
+        );
+    };
+    // With `ext_multigrid` it leaves the client its windows, and the client
+    // reads the layout once it has attached and again once it has gone.
+    let mut other = nvmux::rpc::Client::connect(&sock, Duration::from_secs(5)).expect("connect");
+    other
+        .call(
+            "nvim_ui_attach",
+            vec![
+                Value::from(i64::from(COLS)),
+                Value::from(i64::from(ROWS)),
+                Value::Map(vec![
+                    (Value::from("ext_linegrid"), Value::from(true)),
+                    (Value::from("ext_multigrid"), Value::from(true)),
+                ]),
+            ],
+        )
+        .expect("attach another UI");
+    stays(&mut term, &mut rpc, 2, "another UI attached");
+    drop(other);
+    stays(&mut term, &mut rpc, 1, "the other UI left");
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// As animate.nvim draws it: with `'splitright'` the new window starts as a
 /// sliver at the right edge and its separator moves left frame by frame.
 #[test]
