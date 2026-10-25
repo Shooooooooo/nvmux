@@ -198,7 +198,12 @@ fn osc_payload(bytes: &[u8]) -> Option<(&[u8], usize)> {
 pub(crate) fn parse_colour(spec: &str) -> Option<Rgb> {
     let spec = spec.trim();
     if let Some(hex) = spec.strip_prefix('#') {
-        if hex.is_empty() || hex.len() % 3 != 0 || hex.len() > 12 {
+        // Before slicing by byte: a multibyte char would be split.
+        if hex.is_empty()
+            || hex.len() % 3 != 0
+            || hex.len() > 12
+            || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
             return None;
         }
         let width = hex.len() / 3;
@@ -430,6 +435,9 @@ mod tests {
             "#ff",
             "#fffff",
             "blue",
+            // Byte lengths a multiple of 3, so a slice would split a char.
+            "#èa",
+            "#€abc",
         ] {
             assert_eq!(parse_colour(bad), None, "{bad:?}");
         }
