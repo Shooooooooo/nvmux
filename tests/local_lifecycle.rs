@@ -768,6 +768,151 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
     );
 }
 
+/// Regression: on Linux a blocking connect to a full accept queue waits until
+/// the server accepts, with no timeout. A stalled session's queue fills with
+/// connections nvmux dropped unaccepted, and a listing then hung in its
+/// probe's connect until the session ran again. macOS refuses that connect
+/// instead.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stalled_session_with_a_full_accept_queue_is_listed_at_once_as_busy() {
+    require_nvim!();
+    // A script run and a probe whose connect fails at once take about 15 ms.
+    const DEADLINE: Duration = Duration::from_secs(5);
+    let scratch = Scratch::new("stalled");
+    let t = scratch.transport();
+    let session = t
+        .create_session("stalled", &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let files = [
+        sock.clone(),
+        sock.with_extension("json"),
+        sock.with_extension("log"),
+    ];
+
+    let stopped = Stopped::new(session.pid);
+    let (queued, waiting) = fill_accept_queue(&sock);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dir = scratch.0.clone();
+    let lister = std::thread::spawn(move || {
+        let listed = nvmux::transport::local::LocalTransport::with_dir(dir)
+            .and_then(|t| t.list_sessions())
+            .map_err(|e| e.to_string());
+        let _ = tx.send(listed);
+    });
+    let outcome = rx.recv_timeout(DEADLINE);
+    let held = is_stopped(session.pid);
+    let reaped: Vec<_> = files.iter().filter(|p| !p.exists()).collect();
+
+    // Resumed, Neovim accepts what waits, which ends any connect still waiting.
+    drop(stopped);
+    let ended = common::wait_until(Duration::from_secs(10), || {
+        lister.is_finished() && waiting.is_finished()
+    });
+    drop(queued);
+    assert!(ended, "a connect still waited after the session resumed");
+    lister.join().expect("the listing thread panicked");
+    waiting.join().expect("the connecting thread panicked");
+    t.kill_session(&session).expect("kill");
+
+    assert!(
+        held,
+        "precondition: the session ran before the listing ended"
+    );
+    let listed = outcome
+        .unwrap_or_else(|_| {
+            panic!("the listing still waited after {DEADLINE:?}, on a connect to the full queue")
+        })
+        .expect("list");
+    let s = listed
+        .iter()
+        .find(|s| s.id == session.id)
+        .unwrap_or_else(|| panic!("the stalled session was not listed: {listed:?}"));
+    assert_eq!(s.state.liveness, Liveness::Busy);
+    assert!(
+        reaped.is_empty(),
+        "a stalled session's files were reaped: {reaped:?}"
+    );
+}
+
+/// Neovim's listen backlog (`MAX_CONNECTIONS`). Linux queues one more before
+/// a connect waits.
+#[cfg(target_os = "linux")]
+const NEOVIM_BACKLOG: usize = 32;
+
+/// A process held by SIGSTOP until dropped.
+#[cfg(target_os = "linux")]
+struct Stopped(u32);
+
+#[cfg(target_os = "linux")]
+impl Stopped {
+    fn new(pid: u32) -> Self {
+        use nix::sys::signal::{kill, Signal};
+        kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGSTOP).expect("SIGSTOP");
+        let stopped = Self(pid);
+        // Until it stops, Neovim still accepts.
+        assert!(
+            common::wait_until(Duration::from_secs(3), || is_stopped(pid)),
+            "pid {pid} never stopped"
+        );
+        stopped
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        use nix::sys::signal::{kill, Signal};
+        let _ = kill(nix::unistd::Pid::from_raw(self.0 as i32), Signal::SIGCONT);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_stopped(pid: u32) -> bool {
+    // The state follows the command name, which may itself hold a `)`.
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('T'))
+    })
+}
+
+/// Connect to a stopped server until a connect waits on its full queue.
+///
+/// Returns the queued connections and the thread still connecting, which
+/// ends once the server accepts or goes.
+#[cfg(target_os = "linux")]
+fn fill_accept_queue(
+    sock: &std::path::Path,
+) -> (
+    Vec<std::os::unix::net::UnixStream>,
+    std::thread::JoinHandle<()>,
+) {
+    let mut queued = Vec::new();
+    // Far past the backlog, so a server that still accepts fails the test.
+    while queued.len() < 4 * NEOVIM_BACKLOG {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let to = sock.to_path_buf();
+        let connecting = std::thread::spawn(move || {
+            let _ = tx.send(std::os::unix::net::UnixStream::connect(&to));
+        });
+        // A connect the queue has room for returns at once.
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(stream) => queued.push(stream.expect("connect to the stopped session")),
+            Err(_) => {
+                assert!(
+                    queued.len() > NEOVIM_BACKLOG,
+                    "a connect waited after only {} were queued",
+                    queued.len()
+                );
+                return (queued, connecting);
+            }
+        }
+    }
+    panic!("the stopped session queued {} connects", queued.len());
+}
+
 /// Regression: a timed-out read leaves the rest of its frame in the socket
 /// (rmpv decodes incrementally), and the next call would silently return
 /// that leftover as its answer.
