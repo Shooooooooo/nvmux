@@ -89,9 +89,10 @@ command -v -- "$1" >/dev/null 2>&1 || fail "$1: not found"
 : >>"$log" 2>/dev/null || true
 chmod 600 "$log" 2>/dev/null || true
 
-# Detach from the ssh session's process group, which gets SIGHUP when the
-# connection closes. `setsid` (util-linux) is missing on macOS, so fall back
-# to `nohup`.
+# Detach from this shell's process group, so no hang-up reaches the editor.
+# `setsid` (util-linux) is missing on macOS, so fall back to `nohup`: enough
+# there, as this shell already leads a session with no terminal (sshd's, or
+# src/proc.rs's locally).
 #
 # All three fds are redirected in both branches: `ssh host 'cmd &'` with
 # stdout attached hangs the client until its timeout (12s versus 0.23s).
