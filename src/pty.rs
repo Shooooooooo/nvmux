@@ -5201,6 +5201,75 @@ mod tests {
         eprintln!("relay ended: {ended:?}; unsent: {}", a.input.unsent.len());
     }
 
+    /// Set, to the file its stand-in writes, on the binary rerun by
+    /// [`input_left_waiting_reaches_the_client_once_it_reads`].
+    const LATE_CHILD: &str = "NVMUX_TEST_LATE_CLIENT_CHILD";
+
+    /// The other half of the backlog: input the relay held while its client
+    /// was busy writing must still reach it, whole and in order, once the
+    /// client reads, with nothing more typed to push it along.
+    #[test]
+    fn input_left_waiting_reaches_the_client_once_it_reads() {
+        let file = crate::test_support::scratch_path("pty-late-reader");
+        let typed: Vec<u8> = (0..256 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut child = std::process::Command::new(std::env::current_exe().expect("the tests"))
+            .args([
+                "--exact",
+                "pty::tests::relaying_to_a_client_reading_late",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LATE_CHILD, &file)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the child");
+        let mut stdin = child.stdin.take().expect("its stdin");
+        let sent = typed.clone();
+        let typing = std::thread::spawn(move || {
+            let _ = stdin.write_all(&sent);
+            stdin
+        });
+        let ended = crate::test_support::wait_until(Duration::from_secs(10), || {
+            child.try_wait().is_ok_and(|status| status.is_some())
+        });
+        if !ended {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        drop(typing.join());
+        let mut said = String::new();
+        let _ =
+            std::io::Read::read_to_string(&mut child.stderr.take().expect("its stderr"), &mut said);
+        let got = std::fs::read(&file).unwrap_or_default();
+        let _ = std::fs::remove_file(&file);
+        assert!(ended, "the client never got all its input: {said}");
+        assert!(said.contains("relay ended: Ok(ChildExited)"), "{said}");
+        assert_eq!(got.len(), typed.len(), "{said}");
+        assert!(got == typed, "the input arrived out of order");
+    }
+
+    /// The child half of the test above; does nothing without [`LATE_CHILD`].
+    #[test]
+    #[ignore = "the child half of a test; run by it, not by hand"]
+    fn relaying_to_a_client_reading_late() {
+        if std::env::var_os(LATE_CHILD).is_none() {
+            return;
+        }
+        // Busy writing far more than a pty holds while the input arrives,
+        // then reads all of it.
+        let mut a = attached_to(&format!(
+            "head -c 2000000 /dev/zero; exec head -c {} > \"${LATE_CHILD}\"",
+            256 * 1024
+        ));
+        let winch = winch::Winch::install().expect("the SIGWINCH pipe");
+        let master = a.master.as_raw_fd();
+        let ended = pump(&mut a, master, &winch, 0, None, false, None);
+        eprintln!("relay ended: {ended:?}");
+    }
+
     /// A stand-in kept client (one with a ledger).
     fn kept(script: &str) -> Attachment {
         let mut a = attached_to(script);
