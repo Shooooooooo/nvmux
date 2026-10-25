@@ -72,11 +72,14 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
 const INHERITED: &[u8] = b"\x1b[?2026l\x1b[0m";
 
 /// [`INHERITED`], plus leave the alternate screen (no-op if not in it), show
-/// the cursor and turn mouse reporting off ([`MOUSE_OFF`]). One fixed string
-/// so the signal handler can write it, and error paths match a signal's reset.
-/// Mouse off is included because every path here ends at a shell prompt, and
-/// a client killed with nvmux never turns its own off.
-const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1003l\x1b[?1006l\x1b[?1002l";
+/// the cursor, and turn off focus reports, bracketed paste, modifyOtherKeys and
+/// mouse reporting ([`MOUSE_OFF`]). One fixed string so the signal handler can
+/// write it, and error paths match a signal's reset. The modes are included
+/// because every path here ends at a shell prompt, and a client killed with
+/// nvmux never turns its own off. The kitty keyboard stack is per screen, so
+/// leaving the alternate screen is its reset.
+const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1004l\x1b[?2004l\x1b[>4;0m\
+\x1b[?1003l\x1b[?1006l\x1b[?1002l";
 
 /// Mouse reporting as Neovim's TUI enables it with `'mousemoveevent'`:
 /// button-event tracking (`?1002`) in SGR encoding (`?1006`, needed past
@@ -416,6 +419,19 @@ mod tests {
             RESET.ends_with(MOUSE_OFF),
             "RESET does not end with MOUSE_OFF"
         );
+    }
+
+    /// Both clients turn these on, and they outlive the alternate screen, so a
+    /// client whose own `CLOSING` never arrives leaves them to the shell.
+    #[test]
+    fn the_reset_turns_off_the_terminal_wide_modes_a_client_turns_on() {
+        for undo in [&b"\x1b[?1004l"[..], b"\x1b[?2004l", b"\x1b[>4;0m"] {
+            assert!(contains(RESET, undo), "RESET leaves on {undo:?}");
+            assert!(
+                contains(crate::client::term::CLOSING, undo),
+                "the client's own CLOSING no longer undoes {undo:?}"
+            );
+        }
     }
 
     /// In `RESET` it would wipe a scrollback line on every signal and error
