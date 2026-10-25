@@ -938,6 +938,12 @@ mod tests {
         ] {
             let s = joined(&args);
             assert!(s.contains("-o ClearAllForwardings=yes"), "{s}");
+            // After the host it would be part of the remote command.
+            let at = |word: &str| args.iter().position(|a| a == word);
+            assert!(
+                at("ClearAllForwardings=yes") < at("myhost"),
+                "not an option before the host: {s}"
+            );
         }
     }
 
