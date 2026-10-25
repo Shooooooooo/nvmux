@@ -2793,6 +2793,13 @@ fn pump(
             return Err(NvmuxError::Io(err));
         }
 
+        // Before the output, whose write to the terminal can block: the tail
+        // of a key a full pty split must not wait behind it. A failure is
+        // left to the read below, which sees a client gone.
+        if n > 0 && fds[1].revents & libc::POLLOUT != 0 {
+            let _ = attachment.input.send();
+        }
+
         // Output first, so the screen is current before keys are acted on.
         let child_spoke = n > 0 && ready(&fds[1]);
         if child_spoke {

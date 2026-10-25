@@ -150,9 +150,10 @@ const REPLY_WAIT: Duration = Duration::from_secs(1);
 
 /// Max ms a lone `ESC` is held for the rest of a sequence, whatever
 /// `'ttimeoutlen'` says ([`input`]). The relay already held it as long
-/// (`crate::pty`'s `SEQUENCE_TIMEOUT`); a key's bytes split only at buffer
-/// boundaries. Waiting `'ttimeoutlen'` (50 ms default) on top would delay
-/// every `<Esc>` leaving Insert mode.
+/// (`crate::pty`'s `SEQUENCE_TIMEOUT`) and forwards whole keys; only a pty
+/// left full by a backlog splits one, and its tail can then come late.
+/// Waiting `'ttimeoutlen'` (50 ms default) on top would delay every `<Esc>`
+/// leaving Insert mode.
 const RELAYED_ESCAPE: u64 = 10;
 
 /// Delay before listing UIs again after finding one only passing through
