@@ -232,6 +232,9 @@ pub struct Attachment {
     probe: Option<Probe>,
     /// Whether the client is nvmux's own, which draws cards.
     draws_cards: bool,
+    /// Neovim's client, before its first DA1 answer: that one asks its server
+    /// for a flush (see [`flush_after_answers`]).
+    flush_after_answers: bool,
     /// Told it is out of sight (see [`Attachment::go_away`]) and not yet back.
     away: bool,
     /// While `away`, drawing at a crawl; nvmux's copy may lag by up to 1 s.
@@ -618,12 +621,16 @@ impl Attachment {
     /// changed while parked was sent by [`Attachment::tell_its_size`]. Other
     /// sizes (a resize since) go through.
     fn saw_input(&mut self, step: &mut Step) {
-        if self.ledger.is_none() {
-            return;
-        }
         let Step::Forward(bytes) = step else {
             return;
         };
+        if self.flush_after_answers && answers_device_attributes(bytes) {
+            self.flush_after_answers = false;
+            flush_after_answers(&self.sock);
+        }
+        if self.ledger.is_none() {
+            return;
+        }
         if !self.startup_answered && answers_device_attributes(bytes) {
             self.startup_answered = true;
         }
@@ -2276,6 +2283,7 @@ fn spawn_client_with(
         unshown: None,
         probe: None,
         draws_cards,
+        flush_after_answers: !draws_cards,
         away: false,
         crawling: false,
         // The generation its environment was just given (see `own_client`).
@@ -3647,6 +3655,35 @@ impl Erasing {
 /// fallback nudge can be: a server too busy to answer produces no output to
 /// wake the loop.
 const ERASE_POLL: Duration = Duration::from_millis(50);
+
+/// How long after the terminal's startup answers reach Neovim's client the
+/// flush is asked for, so the client has taken them first.
+const ANSWERS_TAKEN: Duration = Duration::from_millis(50);
+
+/// Have Neovim's client write what it sent in reply to the terminal's
+/// startup answers: 0.11 writes its keyboard protocol and `ESC [ ? 2048 h`
+/// only at its next flush, and answers that come after it has attached (a
+/// paint held for the fade, a client started ahead, a slow attach) wait
+/// for one. Only a full repaint makes it flush; 0.12 needs none.
+fn flush_after_answers(sock: &Path) {
+    let sock = sock.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("nvmux-answers-flush".into())
+        .spawn(move || {
+            if crate::nvim::local_version().is_some_and(|v| (v.major, v.minor) >= (0, 12)) {
+                return;
+            }
+            std::thread::sleep(ANSWERS_TAKEN);
+            let served = repaint_through_server(&sock, Repaint::Notice);
+            tracing::debug!(
+                repainted = served.repainted,
+                "repaint for the client's replies"
+            );
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "no thread for the repaint for the client's replies");
+    }
+}
 
 /// Why the screen is being repainted, which decides what the repaint may do.
 /// A resume may end a hit-enter prompt (drawn over, so the user cannot
@@ -5275,6 +5312,26 @@ mod tests {
         let master = a.master.as_raw_fd();
         let ended = pump(&mut a, master, &winch, 0, None, false, None);
         eprintln!("relay ended: {ended:?}");
+    }
+
+    /// Once per client, and never for nvmux's own, which writes its replies
+    /// at once.
+    #[test]
+    fn neovims_client_asks_for_a_flush_once_its_startup_questions_are_answered() {
+        let mut a = attached_to("exec sleep 30");
+        let mut key = Step::Forward(b"j".to_vec());
+        a.saw_input(&mut key);
+        assert!(a.flush_after_answers, "a key is no answer");
+        let answer = b"\x1b[?62;22c".to_vec();
+        let mut step = Step::Forward(answer.clone());
+        a.saw_input(&mut step);
+        assert!(!a.flush_after_answers);
+        assert_eq!(step, Step::Forward(answer), "the answer still goes through");
+
+        let cmd = Command::new("sh").arg("-c").arg("exec sleep 30");
+        let sock = Path::new("/nvmux-test-never-read.sock");
+        let own = spawn_client_with("id000000", sock, "", cmd, true).expect("spawn sh");
+        assert!(!own.flush_after_answers);
     }
 
     /// A stand-in kept client (one with a ledger).
