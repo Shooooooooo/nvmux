@@ -2275,6 +2275,15 @@ fn fg_on_screen(out: &[u8], row: u16, col: u16) -> vt100::Color {
         .map_or(vt100::Color::Default, vt100::Cell::fgcolor)
 }
 
+/// The colour text shows in: the default foreground is [`PALETTE_FG`]. Fade
+/// frames redraw the client's default-coloured text in that RGB.
+fn shown(color: vt100::Color) -> vt100::Color {
+    match color {
+        vt100::Color::Default => vt100::Color::Rgb(PALETTE_FG, PALETTE_FG, PALETTE_FG),
+        other => other,
+    }
+}
+
 /// Brightness of a grey from the test palette ([`PALETTE_FG`]); 0 for
 /// terminal colours.
 fn bright(color: vt100::Color) -> u8 {
@@ -2375,8 +2384,15 @@ fn a_switch_lands_with_its_card_standing() {
         "the session never painted; the screen: {:#?}",
         screen_rows(&term.output)
     );
-    term.pump_until(Duration::from_millis(500), |_| false);
-    let text_was = fg_on_screen(&term.output, 1, 0);
+    // The row is up from the fade-in's first frame; wait for its end.
+    let full = vt100::Color::Rgb(PALETTE_FG, PALETTE_FG, PALETTE_FG);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| {
+            shown(fg_on_screen(out, 1, 0)) == full
+        }),
+        "the session never came in at full colour: {:?}",
+        fg_on_screen(&term.output, 1, 0)
+    );
 
     let flags = kitty_push_flags(&term.output).unwrap_or(0);
     term.type_bytes(b"\x1b[32;5u");
@@ -2403,8 +2419,8 @@ fn a_switch_lands_with_its_card_standing() {
         "the card dissolved with the session"
     );
     assert_ne!(
-        fg_on_screen(&term.output, 1, 0),
-        text_was,
+        shown(fg_on_screen(&term.output, 1, 0)),
+        full,
         "half way through, the session is still as it was"
     );
 
