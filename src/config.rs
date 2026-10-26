@@ -599,8 +599,9 @@ pub struct StyleSettings {
     pub color: ThemeColor,
     /// Whether the picker (`<prefix> Space`), settings (`<prefix> ,`) and
     /// help (`<prefix> ?`) float in a centred panel over the dimmed, live
-    /// session (see `crate::pty::panel`). Default on. Their hint row stays on
-    /// the screen's last row either way.
+    /// session (see `crate::pty::panel`); behind the picker, the session its
+    /// cursor is on. Default on. Their hint row stays on the screen's last row
+    /// either way.
     ///
     /// Off, each takes the whole terminal, the session dissolving out and
     /// back. The picker's `?` and `,` follow the picker. A terminal too small

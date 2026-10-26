@@ -6,7 +6,8 @@
 //! instead of the terminal; its hint row is the full screen's, on the
 //! screen's last row ([`Floating::draw_hints`]). Keys that lead elsewhere
 //! become a [`Leave`] for the relay. Help, settings and prompts replace the
-//! panel and return to it.
+//! panel and return to it. Behind it, the relay shows the session the cursor
+//! is on ([`Floating::preview`]).
 //!
 //! It opens at once on the session loop's rows ([`hand`]) and lists in the
 //! background (see [`super::Listing`]). A kill or move relists, and the loop
@@ -530,12 +531,16 @@ impl Floating for Panel {
     fn closing(&self) -> bool {
         self.closing
     }
+
+    fn preview(&self) -> Option<&str> {
+        self.app.selected_row_id()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
 
     fn rows(ids: &[&str]) -> Vec<Session> {
         ids.iter()
@@ -703,6 +708,36 @@ mod tests {
             !panel.tick(now + effects::AFTERGLOW * 2),
             "and nothing after"
         );
+        hand(&[], None);
+    }
+
+    /// What the relay shows behind the panel: it follows keys and hover alike.
+    #[test]
+    fn the_preview_is_the_row_under_the_cursor() {
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        assert_eq!(panel.preview(), Some(behind));
+        assert_eq!(press(&mut panel, 'k'), Did::Stay);
+        assert_eq!(panel.preview(), Some(other));
+
+        let area = panel.area(Rect::new(0, 0, 80, 24)).expect("room to float");
+        panel.draw(area);
+        let hover = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: area.x + area.width / 2,
+            // The list starts two rows down; this is its second row.
+            row: area.y + 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(panel.on_mouse(hover, Instant::now()), Did::Stay);
+        assert_eq!(panel.preview(), Some(behind));
+
+        for c in ['/', 'z', 'z', 'z'] {
+            assert_eq!(press(&mut panel, c), Did::Stay);
+        }
+        assert_eq!(panel.preview(), None, "a filter that hides every row");
         hand(&[], None);
     }
 

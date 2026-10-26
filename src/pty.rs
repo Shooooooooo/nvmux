@@ -263,6 +263,15 @@ pub struct Attachment {
     /// The settings or picker to float over the session once the next relay has
     /// its screen back.
     to_float: Option<Outcome>,
+    /// Its screen is on the terminal already, undimmed by the floating picker
+    /// that switched to it ([`panel`]): its relay neither clears nor fades.
+    lit: bool,
+    /// Raw mode, kept on from the relay that handed it over (see `lit`) so a
+    /// key typed meanwhile is neither echoed over its screen nor a signal.
+    raw: Option<term::RawMode>,
+    /// The session the floating picker undimmed in place of this one: this
+    /// relay ends without fading or clearing the screen, and hands it over.
+    handing: Option<Box<Attachment>>,
 }
 
 /// How many clients' exit sequences have been relayed (sessions that ended
@@ -350,13 +359,17 @@ fn unsynced(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     without(bytes, fade::SYNC_END)
 }
 
-/// A released first paint in one synchronized update, closed before any
-/// trailing partial sequence: closing a hold released mid-sequence would cut,
-/// say, a colour in two, and the terminal would print the rest as text.
-fn replay(paint: &[u8]) -> Vec<u8> {
+/// A released first paint in one synchronized update after `first`, closed
+/// before any trailing partial sequence: closing a hold released mid-sequence
+/// would cut, say, a colour in two, and the terminal would print the rest as
+/// text.
+fn replay(first: &[u8], paint: &[u8]) -> Vec<u8> {
     let at = finished(paint);
-    let mut out = Vec::with_capacity(paint.len() + fade::SYNC_BEGIN.len() + fade::SYNC_END.len());
+    let mut out = Vec::with_capacity(
+        first.len() + paint.len() + fade::SYNC_BEGIN.len() + fade::SYNC_END.len(),
+    );
     out.extend_from_slice(fade::SYNC_BEGIN);
+    out.extend_from_slice(first);
     out.extend_from_slice(&unsynced(&paint[..at]));
     out.extend_from_slice(fade::SYNC_END);
     out.extend_from_slice(&paint[at..]);
@@ -818,10 +831,12 @@ impl Attachment {
     /// ignores `SIGWINCH`, so it is written the report the terminal would send
     /// (Neovim 0.11.0 and 0.12.5 take it as a size, not keys). Unchanged sizes
     /// are skipped: a same-size resize clears to the prompt row in `input()`.
-    fn tell_its_size(&mut self, size: PtySize, resized: bool) {
+    /// `false` if it needed a report that could not go in.
+    fn tell_its_size(&mut self, size: PtySize, resized: bool) -> bool {
         if resized && self.ledger.as_ref().is_some_and(Ledger::reads_size_in_band) {
-            self.report_size_in_band(size);
+            return self.report_size_in_band(size);
         }
+        true
     }
 
     /// Write an in-band size report into the client's input; returns whether it
@@ -1127,6 +1142,10 @@ impl Attachment {
         let Some(hold) = self.hold.take() else {
             return Ok(());
         };
+        // Its screen is up already: no fade, and the clear `relay` left out
+        // goes in the paint's update, so it is never shown.
+        let lit = std::mem::take(&mut self.lit);
+        let dissolve = dissolve && !lit;
         let held_for = hold.first.map(|first| first.elapsed());
         let bytes = hold.bytes;
         let drawn = self.drawn();
@@ -1192,8 +1211,9 @@ impl Attachment {
         // stopped (see `replay`).
         let mut paint = bytes[split..].to_vec();
         paint.extend_from_slice(&later);
+        let first = if lit { term::handover_in_span() } else { &[] };
         let mut out = std::io::stdout().lock();
-        out.write_all(&replay(&paint))?;
+        out.write_all(&replay(first, &paint))?;
         out.flush()?;
         drop(out);
         if let Some(shadow) = self.shadow.as_mut() {
@@ -1265,19 +1285,22 @@ impl Attachment {
         }
     }
 
-    /// Without a fade, paint a kept client's screen back at once from its copy,
-    /// so the user sees the session until the server's repaint lands. Returns
-    /// whether it did.
-    fn paint_kept_screen(&mut self) -> bool {
+    /// Paint a kept client's screen back at once from its copy, so the user
+    /// sees the session until the server's repaint lands: without a fade, or,
+    /// if `lit`, over its screen left up by the picker, with what it drew
+    /// since. Returns whether it did.
+    fn paint_kept_screen(&mut self, lit: bool) -> bool {
         // An unkept client was not read while away, so its copy is stale.
         if !self.is_kept() {
             return false;
         }
-        let Some(screen) = self
-            .screen
-            .as_ref()
-            .filter(|s| s.is_usable() && s.has_contents())
-        else {
+        // With a shadow, the fade paints it back.
+        let copy = if lit {
+            self.shadow.as_ref().or(self.screen.as_ref())
+        } else {
+            self.screen.as_ref()
+        };
+        let Some(screen) = copy.filter(|s| s.is_usable() && (lit || s.has_contents())) else {
             return false;
         };
         if let Err(e) = write_stdout(&screen.paint()) {
@@ -1402,6 +1425,12 @@ impl Attachment {
     /// retired.
     pub fn park(mut self) -> Option<Parked> {
         self.exits_seen = EXITS_RELAYED.load(std::sync::atomic::Ordering::Relaxed);
+        self.park_again()
+    }
+
+    /// Park a client lent from the pool (see [`Others::lend`]) as it was
+    /// parked: the exits it has missed since it left the front still count.
+    pub fn park_again(mut self) -> Option<Parked> {
         // The last fade's diff is for a terminal another session is about to
         // use; drop it now, not on a next byte an idle session may never write.
         if let Some(copy) = self.copy() {
@@ -1418,9 +1447,10 @@ impl Attachment {
     /// Unlike a parked client's, its output is kept whole in
     /// [`Attachment::unshown`] and relayed first on its first visit: its
     /// startup queries are still unheard, and it accepts late answers (measured
-    /// on 0.12.5: five seconds late as well as at once).
+    /// on 0.12.5: five seconds late as well as at once). One lent and given
+    /// back keeps what it said meanwhile.
     pub fn start_ahead(mut self, probe: Option<Probe>) -> Option<Parked> {
-        self.unshown = Some(Vec::new());
+        self.unshown.get_or_insert_with(Vec::new);
         self.probe = probe;
         self.go_away();
         self.put_aside("nvmux-ahead", keep_unshown)
@@ -1431,7 +1461,8 @@ impl Attachment {
     /// here, not as the relay ends, where a switch first has it draw the
     /// landing card ([`Attachment::stand_landing`]).
     fn go_away(&mut self) {
-        if self.draws_cards {
+        // Once: each costs a frame, which a client started ahead keeps.
+        if self.draws_cards && !self.away {
             self.tell_client(&card::Command::Away);
             self.away = true;
             self.crawling = true;
@@ -1489,10 +1520,14 @@ impl Attachment {
 
     /// Hand the client to a thread of its own, named `name`, running `keep`.
     fn put_aside(
-        self,
+        mut self,
         name: &str,
         keep: fn(Attachment, UnixStream) -> Option<Attachment>,
     ) -> Option<Parked> {
+        // Not taking the screen over after all (see `lit`): its next relay
+        // starts as any other, from the shell's mode.
+        self.lit = false;
+        drop(self.raw.take());
         let session_id = self.session_id.clone();
         let (stop, stopped) = match UnixStream::pair() {
             Ok(pair) => pair,
@@ -1545,6 +1580,15 @@ impl std::fmt::Debug for Parked {
 }
 
 impl Parked {
+    /// One whose client has exited, to be taken as such.
+    pub fn gone(session_id: &str) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            stop: None,
+            thread: None,
+        }
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -1624,6 +1668,68 @@ impl Drop for Parked {
     }
 }
 
+/// Why a started-ahead client is retired as it talks (see [`keep_unshown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retire {
+    /// Hung up and answered already.
+    Finishing,
+    SaidTooMuch(usize),
+}
+
+impl Attachment {
+    /// A parked client's output, into its copy and ledger. `false` if it is
+    /// finishing (see [`keep_parked`]); it is then hung up and answered.
+    fn keep_parked_output(&mut self, chunk: &[u8]) -> bool {
+        self.saw_unrelayed(chunk);
+        if asks_for_device_attributes(chunk) || leaves_alt_screen(chunk) {
+            self.hang_up();
+            self.answer_device_attributes();
+            return false;
+        }
+        true
+    }
+
+    /// A started-ahead client's probe, looked at without waiting and dropped
+    /// once it answers `Ready`. `false` if the client is to be retired.
+    fn kept_by_its_probe(&mut self) -> bool {
+        let Some(probe) = self.probe.as_mut() else {
+            return true;
+        };
+        let id = &self.session_id;
+        match probe.wait(Duration::ZERO) {
+            None => true,
+            Some(Ok(Answer::Ready)) => {
+                self.probe = None;
+                true
+            }
+            Some(Ok(Answer::Blocked { mode })) => {
+                tracing::debug!(%id, %mode, "a client started ahead is waiting for a key; retiring it");
+                false
+            }
+            Some(Err(e)) => {
+                tracing::debug!(%id, error = %e, "a client started ahead was refused; retiring it");
+                false
+            }
+        }
+    }
+
+    /// A started-ahead client's output, kept whole in `unshown`; why to retire
+    /// it, if it is to be (see [`keep_unshown`]).
+    fn keep_unshown_output(&mut self, chunk: &[u8]) -> Option<Retire> {
+        let unshown = self.unshown.get_or_insert_with(Vec::new);
+        let before = unshown.len();
+        unshown.extend_from_slice(chunk);
+        let leaving = leaves_alt_screen(&unshown[tail_from(before, ALT_SCREEN_LEAVE)..]);
+        let kept = unshown.len();
+        if leaving {
+            self.hang_up();
+            self.answer_device_attributes();
+            return Some(Retire::Finishing);
+        }
+        (kept > AHEAD_MAX).then_some(Retire::SaidTooMuch(kept))
+    }
+}
+
 /// The parked client's thread: read its output into the shadow and ledger
 /// until told to stop, then hand it back, or retire it.
 ///
@@ -1654,12 +1760,8 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
         if n > 0 && ready(&fds[1]) {
             match read_fd(master, &mut buf) {
                 Ok(len) if len > 0 => {
-                    let chunk = &buf[..len];
-                    attachment.saw_unrelayed(chunk);
-                    if asks_for_device_attributes(chunk) || leaves_alt_screen(chunk) {
+                    if !attachment.keep_parked_output(&buf[..len]) {
                         tracing::debug!(%id, "a parked client is finishing; retiring it");
-                        attachment.hang_up();
-                        attachment.answer_device_attributes();
                         return None;
                     }
                 }
@@ -1727,19 +1829,8 @@ fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachme
     let id = attachment.session_id.clone();
     let mut buf = [0u8; 8192];
     loop {
-        if let Some(probe) = attachment.probe.as_mut() {
-            match probe.wait(Duration::ZERO) {
-                None => {}
-                Some(Ok(Answer::Ready)) => attachment.probe = None,
-                Some(Ok(Answer::Blocked { mode })) => {
-                    tracing::debug!(%id, %mode, "a client started ahead is waiting for a key; retiring it");
-                    return None;
-                }
-                Some(Err(e)) => {
-                    tracing::debug!(%id, error = %e, "a client started ahead was refused; retiring it");
-                    return None;
-                }
-            }
+        if !attachment.kept_by_its_probe() {
+            return None;
         }
         let wait = if attachment.probe.is_some() {
             PROBE_POLL_MS
@@ -1760,28 +1851,21 @@ fn keep_unshown(mut attachment: Attachment, stop: UnixStream) -> Option<Attachme
         // The client first, as on a parked client's thread.
         if n > 0 && ready(&fds[1]) {
             match read_fd(master, &mut buf) {
-                Ok(len) if len > 0 => {
-                    let unshown = attachment.unshown.get_or_insert_with(Vec::new);
-                    let before = unshown.len();
-                    unshown.extend_from_slice(&buf[..len]);
-                    let leaving =
-                        leaves_alt_screen(&unshown[tail_from(before, ALT_SCREEN_LEAVE)..]);
-                    let kept = unshown.len();
-                    if leaving {
+                Ok(len) if len > 0 => match attachment.keep_unshown_output(&buf[..len]) {
+                    None => {}
+                    Some(Retire::Finishing) => {
                         tracing::debug!(%id, "a client started ahead is finishing; retiring it");
-                        attachment.hang_up();
-                        attachment.answer_device_attributes();
                         return None;
                     }
-                    if kept > AHEAD_MAX {
+                    Some(Retire::SaidTooMuch(bytes)) => {
                         tracing::debug!(
                             %id,
-                            bytes = kept,
+                            bytes,
                             "a client started ahead said too much before it was shown; retiring it"
                         );
                         return None;
                     }
-                }
+                },
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -2222,6 +2306,9 @@ fn spawn_client_with(
         dark: false,
         painted: None,
         to_float: None,
+        lit: false,
+        raw: None,
+        handing: None,
     })
 }
 
@@ -2325,43 +2412,72 @@ fn take_input_as_written(master: &Pty) {
     }
 }
 
+/// What a relay asks of the session loop, which holds the other sessions'
+/// clients.
+pub trait Others {
+    /// Called once with a switch's target as soon as [`pump`] returns it, so
+    /// the next client's fork and probe run under this session's fade out. It
+    /// must only start work and must not draw: the terminal is still raw with
+    /// this session on it. It returns the switch's landing card, if known,
+    /// which both fades leave standing ([`Attachment::take_left_standing`]).
+    fn begin_next(&mut self, target: Target) -> Option<card::Card>;
+
+    /// The live client held for a session, lent for the floating picker to
+    /// show its screen until [`Others::give_back`] or [`Others::hand_over`].
+    fn lend(&mut self, _session_id: &str) -> Option<Attachment> {
+        None
+    }
+
+    /// Hold a lent client again as it was held. Dropped, it is retired.
+    fn give_back(&mut self, _client: Attachment) {}
+
+    /// A lent client the picker switched to, its screen on the terminal
+    /// already: the next to relay (see [`Attachment::lit`]).
+    fn hand_over(&mut self, _client: Attachment) {}
+}
+
+/// A switch's `begin_next` alone, for relays that lend nothing.
+impl<F: FnMut(Target) -> Option<card::Card>> Others for F {
+    fn begin_next(&mut self, target: Target) -> Option<card::Card> {
+        self(target)
+    }
+}
+
 /// Relay bytes between the terminal and the child until interrupted.
 ///
 /// One thread and one `poll` over stdin, the master and the SIGWINCH pipe:
 /// two readers on one file description would split the stream, and a thread
 /// blocked in `read(0)` cannot be cancelled.
-///
-/// `begin_next` is called once with a switch's target as soon as [`pump`]
-/// returns it, so the next client's fork and probe run under this session's
-/// fade out. It must only start work and must not draw: the terminal is
-/// still raw with this session on it. It returns the switch's landing card,
-/// if known, which both fades leave standing
-/// ([`Attachment::take_left_standing`]).
 pub fn relay(
     mut attachment: Attachment,
     highest_session_num: u32,
-    begin_next: &mut dyn FnMut(Target) -> Option<card::Card>,
+    others: &mut dyn Others,
 ) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment.master.as_raw_fd();
 
     let winch = winch::Winch::install()?;
     // A client that has not painted yet, whose first paint can be held.
     let fresh = !attachment.resumed;
+    // Its screen is up already, so nothing clears it or fades it in.
+    let lit = std::mem::take(&mut attachment.lit);
     if attachment.resumed {
         // The client entered the alternate screen on its first relay and will
         // not re-enter it; on the primary screen, its last frame would stay
         // under the shell prompt after a detach. Not shown to the shadow,
         // whose screen is what fades back in. A picker's name comes off in the
         // same span, closed by the fade's first frame.
-        match attachment.hand_off.as_ref() {
-            Some(h) => term::enter_alt_screen_and_clear_after(&h.erase()),
-            None => term::enter_alt_screen_and_clear(),
+        if !lit {
+            match attachment.hand_off.as_ref() {
+                Some(h) => term::enter_alt_screen_and_clear_after(&h.erase()),
+                None => term::enter_alt_screen_and_clear(),
+            }
         }
     } else {
         // Normally done by whoever handed over the terminal; this is a
         // backstop. Skipped if the picker left a name up: the first paint
-        // takes it down (see `release_hold`).
-        if attachment.hand_off.is_none() {
+        // takes it down (see `release_hold`). If the picker left the session
+        // itself up, the release writes it in the paint's update instead.
+        if attachment.hand_off.is_none() && !(lit && attachment.shadow.is_some()) {
             term::leave_alt_screen_and_clear();
         }
         // A client started ahead was sized at startup; resize it before its
@@ -2379,7 +2495,10 @@ pub fn relay(
         }
         attachment.shadow_saw(term::HANDOVER);
     }
-    let mut raw = term::RawMode::enter()?;
+    let mut raw = match attachment.raw.take() {
+        Some(raw) => raw,
+        None => term::RawMode::enter()?,
+    };
 
     // Whether the screen faded in from the shadow on a resume; lets the
     // notice go up over a quiet kept session.
@@ -2443,11 +2562,11 @@ pub fn relay(
                 .shadow
                 .as_ref()
                 .is_some_and(shadow::Shadow::has_contents);
-        dissolved = !attachment.dark && attachment.dissolve_in();
+        dissolved = !attachment.dark && !lit && attachment.dissolve_in();
         // Off the primary screen since the switch; on the session's only if
         // the fade drew it.
         let carried = attachment.hand_off.take().is_some();
-        let on_screen = attachment.dark || dissolved || attachment.paint_kept_screen();
+        let on_screen = attachment.dark || dissolved || attachment.paint_kept_screen(lit);
         if !on_screen {
             // Close the span the switch opened, which no fade frame closed.
             if carried {
@@ -2485,6 +2604,8 @@ pub fn relay(
     attachment.crawling = false;
     if fresh && attachment.shadow.is_some() {
         attachment.hold = Some(Hold::new(Instant::now()));
+        // For the release (see `release_hold`).
+        attachment.lit = lit;
     }
 
     // Announced by a card the client draws (see `crate::card`). The old
@@ -2503,6 +2624,7 @@ pub fn relay(
         popup,
         dissolved,
         erasing,
+        others,
     );
     // Cleared whether or not shown: this client may come straight back.
     attachment.announce = None;
@@ -2517,12 +2639,16 @@ pub fn relay(
         ledger.left_the_terminal();
     }
 
+    // The session the floating picker undimmed in place of this one, which
+    // needs nothing begun, stood, faded or cleared for it.
+    let handing = attachment.handing.take();
     // As early as possible, so the caller's work runs under the fade.
     let landing = outcome
         .as_ref()
         .ok()
+        .filter(|_| handing.is_none())
         .and_then(|o| o.switch_target())
-        .and_then(begin_next);
+        .and_then(|target| others.begin_next(target));
 
     // However the relay ended, nothing the client wrote may stay unshown.
     if let Err(e) = attachment.stop_watching_the_terminal() {
@@ -2545,6 +2671,13 @@ pub fn relay(
             | Outcome::Resettle
             | Outcome::Switch(_)),
         ) => {
+            // Raw mode stays on into its relay: its screen is up, so a key
+            // typed meanwhile would be echoed over it, or be a signal.
+            if let Some(mut next) = handing {
+                next.raw = Some(raw);
+                others.hand_over(*next);
+                return Ok((held, Some(attachment)));
+            }
             // Fade out before restoring modes (so a key typed meanwhile is not
             // echoed) and before the hand-off, which erases with the last
             // frame's colour. A switch first has the client draw the landing
@@ -2615,6 +2748,7 @@ pub fn relay(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pump(
     attachment: &mut Attachment,
     master_fd: RawFd,
@@ -2623,6 +2757,7 @@ fn pump(
     mut popup: Option<announce::Popup>,
     dissolved: bool,
     mut erasing: Option<Erasing>,
+    others: &mut dyn Others,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let mut keys = crate::config::get().keys;
@@ -2664,7 +2799,7 @@ fn pump(
         // Float pending settings or picker once the screen is back, before
         // reading keys, so keys typed meanwhile go to them.
         if let Some(outcome) = attachment.to_float.filter(|_| attachment.screen_is_back()) {
-            if let Some(outcome) = float_over(attachment, master_fd, winch, outcome)? {
+            if let Some(outcome) = float_over(attachment, master_fd, winch, outcome, others)? {
                 return Ok(outcome);
             }
             // Re-read what they may have changed, as after `<prefix> ,` below.
@@ -2893,13 +3028,14 @@ fn pump(
                             // `<prefix> ,`, `?`, `Space` or `c`: float the
                             // panel and return here, unless it cannot float or
                             // leads to the session loop.
-                            let outcome = match float_over(attachment, master_fd, winch, outcome)? {
-                                Some(outcome) => outcome,
-                                None => {
-                                    floated = true;
-                                    continue;
-                                }
-                            };
+                            let outcome =
+                                match float_over(attachment, master_fd, winch, outcome, others)? {
+                                    Some(outcome) => outcome,
+                                    None => {
+                                        floated = true;
+                                        continue;
+                                    }
+                                };
                             // With unsaved settings, a detach asks first.
                             if outcome == Outcome::Detached {
                                 let unsaved =
@@ -3189,11 +3325,12 @@ fn float_over(
     master_fd: RawFd,
     winch: &winch::Winch,
     outcome: Outcome,
+    others: &mut dyn Others,
 ) -> Result<Option<Outcome>> {
     attachment.to_float = None;
     match panel::What::of(outcome, config::get().style.float) {
         Some(what) => {
-            let floated = panel::float(attachment, master_fd, winch, what);
+            let floated = panel::float(attachment, master_fd, winch, what, others);
             // However it went, drop what its frames were diffed against.
             if let Some(copy) = attachment.copy() {
                 copy.forget_under();
@@ -4224,10 +4361,27 @@ mod tests {
             .collect()
     }
 
+    /// Over its own screen, left up by the picker: the clear a first relay
+    /// writes up front goes in with the paint, so it is never shown alone.
+    #[test]
+    fn a_first_paint_released_over_its_own_screen_takes_the_clear_with_it() {
+        let paint = b"\x1b[?1049h\x1b[1;1Hone";
+        let out = replay(term::handover_in_span(), paint);
+        let front = [fade::SYNC_BEGIN, term::handover_in_span(), paint].concat();
+        assert!(
+            out.starts_with(&front),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(memmem::find_iter(&out, fade::SYNC_END).count(), 1);
+        assert!(term::HANDOVER.ends_with(term::handover_in_span()));
+        assert_eq!(shown(&out)[0], "one");
+    }
+
     #[test]
     fn a_finished_first_paint_is_let_through_in_one_update() {
         let paint = b"\x1b[?2026h\x1b[1;1Hone\x1b[?2026l\x1b[?2026h\x1b[2;1Htwo\x1b[?2026l";
-        let out = replay(paint);
+        let out = replay(&[], paint);
         assert!(out.starts_with(fade::SYNC_BEGIN) && out.ends_with(fade::SYNC_END));
         assert_eq!(memmem::find_iter(&out, fade::SYNC_END).count(), 1);
         assert_eq!(shown(&out)[..2], ["one", "two"]);
@@ -4240,7 +4394,7 @@ mod tests {
         let done = b"\x1b[?2026h\x1b[1;1Hdrawn\x1b[?2026l";
         let open = b"\x1b[?2026h\x1b[2;1H\x1b[38;2;207;2";
         let rest = b"07;207mnext\x1b[?2026l";
-        let out = replay(&[&done[..], &open[..]].concat());
+        let out = replay(&[], &[&done[..], &open[..]].concat());
         assert_eq!(
             shown(&[&out[..], &rest[..]].concat())[..2],
             ["drawn", "next"]
@@ -4265,7 +4419,7 @@ mod tests {
                 "drawn \u{2502}on",
             ),
         ] {
-            let out = replay(paint);
+            let out = replay(&[], paint);
             let close = memmem::find(&out, fade::SYNC_END).expect("closed");
             assert!(
                 paint.ends_with(&out[close + fade::SYNC_END.len()..]),
@@ -5228,6 +5382,76 @@ mod tests {
         assert!(settle_parked(&held), "a client past the bound was kept");
         assert!(held.unpark().is_none());
         assert!(reaped(pid), "and it was not reaped");
+    }
+
+    /// The rules the client's thread follows, which a lent client is read by
+    /// too (see `panel`).
+    #[test]
+    fn a_client_out_of_sight_is_let_go_by_what_it_says() {
+        let mut parked = kept("exec sleep 30");
+        assert!(parked.keep_parked_output(b"\x1b[1;1Hdrawn"));
+        assert!(
+            !parked.keep_parked_output(b"\x1b[c"),
+            "exiting or suspending"
+        );
+
+        let mut ahead = kept("exec sleep 30");
+        assert_eq!(ahead.keep_unshown_output(b"drawn\x1b[?10"), None);
+        assert_eq!(
+            ahead.keep_unshown_output(b"49l"),
+            Some(Retire::Finishing),
+            "leaving the alternate screen across two reads"
+        );
+        assert_eq!(ahead.unshown.as_deref(), Some(&b"drawn\x1b[?1049l"[..]));
+
+        let mut chatty = kept("exec sleep 30");
+        let much = vec![b'x'; AHEAD_MAX + 1];
+        assert_eq!(
+            chatty.keep_unshown_output(&much),
+            Some(Retire::SaidTooMuch(AHEAD_MAX + 1))
+        );
+    }
+
+    /// Lent to the floating picker and given back over and over before its
+    /// first visit, it still has all it said to replay then.
+    #[test]
+    fn a_client_started_ahead_keeps_what_it_said_across_lendings() {
+        let mut held = kept("printf before; sleep 0.3; printf after; exec sleep 30")
+            .start_ahead(None)
+            .expect("held");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let lent = held.unpark().expect("lent");
+            let said = lent.unshown.clone().unwrap_or_default();
+            assert!(
+                b"beforeafter".starts_with(&said),
+                "{:?}",
+                String::from_utf8_lossy(&said)
+            );
+            if said == b"beforeafter" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "it never said it all");
+            held = lent.start_ahead(None).expect("held again");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Or a resume after the picker showed it would not put back the modes
+    /// another session's exit turned off.
+    #[test]
+    fn parked_again_a_client_still_counts_the_exits_it_missed() {
+        let mut a = kept("printf r; exec sleep 30");
+        wait_until_ready(&a);
+        a.exits_seen = u64::MAX;
+        let back = a.park_again().expect("parked").unpark().expect("back");
+        assert_eq!(back.exits_seen, u64::MAX);
+        let back = back.park().expect("parked").unpark().expect("back");
+        assert_ne!(
+            back.exits_seen,
+            u64::MAX,
+            "leaving the front, it counts afresh"
+        );
     }
 
     /// A session with room keeps it and drops the probe; too many UIs or a key

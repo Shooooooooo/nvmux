@@ -315,6 +315,11 @@ pub fn enter_alt_screen_and_clear() {
 const SPAN_BEGIN: &[u8] = b"\x1b[?2026h";
 const SPAN_END: &[u8] = b"\x1b[?2026l";
 
+/// [`HANDOVER`] for inside a synchronized update the caller opened.
+pub(crate) fn handover_in_span() -> &'static [u8] {
+    &HANDOVER[SPAN_END.len()..]
+}
+
 /// [`leave_alt_screen_and_clear`] with `keep` drawn in the same synchronized
 /// update, so the clear is never shown without it. For the picker's hand-off
 /// name (see [`crate::handoff`]).
@@ -326,7 +331,7 @@ fn leaving_keeping(keep: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HANDOVER.len() + keep.len() + 2 * SPAN_BEGIN.len());
     out.extend_from_slice(SPAN_END);
     out.extend_from_slice(SPAN_BEGIN);
-    out.extend_from_slice(&HANDOVER[SPAN_END.len()..]);
+    out.extend_from_slice(handover_in_span());
     out.extend_from_slice(keep);
     out.extend_from_slice(SPAN_END);
     out

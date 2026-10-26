@@ -81,6 +81,12 @@ pub trait Floating {
         None
     }
 
+    /// The session to show behind the panel in place of the one it floats
+    /// over: the picker's cursor row.
+    fn preview(&self) -> Option<&str> {
+        None
+    }
+
     /// Whether it wants to close without a key or mouse event: the picker
     /// once a half-typed number times out, or once the gap `c` opened is up.
     fn closing(&self) -> bool {

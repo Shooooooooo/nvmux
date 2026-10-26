@@ -19,13 +19,19 @@
 //! on while it is up; a press on the session (outside the panel and its hint
 //! row) closes it, like `Esc`.
 //!
+//! Behind the picker is the session its cursor is on ([`Floating::preview`]):
+//! its client, lent by the session loop and read here as its own thread
+//! would ([`Glimpse`]), or nothing if it has none running.
+//!
 //! It comes and goes over nvmux's fade like a card: the session dims, then
-//! the panel and its hint row rise. From the picker ([`Leave`]), a switch
-//! fades panel and session out together; the help, settings or a prompt
-//! replace the picker over the dimmed session and return to it when closed.
-//! Settings switched to float from full screen, and the picker back from a
-//! full-screen prompt ([`Attachment::float_the_picker`]), come up with the
-//! session out of the background.
+//! the panel and its hint row rise. From the picker ([`Leave`]), a switch to
+//! the session shown undims it where it is, and the relay hands its client
+//! over to be relayed next; any other switch fades panel and session out
+//! together. The help, settings or a prompt replace the picker over the
+//! dimmed session and return to it when closed. Settings switched to float
+//! from full screen, and the picker back from a full-screen prompt
+//! ([`Attachment::float_the_picker`]), come up with the session out of the
+//! background.
 //!
 //! Without the terminal's colours the session is drawn faint on a blank
 //! margin, with no fade. A terminal too small ([`Floating::area`]), no copy
@@ -40,8 +46,8 @@ use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
 use super::{
-    pollfd, read_fd, ready, take_step, unsynced, Attachment, Outcome, Target, FRAME_WAIT,
-    SEQUENCE_TIMEOUT,
+    pollfd, pty_size, read_fd, ready, take_step, unsynced, Attachment, Others, Outcome, PtySize,
+    Target, ALT_SCREEN_ENTER, FRAME_WAIT, SEQUENCE_TIMEOUT,
 };
 use crate::boundary::Boundary;
 use crate::error::{NvmuxError, Result};
@@ -189,6 +195,9 @@ enum Way {
     Away,
     /// Out alone, replaced by another panel over the session.
     Across(What),
+    /// Into the session the picker shows behind it ([`Glimpse`]), which
+    /// undims where it is and is relayed next.
+    Into,
 }
 
 impl Way {
@@ -204,15 +213,22 @@ impl Way {
     }
 
     /// As `leave` says (see [`Way::of`]), but out with the session if
-    /// `[style] float` was turned off, and across to a set-aside picker
-    /// instead of back.
-    fn going(leave: Option<Leave>, picker_under: bool, unfloated: bool) -> Self {
+    /// `[style] float` was turned off, across to a set-aside picker instead
+    /// of back, and into the session `shown` behind the panel, if it can be
+    /// handed over, instead of away to it.
+    fn going(
+        leave: Option<Leave>,
+        picker_under: bool,
+        unfloated: bool,
+        shown: Option<&str>,
+    ) -> Self {
         if unfloated {
             return Way::Away;
         }
-        match Way::of(leave) {
-            Way::Back if picker_under => Way::Across(What::Picker),
-            way => way,
+        match (Way::of(leave), leave) {
+            (Way::Back, _) if picker_under => Way::Across(What::Picker),
+            (Way::Away, Some(Leave::Switch(id))) if shown == Some(id.as_str()) => Way::Into,
+            (way, _) => way,
         }
     }
 }
@@ -262,6 +278,142 @@ impl Coming {
     }
 }
 
+/// The session under the picker's cursor, shown behind the panel in place of
+/// the one it floats over: its client, lent by the session loop
+/// ([`Others::lend`]) and read here as its thread would.
+struct Glimpse {
+    client: Attachment,
+    /// A started-ahead client's output parsed: its own copy waits for its
+    /// first relay, which replays all of it.
+    copy: Option<Shadow>,
+}
+
+impl Glimpse {
+    /// Resized to `size`, as a parked pty never is. A parked client comes out
+    /// of its crawl, so its screen keeps up; one started ahead keeps all it
+    /// writes until its first visit, so it stays at its crawl unless it must
+    /// redraw at a new size.
+    fn open(client: Attachment, size: PtySize) -> Self {
+        let copy = client.unshown.as_deref().map(|said| {
+            let at = pty_size(&client.master).unwrap_or(size);
+            let mut copy = Shadow::new(at.rows, at.cols);
+            copy.feed(said);
+            copy
+        });
+        let mut glimpse = Self { client, copy };
+        glimpse.resize_to(size);
+        if !glimpse.client.started_ahead() {
+            glimpse.come_back();
+        }
+        glimpse
+    }
+
+    fn fd(&self) -> RawFd {
+        self.client.master.as_raw_fd()
+    }
+
+    /// Only `Clear` ends the crawl (see `card::Command::Away`); it also drops
+    /// cards left on its screen, such as an old landing card.
+    fn come_back(&mut self) {
+        if std::mem::take(&mut self.client.away) {
+            self.client.tell_client(&card::Command::Clear);
+            self.client.crawling = false;
+        }
+    }
+
+    fn resize_to(&mut self, size: PtySize) {
+        let was = pty_size(&self.client.master);
+        let resized = was != Some(size);
+        self.client.resize_to(size);
+        if let Some(copy) = self.copy.as_mut() {
+            copy.resize(size.rows, size.cols);
+        }
+        // Untold (its input full), it keeps its old size: so does the pty,
+        // or its resume would find nothing to tell it.
+        if !self.client.tell_its_size(size, resized) {
+            if let Some(was) = was {
+                let _ = self.client.master.resize(was.into());
+            }
+        }
+        if resized {
+            self.come_back();
+        }
+    }
+
+    /// Read what it wrote if `readable`, and look at a started-ahead client's
+    /// probe, as its thread would. `false` once it has gone or is to be
+    /// retired: it then goes back for its thread to see to.
+    fn keep(&mut self, readable: bool, buf: &mut [u8]) -> bool {
+        if !self.client.kept_by_its_probe() {
+            self.client.hang_up();
+            return false;
+        }
+        !readable || self.read(buf)
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> bool {
+        match read_fd(self.fd(), buf) {
+            Ok(len) if len > 0 => {
+                let chunk = &buf[..len];
+                if !self.client.started_ahead() {
+                    return self.client.keep_parked_output(chunk);
+                }
+                if let Some(copy) = self.copy.as_mut() {
+                    copy.feed(chunk);
+                }
+                let retired = self.client.keep_unshown_output(chunk).is_some();
+                if retired {
+                    // As its thread would retire it: given back, it is found
+                    // gone.
+                    self.client.hang_up();
+                }
+                !retired
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                true
+            }
+            // EOF on macOS, EIO on Linux: the client has gone.
+            _ => false,
+        }
+    }
+
+    fn copy(&mut self) -> Option<&mut Shadow> {
+        match self.copy.as_mut() {
+            Some(copy) => Some(copy),
+            None => self.client.copy(),
+        }
+        .filter(|copy| copy.is_usable())
+    }
+
+    /// A started-ahead client's ledger has seen nothing; its copy has.
+    fn mouse(&mut self) -> MouseReporting {
+        match self.copy.as_ref() {
+            Some(copy) => copy.mouse().unwrap_or(MouseReporting::Buttons),
+            None => session_mouse(&mut self.client),
+        }
+    }
+
+    /// Whether `Enter` can bring it in where it is: it has a screen, and a
+    /// started-ahead client's probe has answered.
+    fn can_be_handed_over(&mut self) -> bool {
+        self.client.probe.is_none() && self.copy().is_some()
+    }
+
+    /// Back to the session loop as it was lent.
+    fn close(mut self, others: &mut dyn Others) {
+        // As after any floating screen, which it was painted under.
+        if let Some(copy) = self.client.copy() {
+            copy.forget_under();
+        }
+        others.give_back(self.client);
+    }
+}
+
 /// Float `what` over the session until it closes. Returns `None` to go on
 /// relaying, or how the relay ends: full screen, client or terminal gone,
 /// clients to settle after `client.ui` or `client.per_session` changed (see
@@ -271,12 +423,31 @@ pub(super) fn float(
     master_fd: RawFd,
     winch: &winch::Winch,
     what: What,
+    others: &mut dyn Others,
+) -> Result<Option<Outcome>> {
+    let mut glimpse = None;
+    let floated = float_with(a, master_fd, winch, what, others, &mut glimpse);
+    // However it ended, a client still lent goes back.
+    if let Some(glimpse) = glimpse {
+        glimpse.close(others);
+    }
+    floated
+}
+
+/// [`float`], showing the session under the picker's cursor in `glimpse`.
+fn float_with(
+    a: &mut Attachment,
+    master_fd: RawFd,
+    winch: &winch::Winch,
+    what: What,
+    others: &mut dyn Others,
+    glimpse: &mut Option<Glimpse>,
 ) -> Result<Option<Outcome>> {
     let mut what = what;
     let mut panel = what.open(&a.session_id);
     // The picker, set aside while a panel it went across to is up.
     let mut under: Option<Box<dyn Floating>> = None;
-    let size = term::terminal_size();
+    let mut size = term::terminal_size();
     let mut screen = Rect::new(0, 0, size.cols, size.rows);
     let Some(mut area) = panel.area(screen) else {
         return Ok(Some(what.full_screen()));
@@ -322,6 +493,11 @@ pub(super) fn float(
     let mut drawn_away = 0.0;
     let mut sequence_due: Option<Instant> = None;
     let stdin_fd = std::io::stdin().as_raw_fd();
+    // The session under the picker's cursor, if not the one floated over,
+    // whether or not a client could be lent to show it.
+    let mut wanted: Option<String> = None;
+    // What the session area shows changed: the next frame paints it whole.
+    let mut fresh_behind = false;
 
     loop {
         let now = Instant::now();
@@ -343,7 +519,13 @@ pub(super) fn float(
                 .div_ceil(1000)
                 .min(super::IDLE_POLL_MS as u128) as libc::c_int
         });
-        let mut fds = [pollfd(stdin_fd), pollfd(master_fd), pollfd(winch.fd())];
+        // Without a glimpse its fd is -1, which `poll` skips.
+        let mut fds = [
+            pollfd(stdin_fd),
+            pollfd(master_fd),
+            pollfd(winch.fd()),
+            pollfd(glimpse.as_ref().map_or(-1, Glimpse::fd)),
+        ];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -368,10 +550,28 @@ pub(super) fn float(
             }
         }
 
+        let readable = n > 0 && ready(&fds[3]);
+        if glimpse
+            .as_mut()
+            .is_some_and(|g| !g.keep(readable, &mut buf))
+        {
+            if let Some(gone) = glimpse.take() {
+                gone.close(others);
+            }
+            fresh_behind = true;
+            owed = true;
+        } else if readable {
+            owed = true;
+            session_drew = true;
+        }
+
         if n > 0 && ready(&fds[2]) {
             winch.drain();
-            let size = term::terminal_size();
+            size = term::terminal_size();
             a.resize_to(size);
+            if let Some(g) = glimpse.as_mut() {
+                g.resize_to(size);
+            }
             screen = Rect::new(0, 0, size.cols, size.rows);
             (_, hints) = float::split(screen);
             match panel.area(screen) {
@@ -382,7 +582,7 @@ pub(super) fn float(
                 // Too small now: restore the session and go full screen.
                 None => {
                     panel.close();
-                    put_back(a, master_fd, &mut held, &mut boundary)?;
+                    put_back(a, master_fd, &mut held, &mut boundary, None)?;
                     return Ok(Some(what.full_screen()));
                 }
             }
@@ -442,18 +642,55 @@ pub(super) fn float(
         }
         // Just closed: start the way out from wherever the way in got to.
         if going && !was_going {
-            way = Way::going(panel.leave(), under.is_some(), unfloated);
+            let shown = glimpse
+                .as_mut()
+                .and_then(|g| g.can_be_handed_over().then(|| g.client.session_id.clone()));
+            way = Way::going(panel.leave(), under.is_some(), unfloated, shown.as_deref());
             let there = coming.at(now);
             let length = fade_length(look);
             match way {
-                Way::Back => coming = Coming::to(there, 0.0, length, now),
+                // The panel goes, then the session undims.
+                Way::Back | Way::Into => coming = Coming::to(there, 0.0, length, now),
                 // Panel and session fade out together over what is left.
                 Way::Away => away = Coming::to(away.at(now), 1.0, length, now),
                 // The session finishes dimming and stays so for the next.
                 Way::Across(_) => coming = Coming::to(there, 0.5, length, now),
             }
         }
+        // Behind the panel, the session under the picker's cursor (the
+        // set-aside one's under the help, settings or a prompt). Held once
+        // going, but on the way back to the session floated over.
+        let cursor = if !going {
+            panel
+                .preview()
+                .or_else(|| under.as_ref().and_then(|picker| picker.preview()))
+                .filter(|id| *id != a.session_id)
+        } else if way == Way::Back {
+            None
+        } else {
+            wanted.as_deref()
+        };
+        if cursor != wanted.as_deref() {
+            wanted = cursor.map(str::to_string);
+            if let Some(gone) = glimpse.take() {
+                gone.close(others);
+            }
+            *glimpse = wanted
+                .as_deref()
+                .and_then(|id| others.lend(id))
+                .map(|client| Glimpse::open(client, size));
+            fresh_behind = true;
+            owed = true;
+        }
+        // Gone before it could be handed over: out with the session instead.
+        if way == Way::Into && glimpse.is_none() {
+            way = Way::Away;
+            away = Coming::to(away.at(now), 1.0, fade_length(look), now);
+        }
         tell_the_client(a);
+        if let Some(g) = glimpse.as_mut() {
+            tell_the_client(&mut g.client);
+        }
 
         let moving = !coming.done(now) || !away.done(now);
         if going && !moving {
@@ -486,7 +723,7 @@ pub(super) fn float(
                     match panel.area(screen) {
                         Some(fits) => area = fits,
                         None => {
-                            put_back(a, master_fd, &mut held, &mut boundary)?;
+                            put_back(a, master_fd, &mut held, &mut boundary, None)?;
                             return Ok(Some(what.full_screen()));
                         }
                     }
@@ -500,13 +737,14 @@ pub(super) fn float(
                 // mode; the relay has nothing left to dissolve.
                 Way::Away => {
                     let painted = paint(
-                        a,
+                        behind(a, glimpse, &held, fresh_behind),
                         look,
                         panel.as_mut(),
                         area,
                         hints,
                         coming.to,
                         1.0,
+                        false,
                         &mut held,
                         &mut boundary,
                     )?;
@@ -516,7 +754,16 @@ pub(super) fn float(
                     write_stdout(term::mouse_reporting_bytes(session_mouse(a)))?;
                     a.dark = true;
                 }
-                Way::Back => put_back(a, master_fd, &mut held, &mut boundary)?,
+                Way::Back => put_back(a, master_fd, &mut held, &mut boundary, None)?,
+                // Put back as the session floated over would be, then the
+                // relay hands it over (see `relay`).
+                Way::Into => {
+                    if let Some(mut chosen) = glimpse.take() {
+                        put_back(a, master_fd, &mut held, &mut boundary, Some(&mut chosen))?;
+                        chosen.client.lit = true;
+                        a.handing = Some(Box::new(chosen.client));
+                    }
+                }
             }
             if unfloated {
                 return Ok(Some(what.full_screen()));
@@ -538,19 +785,23 @@ pub(super) fn float(
             }
             let there = coming.at(now);
             let gone = away.at(now);
+            // A row with no client to show it by.
+            let blank = wanted.is_some() && glimpse.as_mut().and_then(Glimpse::copy).is_none();
             if paint(
-                a,
+                behind(a, glimpse, &held, fresh_behind),
                 look,
                 panel.as_mut(),
                 area,
                 hints,
                 there,
                 gone,
+                blank,
                 &mut held,
                 &mut boundary,
             )? {
                 owed = false;
                 session_drew = false;
+                fresh_behind = false;
                 drawn_at = there;
                 drawn_away = gone;
             }
@@ -576,11 +827,16 @@ fn way_in(dark: bool, length: Duration, now: Instant) -> (Coming, Coming) {
 }
 
 /// Eased levels for a frame `there` of the way in and `away` of the way out:
-/// (panel text, session dimming, whole-session fade to the background).
-fn levels(there: f32, away: f32) -> (f32, f32, f32) {
+/// (panel text, session dimming, whole-session fade to the background). With
+/// nothing to show behind the panel (`blank`), the session is all background.
+fn levels(there: f32, away: f32, blank: bool) -> (f32, f32, f32) {
     let away = falloff::ease(away);
     let text = falloff::ease(there * 2.0 - 1.0) * (1.0 - away);
-    (text, falloff::ease(there * 2.0), away)
+    (
+        text,
+        falloff::ease(there * 2.0),
+        if blank { 1.0 } else { away },
+    )
 }
 
 /// The whole way in (session dims, then panel rises):
@@ -632,16 +888,18 @@ fn hold(a: &mut Attachment, chunk: &[u8], held: &mut Vec<u8>, boundary: &mut Bou
 
 /// Write a frame (`there` of the way in, `away` of the way out) if one can
 /// go out now (see [`frame_bytes`]); returns whether it did. The hint row at
-/// `hints` fades with the panel.
+/// `hints` fades with the panel. `copy` is the session behind it (see
+/// [`levels`] for `blank`).
 #[allow(clippy::too_many_arguments)]
 fn paint(
-    a: &mut Attachment,
+    copy: Option<&mut Shadow>,
     look: Look,
     panel: &mut dyn Floating,
     area: Rect,
     hints: Rect,
     there: f32,
     away: f32,
+    blank: bool,
     held: &mut Vec<u8>,
     boundary: &mut Boundary,
 ) -> Result<bool> {
@@ -654,7 +912,7 @@ fn paint(
         }
         return Ok(false);
     }
-    let (text, dim, away) = levels(there, away);
+    let (text, dim, away) = levels(there, away, blank);
     let laid: Vec<Laid> = (text > 0.0)
         .then(|| [panel.draw(area), panel.draw_hints(hints)])
         .into_iter()
@@ -666,7 +924,7 @@ fn paint(
             Laid::from_buffer(&buf)
         })
         .collect();
-    let Some(copy) = a.copy() else {
+    let Some(copy) = copy else {
         return Ok(false);
     };
     let Some(out) = frame_bytes(copy, look, &laid, area, hints, dim, away, held, boundary) else {
@@ -675,6 +933,25 @@ fn paint(
     write_stdout(&out)?;
     held.clear();
     Ok(true)
+}
+
+/// The copy to paint behind the panel: the glimpse's, else the session
+/// floated over's. Painted whole if `fresh`, or if it is the glimpse's and
+/// `held` goes out first: the glimpse is not fed the front session's bytes.
+fn behind<'s>(
+    a: &'s mut Attachment,
+    glimpse: &'s mut Option<Glimpse>,
+    held: &[u8],
+    fresh: bool,
+) -> Option<&'s mut Shadow> {
+    let (copy, glimpsed) = match glimpse.as_mut().and_then(Glimpse::copy) {
+        Some(copy) => (copy, true),
+        None => (a.copy()?, false),
+    };
+    if fresh || (glimpsed && !held.is_empty()) {
+        copy.invalidate();
+    }
+    Some(copy)
 }
 
 fn on_the_session(area: Rect, hints: Rect, column: u16, row: u16) -> bool {
@@ -718,15 +995,21 @@ fn frame_bytes(
 /// then every cell repainted with the session's mouse, pen and cursor, in one
 /// update. A client mid-sequence gets up to [`FRAME_WAIT`] to finish it (as on
 /// resume), since the paint must go between its sequences.
+///
+/// The session is `onto`'s if given, to be handed over: then `a`, which
+/// writes here no more, is not waited for, and a sequence it left unfinished
+/// is dropped (its copy and ledger have it), or it would run into the next
+/// session's bytes.
 fn put_back(
     a: &mut Attachment,
     master_fd: RawFd,
     held: &mut Vec<u8>,
     boundary: &mut Boundary,
+    mut onto: Option<&mut Glimpse>,
 ) -> Result<()> {
     let deadline = Instant::now() + FRAME_WAIT;
     let mut buf = [0u8; 8192];
-    while boundary.mid_sequence() || boundary.keeping() {
+    while onto.is_none() && (boundary.mid_sequence() || boundary.keeping()) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             break;
@@ -742,10 +1025,24 @@ fn put_back(
             _ => break,
         }
     }
-    let unfinished = boundary.give_up();
-    let mouse = session_mouse(a);
-    let out = put_back_bytes(a.copy().as_deref(), held, mouse, &unfinished);
-    if let Some(copy) = a.copy() {
+    let mut unfinished = boundary.give_up();
+    // The resume this replaces would have put the terminal on the alternate
+    // screen.
+    let mut enter_alt = false;
+    let mouse = match onto.as_deref_mut() {
+        Some(glimpse) => {
+            unfinished.clear();
+            enter_alt = !a.copy().is_some_and(|c| c.on_alternate_screen());
+            glimpse.mouse()
+        }
+        None => session_mouse(a),
+    };
+    let copy = match onto {
+        Some(glimpse) => glimpse.copy(),
+        None => a.copy(),
+    };
+    let out = put_back_bytes(copy.as_deref(), held, mouse, enter_alt, &unfinished);
+    if let Some(copy) = copy {
         copy.invalidate();
     }
     held.clear();
@@ -763,19 +1060,24 @@ fn session_mouse(a: &mut Attachment) -> MouseReporting {
         .unwrap_or(MouseReporting::Buttons)
 }
 
-/// The bytes that restore the session: `held` (sync closes removed), its
-/// `mouse`, and a full repaint of `copy` with its pen and cursor, ending the
-/// update. Then `unfinished`, a sequence the client left incomplete past
-/// [`put_back`]'s wait: last, so its rest follows it and the paint is not
-/// written into its middle (the copy has not drawn it either).
+/// The bytes that restore the session: `held` (sync closes removed), the
+/// alternate screen if `enter_alt`, its `mouse`, and a full repaint of `copy`
+/// with its pen and cursor, ending the update. Then `unfinished`, a sequence
+/// the client left incomplete past [`put_back`]'s wait: last, so its rest
+/// follows it and the paint is not written into its middle (the copy has not
+/// drawn it either).
 fn put_back_bytes(
     copy: Option<&Shadow>,
     held: &[u8],
     mouse: MouseReporting,
+    enter_alt: bool,
     unfinished: &[u8],
 ) -> Vec<u8> {
     let mut out = fade::SYNC_BEGIN.to_vec();
     out.extend_from_slice(&unsynced(held));
+    if enter_alt {
+        out.extend_from_slice(ALT_SCREEN_ENTER);
+    }
     out.extend_from_slice(term::mouse_reporting_bytes(mouse));
     match copy {
         Some(copy) => out.extend_from_slice(&copy.paint()),
@@ -985,7 +1287,7 @@ mod tests {
         let mut copy = Shadow::new(24, 80);
         copy.feed(b"\x1b[1;1Hhello\x1b[?2026l\x1b]2;tit");
         let held = b"\x1b[1;1Hhello\x1b[?2026l";
-        let out = put_back_bytes(Some(&copy), held, MouseReporting::Off, b"\x1b]2;tit");
+        let out = put_back_bytes(Some(&copy), held, MouseReporting::Off, false, b"\x1b]2;tit");
         let front = [fade::SYNC_BEGIN, b"\x1b[1;1Hhello"].concat();
         assert!(
             out.starts_with(&front),
@@ -1065,7 +1367,8 @@ mod tests {
         let whole = Duration::from_millis(200);
         let panel = Rect::new(24, 6, 72, 23);
         let look = Look::Dimmed(palette());
-        let frame = |(coming, away): (Coming, Coming), at| levels(coming.at(at), away.at(at));
+        let frame =
+            |(coming, away): (Coming, Coming), at| levels(coming.at(at), away.at(at), false);
 
         let dark = way_in(true, whole, t0);
         let (text, dim, away) = frame(dark, t0);
@@ -1133,20 +1436,46 @@ mod tests {
     /// turned off, out with the session.
     #[test]
     fn the_help_the_settings_and_the_prompts_go_back_to_the_picker() {
-        assert_eq!(Way::going(None, true, false), Way::Across(What::Picker));
-        assert_eq!(Way::going(None, false, false), Way::Back);
-        assert_eq!(Way::going(None, true, true), Way::Away);
-        assert_eq!(Way::going(None, false, true), Way::Away);
+        assert_eq!(
+            Way::going(None, true, false, None),
+            Way::Across(What::Picker)
+        );
+        assert_eq!(Way::going(None, false, false, None), Way::Back);
+        assert_eq!(Way::going(None, true, true, None), Way::Away);
+        assert_eq!(Way::going(None, false, true, None), Way::Away);
         let id = crate::ids::Id::new("abcd2345").expect("an id");
         assert_eq!(
-            Way::going(Some(Leave::Switch(id)), true, false),
+            Way::going(Some(Leave::Switch(id)), true, false, None),
             Way::Away,
             "a prompt that made a session goes to it"
         );
         for leave in [Leave::Help, Leave::Settings, Leave::Switch(id), Leave::Quit] {
             assert_eq!(
-                Way::going(Some(leave), false, false),
+                Way::going(Some(leave), false, false, None),
                 Way::of(Some(leave)),
+                "{leave:?}"
+            );
+        }
+    }
+
+    /// Any other switch leaves as before: a row with nothing shown, or a
+    /// number naming another row.
+    #[test]
+    fn a_switch_goes_into_the_session_shown_behind_the_picker() {
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
+        let to = Some(Leave::Switch(id));
+        assert_eq!(Way::going(to, false, false, Some("abcd2345")), Way::Into);
+        assert_eq!(Way::going(to, false, false, Some("efgh6789")), Way::Away);
+        assert_eq!(Way::going(to, false, false, None), Way::Away);
+        assert_eq!(
+            Way::going(to, false, true, Some("abcd2345")),
+            Way::Away,
+            "[style] float turned off"
+        );
+        for leave in [None, Some(Leave::Quit), Some(Leave::Help)] {
+            assert_eq!(
+                Way::going(leave, false, false, Some("abcd2345")),
+                Way::going(leave, false, false, None),
                 "{leave:?}"
             );
         }
@@ -1192,5 +1521,185 @@ mod tests {
         );
         assert!(due(t0 + SESSION_FRAME, Some(t0), false, true, false));
         assert!(due(t0, None, false, false, false), "the first frame");
+    }
+
+    /// A row with no client to show it by: the panel as ever, nothing behind.
+    #[test]
+    fn a_row_shown_blank_takes_the_session_and_leaves_the_panel() {
+        assert_eq!(levels(1.0, 0.0, true), (1.0, 1.0, 1.0));
+        assert_eq!(levels(1.0, 0.0, false), (1.0, 1.0, 0.0));
+        let (text, _, away) = levels(0.75, 0.0, true);
+        assert_eq!(away, 1.0);
+        assert_eq!(text, levels(0.75, 0.0, false).0);
+    }
+
+    /// Given back what was lent, as the session loop would be.
+    #[derive(Default)]
+    struct Lender(Vec<Attachment>);
+
+    impl Others for Lender {
+        fn begin_next(&mut self, _: Target) -> Option<card::Card> {
+            None
+        }
+
+        fn give_back(&mut self, client: Attachment) {
+            self.0.push(client);
+        }
+    }
+
+    /// Read a shown session's output until `done`, or give up.
+    fn read_until(glimpse: &mut Glimpse, done: impl Fn(&mut Glimpse) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 8192];
+        while !done(glimpse) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            let mut p = [pollfd(glimpse.fd())];
+            unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
+            if !glimpse.keep(ready(&p[0]), &mut buf) {
+                return done(glimpse);
+            }
+        }
+        true
+    }
+
+    /// A stand-in that says what it reads of its input back as a title, in
+    /// hex, once `n` bytes have come.
+    fn told(n: usize) -> String {
+        format!(
+            r#"printf r; heard=$(head -c {n} | od -An -tx1 | tr -d ' \n'); printf '\033]0;%s\007' "$heard"; exec sleep 30"#
+        )
+    }
+
+    fn title(glimpse: &Glimpse) -> Option<&[u8]> {
+        glimpse
+            .client
+            .ledger
+            .as_ref()
+            .and_then(crate::ledger::Ledger::title)
+    }
+
+    /// Back from its crawl, so its screen keeps up while it is shown.
+    #[test]
+    fn a_parked_session_shown_behind_the_picker_is_told_it_is_back() {
+        let said = card::encode(&card::Command::Clear);
+        let mut client = crate::pty::kept_standin("s1", &told(said.len()));
+        assert!(client.ready_for_test(), "the stand-in never got ready");
+        client.draws_cards = true;
+        client.away = true;
+        client.crawling = true;
+        let size = pty_size(&client.master).expect("its size");
+        let mut glimpse = Glimpse::open(client, size);
+        assert!(!glimpse.client.away && !glimpse.client.crawling);
+        let mut heard = b"\x1b]0;".to_vec();
+        for b in &said {
+            heard.extend_from_slice(format!("{b:02x}").as_bytes());
+        }
+        heard.push(0x07);
+        assert!(
+            read_until(&mut glimpse, |g| title(g) == Some(&heard[..])),
+            "{:?}",
+            title(&glimpse).map(String::from_utf8_lossy)
+        );
+        let mut lender = Lender::default();
+        glimpse.close(&mut lender);
+        assert_eq!(lender.0.len(), 1, "not given back");
+    }
+
+    /// All it writes is kept for its first visit, so it stays at its crawl
+    /// unless it must redraw at a new size.
+    #[test]
+    fn a_session_started_ahead_is_shown_from_what_it_said() {
+        let mut client =
+            crate::pty::kept_standin("s1", r"sleep 0.2; printf '\033[3;1Hlater'; exec sleep 30");
+        client.draws_cards = true;
+        client.away = true;
+        client.unshown = Some(b"\x1b[?1049h\x1b[2;3Hhello".to_vec());
+        let size = pty_size(&client.master).expect("its size");
+        let mut glimpse = Glimpse::open(client, size);
+        assert!(glimpse.client.away, "told it is back");
+        let painted = |g: &mut Glimpse, text: &[u8]| {
+            g.copy()
+                .is_some_and(|copy| crate::test_support::contains(&copy.paint(), text))
+        };
+        assert!(painted(&mut glimpse, b"hello"));
+        assert!(read_until(&mut glimpse, |g| painted(g, b"later")));
+        let unshown = glimpse.client.unshown.as_deref().unwrap_or_default();
+        assert!(unshown.starts_with(b"\x1b[?1049h\x1b[2;3Hhello"));
+        assert!(unshown.ends_with(b"later"), "kept for its first visit");
+
+        let bigger = PtySize {
+            rows: size.rows + 2,
+            ..size
+        };
+        glimpse.resize_to(bigger);
+        assert!(!glimpse.client.away, "a new size drawn at once");
+        assert_eq!(pty_size(&glimpse.client.master), Some(bigger));
+        let shown = glimpse.copy().map(|copy| copy.size());
+        assert_eq!(shown, Some((bigger.rows, bigger.cols)), "painted whole");
+    }
+
+    #[test]
+    fn a_session_shown_that_ends_goes_back_to_be_seen_gone() {
+        let client = crate::pty::kept_standin("s1", "printf bye; exit 0");
+        let size = pty_size(&client.master).expect("its size");
+        let mut glimpse = Glimpse::open(client, size);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 8192];
+        let mut kept = true;
+        while kept && Instant::now() < deadline {
+            let mut p = [pollfd(glimpse.fd())];
+            unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
+            kept = glimpse.keep(ready(&p[0]), &mut buf);
+        }
+        assert!(!kept, "kept past its client's end");
+    }
+
+    /// The glimpse is not fed the front session's bytes that go out ahead of
+    /// its frame, which would otherwise show through where it painted nothing.
+    #[test]
+    fn the_session_shown_is_painted_whole_after_bytes_it_was_not_fed() {
+        // Its text far enough from the panel to be dimmed only half way.
+        let (area, hints) = (Rect::new(24, 6, 72, 23), HINTS);
+        let look = Look::Dimmed(palette());
+        let mut a = crate::pty::kept_standin("s1", "exec sleep 30");
+        a.screen = Some(Shadow::new(42, 120));
+        let mut shown = crate::pty::kept_standin("s2", "exec sleep 30");
+        let mut copy = Shadow::new(42, 120);
+        copy.feed(b"\x1b[1;1Hshown");
+        shown.screen = Some(copy);
+        let mut glimpse = Some(Glimpse {
+            client: shown,
+            copy: None,
+        });
+        let mut boundary = Boundary::new();
+        let mut frame = |held: &[u8], fresh: bool| {
+            let copy = behind(&mut a, &mut glimpse, held, fresh).expect("a copy");
+            frame_bytes(copy, look, &[], area, hints, 1.0, 0.0, held, &mut boundary)
+                .expect("a frame")
+        };
+        let whole = |out: &[u8]| crate::test_support::contains(out, b"shown");
+        assert!(whole(&frame(b"", false)));
+        assert!(!whole(&frame(b"", false)), "nothing changed");
+        assert!(whole(&frame(b"", true)), "fresh");
+        assert!(whole(&frame(b"\x1b[1;1Hfront", false)), "after the front's");
+    }
+
+    /// The resume it stands in for would have entered it.
+    #[test]
+    fn a_session_handed_over_is_put_on_the_alternate_screen() {
+        let mut copy = Shadow::new(24, 80);
+        copy.feed(b"\x1b[1;1Hhello");
+        let out = put_back_bytes(Some(&copy), b"held", MouseReporting::Off, true, b"");
+        let front = [fade::SYNC_BEGIN, b"held", ALT_SCREEN_ENTER].concat();
+        assert!(
+            out.starts_with(&front),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert_eq!(count(&out, fade::SYNC_END), 1);
+        let out = put_back_bytes(Some(&copy), b"held", MouseReporting::Off, false, b"");
+        assert_eq!(count(&out, ALT_SCREEN_ENTER), 0);
     }
 }
