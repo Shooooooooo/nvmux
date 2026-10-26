@@ -905,6 +905,18 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+pub(super) const ELLIPSIS: &str = "…";
+
+/// `text` cut to `max` columns, its last one a `…` where anything was cut.
+pub(super) fn clip(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
+    }
+    let mut cut = truncate(text, max.saturating_sub(ELLIPSIS.width()));
+    cut.push_str(ELLIPSIS);
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::app::Key;
@@ -1472,6 +1484,13 @@ mod tests {
         assert_eq!(truncate("日本語", 4), "日本", "two columns per character");
         assert_eq!(truncate("日本語", 3), "日", "must not split a wide char");
         assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn clip_marks_a_cut_within_the_width() {
+        assert_eq!(clip("hello", 5), "hello", "nothing cut, nothing marked");
+        assert_eq!(clip("hello", 4), "hel…");
+        assert_eq!(clip("日本語", 4), "日…", "本 does not fit beside the …");
     }
 
     // --- the trail behind a session in flight --------------------------------
