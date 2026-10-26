@@ -21,7 +21,9 @@
 //!
 //! Behind the picker is the session its cursor is on ([`Floating::preview`]):
 //! its client, lent by the session loop and read here as its own thread
-//! would ([`Glimpse`]), or nothing if it has none running.
+//! would ([`Glimpse`]), or nothing if it has none running. A move dips
+//! through the background ([`Dip`]): the one shown fades out, and the next
+//! comes up once the cursor rests.
 //!
 //! It comes and goes over nvmux's fade like a card: the session dims, then
 //! the panel and its hint row rise. From the picker ([`Leave`]), a switch to
@@ -214,20 +216,20 @@ impl Way {
 
     /// As `leave` says (see [`Way::of`]), but out with the session if
     /// `[style] float` was turned off, across to a set-aside picker instead
-    /// of back, and into the session `shown` behind the panel, if it can be
-    /// handed over, instead of away to it.
+    /// of back, and into `into`, a session that can come up where it is
+    /// behind the panel (see [`going_into`]), instead of away to it.
     fn going(
         leave: Option<Leave>,
         picker_under: bool,
         unfloated: bool,
-        shown: Option<&str>,
+        into: Option<&str>,
     ) -> Self {
         if unfloated {
             return Way::Away;
         }
         match (Way::of(leave), leave) {
             (Way::Back, _) if picker_under => Way::Across(What::Picker),
-            (Way::Away, Some(Leave::Switch(id))) if shown == Some(id.as_str()) => Way::Into,
+            (Way::Away, Some(Leave::Switch(id))) if into == Some(id.as_str()) => Way::Into,
             (way, _) => way,
         }
     }
@@ -278,9 +280,102 @@ impl Coming {
     }
 }
 
-/// The session under the picker's cursor, shown behind the panel in place of
-/// the one it floats over: its client, lent by the session loop
-/// ([`Others::lend`]) and read here as its thread would.
+/// The session shown behind the picker, and how far it has dipped toward the
+/// background to make way for the next: a move fades it out, and the next
+/// comes up once the cursor has rested on its row, so a held key passes rows
+/// in the dark and lends none of them.
+struct Dip {
+    /// What is to be shown: `None` is the session floated over.
+    wanted: Option<String>,
+    /// When `wanted` last changed.
+    since: Instant,
+    shown: Option<String>,
+    /// 0 shown as it is, 1 the background.
+    out: Coming,
+}
+
+impl Dip {
+    fn new(shown: Option<String>, now: Instant) -> Self {
+        Self {
+            wanted: shown.clone(),
+            since: now,
+            shown,
+            out: Coming::to(0.0, 0.0, Duration::ZERO, now),
+        }
+    }
+
+    fn want(&mut self, id: Option<&str>, now: Instant) {
+        if id != self.wanted.as_deref() {
+            self.wanted = id.map(str::to_string);
+            self.since = now;
+        }
+    }
+
+    /// When `wanted` is due to be shown, if it is not: once out at the
+    /// background, and `rest` after it was last changed.
+    fn due_at(&self, rest: Duration) -> Option<Instant> {
+        let out = self.out.start + self.out.length;
+        (self.shown != self.wanted).then(|| out.max(self.since + rest))
+    }
+
+    /// Fade toward showing `wanted`: out while another is shown, back up once
+    /// it is, and out at once if `blank`, with nothing to show. Returns
+    /// whether `wanted` is now due ([`Dip::show`]).
+    fn step(&mut self, blank: bool, one_way: Duration, rest: Duration, now: Instant) -> bool {
+        if blank {
+            self.out = Coming::to(1.0, 1.0, Duration::ZERO, now);
+        } else {
+            let to = if self.shown == self.wanted { 0.0 } else { 1.0 };
+            if self.out.to != to {
+                self.out = Coming::to(self.out.at(now), to, one_way, now);
+            }
+        }
+        self.due_at(rest).is_some_and(|due| now >= due)
+    }
+
+    /// `wanted`, up from the background over `one_way` unless `blank`.
+    fn show(&mut self, blank: bool, one_way: Duration, now: Instant) {
+        self.shown = self.wanted.clone();
+        let to = if blank { 1.0 } else { 0.0 };
+        self.out = Coming::to(1.0, to, one_way, now);
+    }
+}
+
+/// What the session area is to show as the panel goes by `going` (`None`
+/// while it is up): the cursor's row while up, the session floated over on
+/// the way back, the one switched into. `None` holds it as it is.
+fn wanted_behind<'a>(
+    going: Option<Way>,
+    cursor: Option<&'a str>,
+    switched: Option<&'a str>,
+) -> Option<Option<&'a str>> {
+    match going {
+        None => Some(cursor),
+        Some(Way::Back) => Some(None),
+        // Even with the dip on its way to another row: the switch's is the one
+        // handed over.
+        Some(Way::Into) => Some(switched),
+        Some(Way::Across(_) | Way::Away) => None,
+    }
+}
+
+/// The session a switch from `panel` can go into where it is: the one shown,
+/// if it can be handed over, or the cursor's row the dip has yet to show,
+/// checked once lent.
+fn going_into(panel: &dyn Floating, dip: &Dip, glimpse: &mut Option<Glimpse>) -> Option<String> {
+    let Some(Leave::Switch(id)) = panel.leave() else {
+        return None;
+    };
+    let id = id.as_str();
+    let shown = dip.shown.as_deref() == Some(id);
+    let coming = !shown && panel.preview() == Some(id);
+    let ready = shown && glimpse.as_mut().is_some_and(|g| g.can_be_handed_over());
+    (ready || coming).then(|| id.to_string())
+}
+
+/// A session shown behind the panel in place of the one it floats over (see
+/// [`Dip`]): its client, lent by the session loop ([`Others::lend`]) and read
+/// here as its thread would.
 struct Glimpse {
     client: Attachment,
     /// A started-ahead client's output parsed: its own copy waits for its
@@ -493,23 +588,35 @@ fn float_with(
     let mut drawn_away = 0.0;
     let mut sequence_due: Option<Instant> = None;
     let stdin_fd = std::io::stdin().as_raw_fd();
-    // The session under the picker's cursor, if not the one floated over,
-    // whether or not a client could be lent to show it.
-    let mut wanted: Option<String> = None;
+    // The cursor's row comes up with the panel: the dip is for moves.
+    let first = panel
+        .preview()
+        .filter(|id| *id != a.session_id)
+        .map(str::to_string);
+    *glimpse = first
+        .as_deref()
+        .and_then(|id| others.lend(id))
+        .map(|client| Glimpse::open(client, size));
+    let mut dip = Dip::new(first, Instant::now());
+    let mut drawn_out = 0.0;
     // What the session area shows changed: the next frame paints it whole.
-    let mut fresh_behind = false;
+    let mut fresh_behind = true;
 
     loop {
         let now = Instant::now();
-        let moving = !coming.done(now) || !away.done(now);
-        if !moving && (drawn_at != coming.to || drawn_away != away.to) {
+        let moving = !coming.done(now) || !away.done(now) || !dip.out.done(now);
+        if !moving && (drawn_at != coming.to || drawn_away != away.to || drawn_out != dip.out.to) {
             owed = true;
         }
         // Fade-paced frames while anything moves.
         let lively = moving || panel.moving();
         let frame_due = (lively || owed)
             .then(|| last_frame.map_or(now, |last| last + gap(lively, session_drew)));
-        let next = [frame_due, sequence_due, panel.wake_at()]
+        // Nothing is shown anew on the way out with the session (see below).
+        let shown_due = (!going || way != Way::Away)
+            .then(|| dip.due_at(rest(look, going)))
+            .flatten();
+        let next = [frame_due, sequence_due, panel.wake_at(), shown_due]
             .into_iter()
             .flatten()
             .min();
@@ -605,7 +712,8 @@ fn float_with(
             inputs.extend(decoder.flush());
         }
         let was_going = going;
-        // A key or mouse event gets a frame at once (see `due`).
+        // A key or mouse event, or a session newly shown, gets a frame at
+        // once (see `due`).
         let mut asked = false;
         for input in inputs {
             match input {
@@ -642,10 +750,8 @@ fn float_with(
         }
         // Just closed: start the way out from wherever the way in got to.
         if going && !was_going {
-            let shown = glimpse
-                .as_mut()
-                .and_then(|g| g.can_be_handed_over().then(|| g.client.session_id.clone()));
-            way = Way::going(panel.leave(), under.is_some(), unfloated, shown.as_deref());
+            let into = going_into(panel.as_ref(), &dip, glimpse);
+            way = Way::going(panel.leave(), under.is_some(), unfloated, into.as_deref());
             let there = coming.at(now);
             let length = fade_length(look);
             match way {
@@ -658,32 +764,45 @@ fn float_with(
             }
         }
         // Behind the panel, the session under the picker's cursor (the
-        // set-aside one's under the help, settings or a prompt). Held once
-        // going, but on the way back to the session floated over.
-        let cursor = if !going {
-            panel
-                .preview()
-                .or_else(|| under.as_ref().and_then(|picker| picker.preview()))
-                .filter(|id| *id != a.session_id)
-        } else if way == Way::Back {
-            None
-        } else {
-            wanted.as_deref()
+        // set-aside one's under the help, settings or a prompt).
+        let cursor = panel
+            .preview()
+            .or_else(|| under.as_ref().and_then(|picker| picker.preview()))
+            .filter(|id| *id != a.session_id);
+        let switched = match panel.leave() {
+            Some(Leave::Switch(id)) => Some(id),
+            _ => None,
         };
-        if cursor != wanted.as_deref() {
-            wanted = cursor.map(str::to_string);
+        let switched = switched.as_ref().map(crate::ids::Id::as_str);
+        if let Some(wanted) = wanted_behind(going.then_some(way), cursor, switched) {
+            dip.want(wanted, now);
+        }
+        let one_way = dip_length(look);
+        let blank = dip.shown.is_some() && glimpse.as_mut().and_then(Glimpse::copy).is_none();
+        // Nothing more is lent on the way out with the session.
+        if dip.step(blank, one_way, rest(look, going), now) && !(going && way == Way::Away) {
             if let Some(gone) = glimpse.take() {
                 gone.close(others);
             }
-            *glimpse = wanted
+            *glimpse = dip
+                .wanted
                 .as_deref()
                 .and_then(|id| others.lend(id))
                 .map(|client| Glimpse::open(client, size));
+            let blank = dip.wanted.is_some() && glimpse.as_mut().and_then(Glimpse::copy).is_none();
+            dip.show(blank, one_way, now);
             fresh_behind = true;
             owed = true;
+            // Its first frame, all background, goes out now, so the dip's
+            // bottom is drawn.
+            asked = true;
         }
-        // Gone before it could be handed over: out with the session instead.
-        if way == Way::Into && glimpse.is_none() {
+        // Gone, or once lent not to be handed over: out with the session
+        // instead.
+        if way == Way::Into
+            && dip.shown == dip.wanted
+            && !glimpse.as_mut().is_some_and(|g| g.can_be_handed_over())
+        {
             way = Way::Away;
             away = Coming::to(away.at(now), 1.0, fade_length(look), now);
         }
@@ -692,7 +811,7 @@ fn float_with(
             tell_the_client(&mut g.client);
         }
 
-        let moving = !coming.done(now) || !away.done(now);
+        let moving = !coming.done(now) || !away.done(now) || !dip.out.done(now);
         if going && !moving {
             // Close it, unless it is the picker going across, which is set
             // aside to return to.
@@ -744,7 +863,7 @@ fn float_with(
                         hints,
                         coming.to,
                         1.0,
-                        false,
+                        dip.out.to,
                         &mut held,
                         &mut boundary,
                     )?;
@@ -759,6 +878,10 @@ fn float_with(
                 // relay hands it over (see `relay`).
                 Way::Into => {
                     if let Some(mut chosen) = glimpse.take() {
+                        debug_assert!(matches!(
+                            panel.leave(),
+                            Some(Leave::Switch(id)) if id.as_str() == chosen.client.session_id
+                        ));
                         put_back(a, master_fd, &mut held, &mut boundary, Some(&mut chosen))?;
                         chosen.client.lit = true;
                         a.handing = Some(Box::new(chosen.client));
@@ -785,8 +908,7 @@ fn float_with(
             }
             let there = coming.at(now);
             let gone = away.at(now);
-            // A row with no client to show it by.
-            let blank = wanted.is_some() && glimpse.as_mut().and_then(Glimpse::copy).is_none();
+            let out = dip.out.at(now);
             if paint(
                 behind(a, glimpse, &held, fresh_behind),
                 look,
@@ -795,7 +917,7 @@ fn float_with(
                 hints,
                 there,
                 gone,
-                blank,
+                out,
                 &mut held,
                 &mut boundary,
             )? {
@@ -804,6 +926,7 @@ fn float_with(
                 fresh_behind = false;
                 drawn_at = there;
                 drawn_away = gone;
+                drawn_out = out;
             }
         }
     }
@@ -826,17 +949,15 @@ fn way_in(dark: bool, length: Duration, now: Instant) -> (Coming, Coming) {
     }
 }
 
-/// Eased levels for a frame `there` of the way in and `away` of the way out:
-/// (panel text, session dimming, whole-session fade to the background). With
-/// nothing to show behind the panel (`blank`), the session is all background.
-fn levels(there: f32, away: f32, blank: bool) -> (f32, f32, f32) {
+/// Eased levels for a frame `there` of the way in, `away` of the way out and
+/// the session behind the panel `out` of the way to the background (see
+/// [`Dip`]): (panel text, session dimming, whole-session fade to the
+/// background).
+fn levels(there: f32, away: f32, out: f32) -> (f32, f32, f32) {
     let away = falloff::ease(away);
     let text = falloff::ease(there * 2.0 - 1.0) * (1.0 - away);
-    (
-        text,
-        falloff::ease(there * 2.0),
-        if blank { 1.0 } else { away },
-    )
+    let gone = away + (1.0 - away) * falloff::ease(out);
+    (text, falloff::ease(there * 2.0), gone)
 }
 
 /// The whole way in (session dims, then panel rises):
@@ -850,6 +971,27 @@ fn fade_length(look: Look) -> Duration {
     }
 }
 
+/// One way of a [`Dip`]: half of `[effects.fade] duration_ms` where a session
+/// dissolves, else zero, a cut.
+fn dip_length(look: Look) -> Duration {
+    match look {
+        Look::Dimmed(_) if fade::enabled() && fade::session() => {
+            config::get().effects.fade.one_way()
+        }
+        Look::Dimmed(_) | Look::Faint => Duration::ZERO,
+    }
+}
+
+/// How long the cursor rests on a row before the [`Dip`] shows it: not at all
+/// once the panel is going, as the cursor no longer moves.
+fn rest(look: Look, going: bool) -> Duration {
+    if going {
+        Duration::ZERO
+    } else {
+        dip_length(look)
+    }
+}
+
 /// Minimum time between frames: [`SESSION_FRAME`] when only session output
 /// is to show, else the fade's frame.
 fn gap(lively: bool, session_drew: bool) -> Duration {
@@ -860,10 +1002,10 @@ fn gap(lively: bool, session_drew: bool) -> Duration {
     }
 }
 
-/// Whether a frame may go out: a [`gap`] after `last`, or at once for a key
-/// or mouse event (`asked`). Otherwise the row the bar just left would be
-/// part faded when first seen, and a held key's glow would beat with the
-/// frames.
+/// Whether a frame may go out: a [`gap`] after `last`, or at once if `asked`,
+/// for a key or mouse event or the bottom of a [`Dip`]. Otherwise the row the
+/// bar just left would be part faded when first seen, a held key's glow would
+/// beat with the frames, and a dip could miss the background.
 fn due(now: Instant, last: Option<Instant>, lively: bool, session_drew: bool, asked: bool) -> bool {
     asked || last.is_none_or(|last| now >= last + gap(lively, session_drew))
 }
@@ -888,8 +1030,8 @@ fn hold(a: &mut Attachment, chunk: &[u8], held: &mut Vec<u8>, boundary: &mut Bou
 
 /// Write a frame (`there` of the way in, `away` of the way out) if one can
 /// go out now (see [`frame_bytes`]); returns whether it did. The hint row at
-/// `hints` fades with the panel. `copy` is the session behind it (see
-/// [`levels`] for `blank`).
+/// `hints` fades with the panel. `copy` is the session behind it, `out` of
+/// the way to the background (see [`levels`]).
 #[allow(clippy::too_many_arguments)]
 fn paint(
     copy: Option<&mut Shadow>,
@@ -899,7 +1041,7 @@ fn paint(
     hints: Rect,
     there: f32,
     away: f32,
-    blank: bool,
+    out: f32,
     held: &mut Vec<u8>,
     boundary: &mut Boundary,
 ) -> Result<bool> {
@@ -912,7 +1054,7 @@ fn paint(
         }
         return Ok(false);
     }
-    let (text, dim, away) = levels(there, away, blank);
+    let (text, dim, away) = levels(there, away, out);
     let laid: Vec<Laid> = (text > 0.0)
         .then(|| [panel.draw(area), panel.draw_hints(hints)])
         .into_iter()
@@ -1367,8 +1509,7 @@ mod tests {
         let whole = Duration::from_millis(200);
         let panel = Rect::new(24, 6, 72, 23);
         let look = Look::Dimmed(palette());
-        let frame =
-            |(coming, away): (Coming, Coming), at| levels(coming.at(at), away.at(at), false);
+        let frame = |(coming, away): (Coming, Coming), at| levels(coming.at(at), away.at(at), 0.0);
 
         let dark = way_in(true, whole, t0);
         let (text, dim, away) = frame(dark, t0);
@@ -1523,14 +1664,168 @@ mod tests {
         assert!(due(t0, None, false, false, false), "the first frame");
     }
 
-    /// A row with no client to show it by: the panel as ever, nothing behind.
+    /// All the way out is also how a row with no client to show it by looks.
     #[test]
-    fn a_row_shown_blank_takes_the_session_and_leaves_the_panel() {
-        assert_eq!(levels(1.0, 0.0, true), (1.0, 1.0, 1.0));
-        assert_eq!(levels(1.0, 0.0, false), (1.0, 1.0, 0.0));
-        let (text, _, away) = levels(0.75, 0.0, true);
+    fn the_dip_takes_the_session_and_leaves_the_panel() {
+        assert_eq!(levels(1.0, 0.0, 0.0), (1.0, 1.0, 0.0));
+        assert_eq!(levels(1.0, 0.0, 0.5), (1.0, 1.0, 0.5), "half way out");
+        assert_eq!(levels(1.0, 0.0, 1.0), (1.0, 1.0, 1.0));
+        let (text, _, away) = levels(0.75, 0.0, 1.0);
         assert_eq!(away, 1.0);
-        assert_eq!(text, levels(0.75, 0.0, false).0);
+        assert_eq!(text, levels(0.75, 0.0, 0.0).0);
+        assert_eq!(levels(1.0, 0.5, 1.0).2, 1.0, "on the way out too");
+    }
+
+    /// One way of the dip, as `[effects.fade] duration_ms = 200`.
+    const ONE_WAY: Duration = Duration::from_millis(100);
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_move_dips_out_then_shows_the_next_from_the_background() {
+        let t0 = Instant::now();
+        let mut dip = Dip::new(None, t0);
+        dip.want(Some("b"), t0);
+        assert!(!dip.step(false, ONE_WAY, ONE_WAY, t0));
+        assert!(
+            (dip.out.at(t0 + ONE_WAY / 2) - 0.5).abs() < 1e-3,
+            "half out"
+        );
+        assert!(!dip.step(false, ONE_WAY, ONE_WAY, t0 + ONE_WAY - MS));
+        assert!(dip.step(false, ONE_WAY, ONE_WAY, t0 + ONE_WAY));
+        dip.show(false, ONE_WAY, t0 + ONE_WAY);
+        assert_eq!(dip.shown.as_deref(), Some("b"));
+        assert_eq!(dip.out.at(t0 + ONE_WAY), 1.0, "its first frame");
+        assert!(!dip.step(false, ONE_WAY, ONE_WAY, t0 + ONE_WAY + MS));
+        assert_eq!(dip.out.at(t0 + 2 * ONE_WAY), 0.0);
+        assert_eq!(dip.due_at(ONE_WAY), None);
+    }
+
+    /// Each move restarts the rest, so rows passed over are never lent.
+    #[test]
+    fn a_held_key_passes_rows_in_the_dark() {
+        let t0 = Instant::now();
+        let mut dip = Dip::new(None, t0);
+        let mut at = t0;
+        for row in ["b", "c", "d", "e", "f", "g"] {
+            dip.want(Some(row), at);
+            assert!(!dip.step(false, ONE_WAY, ONE_WAY, at), "{row}");
+            at += 30 * MS;
+        }
+        let last = at - 30 * MS;
+        assert_eq!(dip.out.at(last), 1.0, "dark since the first one way");
+        assert_eq!(dip.due_at(ONE_WAY), Some(last + ONE_WAY));
+        assert!(!dip.step(false, ONE_WAY, ONE_WAY, last + ONE_WAY - MS));
+        assert!(dip.step(false, ONE_WAY, ONE_WAY, last + ONE_WAY));
+    }
+
+    /// The poll wakes for it when `step` shows it, so a wake gone by always
+    /// shows it and the loop cannot spin: a rest after the move, or later,
+    /// when out (here a shorter rest, the fade changed meanwhile).
+    #[test]
+    fn a_dip_is_due_when_it_says() {
+        let t0 = Instant::now();
+        let mut dip = Dip::new(None, t0);
+        dip.want(Some("b"), t0);
+        dip.step(false, ONE_WAY, ONE_WAY, t0);
+        // Back, and off again: out from part way, by about 120 ms.
+        dip.want(None, t0 + 60 * MS);
+        dip.step(false, ONE_WAY, ONE_WAY, t0 + 60 * MS);
+        dip.want(Some("c"), t0 + 70 * MS);
+        dip.step(false, ONE_WAY, ONE_WAY, t0 + 70 * MS);
+        assert_eq!(dip.due_at(ONE_WAY), Some(t0 + 170 * MS));
+        let out = dip.due_at(ONE_WAY / 4).expect("due");
+        assert!(out > t0 + 119 * MS && out < t0 + 121 * MS, "{:?}", out - t0);
+        for rest in [ONE_WAY, ONE_WAY / 4] {
+            let due = dip.due_at(rest).expect("due");
+            assert!(!dip.step(false, ONE_WAY, rest, due - MS), "{rest:?}");
+            assert!(dip.step(false, ONE_WAY, rest, due), "{rest:?}");
+        }
+    }
+
+    #[test]
+    fn back_on_the_row_shown_it_comes_back_up_from_where_it_got_to() {
+        let t0 = Instant::now();
+        let mut dip = Dip::new(Some("b".to_string()), t0);
+        dip.want(Some("c"), t0);
+        dip.step(false, ONE_WAY, ONE_WAY, t0);
+        let back = t0 + 40 * MS;
+        dip.want(Some("b"), back);
+        assert!(!dip.step(false, ONE_WAY, ONE_WAY, back));
+        assert_eq!(dip.due_at(ONE_WAY), None, "nothing to show anew");
+        assert!((dip.out.at(back) - 0.4).abs() < 1e-3);
+        assert!(
+            !dip.out.done(back + 39 * MS) && dip.out.done(back + 41 * MS),
+            "as fast as it went"
+        );
+    }
+
+    /// No client to show it by, or its client gone half way up.
+    #[test]
+    fn with_nothing_to_show_it_is_the_background_at_once() {
+        let t0 = Instant::now();
+        let mut dip = Dip::new(None, t0);
+        dip.want(Some("b"), t0);
+        dip.step(false, ONE_WAY, ONE_WAY, t0);
+        assert!(dip.step(false, ONE_WAY, ONE_WAY, t0 + ONE_WAY));
+        dip.show(true, ONE_WAY, t0 + ONE_WAY);
+        let later = t0 + 3 * ONE_WAY;
+        assert!(!dip.step(true, ONE_WAY, ONE_WAY, later));
+        assert_eq!(dip.out.at(later), 1.0);
+
+        let mut dip = Dip::new(None, t0);
+        dip.want(Some("b"), t0);
+        dip.step(false, ONE_WAY, ONE_WAY, t0);
+        dip.step(false, ONE_WAY, ONE_WAY, t0 + ONE_WAY);
+        dip.show(false, ONE_WAY, t0 + ONE_WAY);
+        let half = t0 + ONE_WAY + ONE_WAY / 2;
+        assert!(dip.out.at(half) < 1.0);
+        dip.step(true, ONE_WAY, ONE_WAY, half);
+        assert_eq!(dip.out.at(half), 1.0);
+    }
+
+    /// Going, the cursor no longer moves, so nothing waits for it to rest.
+    #[test]
+    fn going_or_without_the_fade_nothing_waits() {
+        let t0 = Instant::now();
+        let mut dip = Dip::new(Some("b".to_string()), t0);
+        dip.want(Some("c"), t0);
+        dip.step(false, ONE_WAY, ONE_WAY, t0);
+        dip.want(None, t0 + 90 * MS);
+        assert!(!dip.step(false, ONE_WAY, Duration::ZERO, t0 + 90 * MS));
+        assert!(
+            dip.step(false, ONE_WAY, Duration::ZERO, t0 + ONE_WAY),
+            "as soon as it is out"
+        );
+        assert_eq!(
+            dip.due_at(ONE_WAY),
+            Some(t0 + 190 * MS),
+            "with the panel up"
+        );
+
+        let mut cut = Dip::new(None, t0);
+        cut.want(Some("b"), t0);
+        assert!(cut.step(false, Duration::ZERO, Duration::ZERO, t0));
+        cut.show(false, Duration::ZERO, t0);
+        assert_eq!(cut.out.at(t0), 0.0, "without the fade, a cut");
+    }
+
+    /// Into, the switch's session is the one handed over even with the dip on
+    /// its way to another row: it turns back rather than lend that one.
+    #[test]
+    fn what_the_session_area_is_to_show_as_the_panel_goes() {
+        assert_eq!(wanted_behind(None, Some("c"), None), Some(Some("c")));
+        assert_eq!(wanted_behind(Some(Way::Back), Some("c"), None), Some(None));
+        assert_eq!(
+            wanted_behind(Some(Way::Into), Some("c"), Some("b")),
+            Some(Some("b"))
+        );
+        for way in [Way::Away, Way::Across(What::Help)] {
+            assert_eq!(
+                wanted_behind(Some(way), Some("c"), Some("b")),
+                None,
+                "{way:?}"
+            );
+        }
     }
 
     /// Given back what was lent, as the session loop would be.

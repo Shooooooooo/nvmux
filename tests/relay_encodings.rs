@@ -2754,9 +2754,11 @@ fn neovims_own_client_is_sent_no_card() {
 }
 
 /// Floating, the picker shows the session under its cursor behind it: one
-/// started ahead, then, after a switch, the one left, parked. `Esc` goes back
-/// to the session floated over; `Enter` brings the one shown up where it is,
-/// with nothing else shown on the way, and keys go to it.
+/// started ahead, then, after a switch, the one left, parked. Each change dips
+/// through the background. `Esc` goes back to the session floated over;
+/// `Enter` brings the one shown up where it is, with nothing else shown on the
+/// way, and keys go to it. `j` and `Enter` read together do the same once the
+/// dip gets there.
 #[test]
 fn the_floating_picker_shows_the_session_under_its_cursor() {
     require_nvim!();
@@ -2806,7 +2808,16 @@ fn the_floating_picker_shows_the_session_under_its_cursor() {
     term.pump_until(Duration::from_millis(300), |_| false);
 
     let floating = |out: &[u8]| row_on_screen(out, ROWS - 1).contains("esc back");
-    let open = |term: &mut Terminal, key: &[u8], shown: &str| {
+    // Row 1 is empty at some moment after `from`, before `to` first shows on
+    // it: the dip's bottom.
+    let dips = |out: &[u8], from: usize, to: &str| {
+        presented(out, 0)
+            .into_iter()
+            .filter(|(at, _)| *at > from)
+            .take_while(|(_, row)| !row.contains(to))
+            .any(|(_, row)| row.is_empty())
+    };
+    let float = |term: &mut Terminal| {
         let mark = term.output.len();
         term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
         assert!(
@@ -2814,12 +2825,44 @@ fn the_floating_picker_shows_the_session_under_its_cursor() {
             "the picker never floated; the child wrote: {}",
             term.since(mark)
         );
+    };
+    let open = |term: &mut Terminal, key: &[u8], shown: &str| {
+        float(term);
+        let keyed = term.output.len();
         term.type_bytes(key);
         assert!(
             term.pump_until(Duration::from_secs(5), |out| row_on_screen(out, 0)
                 .contains(shown)),
             "{shown:?} never showed behind the picker; row 1 says {:?}",
             row_on_screen(&term.output, 0)
+        );
+        assert!(
+            dips(&term.output, keyed, shown),
+            "{shown:?} came up without dipping through the background; the child wrote: {}",
+            term.since(keyed)
+        );
+    };
+    // Through the hand-over after `entered`, and the first paint its relay
+    // writes over it.
+    let painted = |out: &[u8], entered: usize| {
+        let from = entered + find(&out[entered.min(out.len())..], SWITCHED)? + SWITCHED.len();
+        find(&out[from..], nvmux::fade::SYNC_END).map(|at| from + at + nvmux::fade::SYNC_END.len())
+    };
+    let reaches = |term: &mut Terminal, sock: &Path, to: &str, typed: char| {
+        term.type_bytes(format!("i{typed}\x1b").as_bytes());
+        let line = || {
+            common::lua(sock, "return vim.api.nvim_get_current_line()")
+                .as_str()
+                .map(str::to_string)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !line().is_some_and(|l| l.starts_with(typed)) && Instant::now() < deadline {
+            term.pump_until(Duration::from_millis(50), |_| false);
+        }
+        assert!(
+            line().is_some_and(|l| l.starts_with(typed)),
+            "keys did not reach {to:?}: its line is {:?}",
+            line()
         );
     };
 
@@ -2832,28 +2875,25 @@ fn the_floating_picker_shows_the_session_under_its_cursor() {
         "Esc did not go back to the session floated over; the child wrote: {}",
         term.since(mark)
     );
+    assert!(
+        dips(&term.output, mark, front),
+        "Esc went back without dipping through the background; the child wrote: {}",
+        term.since(mark)
+    );
 
     for (key, to, sock) in [(b"j", other, &b_sock), (b"k", front, &a_sock)] {
         term.pump_until(Duration::from_millis(300), |_| false);
         open(&mut term, key, to);
         let entered = term.output.len();
         term.type_bytes(b"\r");
-        let switched = |out: &[u8]| {
-            find(&out[entered.min(out.len())..], SWITCHED).map(|at| entered + at + SWITCHED.len())
-        };
-        // Through the hand-over, and the first paint its relay writes over it.
-        let painted = |out: &[u8]| {
-            let from = switched(out)?;
-            find(&out[from..], nvmux::fade::SYNC_END)
-                .map(|at| from + at + nvmux::fade::SYNC_END.len())
-        };
         assert!(
-            term.pump_until(Duration::from_secs(5), |out| painted(out).is_some()
+            term.pump_until(Duration::from_secs(5), |out| painted(out, entered)
+                .is_some()
                 && !floating(out)),
             "Enter did not bring {to:?} up; the child wrote: {}",
             term.since(entered)
         );
-        let upto = painted(&term.output).expect("painted");
+        let upto = painted(&term.output, entered).expect("painted");
         let shown: Vec<_> = presented(&term.output[..upto], 0)
             .into_iter()
             .filter(|(at, _)| *at > entered)
@@ -2868,22 +2908,37 @@ fn the_floating_picker_shows_the_session_under_its_cursor() {
             "its mouse reporting was not put back; the child wrote: {}",
             term.since(entered)
         );
-
-        term.type_bytes(b"ix\x1b");
-        let line = || {
-            common::lua(sock, "return vim.api.nvim_get_current_line()")
-                .as_str()
-                .map(str::to_string)
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !line().is_some_and(|l| l.starts_with('x')) && Instant::now() < deadline {
-            term.pump_until(Duration::from_millis(50), |_| false);
-        }
-        assert!(
-            line().is_some_and(|l| l.starts_with('x')),
-            "keys did not reach {to:?}: its line is {:?}",
-            line()
-        );
+        reaches(&mut term, sock, to, 'x');
     }
+
+    // Read together, so the switch comes before the dip has left the session
+    // floated over.
+    term.pump_until(Duration::from_millis(300), |_| false);
+    float(&mut term);
+    let entered = term.output.len();
+    term.type_bytes(b"j\r");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| painted(out, entered)
+            .is_some()
+            && !floating(out)),
+        "j and Enter did not bring {other:?} up; the child wrote: {}",
+        term.since(entered)
+    );
+    let upto = painted(&term.output, entered).expect("painted");
+    assert!(
+        dips(&term.output[..upto], entered, other),
+        "{other:?} came up without dipping through the background; the child wrote: {}",
+        term.since(entered)
+    );
+    let shown: Vec<_> = presented(&term.output[..upto], 0)
+        .into_iter()
+        .filter(|(at, _)| *at > entered)
+        .skip_while(|(_, row)| !row.contains(other))
+        .collect();
+    assert!(
+        !shown.is_empty() && shown.iter().all(|(_, row)| row.contains(other)),
+        "something else showed once {other:?} was up: {shown:#?}"
+    );
+    reaches(&mut term, &b_sock, other, 'y');
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }

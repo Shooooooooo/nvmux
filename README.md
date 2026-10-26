@@ -113,8 +113,10 @@ instead. Flipped in the settings, it moves them at once.
 
 Floating, the picker shows behind it the session its cursor is on, as it
 runs, and `Enter` brings that one up where it is; `Esc` goes back to the one
-you came from. A session with no client running yet shows nothing, as with
-`lazy = true` under `[client]` before its first visit.
+you came from. As the cursor moves, the session shown fades out and the next
+fades in once the cursor stops, like the dissolve between sessions
+(`[effects.fade]`). A session with no client running yet shows nothing, as
+with `lazy = true` under `[client]` before its first visit.
 
 Two keys after the prefix are not commands, and stay where they are: a number
 — `<prefix> 1`, `<prefix> 12` — switches straight to that session, and
