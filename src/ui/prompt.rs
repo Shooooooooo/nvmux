@@ -72,7 +72,9 @@
 //! With `[style] float` (the default) the prompt is drawn in a relay [`Panel`]
 //! over the session, or in the picker's place for its `c` and `r` (the picker
 //! returns if no session results). Behaviour is identical; only drawing and
-//! key input differ.
+//! key input differ. The panel is at most as wide as the settings panel,
+//! unless that would cut the fields' opening values short; then it widens as
+//! far as the screen allows.
 
 use std::time::Instant;
 
@@ -681,10 +683,17 @@ const SESSION_COLS: u16 = 2;
 const SESSION_ROWS: u16 = 1;
 
 /// Extra width beyond the opening lines for typing, and the width bounds
-/// (the settings panel's).
+/// (the settings panel's). The widest gives way to opening lines it would cut
+/// short (see [`WHOLE`]), as far as the screen allows.
 const PANEL_ROOM: u16 = 24;
 const PANEL_NARROWEST: u16 = 48;
 const PANEL_WIDEST: u16 = 72;
+
+/// How much wider than its opening lines a panel must be to show them whole,
+/// the cursor after them: a margin each side ([`float::inside`]), and three
+/// columns more, as the form is centred and [`field_line`] needs two of them
+/// to its right.
+const WHOLE: u16 = 5;
 
 /// Panel heights: the body plus the last row, where the prompt has its hint
 /// row full screen, left blank ([`float::inside`]). A create's form (three
@@ -882,8 +891,13 @@ impl Floating for Panel {
             .map(|f| f.label.width() + f.default.width())
             .max()
             .unwrap_or(0) as u16;
+        let widest = if opening + WHOLE > PANEL_WIDEST {
+            opening + PANEL_ROOM
+        } else {
+            PANEL_WIDEST
+        };
         let width = (opening + PANEL_ROOM)
-            .clamp(PANEL_NARROWEST, PANEL_WIDEST)
+            .clamp(PANEL_NARROWEST, widest)
             .min(room.width.saturating_sub(2 * SESSION_COLS));
         let height = match self.job {
             Job::Create { .. } => CREATE_ROWS,
@@ -3230,6 +3244,83 @@ mod tests {
         assert!(r.height < c.height && r.width <= c.width, "{r:?} {c:?}");
         assert_eq!(create.area(Rect::new(0, 0, 50, 24)), None);
         assert_eq!(create.area(Rect::new(0, 0, 80, 18)), None);
+    }
+
+    fn drawn(panel: &mut Panel, area: Rect) -> Vec<String> {
+        let buf = panel.draw(area);
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The panel keeps its bounds while they cut nothing, and grows past
+    /// them only when they would.
+    #[test]
+    fn a_floating_create_shows_its_command_whole_however_long() {
+        let screen = Rect::new(0, 0, 220, 40);
+        let widest = Rect::new(0, 0, PANEL_WIDEST, CREATE_ROWS);
+        for len in 10..=150 {
+            let command: String = LONG_COMMAND.chars().cycle().take(len).collect();
+            let shows =
+                |panel: &mut Panel, at: Rect| drawn(panel, at).iter().any(|r| r.contains(&command));
+            let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+            panel.prompt = Prompt::create(
+                "session 2".to_string(),
+                command.clone(),
+                DIRECTORY_DEFAULT.to_string(),
+            );
+            let area = panel.area(screen).expect("room");
+            let mut cut_at_widest = false;
+            for focused in [false, true] {
+                if focused {
+                    panel.prompt.on_key(Key::Down);
+                }
+                assert!(
+                    shows(&mut panel, area),
+                    "{len}, focused {focused}: {:#?}",
+                    drawn(&mut panel, area)
+                );
+                cut_at_widest |= !shows(&mut panel, widest);
+            }
+            assert_eq!(area.width > PANEL_WIDEST, cut_at_widest, "{len}: {area:?}");
+        }
+    }
+
+    #[test]
+    fn a_widened_panel_keeps_its_margins_and_marks_what_still_does_not_fit() {
+        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+        panel.prompt = Prompt::create(
+            "session 2".to_string(),
+            LONG_COMMAND.to_string(),
+            DIRECTORY_DEFAULT.to_string(),
+        );
+        let area = panel.area(Rect::new(0, 0, 100, 30)).expect("room");
+        assert!(area.width > PANEL_WIDEST, "{area:?}");
+        assert!(
+            area.x >= SESSION_COLS && area.right() + SESSION_COLS <= 100,
+            "{area:?}"
+        );
+        let rows = drawn(&mut panel, area);
+        let row = rows
+            .iter()
+            .find(|r| r.contains("nvim command"))
+            .expect("the command row");
+        assert!(row.trim_end().ends_with('…'), "{row:?}");
+    }
+
+    /// The label names the session, so a long name is cut twice as soon.
+    #[test]
+    fn a_long_name_widens_its_rename_panel_too() {
+        let name = "the-api-server-staging-environment-rewrite";
+        let mut panel = Panel::rename_on(id("aaaaaaaa"), hosted(&[name]), None);
+        let area = panel.area(Rect::new(0, 0, 200, 30)).expect("room");
+        let rows = drawn(&mut panel, area);
+        let line = format!("rename {name:?} to: {name}");
+        assert!(rows.iter().any(|r| r.contains(&line)), "{rows:#?}");
     }
 
     #[test]
