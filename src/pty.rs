@@ -232,8 +232,8 @@ pub struct Attachment {
     probe: Option<Probe>,
     /// Whether the client is nvmux's own, which draws cards.
     draws_cards: bool,
-    /// Neovim's client, before its first DA1 answer: that one asks its server
-    /// for a flush (see [`flush_after_answers`]).
+    /// Neovim's client, until its first DA1 answer, on which its server is
+    /// asked for a flush (see [`flush_after_answers`]).
     flush_after_answers: bool,
     /// Told it is out of sight (see [`Attachment::go_away`]) and not yet back.
     away: bool,
@@ -613,13 +613,15 @@ impl Attachment {
         }
     }
 
-    /// Watch terminal input to a kept client: note when its startup queries are
-    /// answered, and swallow the size report a resume triggered. That report
-    /// repeats the client's current size; passed on, the server would resize to
-    /// the same size, which in `input()` or `getchar()` clears to the prompt
-    /// row and wipes the `:mode` repaint. Swallowing it loses nothing: a size
-    /// changed while parked was sent by [`Attachment::tell_its_size`]. Other
-    /// sizes (a resize since) go through.
+    /// Watch terminal input. Neovim's client's first DA1 answer asks for the
+    /// flush its replies wait on (see [`flush_after_answers`]). For a kept
+    /// client, note when its startup queries are answered, and swallow the
+    /// size report a resume triggered. That report repeats the client's
+    /// current size; passed on, the server would resize to the same size,
+    /// which in `input()` or `getchar()` clears to the prompt row and wipes
+    /// the `:mode` repaint. Swallowing it loses nothing: a size changed while
+    /// parked was sent by [`Attachment::tell_its_size`]. Other sizes (a
+    /// resize since) go through.
     fn saw_input(&mut self, step: &mut Step) {
         let Step::Forward(bytes) = step else {
             return;
