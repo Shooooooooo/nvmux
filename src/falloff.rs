@@ -30,19 +30,38 @@ pub fn around(distance: f32, peak: f32, reach: f32) -> f32 {
     peak * (1.0 - ease(distance / reach))
 }
 
-/// Distance in columns from (`col`, `row`) to the rectangle, a row counting
-/// as [`ASPECT`]; 0 inside it.
-pub fn distance(col: u16, row: u16, left: u16, top: u16, width: u16, height: u16) -> f32 {
-    let gap = |at: u16, from: u16, len: u16| {
-        if at < from {
-            from - at
-        } else {
-            at.saturating_sub((from + len).saturating_sub(1))
-        }
+/// Distance in columns from (`col`, `row`) to the rectangle with its corners
+/// rounded `radius` columns, a row counting as [`ASPECT`]; 0 inside it.
+///
+/// Measured between cell centres, so any radius above 0 cuts the corner
+/// cells. It is at most half the shorter side.
+pub fn distance(
+    col: u16,
+    row: u16,
+    left: u16,
+    top: u16,
+    width: u16,
+    height: u16,
+    radius: f32,
+) -> f32 {
+    // Past the nearer edge: positive outside, negative inside.
+    let past = |at: u16, from: u16, len: u16| {
+        let (at, from) = (i32::from(at), i32::from(from));
+        (from - at).max(at - from - i32::from(len) + 1) as f32
     };
-    let dx = f32::from(gap(col, left, width));
-    let dy = f32::from(gap(row, top, height)) * ASPECT;
-    (dx * dx + dy * dy).sqrt()
+    let dx = past(col, left, width);
+    let dy = past(row, top, height) * ASPECT;
+    let radius = radius
+        .min(f32::from(width.saturating_sub(1)) / 2.0)
+        .min(f32::from(height.saturating_sub(1)) * ASPECT / 2.0);
+    // Within `radius` of a corner on both axes, from its arc; elsewhere from
+    // the nearer edge and exact, so a row off is ASPECT on the dot.
+    let (x, y) = (dx + radius, dy + radius);
+    if x > 0.0 && y > 0.0 {
+        (x.hypot(y) - radius).max(0.0)
+    } else {
+        dx.max(dy).max(0.0)
+    }
 }
 
 #[cfg(test)]
@@ -71,7 +90,7 @@ mod tests {
     #[test]
     fn a_row_counts_as_more_than_a_column() {
         // A rectangle at columns 10..20, rows 5..8.
-        let d = |col, row| distance(col, row, 10, 5, 10, 3);
+        let d = |col, row| distance(col, row, 10, 5, 10, 3, 0.0);
         assert_eq!(d(10, 5), 0.0);
         assert_eq!(d(19, 7), 0.0, "its far corner is in it");
         assert_eq!(d(9, 6), 1.0, "a column left of it");
@@ -83,5 +102,32 @@ mod tests {
         );
         let corner = d(9, 4);
         assert!((corner - (1.0 + ASPECT * ASPECT).sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_round_corner_cuts_its_cells_and_is_measured_from_its_arc() {
+        // Columns 10..60, rows 5..25.
+        let d = |col, row| distance(col, row, 10, 5, 50, 20, 4.0);
+        let square = |col, row| distance(col, row, 10, 5, 50, 20, 0.0);
+        for col in [10, 13, 56, 59] {
+            assert!(d(col, 5) > 0.0 && d(col, 24) > 0.0, "column {col}");
+        }
+        assert_eq!(d(14, 5), 0.0);
+        assert_eq!(d(55, 24), 0.0);
+        assert!(d(10, 6) > 0.0 && d(59, 23) > 0.0, "the outer cell below");
+        assert_eq!(d(11, 6), 0.0);
+        assert_eq!(d(10, 7), 0.0);
+        assert_eq!(d(9, 15), 1.0, "beside a side, as square");
+        assert_eq!(d(14, 4), ASPECT);
+        assert!(d(9, 4) > square(9, 4), "further off the corner");
+    }
+
+    #[test]
+    fn the_radius_is_at_most_half_the_shorter_side() {
+        for col in 10..60 {
+            assert_eq!(distance(col, 5, 10, 5, 50, 1, 4.0), 0.0, "{col}");
+        }
+        let low = |col| distance(col, 5, 10, 5, 50, 3, 9.0);
+        assert_eq!(low(10), distance(10, 5, 10, 5, 50, 3, ASPECT));
     }
 }

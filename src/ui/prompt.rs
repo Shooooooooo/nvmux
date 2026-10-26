@@ -3043,12 +3043,13 @@ mod tests {
         assert_eq!(last.prompt.fields[NAME].default, "session 4");
     }
 
-    /// The panel ends at least a row of the session above the hint row.
+    /// The panel ends at least a row of the session above the hint row, and
+    /// its corners cut off none of its text.
     #[test]
     fn the_floating_prompt_fits_where_it_can() {
         let rows = hosted(&["one", "two"]);
-        let create = Panel::create_on(Place::Last, rows.clone(), None);
-        let rename = Panel::rename_on(id("aaaaaaaa"), rows, None);
+        let mut create = Panel::create_on(Place::Last, rows.clone(), None);
+        let mut rename = Panel::rename_on(id("aaaaaaaa"), rows, None);
         let screen = Rect::new(0, 0, 80, 24);
         let c = create.area(screen).expect("room for a create");
         let r = rename.area(screen).expect("room for a rename");
@@ -3065,6 +3066,8 @@ mod tests {
         assert!(r.height < c.height && r.width <= c.width, "{r:?} {c:?}");
         assert_eq!(create.area(Rect::new(0, 0, 50, 24)), None);
         assert_eq!(create.area(Rect::new(0, 0, 80, 18)), None);
+        test_support::assert_corners_blank(&create.draw(c));
+        test_support::assert_corners_blank(&rename.draw(r));
     }
 
     #[test]

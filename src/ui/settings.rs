@@ -2556,6 +2556,7 @@ mod tests {
         let area = panel_area(screen).expect("floats on 80x24");
         let buf = panel.draw(area);
         assert_eq!(buf.area, area);
+        test_support::assert_corners_blank(&buf);
         let rows = rows_of(&buf);
         assert_eq!(rows.len(), 17);
         assert!(rows[0].is_empty(), "a clear row over the sections");
