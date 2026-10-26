@@ -25,12 +25,16 @@
 //! rename starts pre-filled. An emptied field shows its default dimmed, which
 //! is what Enter would submit.
 //!
+//! A value too wide for its field ends in a `…`. With the cursor in it, the
+//! field scrolls to keep the cursor in view, with a `…` on each side that has
+//! more.
+//!
 //! # Styles
 //!
 //! No colours, only modifiers (see [`super::draw`]): **dim** for labels,
-//! untouched defaults, the hint row and a path's discarded part; **plain** for
-//! typed text; **reversed** for the cursor, and reversed+bold for the selected
-//! menu row, as in the picker.
+//! untouched defaults, the hint row, a path's discarded part and the `…`
+//! where a value is cut; **plain** for typed text; **reversed** for the
+//! cursor, and reversed+bold for the selected menu row, as in the picker.
 //!
 //! # Keys
 //!
@@ -68,7 +72,9 @@
 //! With `[style] float` (the default) the prompt is drawn in a relay [`Panel`]
 //! over the session, or in the picker's place for its `c` and `r` (the picker
 //! returns if no session results). Behaviour is identical; only drawing and
-//! key input differ.
+//! key input differ. The panel is at most as wide as the settings panel,
+//! unless that would cut the fields' opening values short; then it widens as
+//! far as the screen allows.
 
 use std::time::Instant;
 
@@ -677,10 +683,17 @@ const SESSION_COLS: u16 = 2;
 const SESSION_ROWS: u16 = 1;
 
 /// Extra width beyond the opening lines for typing, and the width bounds
-/// (the settings panel's).
+/// (the settings panel's). The widest gives way to opening lines it would cut
+/// short (see [`WHOLE`]), as far as the screen allows.
 const PANEL_ROOM: u16 = 24;
 const PANEL_NARROWEST: u16 = 48;
 const PANEL_WIDEST: u16 = 72;
+
+/// How much wider than its opening lines a panel must be to show them whole,
+/// the cursor after them: a margin each side ([`float::inside`]), and three
+/// columns more, as the form is centred and [`field_line`] needs two of them
+/// to its right.
+const WHOLE: u16 = 5;
 
 /// Panel heights: the body plus the last row, where the prompt has its hint
 /// row full screen, left blank ([`float::inside`]). A create's form (three
@@ -878,8 +891,13 @@ impl Floating for Panel {
             .map(|f| f.label.width() + f.default.width())
             .max()
             .unwrap_or(0) as u16;
+        let widest = if opening + WHOLE > PANEL_WIDEST {
+            opening + PANEL_ROOM
+        } else {
+            PANEL_WIDEST
+        };
         let width = (opening + PANEL_ROOM)
-            .clamp(PANEL_NARROWEST, PANEL_WIDEST)
+            .clamp(PANEL_NARROWEST, widest)
             .min(room.width.saturating_sub(2 * SESSION_COLS));
         let height = match self.job {
             Job::Create { .. } => CREATE_ROWS,
@@ -1381,7 +1399,8 @@ fn draw_menu(frame: &mut Frame, menu: &Menu, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// One field's line: dim label, then the input or the dim default.
+/// One field's line: dim label, then the input or the dim default, with a
+/// dim `…` where it is cut.
 fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
     // Reserve a column for the cursor so a long label cannot push it off.
     let label = draw::truncate(&field.label, width.saturating_sub(1));
@@ -1392,20 +1411,28 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
     let inert = crate::dirs::anchored(&field.input).0.chars().count();
 
     match (field.input.is_empty(), focused) {
-        // Cursor on the placeholder's first letter.
+        // Cursor on the placeholder's first letter, in the column reserved
+        // for it (and the next, if wide).
         (true, true) => match split_first(&field.default) {
             Some((first, rest)) => {
+                let rest = draw::clip(rest, (room + 1).saturating_sub(first.width()));
                 spans.push(Span::styled(first, CURSOR));
-                spans.push(Span::styled(draw::truncate(rest, room), DIM));
+                spans.push(Span::styled(rest, DIM));
             }
             None => spans.push(Span::styled(" ", CURSOR)),
         },
         // Unfocused: no cursor.
-        (true, false) => spans.push(Span::styled(draw::truncate(&field.default, room), DIM)),
+        (true, false) => spans.push(Span::styled(draw::clip(&field.default, room), DIM)),
         (false, true) => spans.extend(windowed(field, room, inert)),
         (false, false) => {
-            // No cursor to keep in view: truncate, keeping the dim prefix.
-            let text = draw::truncate(&field.input, room);
+            // No cursor to keep in view: cut at the end, keeping the dim prefix.
+            let over = field.input.width() > room;
+            let fits = if over {
+                room.saturating_sub(draw::ELLIPSIS.width())
+            } else {
+                room
+            };
+            let text = draw::truncate(&field.input, fits);
             let shown = text.chars().count();
             let cut = inert.min(shown);
             let (before, after): (String, String) = (
@@ -1418,6 +1445,9 @@ fn field_line(field: &Field, focused: bool, width: usize) -> Line<'static> {
             if !after.is_empty() {
                 spans.push(Span::raw(after));
             }
+            if over {
+                spans.push(Span::styled(draw::ELLIPSIS, DIM));
+            }
         }
     }
 
@@ -1429,38 +1459,82 @@ fn split_first(s: &str) -> Option<(String, &str)> {
     Some((first.to_string(), &s[first.len_utf8()..]))
 }
 
-/// The visible window of `input` as character indices `(start, cursor, end)`.
-/// Indices, not strings, so `windowed` can place the dim/plain boundary.
+/// The part of a focused field shown: character indices into its input, and
+/// whether text is hidden before or after it.
+#[derive(Debug)]
+struct Window {
+    start: usize,
+    at: usize,
+    end: usize,
+    more_before: bool,
+    more_after: bool,
+}
+
+/// The visible window of `input`, fitting `max` with a `…` on each side that
+/// hides text. Indices, not strings, so `windowed` can place the dim/plain
+/// boundary.
 ///
 /// Unlike `draw::truncate`, it scrolls to keep the cursor visible. The input
 /// gets a trailing blank cell for a cursor past the end.
-fn around_cursor(field: &Field, max: usize) -> (usize, usize, usize) {
+fn around_cursor(field: &Field, max: usize) -> Window {
     let cells: Vec<char> = field.input.chars().chain([' ']).collect();
-    let at = field.cursor.min(cells.len() - 1);
+    let len = cells.len() - 1;
+    let at = field.cursor.min(len);
     let width = |c: char| c.to_string().width().max(1);
+    let mark = draw::ELLIPSIS.width();
+    // A `…` never costs the cursor its cell: a field without room for the
+    // cursor and a `…` each side has none.
+    let marks = max >= width(cells[at]) + 2 * mark;
 
-    // The cursor cell is kept even when `max` is 0.
-    let mut used = width(cells[at]).min(max);
-    let (mut start, mut end) = (at, at + 1);
+    // Columns kept for a `…` before and after.
+    let (mut before, mut after) = (false, false);
+    loop {
+        let budget = max.saturating_sub(mark * (usize::from(before) + usize::from(after)));
 
-    // Extend left first, so long text scrolls off the left, then right.
-    while start > 0 && used + width(cells[start - 1]) <= max {
-        start -= 1;
-        used += width(cells[start]);
+        // The cursor cell is kept even when the budget is 0.
+        let mut used = width(cells[at]).min(budget);
+        let (mut start, mut end) = (at, at + 1);
+
+        // Extend left first, so long text scrolls off the left, then right.
+        while start > 0 && used + width(cells[start - 1]) <= budget {
+            start -= 1;
+            used += width(cells[start]);
+        }
+        while end < cells.len() && used + width(cells[end]) <= budget {
+            used += width(cells[end]);
+            end += 1;
+        }
+
+        // Keeping a column for a `…` can hide more, so go round until every
+        // side hiding text has one. A wide glyph can leave a kept column
+        // with nothing to mark; it stays blank. The trailing blank is the
+        // cursor's, not text.
+        let (more_before, more_after) = (marks && start > 0, marks && end < len);
+        if (before || !more_before) && (after || !more_after) {
+            return Window {
+                start,
+                at,
+                end,
+                more_before,
+                more_after,
+            };
+        }
+        before |= more_before;
+        after |= more_after;
     }
-    while end < cells.len() && used + width(cells[end]) <= max {
-        used += width(cells[end]);
-        end += 1;
-    }
-
-    (start, at, end)
 }
 
 /// The windowed text as spans, coalescing runs of equal style (cursor and
-/// dim prefix vary independently).
+/// dim prefix vary independently), between its `…`s.
 fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
     let cells: Vec<char> = field.input.chars().chain([' ']).collect();
-    let (start, at, end) = around_cursor(field, max);
+    let Window {
+        start,
+        at,
+        end,
+        more_before,
+        more_after,
+    } = around_cursor(field, max);
 
     let style = |i: usize| match (i == at, i < inert) {
         // The cursor wins, even in the dim prefix.
@@ -1470,6 +1544,9 @@ fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
+    if more_before {
+        spans.push(Span::styled(draw::ELLIPSIS, DIM));
+    }
     let mut run = String::new();
     let mut current = style(start);
     for (i, c) in cells.iter().enumerate().take(end).skip(start) {
@@ -1483,6 +1560,9 @@ fn windowed(field: &Field, max: usize, inert: usize) -> Vec<Span<'static>> {
     if !run.is_empty() {
         spans.push(Span::styled(run, current));
     }
+    if more_after {
+        spans.push(Span::styled(draw::ELLIPSIS, DIM));
+    }
     spans
 }
 
@@ -1493,6 +1573,9 @@ mod tests {
 
     const COMMAND_DEFAULT: &str = "nvim --headless --listen {sock}";
     const DIRECTORY_DEFAULT: &str = "~/";
+    /// Too wide for the usual panel.
+    const LONG_COMMAND: &str = "env NVIM_APPNAME=nvim-work /opt/nvim-nightly/bin/nvim \
+                                --cmd \"let g:remote = 1\" --headless --listen {sock}";
 
     /// Clearing after a rename or cancel would flash a blank screen before the
     /// picker or client repaints.
@@ -2647,10 +2730,11 @@ mod tests {
         );
     }
 
-    /// Including with the cursor inside the dim prefix.
+    /// Including with the cursor inside the dim prefix. From 25 columns, the
+    /// fewest that show `etc` beside the `…` and the cursor.
     #[test]
     fn a_dim_prefix_survives_a_field_too_narrow_for_it() {
-        for width in [24u16, 30, 40, 60] {
+        for width in [25u16, 30, 40, 60] {
             let mut p = at_directory("/home/you/a-long-directory-name//etc");
             // After the label, every dim cell precedes every live one.
             let value: Vec<_> = after_label(&p, width, 14);
@@ -2755,6 +2839,101 @@ mod tests {
             text_of(&cells).contains("nvim --head"),
             "the start must come back into view: {cells:?}"
         );
+    }
+
+    fn command_row(p: &Prompt, w: u16, h: u16) -> Vec<Cell> {
+        cells_of(p, w, h)
+            .into_iter()
+            .find(|row| text_of(row).contains("nvim command"))
+            .expect("the command row")
+    }
+
+    #[test]
+    fn a_value_too_long_for_its_field_ends_in_a_dim_ellipsis() {
+        let p = Prompt::create(
+            "session 3".to_string(),
+            LONG_COMMAND.to_string(),
+            DIRECTORY_DEFAULT.to_string(),
+        );
+        let row = command_row(&p, 60, 9);
+        let last = row.iter().rposition(|(s, _)| s != " ").expect("a value");
+        assert_eq!(row[last], ("…".to_string(), Modifier::DIM), "{row:?}");
+        let shown = text_of(&row[..last]);
+        let value = shown
+            .trim_start()
+            .trim_start_matches("nvim command:")
+            .trim_start();
+        assert!(LONG_COMMAND.starts_with(value), "{value:?}");
+    }
+
+    /// Focused, the cursor is on its first letter; unfocused, there is none.
+    #[test]
+    fn a_long_default_in_an_emptied_field_ends_in_a_dim_ellipsis() {
+        let mut p = at_command("");
+        p.fields[COMMAND].default = LONG_COMMAND.to_string();
+        for focused in [true, false] {
+            let row = command_row(&p, 60, 9);
+            let last = row.iter().rposition(|(s, _)| s != " ").expect("a value");
+            assert_eq!(
+                row[last],
+                ("…".to_string(), Modifier::DIM),
+                "focused {focused}: {row:?}"
+            );
+            p.on_key(Key::Down);
+        }
+    }
+
+    #[test]
+    fn a_focused_value_marks_each_side_with_more() {
+        let mark = ("…".to_string(), Modifier::DIM);
+        let mut p = at_command(LONG_COMMAND);
+
+        let value = after_label(&p, 60, 9);
+        assert_eq!(value[0], mark, "the start is hidden: {value:?}");
+        assert!(
+            value[value.len() - 1].1.contains(Modifier::REVERSED),
+            "the cursor ends the line: {value:?}"
+        );
+
+        p.on_key(Key::Home);
+        let value = after_label(&p, 60, 9);
+        assert!(value[0].1.contains(Modifier::REVERSED), "{value:?}");
+        assert_eq!(value[value.len() - 1], mark, "the end is hidden: {value:?}");
+
+        press(&mut p, &[Key::Right; 54]);
+        let value = after_label(&p, 60, 9);
+        assert_eq!(value[0], mark, "{value:?}");
+        assert_eq!(value[value.len() - 1], mark, "{value:?}");
+        let cursors: Vec<_> = value
+            .iter()
+            .filter(|(_, m)| m.contains(Modifier::REVERSED))
+            .collect();
+        assert_eq!(cursors.len(), 1, "{value:?}");
+        assert_eq!(cursors[0].0, "-", "on `--cmd`, not under a mark");
+    }
+
+    /// At every cursor position and width, wide glyphs included.
+    #[test]
+    fn a_window_fits_its_field_and_marks_each_side_it_hides() {
+        let mut field = Field::with("~/写真/2024年/北海道の旅/day one".to_string());
+        let cells: Vec<char> = field.input.chars().chain([' ']).collect();
+        let width = |c: &char| c.to_string().width();
+        for max in 0..40 {
+            for cursor in 0..=field.len() {
+                field.cursor = cursor;
+                let w = around_cursor(&field, max);
+                assert!(w.start <= w.at && w.at < w.end, "{max}: {w:?}");
+                let marks = usize::from(w.more_before) + usize::from(w.more_after);
+                if max < width(&cells[w.at]) + 2 {
+                    assert_eq!(marks, 0, "no room for a mark beside the cursor at {max}");
+                    continue;
+                }
+                let used = cells[w.start..w.end].iter().map(width).sum::<usize>() + marks;
+                assert!(used <= max, "{used} columns in {max}: {w:?}");
+                assert_eq!(w.more_before, w.start > 0, "{max}: {w:?}");
+                assert_eq!(w.more_after, w.end < field.len(), "{max}: {w:?}");
+            }
+        }
     }
 
     #[test]
@@ -3068,6 +3247,83 @@ mod tests {
         assert_eq!(create.area(Rect::new(0, 0, 80, 18)), None);
         test_support::assert_corners_blank(&create.draw(c));
         test_support::assert_corners_blank(&rename.draw(r));
+    }
+
+    fn drawn(panel: &mut Panel, area: Rect) -> Vec<String> {
+        let buf = panel.draw(area);
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The panel keeps its bounds while they cut nothing, and grows past
+    /// them only when they would.
+    #[test]
+    fn a_floating_create_shows_its_command_whole_however_long() {
+        let screen = Rect::new(0, 0, 220, 40);
+        let widest = Rect::new(0, 0, PANEL_WIDEST, CREATE_ROWS);
+        for len in 10..=150 {
+            let command: String = LONG_COMMAND.chars().cycle().take(len).collect();
+            let shows =
+                |panel: &mut Panel, at: Rect| drawn(panel, at).iter().any(|r| r.contains(&command));
+            let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+            panel.prompt = Prompt::create(
+                "session 2".to_string(),
+                command.clone(),
+                DIRECTORY_DEFAULT.to_string(),
+            );
+            let area = panel.area(screen).expect("room");
+            let mut cut_at_widest = false;
+            for focused in [false, true] {
+                if focused {
+                    panel.prompt.on_key(Key::Down);
+                }
+                assert!(
+                    shows(&mut panel, area),
+                    "{len}, focused {focused}: {:#?}",
+                    drawn(&mut panel, area)
+                );
+                cut_at_widest |= !shows(&mut panel, widest);
+            }
+            assert_eq!(area.width > PANEL_WIDEST, cut_at_widest, "{len}: {area:?}");
+        }
+    }
+
+    #[test]
+    fn a_widened_panel_keeps_its_margins_and_marks_what_still_does_not_fit() {
+        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+        panel.prompt = Prompt::create(
+            "session 2".to_string(),
+            LONG_COMMAND.to_string(),
+            DIRECTORY_DEFAULT.to_string(),
+        );
+        let area = panel.area(Rect::new(0, 0, 100, 30)).expect("room");
+        assert!(area.width > PANEL_WIDEST, "{area:?}");
+        assert!(
+            area.x >= SESSION_COLS && area.right() + SESSION_COLS <= 100,
+            "{area:?}"
+        );
+        let rows = drawn(&mut panel, area);
+        let row = rows
+            .iter()
+            .find(|r| r.contains("nvim command"))
+            .expect("the command row");
+        assert!(row.trim_end().ends_with('…'), "{row:?}");
+    }
+
+    /// The label names the session, so a long name is cut twice as soon.
+    #[test]
+    fn a_long_name_widens_its_rename_panel_too() {
+        let name = "the-api-server-staging-environment-rewrite";
+        let mut panel = Panel::rename_on(id("aaaaaaaa"), hosted(&[name]), None);
+        let area = panel.area(Rect::new(0, 0, 200, 30)).expect("room");
+        let rows = drawn(&mut panel, area);
+        let line = format!("rename {name:?} to: {name}");
+        assert!(rows.iter().any(|r| r.contains(&line)), "{rows:#?}");
     }
 
     #[test]
