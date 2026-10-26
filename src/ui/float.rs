@@ -9,13 +9,19 @@
 //!
 //! The hint row does not float: it stays on the terminal's last row, full
 //! width, as full screen ([`Floating::draw_hints`]), with the panel in the
-//! room above it ([`split`]).
+//! room above it ([`split`]). The panel's corners are round ([`RADIUS`]).
 
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
+
+/// How far a panel's corners are rounded, in columns: about two rows, so the
+/// arc is round on screen. It cuts four cells off each end of the first and
+/// last rows and the margin column ([`inside`]) of the rows next to them,
+/// which every screen leaves blank.
+pub const RADIUS: f32 = 4.0;
 
 /// What the relay should do after a key or mouse event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +102,20 @@ pub fn split(screen: Rect) -> (Rect, Rect) {
         return (screen, screen);
     }
     super::draw::split_hint_row(screen)
+}
+
+/// How far (`col`, `row`) is from `panel`, its corners rounded, in columns
+/// (see [`crate::falloff::distance`]); 0 on it.
+pub fn distance(panel: Rect, col: u16, row: u16) -> f32 {
+    crate::falloff::distance(
+        col,
+        row,
+        panel.x,
+        panel.y,
+        panel.width,
+        panel.height,
+        RADIUS,
+    )
 }
 
 /// The panel minus a column each side, which keep its text off the

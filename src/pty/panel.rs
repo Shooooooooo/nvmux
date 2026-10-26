@@ -2,11 +2,12 @@
 //! `<prefix> ,`, `<prefix> ?`, `<prefix> Space`, `<prefix> c`, and the
 //! picker's `c` and `r`.
 //!
-//! The screen draws into a panel (see [`crate::ui::float`]) while the session
-//! keeps running behind it, dimmed half way to the background, more near the
-//! panel by the cards' falloff ([`crate::falloff`]), and blank under it. The
-//! hint row does not float: it stays on the terminal's last row, full width
-//! ([`Floating::draw_hints`]), and the session is blank under it too.
+//! The screen draws into a panel with round corners (see [`crate::ui::float`])
+//! while the session keeps running behind it, dimmed half way to the
+//! background, more near the panel by the cards' falloff ([`crate::falloff`]),
+//! and blank under it. The hint row does not float: it stays on the
+//! terminal's last row, full width ([`Floating::draw_hints`]), and the session
+//! is blank under it too.
 //!
 //! The relay draws it, not the client, so it also works with
 //! `[client] ui = "nvim"`: each frame paints the session from its copy of the
@@ -67,9 +68,9 @@ const SESSION_FRAME: Duration = Duration::from_millis(33);
 /// Past this, a sequence that never ends is written out as is.
 const HELD_MAX: usize = 8 << 20;
 
-/// The blank margin round the panel when there are no colours.
-const MARGIN_COLS: u16 = 2;
-const MARGIN_ROWS: u16 = 1;
+/// The blank margin round the panel when there are no colours, in columns:
+/// two, or a row.
+const MARGIN: f32 = falloff::ASPECT;
 
 #[derive(Debug, Clone, Copy)]
 enum Look {
@@ -93,9 +94,9 @@ impl Look {
     /// panel, but the row has no falloff of its own.
     fn shade(self, row: u16, col: u16, panel: Rect, hints: Rect, dim: f32, away: f32) -> Shade {
         let under_hints = hints.contains(Position::new(col, row));
+        let d = float::distance(panel, col, row);
         match self {
             Look::Dimmed(_) => {
-                let d = falloff::distance(col, row, panel.x, panel.y, panel.width, panel.height);
                 let amount = if d == 0.0 || under_hints {
                     1.0
                 } else {
@@ -105,19 +106,8 @@ impl Look {
                 Shade::Toward(dimmed + (1.0 - dimmed) * away)
             }
             Look::Faint if away > 0.0 => Shade::Blank,
-            Look::Faint => {
-                let left = panel.x.saturating_sub(MARGIN_COLS);
-                let top = panel.y.saturating_sub(MARGIN_ROWS);
-                let inside = col >= left
-                    && col < panel.right() + MARGIN_COLS
-                    && row >= top
-                    && row < panel.bottom() + MARGIN_ROWS;
-                if inside || under_hints {
-                    Shade::Blank
-                } else {
-                    Shade::Faint
-                }
-            }
+            Look::Faint if d <= MARGIN || under_hints => Shade::Blank,
+            Look::Faint => Shade::Faint,
         }
     }
 }
@@ -655,16 +645,21 @@ fn paint(
         return Ok(false);
     }
     let (text, dim, away) = levels(there, away);
+    let faded = |mut buf| {
+        if let (Some(palette), true) = (look.palette(), text < 1.0) {
+            fade::apply(&mut buf, palette, 1.0 - text);
+        }
+        buf
+    };
     let laid: Vec<Laid> = (text > 0.0)
-        .then(|| [panel.draw(area), panel.draw_hints(hints)])
+        .then(|| {
+            [
+                Laid::rounded(&faded(panel.draw(area)), float::RADIUS),
+                Laid::from_buffer(&faded(panel.draw_hints(hints))),
+            ]
+        })
         .into_iter()
         .flatten()
-        .map(|mut buf| {
-            if let (Some(palette), true) = (look.palette(), text < 1.0) {
-                fade::apply(&mut buf, palette, 1.0 - text);
-            }
-            Laid::from_buffer(&buf)
-        })
         .collect();
     let Some(copy) = a.copy() else {
         return Ok(false);
@@ -678,8 +673,7 @@ fn paint(
 }
 
 fn on_the_session(area: Rect, hints: Rect, column: u16, row: u16) -> bool {
-    let at = Position::new(column, row);
-    !area.contains(at) && !hints.contains(at)
+    float::distance(area, column, row) > 0.0 && !hints.contains(Position::new(column, row))
 }
 
 /// A frame's bytes in one synchronized update: client output since the last
@@ -839,6 +833,26 @@ mod tests {
         assert_eq!(shade(29, 30), Shade::Blank, "and below");
         assert_eq!(shade(10, 21), Shade::Faint);
         assert_eq!(shade(4, 30), Shade::Faint);
+    }
+
+    #[test]
+    fn the_panels_corners_are_round() {
+        let panel = Rect::new(24, 6, 72, 23);
+        let look = Look::Dimmed(palette());
+        let amount = |row, col| match look.shade(row, col, panel, HINTS, 1.0, 0.0) {
+            Shade::Toward(t) => t,
+            other => panic!("{other:?}"),
+        };
+        assert!(amount(6, 24) < falloff::EMPTIED, "the corner cell shows");
+        assert!(amount(7, 24) < falloff::EMPTIED && amount(28, 95) < falloff::EMPTIED);
+        assert_eq!(amount(6, 28), 1.0, "under it past the curve");
+        assert_eq!(amount(7, 25), 1.0);
+        let faint = |row, col| Look::Faint.shade(row, col, panel, HINTS, 1.0, 0.0);
+        assert_eq!(faint(5, 22), Shade::Faint, "off the margin's corner");
+        assert_eq!(faint(6, 23), Shade::Faint);
+        assert_eq!(faint(6, 24), Shade::Blank, "in the margin");
+        assert!(on_the_session(panel, HINTS, 24, 6), "a press on the corner");
+        assert!(!on_the_session(panel, HINTS, 28, 6));
     }
 
     #[test]

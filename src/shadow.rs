@@ -192,6 +192,9 @@ pub struct Laid {
     left: u16,
     width: u16,
     height: u16,
+    /// Per row, how many cells at each end rounded corners leave to the
+    /// session ([`Laid::rounded`]); empty for none.
+    cut: Vec<u16>,
     /// Every cell's text in one string, not one allocation per cell per
     /// frame.
     text: String,
@@ -229,8 +232,26 @@ impl Laid {
             left: area.x,
             width: area.width,
             height: area.height,
+            cut: Vec::new(),
             text,
             cells,
+        }
+    }
+
+    /// `buf`'s cells, placed at its area, but for those its corners rounded
+    /// `radius` columns cut off ([`falloff::distance`]).
+    pub fn rounded(buf: &ratatui::buffer::Buffer, radius: f32) -> Self {
+        let a = buf.area;
+        let off = |row, col| falloff::distance(col, row, a.x, a.y, a.width, a.height, radius) > 0.0;
+        Self {
+            cut: (a.y..a.bottom())
+                .map(|row| {
+                    (a.x..a.x + a.width / 2)
+                        .take_while(|&col| off(row, col))
+                        .count() as u16
+                })
+                .collect(),
+            ..Self::from_buffer(buf)
         }
     }
 
@@ -242,6 +263,10 @@ impl Laid {
         }
         let (r, c) = (row - self.top, col - self.left);
         if r >= self.height || c >= self.width {
+            return None;
+        }
+        let cut = self.cut.get(usize::from(r)).copied().unwrap_or(0);
+        if c < cut || c >= self.width - cut {
             return None;
         }
         let cell = self
@@ -2429,6 +2454,30 @@ mod tests {
             "a quarter"
         );
         assert_eq!(cells[&(3, 12)].1, "l", "the session again past its edge");
+    }
+
+    #[test]
+    fn the_session_shows_in_the_corners_a_round_panel_cuts_off() {
+        let mut shadow = lettered();
+        let area = ratatui::layout::Rect::new(2, 0, 16, 6);
+        let panel = Laid::rounded(&ratatui::buffer::Buffer::empty(area), 4.0);
+        let frame = shadow.frame_under(
+            &|_, _| Shade::Toward(0.0),
+            Some(&palette()),
+            std::slice::from_ref(&panel),
+            Cursor::Hidden,
+        );
+        let cells = screen_of(&frame);
+        let row = |row| -> String {
+            (1..=20)
+                .map(|col| cells.get(&(row, col)).map_or(" ", |c| c.1.as_str()))
+                .collect()
+        };
+        assert_eq!(row(1), "abcdef        opqrst");
+        assert_eq!(row(2), "abc              rst");
+        assert_eq!(row(3), "ab                st");
+        assert_eq!(row(5), "abc              rst");
+        assert_eq!(row(6), "abcdef        opqrst");
     }
 
     /// The hint row is laid the full width, so none of the session's last row
