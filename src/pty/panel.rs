@@ -343,7 +343,9 @@ pub(super) fn float(
                 .div_ceil(1000)
                 .min(super::IDLE_POLL_MS as u128) as libc::c_int
         });
-        let mut fds = [pollfd(stdin_fd), pollfd(master_fd), pollfd(winch.fd())];
+        // Stdin is read even while the client is behind on its input: only
+        // terminal replies go to it from here.
+        let mut fds = [pollfd(stdin_fd), a.master_pollfd(), pollfd(winch.fd())];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -366,6 +368,9 @@ pub(super) fn float(
                     session_drew = true;
                 }
             }
+        }
+        if n > 0 && fds[1].revents & libc::POLLOUT != 0 {
+            a.input.send()?;
         }
 
         if n > 0 && ready(&fds[2]) {

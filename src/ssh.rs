@@ -117,6 +117,13 @@ fn unattended(ctl: &Path) -> Vec<String> {
 /// leaves the socket file and the next forward onto that path fails (rc 255,
 /// `mux_client_forward: forwarding request failed`), breaking reattach.
 ///
+/// `ClearAllForwardings=yes` drops the config's `LocalForward`,
+/// `RemoteForward` and `DynamicForward`, which would hold the user's ports
+/// while the master lives. Later `-O forward` requests are not affected.
+/// `ExitOnForwardFailure=yes` still matters: on a changed or revoked host key
+/// that `StrictHostKeyChecking=no` lets through, ssh then exits with its
+/// warning instead of connecting quietly.
+///
 /// `connect_timeout` (seconds): `None`, the system's TCP timeout, for the
 /// first connect, which the user watches. Reconnects need it: a down link
 /// drops packets rather than refusing, so each attempt would hang for minutes
@@ -138,6 +145,8 @@ fn master_args(
         "ControlPersist=60".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
+        "-o".into(),
+        "ClearAllForwardings=yes".into(),
         "-o".into(),
         "StreamLocalBindUnlink=yes".into(),
         // Detect a dead link instead of hanging on a half-open TCP connection.
@@ -194,9 +203,19 @@ fn check_args(host: &str, ctl: &Path) -> Vec<String> {
     args
 }
 
+/// Options for `-O forward` and `-O cancel`. A mux client sends the master
+/// every forward it holds, the config's too, so these read no config;
+/// `ClearAllForwardings` would clear their own `-L` as well. They need
+/// nothing from it: the `ControlPath` is given, with no `%` tokens.
+fn forward_client(ctl: &Path) -> Vec<String> {
+    let mut args = vec!["-F".into(), "/dev/null".into()];
+    args.extend(common(ctl));
+    args
+}
+
 /// `ssh -O <op> -L <local>:<remote> <host>` against the running master.
 fn forward_op(op: &str, host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<String> {
-    let mut args = common(ctl);
+    let mut args = forward_client(ctl);
     args.extend([
         "-O".into(),
         op.to_string(),
@@ -218,7 +237,7 @@ fn cancel_args(host: &str, ctl: &Path, local: &Path, remote: &Path) -> Vec<Strin
 
 /// Add all these forwards to the running master in one command.
 fn forward_all_args(host: &str, ctl: &Path, pairs: &[(PathBuf, PathBuf)]) -> Vec<String> {
-    let mut args = common(ctl);
+    let mut args = forward_client(ctl);
     args.extend(["-O".into(), "forward".into()]);
     for (local, remote) in pairs {
         args.extend([
@@ -246,6 +265,10 @@ fn forward_all_args(host: &str, ctl: &Path, pairs: &[(PathBuf, PathBuf)]) -> Vec
 /// `-T` because stdin is the command stream: with `RequestTTY force` a pty
 /// would echo every script into the output. Never add `-n`: it puts
 /// `/dev/null` on stdin, so `sh -s` silently exits 0 with *empty* output.
+///
+/// `ClearAllForwardings=yes` because a mux client asks the master for every
+/// forward in the config: the master binds those it lacks, and if one fails
+/// the shell connects without the master.
 fn shell_args(host: &str, ctl: &Path) -> Vec<String> {
     shell_args_with(common(ctl), host)
 }
@@ -257,7 +280,7 @@ fn unattended_shell_args(host: &str, ctl: &Path) -> Vec<String> {
 }
 
 fn shell_args_with(mut args: Vec<String>, host: &str) -> Vec<String> {
-    args.push("-T".into());
+    args.extend(["-o".into(), "ClearAllForwardings=yes".into(), "-T".into()]);
     args.extend([host.to_string(), remote_shell_command()]);
     args
 }
@@ -719,7 +742,10 @@ mod tests {
         assert!(s.contains("StreamLocalBindUnlink=yes"), "missing in: {s}");
         assert!(s.contains("ControlMaster=yes"));
         assert!(s.contains("ControlPersist=60"));
-        assert!(s.contains("ExitOnForwardFailure=yes"));
+        assert!(
+            s.contains("ExitOnForwardFailure=yes"),
+            "kept with no forwards, for a changed host key: {s}"
+        );
         assert!(s.contains("ServerAliveInterval=15"));
         assert!(s.contains("ServerAliveCountMax=3"));
         assert!(s.contains(&format!("ControlPath={CTL}")));
@@ -865,7 +891,7 @@ mod tests {
         assert_eq!(
             joined(&forward_all_args("h", Path::new(CTL), &pairs)),
             format!(
-                "-o ControlPath={CTL} -O forward \
+                "-F /dev/null -o ControlPath={CTL} -O forward \
                  -L /tmp/a.sock:/r/a.sock -L /tmp/b.sock:/r/b.sock h"
             )
         );
@@ -899,6 +925,42 @@ mod tests {
 
         let missing = LocalCheck(Err(std::io::Error::from(ErrorKind::NotFound)));
         assert!(matches!(missing.verdict(), Err(SshError::NotFound)));
+    }
+
+    /// A mux client sends the master every forward it holds, the config's
+    /// included, and the master binds each one it lacks.
+    #[test]
+    fn the_master_and_its_shells_take_no_forwards_from_the_config() {
+        for args in [
+            master_args("myhost", Path::new(CTL), None, None),
+            shell_args("myhost", Path::new(CTL)),
+            unattended_shell_args("myhost", Path::new(CTL)),
+        ] {
+            let s = joined(&args);
+            assert!(s.contains("-o ClearAllForwardings=yes"), "{s}");
+            // After the host it would be part of the remote command.
+            let at = |word: &str| args.iter().position(|a| a == word);
+            assert!(
+                at("ClearAllForwardings=yes") < at("myhost"),
+                "not an option before the host: {s}"
+            );
+        }
+    }
+
+    /// `ClearAllForwardings` would clear nvmux's own `-L` with the config's.
+    #[test]
+    fn forward_and_cancel_send_the_master_only_their_own_forwards() {
+        let (l, r) = (Path::new("/tmp/l.sock"), Path::new("/tmp/r.sock"));
+        let pairs = [(l.to_path_buf(), r.to_path_buf())];
+        for args in [
+            forward_args("h", Path::new(CTL), l, r),
+            cancel_args("h", Path::new(CTL), l, r),
+            forward_all_args("h", Path::new(CTL), &pairs),
+        ] {
+            let s = joined(&args);
+            assert!(s.starts_with("-F /dev/null "), "the config is read: {s}");
+            assert!(!s.contains("ClearAllForwardings"), "{s}");
+        }
     }
 
     #[test]

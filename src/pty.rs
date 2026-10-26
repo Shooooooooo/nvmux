@@ -184,6 +184,8 @@ pub struct Attachment {
     hand_off: Option<HandOff>,
     child: Child,
     master: Pty,
+    /// What goes into the client's input, through `master`.
+    input: ClientInput,
     /// Set by its first relay: later ones must force a repaint and restore the
     /// alternate screen, which the client will not re-enter.
     resumed: bool,
@@ -230,6 +232,9 @@ pub struct Attachment {
     probe: Option<Probe>,
     /// Whether the client is nvmux's own, which draws cards.
     draws_cards: bool,
+    /// Neovim's client, until its first DA1 answer, on which its server is
+    /// asked for a flush (see [`flush_after_answers`]).
+    flush_after_answers: bool,
     /// Told it is out of sight (see [`Attachment::go_away`]) and not yet back.
     away: bool,
     /// While `away`, drawing at a crawl; nvmux's copy may lag by up to 1 s.
@@ -447,6 +452,71 @@ fn in_band_size_report(size: PtySize) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Unsent input past which the relay leaves stdin unread, so a paste the
+/// client is slow to take waits in the terminal. A few times what a pty holds
+/// (about 18 KiB on Linux), so the client never waits on the relay.
+const UNSENT_MAX: usize = 64 * 1024;
+
+/// The client's input, written without ever waiting for room. A blocked
+/// write would stop the relay reading the client, which may be blocked
+/// writing a frame and so never read its input. What the pty has no room for
+/// waits here, in order, until [`ClientInput::send`] finds room.
+struct ClientInput {
+    /// The master's.
+    fd: RawFd,
+    unsent: Vec<u8>,
+}
+
+impl ClientInput {
+    fn new(fd: RawFd) -> Self {
+        Self {
+            fd,
+            unsent: Vec::new(),
+        }
+    }
+
+    /// Write as much of what waits as the pty takes now.
+    fn send(&mut self) -> std::io::Result<()> {
+        while !self.unsent.is_empty() {
+            match write_without_waiting(self.fd, &self.unsent) {
+                Ok(0) => return Ok(()),
+                Ok(n) => drop(self.unsent.drain(..n)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn waiting(&self) -> bool {
+        !self.unsent.is_empty()
+    }
+
+    /// Past [`UNSENT_MAX`]: stdin is left unread.
+    fn backlogged(&self) -> bool {
+        self.unsent.len() > UNSENT_MAX
+    }
+
+    /// Drop what waits, for a client on its way out.
+    fn discard(&mut self) {
+        self.unsent = Vec::new();
+    }
+}
+
+/// `write` queues behind what waits and sends what fits; `flush` never waits.
+impl Write for ClientInput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.unsent.extend_from_slice(bytes);
+        self.send()?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Attachment {
     /// Mark the notice to say the session is waiting for a key; otherwise it
     /// looks broken, drawing nothing until one arrives. Known only between the
@@ -487,8 +557,10 @@ impl Attachment {
     /// (SIGKILL), which gives no chance to restore the terminal. SIGCONT too:
     /// SIGHUP is not delivered to a stopped process (see `check_child`). Safe
     /// to repeat: nothing reaps in between (the peek in `check_child` passes
-    /// `WNOWAIT`), so the pid cannot be recycled.
+    /// `WNOWAIT`), so the pid cannot be recycled. Input still waiting for room
+    /// is dropped.
     pub fn hang_up(&mut self) {
+        self.input.discard();
         if self.reaped {
             return;
         }
@@ -541,20 +613,26 @@ impl Attachment {
         }
     }
 
-    /// Watch terminal input to a kept client: note when its startup queries are
-    /// answered, and swallow the size report a resume triggered. That report
-    /// repeats the client's current size; passed on, the server would resize to
-    /// the same size, which in `input()` or `getchar()` clears to the prompt
-    /// row and wipes the `:mode` repaint. Swallowing it loses nothing: a size
-    /// changed while parked was sent by [`Attachment::tell_its_size`]. Other
-    /// sizes (a resize since) go through.
+    /// Watch terminal input. Neovim's client's first DA1 answer asks for the
+    /// flush its replies wait on (see [`flush_after_answers`]). For a kept
+    /// client, note when its startup queries are answered, and swallow the
+    /// size report a resume triggered. That report repeats the client's
+    /// current size; passed on, the server would resize to the same size,
+    /// which in `input()` or `getchar()` clears to the prompt row and wipes
+    /// the `:mode` repaint. Swallowing it loses nothing: a size changed while
+    /// parked was sent by [`Attachment::tell_its_size`]. Other sizes (a
+    /// resize since) go through.
     fn saw_input(&mut self, step: &mut Step) {
-        if self.ledger.is_none() {
-            return;
-        }
         let Step::Forward(bytes) = step else {
             return;
         };
+        if self.flush_after_answers && answers_device_attributes(bytes) {
+            self.flush_after_answers = false;
+            flush_after_answers(&self.sock);
+        }
+        if self.ledger.is_none() {
+            return;
+        }
         if !self.startup_answered && answers_device_attributes(bytes) {
             self.startup_answered = true;
         }
@@ -824,36 +902,20 @@ impl Attachment {
         }
     }
 
-    /// Write an in-band size report into the client's input; returns whether it
-    /// went out whole. One `write`, never `write_all`: a split report would be
-    /// read as keys, and one that does not fit is better not sent.
-    fn report_size_in_band(&mut self, size: PtySize) -> bool {
-        let fd = self.master.as_raw_fd();
-        if !writable(fd) {
-            tracing::debug!("the client's input queue is full; not reporting its size");
-            return false;
+    /// Write an in-band size report into the client's input, after whatever
+    /// input waits for room, so it never lands inside a key on its way.
+    fn report_size_in_band(&mut self, size: PtySize) {
+        if let Err(e) = self.input.write_all(&in_band_size_report(size)) {
+            tracing::debug!(error = %e, "could not report the client's size");
         }
-        let report = in_band_size_report(size);
-        let n = unsafe { libc::write(fd, report.as_ptr().cast(), report.len()) };
-        if n != report.len() as isize {
-            tracing::debug!(wrote = n, "the in-band size report went out short");
-            return false;
-        }
-        true
     }
 
-    /// Send `cmd` into the client's input in one write: split, it would be read
-    /// as keys. Best effort: dropped if the input queue is full.
+    /// Send `cmd` into the client's input, after whatever input waits for
+    /// room, so it never lands inside a key or a paste on its way (see
+    /// [`card::Forwarded`]).
     fn tell_client(&mut self, cmd: &card::Command) {
-        let fd = self.master.as_raw_fd();
-        if !writable(fd) {
-            tracing::debug!("the client's input queue is full; no card");
-            return;
-        }
-        let wire = card::encode(cmd);
-        let n = unsafe { libc::write(fd, wire.as_ptr().cast(), wire.len()) };
-        if n != wire.len() as isize {
-            tracing::debug!(wrote = n, "a card went out short");
+        if let Err(e) = self.input.write_all(&card::encode(cmd)) {
+            tracing::debug!(error = %e, "could not send the client a card");
         }
     }
 
@@ -946,6 +1008,15 @@ impl Attachment {
                 None
             }
         }
+    }
+
+    /// The master's `poll` entry: readable, and writable while input waits.
+    fn master_pollfd(&self) -> libc::pollfd {
+        let mut p = pollfd(self.master.as_raw_fd());
+        if self.input.waiting() {
+            p.events |= libc::POLLOUT;
+        }
+        p
     }
 
     /// Wait up to `within` for client output, without reading it.
@@ -1340,17 +1411,11 @@ impl Attachment {
             return false;
         }
         tracing::debug!("answering the departing client's DA1 request");
-        // One `write`: `writable` promises room for one byte, and `write_all`
-        // could block. A torn reply only costs the exiting client its wait.
-        let n = unsafe {
-            libc::write(
-                fd,
-                DA1_REPLY.as_ptr() as *const libc::c_void,
-                DA1_REPLY.len(),
-            )
-        };
-        if n != DA1_REPLY.len() as isize {
-            tracing::debug!(wrote = n, "the DA1 answer went out short");
+        // `writable` promises room for one byte only. A torn reply only costs
+        // the exiting client its wait.
+        let wrote = write_without_waiting(fd, DA1_REPLY);
+        if !matches!(wrote, Ok(n) if n == DA1_REPLY.len()) {
+            tracing::debug!(?wrote, "the DA1 answer went out short");
         }
         true
     }
@@ -1363,6 +1428,8 @@ impl Attachment {
     /// strips it from the output, an exception to the module's rule: the real
     /// terminal's answer would land in the shell as text after we exit.
     fn drain_until_eof(&mut self) {
+        // Input still waiting is moot, and the DA1 answer goes in alone.
+        self.input.discard();
         let fd = self.master.as_raw_fd();
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         let mut buf = [0u8; 8192];
@@ -1624,8 +1691,9 @@ impl Drop for Parked {
     }
 }
 
-/// The parked client's thread: read its output into the shadow and ledger
-/// until told to stop, then hand it back, or retire it.
+/// The parked client's thread: read its output into the shadow and ledger,
+/// and send it input left waiting for room, until told to stop, then hand it
+/// back, or retire it.
 ///
 /// **A parked client that sends DA1 or leaves the alternate screen is
 /// finishing**: both end Neovim's exit and its `suspend` (which `Ctrl-Z` in
@@ -1639,7 +1707,7 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
     let mut buf = [0u8; 8192];
     loop {
         let master = attachment.master.as_raw_fd();
-        let mut fds = [pollfd(stop.as_raw_fd()), pollfd(master)];
+        let mut fds = [pollfd(stop.as_raw_fd()), attachment.master_pollfd()];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, IDLE_POLL_MS) };
         if n < 0 {
             // A `SIGWINCH` meant for the relay can land on this thread.
@@ -1673,6 +1741,12 @@ fn keep_parked(mut attachment: Attachment, stop: UnixStream) -> Option<Attachmen
                     tracing::debug!(%id, "a parked client left");
                     return None;
                 }
+            }
+        }
+        if n > 0 && fds[1].revents & libc::POLLOUT != 0 {
+            if let Err(e) = attachment.input.send() {
+                tracing::debug!(%id, error = %e, "a parked client's input failed; retiring it");
+                return None;
             }
         }
         if n > 0 && ready(&fds[0]) {
@@ -2013,8 +2087,8 @@ pub enum Answer {
 }
 
 impl Probe {
-    /// Connect and start asking. The connect runs here, since a dead unix
-    /// socket is refused at once; only the calls go to the worker.
+    /// Connect and start asking. The connect runs here, since it never waits
+    /// (see [`rpc::Client::connect`]); only the calls go to the worker.
     pub fn start(session_id: &str, sock: &Path) -> Result<Self> {
         let mut client = rpc::Client::connect_with(sock, None)?;
         let interrupt = client.interrupt()?;
@@ -2183,6 +2257,7 @@ fn spawn_client_with(
     let fades = fade::enabled() && fade::session();
     let shadow = fades.then(|| shadow::Shadow::new(size.rows, size.cols));
     let kept = crate::config::get().client.per_session;
+    let input = ClientInput::new(master.as_raw_fd());
 
     Ok(Attachment {
         session_id: session_id.to_string(),
@@ -2191,6 +2266,7 @@ fn spawn_client_with(
         hand_off: None,
         child,
         master,
+        input,
         resumed: false,
         reaped: false,
         // A shadow costs a parse of all output, so only with the fade; one of
@@ -2209,6 +2285,7 @@ fn spawn_client_with(
         unshown: None,
         probe: None,
         draws_cards,
+        flush_after_answers: !draws_cards,
         away: false,
         crawling: false,
         // The generation its environment was just given (see `own_client`).
@@ -2661,6 +2738,10 @@ fn pump(
     }
 
     loop {
+        // While the client is behind on its input, stdin is left unread and
+        // the prefix's clock stands still (see `UNSENT_MAX`).
+        let backlogged = attachment.input.backlogged();
+
         // Float pending settings or picker once the screen is back, before
         // reading keys, so keys typed meanwhile go to them.
         if let Some(outcome) = attachment.to_float.filter(|_| attachment.screen_is_back()) {
@@ -2679,7 +2760,7 @@ fn pump(
         // Every clock folds into one absolute `poll` deadline.
         let now = Instant::now();
         let next = [
-            deadline,
+            deadline.filter(|_| !backlogged),
             popup.as_ref().map(announce::Popup::wake_at),
             bar.wake_at(),
             attachment.hold_wake_at(),
@@ -2708,8 +2789,8 @@ fn pump(
         // Without its pipe it is polled as -1, which `poll` skips.
         let board = card::board();
         let mut fds = [
-            pollfd(stdin_fd),
-            pollfd(master_fd),
+            pollfd(if backlogged { -1 } else { stdin_fd }),
+            attachment.master_pollfd(),
             pollfd(winch.fd()),
             pollfd(board.wake_fd().unwrap_or(-1)),
         ];
@@ -2720,6 +2801,13 @@ fn pump(
                 continue;
             }
             return Err(NvmuxError::Io(err));
+        }
+
+        // Before the output, whose write to the terminal can block: the tail
+        // of a key a full pty split must not wait behind it. A failure is
+        // left to the read below, which sees a client gone.
+        if n > 0 && fds[1].revents & libc::POLLOUT != 0 {
+            let _ = attachment.input.send();
         }
 
         // Output first, so the screen is current before keys are acted on.
@@ -2739,6 +2827,9 @@ fn pump(
                     last_byte = now;
                 }
             }
+        }
+        if n > 0 && fds[1].revents & libc::POLLOUT != 0 {
+            attachment.input.send()?;
         }
 
         // Release the finished first paint before the notice below,
@@ -2841,6 +2932,10 @@ fn pump(
         // sequence is the opposite: waiting input may complete it, so it is
         // read first.
         let stdin_ready = n > 0 && ready(&fds[0]);
+        // Keys left unread behind the backlog are not late.
+        if backlogged {
+            deadline = settles_at(&prefix, prefix_timeout);
+        }
         let overdue = deadline.is_some_and(|d| Instant::now() >= d);
         if overdue && !(stdin_ready && prefix.wait() == Some(Wait::Sequence)) {
             deadline = None;
@@ -2928,13 +3023,7 @@ fn pump(
                     }
                     // Every keystroke restarts the clock, so a number typed at
                     // a human pace is one number.
-                    deadline = prefix.wait().map(|wait| {
-                        Instant::now()
-                            + match wait {
-                                Wait::Command => prefix_timeout,
-                                Wait::Sequence => SEQUENCE_TIMEOUT,
-                            }
-                    });
+                    deadline = settles_at(&prefix, prefix_timeout);
                 }
             }
         }
@@ -3179,7 +3268,7 @@ fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outco
     if let (Step::Forward(bytes), Some(desk)) = (&step, attachment.desk.as_mut()) {
         desk.forwarded.saw(bytes, Instant::now());
     }
-    act(&mut attachment.master, step)
+    act(&mut attachment.input, step)
 }
 
 /// Float `outcome`'s panel over the session if it floats and `[style] float`
@@ -3208,6 +3297,17 @@ fn float_over(
 /// Short: a bare `ESC` key is delayed this long (tmux's `escape-time`
 /// defaults to 10 ms too).
 const SEQUENCE_TIMEOUT: Duration = Duration::from_millis(10);
+
+/// When the prefix machine's wait, if any, must be settled, timed from now.
+fn settles_at(prefix: &Prefix, prefix_timeout: Duration) -> Option<Instant> {
+    prefix.wait().map(|wait| {
+        Instant::now()
+            + match wait {
+                Wait::Command => prefix_timeout,
+                Wait::Sequence => SEQUENCE_TIMEOUT,
+            }
+    })
+}
 
 /// How often to check an idle child: a *stopped* one makes no fd readable
 /// and sends no signal we watch.
@@ -3310,6 +3410,29 @@ pub(crate) fn pollfd(fd: RawFd) -> libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
+    }
+}
+
+/// One `write` of what `fd` has room for, never waiting for more. Not
+/// `O_NONBLOCK` for good: the relay's reads of the master take any error for
+/// the client gone.
+fn write_without_waiting(fd: RawFd, bytes: &[u8]) -> std::io::Result<usize> {
+    // SAFETY: `fcntl` and `write` on an open fd, from `bytes.len()` bytes of
+    // `bytes`. The flag is the open file's, used only by the thread owning
+    // the attachment.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let n = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+        let wrote = if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        };
+        libc::fcntl(fd, libc::F_SETFL, flags);
+        wrote
     }
 }
 
@@ -3534,6 +3657,35 @@ impl Erasing {
 /// fallback nudge can be: a server too busy to answer produces no output to
 /// wake the loop.
 const ERASE_POLL: Duration = Duration::from_millis(50);
+
+/// How long after the terminal's startup answers reach Neovim's client the
+/// flush is asked for, so the client has taken them first.
+const ANSWERS_TAKEN: Duration = Duration::from_millis(50);
+
+/// Have Neovim's client write what it sent in reply to the terminal's
+/// startup answers: 0.11 writes its keyboard protocol and `ESC [ ? 2048 h`
+/// only at its next flush, and answers that come after it has attached (a
+/// paint held for the fade, a client started ahead, a slow attach) wait
+/// for one. Only a full repaint makes it flush; 0.12 needs none.
+fn flush_after_answers(sock: &Path) {
+    let sock = sock.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("nvmux-answers-flush".into())
+        .spawn(move || {
+            if crate::nvim::local_version().is_some_and(|v| (v.major, v.minor) >= (0, 12)) {
+                return;
+            }
+            std::thread::sleep(ANSWERS_TAKEN);
+            let served = repaint_through_server(&sock, Repaint::Notice);
+            tracing::debug!(
+                repainted = served.repainted,
+                "repaint for the client's replies"
+            );
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "no thread for the repaint for the client's replies");
+    }
+}
 
 /// Why the screen is being repainted, which decides what the repaint may do.
 /// A resume may end a hit-enter prompt (drawn over, so the user cannot
@@ -5015,6 +5167,173 @@ mod tests {
             "the client took {took:?} — nothing answered the device attributes \
              request it was waiting on, so it sat there until the reap's deadline"
         );
+    }
+
+    /// Set on the test binary rerun by
+    /// [`a_client_taking_no_input_is_still_read_until_it_exits`].
+    const DEAF_CHILD: &str = "NVMUX_TEST_DEAF_CLIENT_CHILD";
+
+    /// **Regression test for a relay that stopped reading its client.** A
+    /// client blocked writing a frame reads no input, and the relay blocked
+    /// writing it input past what the pty holds (about 18 KiB on Linux), so
+    /// neither moved again. Input it is not taking must also stay in stdin
+    /// past [`UNSENT_MAX`]. The relay uses fds 0 and 1, so it runs in a rerun
+    /// of this binary, killed at the deadline if it hangs.
+    #[test]
+    fn a_client_taking_no_input_is_still_read_until_it_exits() {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("the tests"))
+            .args([
+                "--exact",
+                "pty::tests::relaying_to_a_client_taking_no_input",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DEAF_CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the child");
+        // From a thread, as the relay may leave some unread for good. Held
+        // open after, so the relay can end only with its client.
+        let mut stdin = child.stdin.take().expect("its stdin");
+        let typing = std::thread::spawn(move || {
+            let _ = stdin.write_all(&vec![b'x'; 256 * 1024]);
+            stdin
+        });
+        let ended = crate::test_support::wait_until(Duration::from_secs(10), || {
+            child.try_wait().is_ok_and(|status| status.is_some())
+        });
+        if !ended {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        drop(typing.join());
+        let mut said = String::new();
+        let _ =
+            std::io::Read::read_to_string(&mut child.stderr.take().expect("its stderr"), &mut said);
+        assert!(
+            ended,
+            "the relay stopped reading a client that took no input: {said}"
+        );
+        assert!(said.contains("relay ended: Ok(ChildExited)"), "{said}");
+        let unsent: usize = said
+            .split("unsent: ")
+            .nth(1)
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no count of input left waiting: {said}"));
+        assert!(unsent > 0, "the pty took all the input: {said}");
+        // One read of stdin may take it past the bound.
+        assert!(
+            unsent <= UNSENT_MAX + 8192,
+            "the relay kept reading input its client was not taking: {said}"
+        );
+    }
+
+    /// The child half of the test above; does nothing without [`DEAF_CHILD`].
+    /// Its stdin is the parent's typing, its stdout `/dev/null`.
+    #[test]
+    #[ignore = "the child half of a test; run by it, not by hand"]
+    fn relaying_to_a_client_taking_no_input() {
+        if std::env::var_os(DEAF_CHILD).is_none() {
+            return;
+        }
+        // Far more than a pty holds, so it blocks writing unless read.
+        let mut a = attached_to("exec head -c 1000000 /dev/zero");
+        let winch = winch::Winch::install().expect("the SIGWINCH pipe");
+        let master = a.master.as_raw_fd();
+        let ended = pump(&mut a, master, &winch, 0, None, false, None);
+        eprintln!("relay ended: {ended:?}; unsent: {}", a.input.unsent.len());
+    }
+
+    /// Set, to the file its stand-in writes, on the binary rerun by
+    /// [`input_left_waiting_reaches_the_client_once_it_reads`].
+    const LATE_CHILD: &str = "NVMUX_TEST_LATE_CLIENT_CHILD";
+
+    /// The other half of the backlog: input the relay held while its client
+    /// was busy writing must still reach it, whole and in order, once the
+    /// client reads, with nothing more typed to push it along.
+    #[test]
+    fn input_left_waiting_reaches_the_client_once_it_reads() {
+        let file = crate::test_support::scratch_path("pty-late-reader");
+        let typed: Vec<u8> = (0..256 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut child = std::process::Command::new(std::env::current_exe().expect("the tests"))
+            .args([
+                "--exact",
+                "pty::tests::relaying_to_a_client_reading_late",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LATE_CHILD, &file)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the child");
+        let mut stdin = child.stdin.take().expect("its stdin");
+        let sent = typed.clone();
+        let typing = std::thread::spawn(move || {
+            let _ = stdin.write_all(&sent);
+            stdin
+        });
+        let ended = crate::test_support::wait_until(Duration::from_secs(10), || {
+            child.try_wait().is_ok_and(|status| status.is_some())
+        });
+        if !ended {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        drop(typing.join());
+        let mut said = String::new();
+        let _ =
+            std::io::Read::read_to_string(&mut child.stderr.take().expect("its stderr"), &mut said);
+        let got = std::fs::read(&file).unwrap_or_default();
+        let _ = std::fs::remove_file(&file);
+        assert!(ended, "the client never got all its input: {said}");
+        assert!(said.contains("relay ended: Ok(ChildExited)"), "{said}");
+        assert_eq!(got.len(), typed.len(), "{said}");
+        assert!(got == typed, "the input arrived out of order");
+    }
+
+    /// The child half of the test above; does nothing without [`LATE_CHILD`].
+    #[test]
+    #[ignore = "the child half of a test; run by it, not by hand"]
+    fn relaying_to_a_client_reading_late() {
+        if std::env::var_os(LATE_CHILD).is_none() {
+            return;
+        }
+        // Busy writing far more than a pty holds while the input arrives,
+        // then reads all of it.
+        let mut a = attached_to(&format!(
+            "head -c 2000000 /dev/zero; exec head -c {} > \"${LATE_CHILD}\"",
+            256 * 1024
+        ));
+        let winch = winch::Winch::install().expect("the SIGWINCH pipe");
+        let master = a.master.as_raw_fd();
+        let ended = pump(&mut a, master, &winch, 0, None, false, None);
+        eprintln!("relay ended: {ended:?}");
+    }
+
+    /// Once per client, and never for nvmux's own, which writes its replies
+    /// at once.
+    #[test]
+    fn neovims_client_asks_for_a_flush_once_its_startup_questions_are_answered() {
+        let mut a = attached_to("exec sleep 30");
+        let mut key = Step::Forward(b"j".to_vec());
+        a.saw_input(&mut key);
+        assert!(a.flush_after_answers, "a key is no answer");
+        let answer = b"\x1b[?62;22c".to_vec();
+        let mut step = Step::Forward(answer.clone());
+        a.saw_input(&mut step);
+        assert!(!a.flush_after_answers);
+        assert_eq!(step, Step::Forward(answer), "the answer still goes through");
+
+        let cmd = Command::new("sh").arg("-c").arg("exec sleep 30");
+        let sock = Path::new("/nvmux-test-never-read.sock");
+        let own = spawn_client_with("id000000", sock, "", cmd, true).expect("spawn sh");
+        assert!(!own.flush_after_answers);
     }
 
     /// A stand-in kept client (one with a ledger).

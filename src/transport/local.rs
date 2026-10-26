@@ -1,6 +1,6 @@
 //! Sessions on this machine. The socket is reachable directly, liveness is
-//! probed over it rather than taken from the script's process-table lookup,
-//! and metadata is a local file edited in place. The rest is shared with
+//! probed over it (the script's process-table lookup only vetoes a reap), and
+//! metadata is a local file edited in place. The rest is shared with
 //! [`crate::transport`].
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -128,9 +128,10 @@ impl Host for LocalTransport {
     }
 
     /// Replaces the script's liveness hint with a probe over the socket, and
-    /// reaps sessions found dead. Probes run in parallel: a busy session uses
-    /// its whole budget ([`rpc::QUICK_PROBE_TIMEOUT`]), so the listing waits
-    /// one budget in total rather than one per session.
+    /// reaps sessions found dead that the script did not see served. Probes
+    /// run in parallel: a busy session uses its whole budget
+    /// ([`rpc::QUICK_PROBE_TIMEOUT`]), so the listing waits one budget in
+    /// total rather than one per session.
     fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>> {
         let t_probe = std::time::Instant::now();
         let budget = rpc::QUICK_PROBE_TIMEOUT;
@@ -152,7 +153,16 @@ impl Host for LocalTransport {
         });
         let mut alive = Vec::with_capacity(listed.len());
         for ((mut s, paths), liveness) in listed.into_iter().zip(paths).zip(found) {
-            s.state.liveness = liveness;
+            // macOS refuses a connect to a full accept queue, as a stalled
+            // session's is, so a refusal does not outweigh a serving process.
+            let served = s.state.liveness != Liveness::Dead;
+            s.state.liveness = match liveness {
+                Liveness::Dead if served => {
+                    tracing::debug!(id = %s.id, "refused, but served; kept as busy");
+                    Liveness::Busy
+                }
+                probed => probed,
+            };
             match s.state.liveness {
                 // Never reap a busy session: blocked in `:!make` it is
                 // reachable but cannot answer a deferred call.
@@ -315,6 +325,41 @@ mod tests {
             .pid()
     }
 
+    /// macOS refuses a connect to a stalled session's full accept queue, so
+    /// its probe reads Dead; reaping on that would orphan a running nvim.
+    #[test]
+    fn a_refused_session_the_script_saw_served_is_kept() {
+        let (t, dir) = transport("refused");
+        let row = |id: &str, liveness| {
+            let paths = t.paths(id).expect("paths");
+            crate::test_support::dead_socket(&paths.sock);
+            std::fs::write(&paths.json, b"{}").expect("json");
+            std::fs::write(&paths.log, b"").expect("log");
+            let mut s = Session::new(id.into(), id.into(), 1, 1);
+            s.state.liveness = liveness;
+            (s, paths)
+        };
+        // As `rows_to_sessions` sets them from the script's process check.
+        let (served, kept_paths) = row("served22", Liveness::Busy);
+        let (unseen, reaped_paths) = row("unseen22", Liveness::Dead);
+
+        let listed = t.settle(vec![served, unseen]).expect("settle");
+
+        let ids: Vec<(&str, Liveness)> = listed
+            .iter()
+            .map(|s| (s.id.as_str(), s.state.liveness))
+            .collect();
+        assert_eq!(ids, [("served22", Liveness::Busy)]);
+        for p in [&kept_paths.sock, &kept_paths.json, &kept_paths.log] {
+            assert!(p.exists(), "{} was reaped", p.display());
+        }
+        assert!(
+            !reaped_paths.sock.exists(),
+            "the probe did not find it Dead"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A failing script keeps the shell; one that died while idle is replaced
     /// by the next script, not reported forever.
     #[test]
@@ -353,5 +398,23 @@ mod tests {
         assert_ne!(shell_pid(&t), pid, "the dead shell was not replaced");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opened up after the transport checked it. The script's refusal must
+    /// reach the picker, not read as no sessions.
+    #[test]
+    fn a_runtime_directory_others_can_reach_fails_the_listing_with_the_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (t, dir) = transport("opened");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let listed = t.list_sessions();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = listed.expect_err("listed a directory other users can reach");
+        assert!(
+            err.to_string().contains("accessible to other users"),
+            "{err}"
+        );
     }
 }

@@ -754,6 +754,12 @@ fn a_yank_reaches_the_terminals_clipboard() {
     require_nvim!();
     let scratch = Scratch::new("client-osc52");
     let (sock, mut rpc, config) = session(&scratch, "client-osc52");
+    // Neovim 0.11 asks the terminal through its own stdout, which for a
+    // headless session is its log, so no client can carry the question.
+    if rpc.eval("has('nvim-0.12')").ok().and_then(|v| v.as_i64()) != Some(1) {
+        eprintln!("skipping: OSC 52 detection through a UI needs Neovim 0.12");
+        return;
+    }
     rpc.command("setlocal noswapfile | call setline(1, 'to the clipboard')")
         .expect("setline");
 
@@ -860,6 +866,182 @@ fn a_ui_without_windows_of_its_own_is_made_room_for() {
         "not drawn whole after:\n{}",
         term.text()
     );
+}
+
+/// The (row, column) of each place `lines` are drawn one under another.
+fn drawn_at(screen: &str, lines: &[&str]) -> Vec<(usize, usize)> {
+    let rows: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
+    let at = |row: usize, col: usize, text: &str| {
+        let text: Vec<char> = text.chars().collect();
+        rows.get(row)
+            .and_then(|r| r.get(col..col + text.len()))
+            .is_some_and(|cells| cells == text)
+    };
+    let mut found = Vec::new();
+    for (row, cells) in rows.iter().enumerate() {
+        for col in 0..cells.len() {
+            if lines.iter().enumerate().all(|(i, l)| at(row + i, col, l)) {
+                found.push((row, col));
+            }
+        }
+    }
+    found
+}
+
+/// Neovim 0.11's `win_float_pos` says only how a float is anchored, and it
+/// alone places the popup menu. Under `ext_multigrid` 0.11's
+/// `nvim_win_get_position` is a float's anchor point, so the layout read
+/// when another UI comes or goes must not move a float anchored by its foot.
+#[test]
+fn the_popup_menu_and_a_float_moved_are_drawn_where_neovim_puts_them() {
+    require_nvim!();
+    let tag = "client-floats";
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    // Typed into the left window: under `ext_multigrid` 0.11's
+    // `pum_getpos()` counts from the window's corner, 0.12's from the
+    // screen's.
+    rpc.command(
+        "setlocal noswapfile | call setline(1, 'alpha alphabet alpine') | \
+         set splitright | vsplit | let g:right = win_getid() | wincmd p",
+    )
+    .expect("a buffer in two windows");
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s
+            .starts_with("alpha alphabet alpine")),
+        "never drawn:\n{}",
+        term.text()
+    );
+
+    term.type_bytes(b"oso al\x0e");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            rpc.eval("pumvisible()").ok().and_then(|v| v.as_i64()) == Some(1)
+        }),
+        "no popup menu:\n{}",
+        term.text()
+    );
+    let pum = common::lua(
+        &sock,
+        "local p = vim.fn.pum_getpos() \
+         local items = vim.fn.complete_info({ 'items' }).items \
+         return { math.floor(p.row), math.floor(p.col), \
+           vim.tbl_map(function(i) return i.word end, items) }",
+    );
+    let pum = pum.as_array().expect("a list");
+    let cell = |v: &Value| usize::try_from(v.as_i64().expect("a number")).expect("on the screen");
+    let at = (cell(&pum[0]), cell(&pum[1]));
+    let words: Vec<&str> = pum[2]
+        .as_array()
+        .expect("the items")
+        .iter()
+        .map(|w| w.as_str().expect("a word"))
+        .collect();
+    assert_eq!(words, ["alpha", "alphabet", "alpine"], "the matches");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn_at(s, &words) == [at]),
+        "the popup menu is not drawn at {at:?}:\n{}",
+        term.text()
+    );
+    term.type_bytes(b"\x1b");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn_at(s, &words).is_empty()),
+        "the popup menu outlived the completion:\n{}",
+        term.text()
+    );
+
+    let win = common::lua(
+        &sock,
+        "local b = vim.api.nvim_create_buf(false, true) \
+         vim.api.nvim_buf_set_lines(b, 0, -1, false, { 'a float', 'its foot' }) \
+         return vim.api.nvim_open_win(b, false, { relative = 'win', win = vim.g.right, \
+           anchor = 'SE', row = 12, col = 30, width = 10, height = 2, style = 'minimal' })",
+    )
+    .as_i64()
+    .expect("the float");
+    // From its config, as only a layout window's position is right under
+    // `ext_multigrid`.
+    let corner = || {
+        let v = common::lua(
+            &sock,
+            &format!(
+                "local c = vim.api.nvim_win_get_config({win}) \
+                 local at = c.relative == 'win' and vim.api.nvim_win_get_position(c.win) \
+                   or {{ 0, 0 }} \
+                 return {{ \
+                   math.floor(at[1] + c.row - (c.anchor:sub(1, 1) == 'S' and c.height or 0)), \
+                   math.floor(at[2] + c.col - (c.anchor:sub(2) == 'E' and c.width or 0)) }}"
+            ),
+        );
+        let v = v.as_array().expect("a row and column");
+        (cell(&v[0]), cell(&v[1]))
+    };
+    let float = ["a float", "its foot"];
+    let first = corner();
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn_at(s, &float) == [first]),
+        "the float is not drawn at {first:?}:\n{}",
+        term.text()
+    );
+
+    common::lua(
+        &sock,
+        &format!(
+            "vim.api.nvim_win_set_config({win}, \
+               {{ relative = 'editor', anchor = 'SW', row = 21, col = 12 }})"
+        ),
+    );
+    let moved = corner();
+    assert_ne!(moved, first);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| drawn_at(s, &float) == [moved]),
+        "the float moved to {moved:?} is not drawn there:\n{}",
+        term.text()
+    );
+
+    let stays = |term: &mut Terminal,
+                 rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+                 uis: usize,
+                 when: &str| {
+        assert!(
+            common::wait_until(Duration::from_secs(5), || {
+                term.pump_until(Duration::from_millis(20), |_| false);
+                rpc.list_uis().ok() == Some(uis)
+            }),
+            "never {when}"
+        );
+        assert!(
+            settle(term, Duration::from_millis(400), Duration::from_secs(10)),
+            "never settled once {when}"
+        );
+        assert!(
+            drawn_at(&term.text(), &float) == [moved],
+            "the float left {moved:?} once {when}:\n{}",
+            term.text()
+        );
+    };
+    // With `ext_multigrid` it leaves the client its windows, and the client
+    // reads the layout once it has attached and again once it has gone.
+    let mut other = nvmux::rpc::Client::connect(&sock, Duration::from_secs(5)).expect("connect");
+    other
+        .call(
+            "nvim_ui_attach",
+            vec![
+                Value::from(i64::from(COLS)),
+                Value::from(i64::from(ROWS)),
+                Value::Map(vec![
+                    (Value::from("ext_linegrid"), Value::from(true)),
+                    (Value::from("ext_multigrid"), Value::from(true)),
+                ]),
+            ],
+        )
+        .expect("attach another UI");
+    stays(&mut term, &mut rpc, 2, "another UI attached");
+    drop(other);
+    stays(&mut term, &mut rpc, 1, "the other UI left");
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
 /// As animate.nvim draws it: with `'splitright'` the new window starts as a
@@ -4413,7 +4595,8 @@ fn predicted_rows_show_what_neovim_shows_as_something_else_in_its_colours() {
 /// does: single and runs of spaces, leading and trailing, no-break spaces,
 /// leading and inner tabs, the line's end, and `extends`/`precedes` in a
 /// nowrap view. With `'linebreak'`, leading spaces are in `Whitespace` even
-/// with only `leadtab` set. No cell changes when Neovim's rows land.
+/// with only `leadtab` set, which Neovim 0.11 lacks. No cell changes when
+/// Neovim's rows land.
 #[test]
 fn predicted_rows_show_listchars_as_neovim_draws_them() {
     require_nvim!();
@@ -4425,12 +4608,17 @@ fn predicted_rows_show_listchars_as_neovim_draws_them() {
         "client-listchars",
         r"lua local t = {} for i = 1, 200 do local k = i % 4 t[i] = k == 0 and ('  line ' .. i .. '  with  runs   ') or k == 1 and ('\t\tline ' .. i .. '\tend ') or k == 2 and (' \194\160line ' .. i .. '\226\128\175x ') or ('    line ' .. string.format('%-3d', i) .. ' ' .. string.rep('ab  ', 16)) end vim.api.nvim_buf_set_lines(0, 0, -1, false, t)",
     );
-    rpc.command(
+    let leadtab = if rpc.eval("has('nvim-0.12')").ok().and_then(|v| v.as_i64()) == Some(1) {
+        "leadtab:\\|.,"
+    } else {
+        ""
+    };
+    rpc.command(&format!(
         "set termguicolors list \
-         listchars=tab:>-,leadtab:\\|.,space:.,multispace:ab,lead:_,leadmultispace:12,\
+         listchars=tab:>-,{leadtab}space:.,multispace:ab,lead:_,leadmultispace:12,\
          trail:~,nbsp:+,eol:$,extends:>,precedes:< \
          | hi Whitespace guifg=#5f87ff | hi NonText guifg=#87d75f",
-    )
+    ))
     .expect("listchars");
     term.pump_until(4 * SLOW, |_| false);
     let step = |term: &mut Terminal, name: &str, keys: &[u8]| {
@@ -4481,8 +4669,10 @@ fn predicted_rows_show_listchars_as_neovim_draws_them() {
             "no {what} drawn: {seen:#?}"
         );
     }
-    rpc.command("set listchars=tab:>-,leadtab:\\|.,eol:$ linebreak wrap nonumber")
-        .expect("linebreak");
+    rpc.command(&format!(
+        "set listchars=tab:>-,{leadtab}eol:$ linebreak wrap nonumber"
+    ))
+    .expect("linebreak");
     term.pump_until(4 * SLOW, |_| false);
     for (name, keys) in [
         ("<C-f> with linebreak", &b"\x06"[..]),
@@ -4714,6 +4904,68 @@ fn a_session_over_ssh_is_sent_lines_however_fast_the_link() {
             }
         }
     }
+}
+
+/// The buffer is wiped as plugins wipe theirs (`nvim_buf_delete`), then a
+/// scroll, an edit in another buffer and CursorHold each make the agent push.
+/// A push that asks Neovim about the wiped buffer raises `Invalid buffer id`,
+/// whose traceback waits at the hit-enter prompt.
+#[test]
+fn wiping_a_buffer_the_agent_follows_raises_no_error() {
+    require_nvim!();
+    let tag = "client-wiped";
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    rpc.command(
+        "setlocal noswapfile | set updatetime=100 | \
+         call setline(1, map(range(1, 200), '\"local v\" . v:val . \" = \" . v:val')) | \
+         lua vim.treesitter.start(0, 'lua')",
+    )
+    .expect("start tree-sitter");
+    rpc.command(COUNT_SENT).expect("count what the agent sends");
+    let mut term = Terminal::spawn_told(&sock, &config, &over_ssh(""));
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| s.contains("local v1 = 1")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // The push that sends a window's lines follows its buffer's tree.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            sent_by_kind(&mut rpc).get("lines").is_some_and(|&n| n > 0)
+        }),
+        "the agent sent no lines"
+    );
+    rpc.command("let v:errmsg = '' | messages clear")
+        .expect("clear the errors");
+    rpc.command(
+        "enew | setlocal noswapfile | \
+         call setline(1, map(range(1, 200), '\"other \" . v:val')) | \
+         lua vim.api.nvim_buf_delete(vim.fn.bufnr('#'), { force = true })",
+    )
+    .expect("wipe the followed buffer");
+    term.pump_until(Duration::from_secs(5), |s| s.contains("other 1"));
+    for keys in [&b"\x06"[..], b"ox", b"\x1b"] {
+        term.type_bytes(keys);
+        term.pump_until(Duration::from_millis(500), |_| false);
+    }
+    // Asked first: it is fast, and the others wait out a hit-enter prompt.
+    let mode = rpc.get_mode().expect("the mode");
+    assert!(
+        !mode.at_hit_enter(),
+        "an error waits at the hit-enter prompt:\n{}",
+        term.text()
+    );
+    let errmsg = rpc.eval("v:errmsg").expect("v:errmsg");
+    let messages = rpc.eval("execute('messages')").expect(":messages");
+    assert!(
+        errmsg.as_str() == Some("")
+            && !messages
+                .as_str()
+                .is_some_and(|m| m.contains("Invalid buffer id")),
+        "v:errmsg {errmsg}, :messages {messages}"
+    );
 }
 
 /// The agent's autocommand count, and how many listen for the line reach

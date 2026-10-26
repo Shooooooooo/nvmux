@@ -95,20 +95,27 @@ pub fn run_local(script: &str, args: &[&str]) -> Result<Output> {
 /// ([`crate::paths::restrict_umask`]), because this shell runs
 /// `scripts/spawn.sh`, which launches the session's editor. Local only: a
 /// umask does not travel over ssh, so remote sessions get the remote host's.
+///
+/// In a session of its own, with no controlling terminal, as sshd gives a
+/// remote one: the editors it starts must outlive nvmux's terminal, and
+/// spawn.sh's `nohup` fallback (no `setsid` on macOS) does not detach them.
 fn sh_command() -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-s");
-    if let Some(mask) = crate::paths::launch_umask() {
-        let mask = mask.bits();
-        // SAFETY: `umask(2)` neither allocates nor locks, as a pre-exec hook
-        // requires. Set between fork and exec so only the child gets it: the
-        // parent's mask is process-wide and cannot be swapped around a spawn.
-        unsafe {
-            cmd.pre_exec(move || {
+    let mask = crate::paths::launch_umask().map(|m| m.bits());
+    // SAFETY: `setsid(2)` and `umask(2)` neither allocate nor lock, as a
+    // pre-exec hook requires. The umask is set between fork and exec so only
+    // the child gets it: the parent's mask is process-wide and cannot be
+    // swapped around a spawn. setsid cannot fail in a fresh child, which leads
+    // no process group.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setsid();
+            if let Some(mask) = mask {
                 libc::umask(mask);
-                Ok(())
-            });
-        }
+            }
+            Ok(())
+        });
     }
     cmd
 }
@@ -637,6 +644,21 @@ mod tests {
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         crate::test_support::scratch_dir(&format!("proc-{tag}"))
+    }
+
+    /// Else a hang-up of nvmux's terminal reaches the editors this shell
+    /// starts: spawn.sh's `nohup` fallback (macOS) leaves them in its session.
+    #[test]
+    fn the_local_shell_leads_a_session_of_its_own() {
+        let mut shell = sh();
+        let pid: libc::pid_t = run(&mut shell, r#"printf '%s' "$$""#, &[])
+            .stdout
+            .parse()
+            .expect("a pid");
+        // SAFETY: getsid only reads the process table.
+        let (theirs, ours) = unsafe { (libc::getsid(pid), libc::getsid(0)) };
+        assert_eq!(theirs, pid, "the shell is not a session leader");
+        assert_ne!(theirs, ours);
     }
 
     #[test]

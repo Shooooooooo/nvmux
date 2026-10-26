@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::grid::{Cell, Grid};
-use super::redraw::{Event, ModeInfo, OptionValue};
+use super::redraw::{Event, FloatAt, ModeInfo, OptionValue};
 use super::style::{Attrs, Colors, DefaultColors, Style};
 use super::wide::Tail;
 use crate::palette::Palette;
@@ -34,6 +34,8 @@ pub enum Place {
         /// Anchor grid, if given; a float anchored to a window follows where
         /// that window's text is drawn.
         anchor: Option<u64>,
+        /// As Neovim gave it; `row` and `col` are resolved from it.
+        at: FloatAt,
     },
     /// Full width from `row` down. `scrolled`: messages pushed it up over the
     /// windows, and the row above is a separator drawn with `sep`.
@@ -377,6 +379,9 @@ pub struct Model {
     /// Past-end-of-line text that does not fit in a narrowed window grid, by
     /// grid and row (see [`super::wide`]).
     pub tails: HashMap<u64, BTreeMap<usize, Tail>>,
+    /// Where the message area last rested, unscrolled: `'cmdheight'` rows
+    /// from the bottom.
+    cmdline_top: Option<usize>,
     highlights: Highlights,
     /// Resolved styles and blends by id; all re-resolved when the defaults or
     /// `'termguicolors'` change (see [`Model::colors`]).
@@ -420,6 +425,7 @@ impl Model {
             groups: HashMap::new(),
             laststatus: None,
             tails: HashMap::new(),
+            cmdline_top: None,
             highlights: Highlights::default(),
             styles: Vec::new(),
             blends: Vec::new(),
@@ -726,6 +732,9 @@ impl Model {
                     tails.retain(|&r, _| r < height);
                 }
                 g.resize(width, height);
+                // Neovim 0.11 places a resized float before it resizes the
+                // grid.
+                self.reanchor(grid);
             }
             Event::GridClear { grid } => {
                 if let Some(g) = self.grids.get_mut(&grid) {
@@ -810,21 +819,25 @@ impl Model {
                 mouse,
                 zindex,
                 compindex,
-                row,
-                col,
+                at,
                 anchor,
-            } => self.place(
-                grid,
-                win,
-                Place::Float {
-                    row,
-                    col,
-                    zindex,
-                    compindex,
-                    mouse,
-                    anchor,
-                },
-            ),
+            } => {
+                let compindex = compindex.unwrap_or_else(|| self.stacked(grid));
+                let (row, col) = self.resolve_float(grid, at, zindex, anchor);
+                self.place(
+                    grid,
+                    win,
+                    Place::Float {
+                        row,
+                        col,
+                        zindex,
+                        compindex,
+                        mouse,
+                        anchor,
+                        at,
+                    },
+                );
+            }
             Event::MsgSetPos {
                 grid,
                 row,
@@ -832,17 +845,22 @@ impl Model {
                 sep,
                 zindex,
                 compindex,
-            } => self.place(
-                grid,
-                None,
-                Place::Message {
-                    row,
-                    scrolled,
-                    sep,
-                    zindex,
-                    compindex,
-                },
-            ),
+            } => {
+                if !scrolled {
+                    self.cmdline_top = Some(row);
+                }
+                self.place(
+                    grid,
+                    None,
+                    Place::Message {
+                        row,
+                        scrolled,
+                        sep,
+                        zindex,
+                        compindex,
+                    },
+                );
+            }
             // A grid hidden before it was placed (e.g. on another tab page)
             // is recorded hidden until Neovim places it.
             Event::WinHide { grid } => {
@@ -980,6 +998,90 @@ impl Model {
         );
         if let Some(win) = win {
             self.wins.insert(grid, win);
+        }
+    }
+
+    /// Screen position of float `grid` at `at`. Neovim 0.11's anchoring is
+    /// resolved as its compositor does (`ui_ext_win_position`): the corner at
+    /// the anchor grid's place, kept on the screen and, below the messages'
+    /// zindex, off the command line.
+    fn resolve_float(
+        &self,
+        grid: u64,
+        at: FloatAt,
+        zindex: i64,
+        anchor: Option<u64>,
+    ) -> (i64, i64) {
+        let (south, east, row, col) = match at {
+            FloatAt::Screen { row, col } => return (row, col),
+            FloatAt::Corner {
+                south,
+                east,
+                row,
+                col,
+            } => (south, east, row, col),
+        };
+        let size = |grid| {
+            self.grids
+                .get(&grid)
+                .map_or((0, 0), |g| (g.width() as i64, g.height() as i64))
+        };
+        let (width, height) = size(grid);
+        let (columns, rows) = size(1);
+        let (top, left) = anchor
+            .and_then(|a| self.layout.get(&a))
+            .map_or((0, 0), Placement::origin);
+        let row = top + row - if south { height } else { 0 };
+        let col = left + col - if east { width } else { 0 };
+        // 200 is Neovim's kZIndexMessages.
+        let bottom = match self.cmdline_top {
+            Some(top) if zindex < 200 => top as i64,
+            _ => rows,
+        };
+        (
+            row.min(bottom - height).max(0),
+            col.min(columns - width).max(0),
+        )
+    }
+
+    /// Resolves float `grid` again, if it was placed by Neovim 0.11's
+    /// anchoring.
+    fn reanchor(&mut self, grid: u64) {
+        let Some(Placement {
+            place:
+                Place::Float {
+                    zindex,
+                    anchor,
+                    at: at @ FloatAt::Corner { .. },
+                    ..
+                },
+            ..
+        }) = self.layout.get(&grid)
+        else {
+            return;
+        };
+        let to = self.resolve_float(grid, *at, *zindex, *anchor);
+        if let Some(Placement {
+            place: Place::Float { row, col, .. },
+            ..
+        }) = self.layout.get_mut(&grid)
+        {
+            (*row, *col) = to;
+        }
+    }
+
+    /// `compindex` for a float placed without one (Neovim 0.11): its own
+    /// while shown, as moving it keeps its layer, else over every other.
+    fn stacked(&self, grid: u64) -> i64 {
+        match self.layout.get(&grid) {
+            Some(Placement {
+                place: Place::Float { compindex, .. },
+                hidden: false,
+            }) => *compindex,
+            _ => {
+                let top = self.layout.values().filter_map(Placement::layer);
+                top.map(|(_, c)| c).max().unwrap_or(0) + 1
+            }
         }
     }
 
@@ -1793,9 +1895,8 @@ mod tests {
                     win: Some(-1),
                     mouse: false,
                     zindex: 100,
-                    compindex: 1,
-                    row: 2,
-                    col: 0,
+                    compindex: Some(1),
+                    at: FloatAt::Screen { row: 2, col: 0 },
                     anchor: None,
                 },
                 Event::GridDestroy { grid: 4 },
@@ -1804,6 +1905,178 @@ mod tests {
         assert!(!m.grids.contains_key(&4));
         assert!(!m.layout.contains_key(&4));
         assert!(changes.reshaped.contains(&4));
+    }
+
+    fn sized(grid: u64, width: usize, height: usize) -> Event {
+        Event::GridResize {
+            grid,
+            width,
+            height,
+        }
+    }
+
+    /// `win_float_pos` as Neovim 0.11 sends it, through the decoder: eight
+    /// arguments, the anchoring without a screen position.
+    fn float_0_11(
+        grid: u64,
+        win: i64,
+        anchor: &str,
+        anchor_grid: u64,
+        (row, col): (f64, f64),
+        zindex: i64,
+    ) -> Vec<Event> {
+        use rmpv::Value;
+        let mut handle = Vec::new();
+        rmpv::encode::write_value(&mut handle, &Value::from(win)).expect("encode");
+        let call = Value::Array(vec![
+            Value::from(grid),
+            Value::Ext(1, handle),
+            Value::from(anchor),
+            Value::from(anchor_grid),
+            Value::F64(row),
+            Value::F64(col),
+            Value::from(win > 0),
+            Value::from(zindex),
+        ]);
+        let batch = Value::Array(vec![Value::from("win_float_pos"), call]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &Value::Array(vec![batch])).expect("encode");
+        let mut out = Vec::new();
+        crate::client::redraw::decode_bytes(&buf, &mut out);
+        out
+    }
+
+    /// 20x10 with `'cmdheight'` 1, as the message area resting on the last
+    /// row says, and window grid 2 at row 1, col 4.
+    fn screen() -> Model {
+        let mut m = model();
+        apply(
+            &mut m,
+            vec![
+                sized(1, 20, 10),
+                sized(2, 10, 6),
+                Event::WinPos {
+                    grid: 2,
+                    win: Some(1000),
+                    row: 1,
+                    col: 4,
+                    width: 10,
+                    height: 6,
+                },
+                sized(3, 20, 10),
+                Event::MsgSetPos {
+                    grid: 3,
+                    row: 9,
+                    scrolled: false,
+                    sep: " ".into(),
+                    zindex: 200,
+                    compindex: 0,
+                },
+            ],
+        );
+        m
+    }
+
+    /// As `ui_ext_win_position` in Neovim 0.11 places a float for its own
+    /// compositor; a 4x2 float throughout.
+    #[test]
+    fn a_float_from_0_11_lands_where_its_compositor_puts_it() {
+        let cases = [
+            ("NW", 2, (3.0, 5.0), 50, (4, 9)),
+            ("NE", 2, (3.0, 5.0), 50, (4, 5)),
+            ("SW", 2, (3.0, 5.0), 50, (2, 9)),
+            ("SE", 2, (3.0, 5.0), 50, (2, 5)),
+            ("NW", 1, (3.0, 5.0), 50, (3, 5)),
+            ("NE", 1, (3.0, 5.0), 50, (3, 1)),
+            ("SW", 1, (3.0, 5.0), 50, (1, 5)),
+            ("SE", 1, (3.0, 5.0), 50, (1, 1)),
+            ("NW", 1, (3.7, 5.2), 50, (3, 5)),
+            // Kept clear of the command line below the messages' zindex.
+            ("NW", 1, (9.0, 18.0), 50, (7, 16)),
+            ("NW", 1, (9.0, 18.0), 200, (8, 16)),
+            ("SE", 1, (1.0, 2.0), 50, (0, 0)),
+            ("NW", 2, (8.0, -9.0), 50, (7, 0)),
+            ("SE", 2, (0.0, 30.0), 250, (0, 16)),
+        ];
+        for (anchor, on, at, zindex, want) in cases {
+            let mut m = screen();
+            apply(&mut m, vec![sized(5, 4, 2)]);
+            apply(&mut m, float_0_11(5, 1005, anchor, on, at, zindex));
+            assert_eq!(
+                m.layout.get(&5).map(Placement::origin),
+                Some(want),
+                "{anchor} at {at:?} of grid {on}, zindex {zindex}"
+            );
+        }
+    }
+
+    /// Its only placement: the popup menu is no window and gets no
+    /// `win_viewport`. Shown above the cursor, it is anchored by its foot.
+    #[test]
+    fn the_popup_menu_from_0_11_is_placed_and_drawn() {
+        let mut m = screen();
+        apply(
+            &mut m,
+            vec![
+                sized(7, 6, 3),
+                cells(7, 0, 0, 6),
+                cells(7, 1, 0, 6),
+                cells(7, 2, 0, 6),
+            ],
+        );
+        apply(&mut m, float_0_11(7, -1, "SW", 2, (4.0, 2.0), 100));
+        let Some(p) = m.layout.get(&7) else {
+            panic!("the popup menu was not placed");
+        };
+        assert_eq!(p.origin(), (2, 6));
+        assert!(matches!(
+            p.place,
+            Place::Float {
+                zindex: 100,
+                mouse: false,
+                ..
+            }
+        ));
+        m.refresh_styles();
+        let frame = crate::client::compose::compose(&m, &crate::client::compose::Still, 20, 10);
+        let rows: Vec<String> = frame.text().lines().map(str::to_string).collect();
+        assert_eq!(rows[1].trim(), "");
+        for row in &rows[2..5] {
+            assert_eq!(&row[6..12], "xxxxxx", "{rows:#?}");
+        }
+        assert_eq!(rows[5].trim(), "");
+    }
+
+    /// Neovim 0.11 places a resized float before it resizes its grid, so one
+    /// anchored by its foot is placed again at its new height.
+    #[test]
+    fn a_float_from_0_11_anchored_below_follows_its_resize() {
+        let mut m = screen();
+        apply(&mut m, vec![sized(5, 4, 2)]);
+        apply(&mut m, float_0_11(5, 1005, "SW", 1, (6.0, 3.0), 50));
+        assert_eq!(m.layout.get(&5).map(Placement::origin), Some((4, 3)));
+        let mut moved = float_0_11(5, 1005, "SW", 1, (6.0, 3.0), 50);
+        moved.push(sized(5, 4, 3));
+        apply(&mut m, moved);
+        assert_eq!(m.layout.get(&5).map(Placement::origin), Some((3, 3)));
+    }
+
+    /// Neovim 0.11 sends no `compindex`. Its compositor puts a float shown
+    /// over the others at its zindex, and leaves one moved where it was.
+    #[test]
+    fn floats_from_0_11_stack_in_the_order_they_are_shown() {
+        let mut m = screen();
+        apply(&mut m, vec![sized(5, 4, 2), sized(8, 4, 2)]);
+        let layer = |m: &Model, grid| m.layout.get(&grid).and_then(Placement::layer);
+        apply(&mut m, float_0_11(8, 1008, "NW", 1, (0.0, 0.0), 50));
+        apply(&mut m, float_0_11(5, 1005, "NW", 1, (0.0, 0.0), 50));
+        assert!(layer(&m, 8).is_some());
+        assert!(layer(&m, 5) > layer(&m, 8), "shown later");
+        apply(&mut m, float_0_11(8, 1008, "NW", 1, (1.0, 1.0), 50));
+        assert!(layer(&m, 5) > layer(&m, 8), "moved, not raised");
+        apply(&mut m, vec![Event::WinHide { grid: 8 }]);
+        apply(&mut m, float_0_11(8, 1008, "NW", 1, (1.0, 1.0), 50));
+        assert!(layer(&m, 8) > layer(&m, 5), "shown again");
     }
 
     /// Neovim highlight `id` with foreground `0xRRGGBB`.

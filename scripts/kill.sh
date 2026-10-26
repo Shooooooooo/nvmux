@@ -5,6 +5,7 @@
 #
 # Output:
 #   RESULT killed|absent|orphaned|unknown
+#   ERROR <reason>   (in place of RESULT, for a refused runtime directory)
 #   NVMUX_END
 #
 # where:
@@ -21,6 +22,11 @@
 dir="${1:?usage: kill.sh <runtime_dir> <id> <pid>}"
 id="${2:?usage: kill.sh <runtime_dir> <id> <pid>}"
 pid="${3:-}"
+
+# Missing is fine: a session whose files /tmp lost can still be stopped.
+# Nothing here reads or writes a file there (`rm -f` follows no link), and
+# signals reach only our own processes.
+require_private_dir "$dir" || true
 
 sock="$dir/$id.sock"
 

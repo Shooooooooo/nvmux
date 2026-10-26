@@ -19,9 +19,13 @@ pub(crate) fn scratch_path(tag: &str) -> PathBuf {
     p
 }
 
+/// Created 0700, as the scripts refuse a runtime directory others can reach.
 pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let p = scratch_path(tag);
     std::fs::create_dir_all(&p).expect("scratch dir");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod scratch dir");
     p
 }
 
