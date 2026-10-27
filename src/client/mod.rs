@@ -107,16 +107,18 @@ fn options(v: &[ValueRef<'_>]) -> anim::layout::Options {
     }
 }
 
-/// Parses [`wide::MEASURE_LUA`]'s `{ window, wanted }` pairs; `None` if absent.
-fn wants(v: Option<&ValueRef<'_>>) -> Option<BTreeMap<i64, usize>> {
+/// Parses [`wide::MEASURE_LUA`]'s `{ window, wanted, nowrap }` triples; `None`
+/// if absent.
+fn wants(v: Option<&ValueRef<'_>>) -> Option<BTreeMap<i64, wide::Want>> {
     let v = v?.as_array()?;
     Some(
         v.iter()
-            .filter_map(|pair| {
-                let pair = pair.as_array()?;
-                let win = redraw::int(pair.first()?)?;
-                let wanted = usize::try_from(redraw::int(pair.get(1)?)?).ok()?;
-                Some((win, wanted))
+            .filter_map(|each| {
+                let each = each.as_array()?;
+                let win = redraw::int(each.first()?)?;
+                let width = usize::try_from(redraw::int(each.get(1)?)?).ok()?;
+                let nowrap = matches!(each.get(2), Some(ValueRef::Boolean(true)));
+                Some((win, wide::Want { width, nowrap }))
             })
             .collect(),
     )
@@ -1717,7 +1719,7 @@ pub struct App {
     /// ask a resize answers ([`App::grid_resized`]).
     unanswered: HashMap<u64, Vec<usize>>,
     /// The measure's last wants for windows of the current tab page.
-    wants: BTreeMap<i64, usize>,
+    wants: BTreeMap<i64, wide::Want>,
     /// Text past each window grid's edge reported since the last `flush`,
     /// and since when; taken with that `flush` ([`wide::TAILS_LUA`]).
     tails: Vec<(i64, BTreeMap<usize, wide::Tail>)>,
@@ -1917,7 +1919,7 @@ impl App {
     fn measured(
         &mut self,
         laststatus: Option<i64>,
-        wants: Option<BTreeMap<i64, usize>>,
+        wants: Option<BTreeMap<i64, wide::Want>>,
         now: Instant,
     ) {
         if let Some(w) = wants.filter(|w| *w != self.wants) {
@@ -1934,14 +1936,16 @@ impl App {
     }
 
     /// When centring, asks for each window wider than it wants to get a grid
-    /// that wide and the rest their full width ([`wide`]); hidden windows
-    /// keep theirs. When not, releases every narrowed grid. A window found on
-    /// another client's narrowed grid that this one would not narrow is
-    /// asked for whole. Narrowed grids are cut locally at once, as Neovim
-    /// will. Returns whether anything was asked.
+    /// that wide, or if it does not wrap one running on to its right edge,
+    /// and the rest their full width ([`wide`]); hidden windows keep theirs.
+    /// When not, releases every narrowed grid. A window found on another
+    /// client's narrowed grid that this one would not narrow is asked for
+    /// whole. Narrowed grids are cut locally at once, as Neovim will.
+    /// Returns whether anything was asked.
     fn narrow_windows(&mut self, now: Instant) -> bool {
         let on = self.centring() && self.multigrid();
         let mut want: HashMap<u64, usize> = HashMap::new();
+        let mut texts: HashMap<u64, usize> = HashMap::new();
         if on {
             for (&grid, p) in &self.model.layout {
                 let Place::Window { width, .. } = p.place else {
@@ -1954,10 +1958,23 @@ impl App {
                     if let Some(&w) = self.narrowed.get(&grid) {
                         want.insert(grid, w);
                     }
+                    if let Some(&text) = self.model.runs_on.get(&grid) {
+                        texts.insert(grid, text);
+                    }
                 } else {
                     let w = self.want_of(grid);
-                    if w < width {
-                        want.insert(grid, w);
+                    // A grid as wide as the text would cut an unwrapped line
+                    // there, with the rest of the window empty beside it.
+                    let asked = if w.nowrap {
+                        wide::run_on(width, w.width)
+                    } else {
+                        w.width
+                    };
+                    if asked < width {
+                        want.insert(grid, asked);
+                        if w.nowrap {
+                            texts.insert(grid, w.width);
+                        }
                     }
                 }
             }
@@ -2014,23 +2031,30 @@ impl App {
                 Some(&w) => narrowed.insert(grid, w),
                 None => narrowed.remove(&grid),
             };
+            match self.model.runs_on.get(&grid) {
+                Some(&text) => texts.insert(grid, text),
+                None => texts.remove(&grid),
+            };
             false
         });
         self.narrowed = narrowed;
+        self.model.set_runs_on(texts);
         let asked = !asks.is_empty();
         for (grid, width) in asks {
+            let to = self.asked_width(grid, width);
             // Cut the local copy now, keeping the left as a resize does, so
             // the text is placed right from the next frame (a split's first,
-            // as it flies in) instead of a round trip later. Widening is left
-            // to Neovim.
+            // as it flies in) instead of a round trip later, and a grid wider
+            // than its window never covers the next. Widening is left to
+            // Neovim.
             if let Some(g) = self
                 .model
                 .grids
                 .get_mut(&grid)
-                .filter(|g| width > 0 && width < g.width())
+                .filter(|g| to > 0 && to < g.width())
             {
                 self.cut.entry(grid).or_insert(g.width());
-                g.resize(width, g.height());
+                g.resize(to, g.height());
                 self.dirty = true;
                 // Tails were for the old width; Neovim resends them.
                 self.model.forget_tails(grid);
@@ -2040,7 +2064,6 @@ impl App {
                 "nvim_ui_try_resize_grid",
                 &[Arg::Int(grid as i64), Arg::Int(width as i64), Arg::Int(0)],
             );
-            let to = self.asked_width(grid, width);
             self.unanswered.entry(grid).or_default().push(to);
         }
         // Text that moved in or out of its window slides there.
@@ -2092,13 +2115,16 @@ impl App {
     }
 
     /// The measure's want for `grid`'s window, or `window_width` if none yet.
-    fn want_of(&self, grid: u64) -> usize {
+    fn want_of(&self, grid: u64) -> wide::Want {
         self.model
             .wins
             .get(&grid)
             .and_then(|win| self.wants.get(win))
             .copied()
-            .unwrap_or(self.window_width)
+            .unwrap_or(wide::Want {
+                width: self.window_width,
+                nowrap: false,
+            })
     }
 
     /// Releases every narrowed grid as the client exits, so other UIs see
@@ -12313,6 +12339,75 @@ mod tests {
     fn wanting(width: i64) -> Vec<Value> {
         let each = vec![Value::Array(vec![1000.into(), width.into()])];
         vec!["measure".into(), 2.into(), Value::Array(each)]
+    }
+
+    /// [`wanting`], with `'nowrap'`.
+    fn unwrapped(width: i64) -> Vec<Value> {
+        let each = vec![Value::Array(vec![1000.into(), width.into(), true.into()])];
+        vec!["measure".into(), 2.into(), Value::Array(each)]
+    }
+
+    /// Wrapping again, the grid is as wide as the text.
+    #[test]
+    fn a_window_that_does_not_wrap_runs_on_to_its_edge() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+        calls(&mut a);
+        // 8 of text, 6 in: the grid runs on 14 to the edge.
+        notify(&mut a, "nvmux_client", unwrapped(8), t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(14), n(0)]]);
+        redraw(
+            &mut a,
+            vec![resize(2, 14, 5), line(2, 0, "text and more")],
+            t0,
+        );
+        assert_eq!(a.model.inset(2), 6, "centred by the text");
+        assert_eq!(shown(&mut a, t0)[0], "      text and more");
+
+        notify(&mut a, "nvmux_client", wanting(8), t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(8), n(0)]]);
+        assert_eq!(
+            (a.model.grids[&2].width(), a.model.inset(2)),
+            (8, 6),
+            "cut to the text"
+        );
+    }
+
+    /// So it never covers the next window while asked for whole: here one
+    /// running on, left too narrow to centre by a split.
+    #[test]
+    fn a_grid_wider_than_its_window_is_cut_to_it_at_once() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+            ],
+            t0,
+        );
+        notify(&mut a, "nvmux_client", unwrapped(8), t0);
+        redraw(&mut a, vec![resize(2, 14, 5)], t0);
+        calls(&mut a);
+        redraw(&mut a, vec![place(2, 1000, 0, 0, 9, 5)], t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
+        assert_eq!((a.model.grids[&2].width(), a.model.inset(2)), (9, 0));
     }
 
     /// [`wide_app`] with one full-width drawn window asked for 8

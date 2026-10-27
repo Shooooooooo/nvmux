@@ -275,7 +275,7 @@ fn put_together(
     }
 
     // Windows never overlap, so order does not matter. A grid narrower than
-    // its place fills the middle.
+    // its place has its text in the middle.
     for (&grid, p) in &model.layout {
         if p.hidden || grid == 1 {
             continue;
@@ -292,6 +292,7 @@ fn put_together(
             let within = Within {
                 cols: place.filter(|_| shift != 0),
                 place,
+                text: model.runs_on.get(&grid).copied(),
                 ..Within::default()
             };
             draw(
@@ -366,12 +367,14 @@ fn wanted(rows: Option<&[bool]>, row: usize) -> bool {
 
 /// What part of a grid [`draw`] puts on the frame: rows from its top and the
 /// frame columns it may cover (all when `None`); for a window, its place's
-/// columns, which tails past its grid's edge may cover (see `super::wide`).
+/// columns, which tails past its grid's edge may cover, and the width of its
+/// text if its grid runs on past it (see `super::wide`).
 #[derive(Debug, Clone, Copy, Default)]
 struct Within {
     rows: Option<usize>,
     cols: Option<(i64, i64)>,
     place: Option<(i64, i64)>,
+    text: Option<usize>,
 }
 
 /// Draw grid `grid` with its top left at `at`, limited by `within`, skipping
@@ -431,6 +434,39 @@ fn draw(
                 .contains(&r)
                 .then(|| (left, right, s.row(r - top, g)))
         });
+        let patches = view.patches(grid, r);
+        // The cell shown at column `c`, and whether it is wide.
+        let shown = |c: usize| match (
+            patches
+                .iter()
+                .find(|p| (p.col..p.col + p.cells.len()).contains(&c)),
+            scrolled,
+        ) {
+            (Some(p), _) => {
+                let i = c - p.col;
+                let wide = p.cells.get(i + 1).is_some_and(|n| n.text == Text::Half);
+                (&p.cells[i], wide)
+            }
+            (None, Some((left, right, line))) if (left..right).contains(&c) => {
+                let i = c - left;
+                let line = line.unwrap_or(&[]);
+                let cell = line.get(i).unwrap_or(&blank);
+                let wide = line.get(i + 1).is_some_and(|n| n.text == Text::Half);
+                (cell, wide)
+            }
+            (None, _) => (
+                &own[c],
+                own.get(c + 1).is_some_and(|n| n.text == Text::Half),
+            ),
+        };
+        let hi = match within.text {
+            Some(text) => {
+                let end =
+                    super::wide::ink_end(text, hi.max(0) as usize, |c| !shown(c).0.text.is_blank());
+                hi.min(end as i64)
+            }
+            None => hi,
+        };
         // This row's columns, minus the skipped rectangles.
         runs.clear();
         runs.push((lo, hi));
@@ -455,30 +491,9 @@ fn draw(
             std::mem::swap(&mut runs, &mut cut);
         }
         let row = &mut frame.cells[y * frame.width..(y + 1) * frame.width];
-        let patches = view.patches(grid, r);
         for &(s, e) in &runs {
             for c in s as usize..e as usize {
-                let patch = patches
-                    .iter()
-                    .find(|p| (p.col..p.col + p.cells.len()).contains(&c));
-                let (cell, wide) = match (patch, scrolled) {
-                    (Some(p), _) => {
-                        let i = c - p.col;
-                        let wide = p.cells.get(i + 1).is_some_and(|n| n.text == Text::Half);
-                        (&p.cells[i], wide)
-                    }
-                    (None, Some((left, right, line))) if (left..right).contains(&c) => {
-                        let i = c - left;
-                        let line = line.unwrap_or(&[]);
-                        let cell = line.get(i).unwrap_or(&blank);
-                        let wide = line.get(i + 1).is_some_and(|n| n.text == Text::Half);
-                        (cell, wide)
-                    }
-                    (None, _) => (
-                        &own[c],
-                        own.get(c + 1).is_some_and(|n| n.text == Text::Half),
-                    ),
-                };
+                let (cell, wide) = shown(c);
                 let (style, blend) = match last {
                     Some((hl, style, blend)) if hl == cell.hl => (style, blend),
                     _ => {
@@ -578,9 +593,9 @@ fn status_lines_over_text(
     for &(grid, (row, col, width, height)) in &windows {
         // Text offset, including any animated shift.
         let inset = model.inset(grid) as i64 + view.shift(grid);
-        let Some(g) = model.grids.get(&grid).filter(|_| inset > 0) else {
+        if inset <= 0 || !model.grids.contains_key(&grid) {
             continue;
-        };
+        }
         let below = row + height;
         let has = match laststatus {
             2 => true,
@@ -592,7 +607,11 @@ fn status_lines_over_text(
         }
         let start = below * frame.width + col;
         let end = start + width.min(frame.width - col);
-        super::wide::realign(&mut frame.cells[start..end], inset as usize, g.width());
+        super::wide::realign(
+            &mut frame.cells[start..end],
+            inset as usize,
+            model.text_width(grid),
+        );
         laid = true;
     }
     laid
@@ -988,6 +1007,51 @@ mod tests {
         compose_rows(&mut shown, &m, &Still, &[false, false, true]);
         assert_eq!(shown, compose(&m, &Still, 6, 3));
         assert_eq!(shown.text(), " WWWW \n WWWW \n efgh ");
+    }
+
+    /// Centred by its text, and past it drawn only as far as each row has
+    /// text: a lit line (`'cursorline'`) ends with the text, as on a grid that
+    /// wide. Also when only one row is recomposed.
+    #[test]
+    fn a_grid_running_on_past_its_text_shows_rows_as_far_as_they_go() {
+        let lit = Event::HlAttr {
+            id: 5,
+            rgb: Attrs {
+                bg: Some(0xff_0000),
+                ..Attrs::default()
+            },
+            cterm: Attrs::default(),
+        };
+        // 6 of text in 12: 3 in, the grid running on 9 to the window's edge.
+        let mut m = model(vec![
+            lit,
+            resize(1, 12, 3),
+            line(1, 2, "ab        cd", 0),
+            resize(2, 9, 2),
+            line(2, 0, "abc      ", 5),
+            line(2, 1, "abcdefgh ", 0),
+            Event::WinPos {
+                grid: 2,
+                win: Some(1000),
+                row: 0,
+                col: 0,
+                width: 12,
+                height: 2,
+            },
+        ]);
+        m.laststatus = Some(2);
+        m.set_runs_on(std::collections::HashMap::from([(2, 6)]));
+        let f = compose(&m, &Still, 12, 3);
+        assert_eq!(f.text(), "   abc      \n   abcdefgh \n   ab  cd   ");
+        let red = Color::Rgb(Rgb(255, 0, 0));
+        let lit: Vec<usize> = (0..12).filter(|&c| f.cells[c].style.bg == red).collect();
+        assert_eq!(lit, (3..9).collect::<Vec<_>>(), "lit over the text alone");
+
+        let mut shown = f;
+        m.apply(line(2, 1, "abcdefghi", 0), &mut Changes::default());
+        compose_rows(&mut shown, &m, &Still, &[false, true, false]);
+        assert_eq!(shown, compose(&m, &Still, 12, 3));
+        assert_eq!(shown.text(), "   abc      \n   abcdefghi\n   ab  cd   ");
     }
 
     /// Even when the window is drawn elsewhere for a frame.
