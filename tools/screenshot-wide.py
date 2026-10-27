@@ -47,25 +47,26 @@ CODE_WIDTH = TEXTWIDTH + 4
 NAME = "api-server"
 
 # Each shot, in order: name, `[client] centre`, and what `widths` should
-# then report: `'columns'`, each window's text width, each window's width.
+# then report: `'columns'`, each window's grid width, each window's width.
 # The left window is half the terminal; the right one leaves a column for
-# the separator.
+# the separator. The code does not wrap, so its grid runs on past its text
+# to the window's edge.
 LEFT, RIGHT = COLS // 2, COLS - 1 - COLS // 2
 SHOTS = [
     ("off", "off", [COLS, [LEFT, RIGHT], [LEFT, RIGHT]]),
-    ("on", "smart", [COLS, [CODE_WIDTH, WIDTH], [LEFT, RIGHT]]),
+    ("on", "smart", [COLS, [LEFT - (LEFT - CODE_WIDTH) // 2, WIDTH], [LEFT, RIGHT]]),
 ]
 
 # The demo api-server's files, enough to fill a monitor-tall window. Every
-# line, with line numbers, fits in WIDTH and every paragraph wrapped there
-# fits above the status line; otherwise a line would be cut off, or the
-# paragraph would end in Neovim's `@@@`.
+# line of code fits in TEXTWIDTH, or the code's text would widen past
+# CODE_WIDTH, and every paragraph wrapped at WIDTH fits above the status
+# line, or it would end in Neovim's `@@@`.
 FILES = {
     "src/sessions.rs": """\
 //! Sessions: who is signed in, and until when.
 //!
-//! A session is a row in `sessions`, found by the hash of its token. The token itself is only ever in the
-//! user's cookie, so a copy of the database is not a copy of anyone's sign-in.
+//! A session is a row in `sessions`, found by the hash of its token. The token itself is only
+//! ever in the user's cookie, so a copy of the database is not a copy of anyone's sign-in.
 
 use std::time::Duration;
 
@@ -79,7 +80,8 @@ use tracing::{debug, info};
 /// How long a session lasts unused.
 pub const IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// How many rows the cleanup deletes in one statement, so that a backlog never holds the table for long.
+/// How many rows the cleanup deletes in one statement, so that a backlog never holds the
+/// table for long.
 const BATCH: i64 = 1000;
 
 /// A signed-in user, as a request sees them.

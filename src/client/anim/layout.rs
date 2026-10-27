@@ -655,8 +655,10 @@ impl Shot {
                 if let Some(rows) = showed(g) {
                     return Some((*g, rows.clone()));
                 }
+                // Old rows are centred by their width, so a grid running on
+                // past its text keeps only the text.
                 let grid = model.grids.get(g)?;
-                Some((*g, grid.lines(0, grid.height(), 0, grid.width())))
+                Some((*g, grid.lines(0, grid.height(), 0, model.text_width(*g))))
             })
             .collect();
         let insets = layout
@@ -665,7 +667,7 @@ impl Shot {
             .filter_map(|(g, p)| {
                 let width = match showed(g) {
                     Some(rows) => rows.first().map_or(0, Vec::len),
-                    None if model.inset(*g) > 0 => model.grids.get(g)?.width(),
+                    None if model.inset(*g) > 0 => model.text_width(*g),
                     None => return None,
                 };
                 let text = p.grid(p.frame).width().max(0) as usize;
@@ -1312,7 +1314,7 @@ fn ghost_shift(model: &Model, grid: u64, text: Area, ghosts: &[(&Ghost, Spot)]) 
         .filter(|(g, at)| g.kind == Kind::Row && at.f.overlaps(&text) && at.f.left > text.left)
         .map(|(_, at)| at.f.left)
         .fold(text.right, i64::min);
-    let cols = model.grids.get(&grid).map_or(0, Grid::width) as i64;
+    let cols = model.text_width(grid) as i64;
     let pad = |width: i64| (width - cols).max(0) / 2;
     pad(open - text.left) - pad(text.width())
 }
@@ -1327,12 +1329,13 @@ struct Middle {
 }
 
 /// What [`draw_window`] centres in window `grid`'s frame (see
-/// `crate::client::wide`): its grid if centred at the destination, else its
-/// old content if centred before (`was`). Narrowed below its text width, it
-/// thus moves its old content to the frame's edge before cutting it to size.
+/// `crate::client::wide`): its grid's text if centred at the destination,
+/// else its old content if centred before (`was`). Narrowed below its text
+/// width, it thus moves its old content to the frame's edge before cutting it
+/// to size.
 fn middle(model: &Model, grid: u64, old: Option<&Vec<Vec<Cell>>>, was: bool) -> Option<Middle> {
     if model.inset(grid) > 0 {
-        let width = model.grids.get(&grid)?.width();
+        let width = model.text_width(grid);
         return Some(Middle { width, old: false });
     }
     let rows = old.filter(|_| was)?;
@@ -1366,11 +1369,19 @@ fn draw_window(
     // Plus `shift` while it moves across the window.
     let pad = (pad as i64 + shift).max(0) as usize;
     let showed = middle.is_some_and(|m| m.old);
+    let runs_on = model.runs_on.get(&grid).copied();
     for r in 0..height {
+        // As `crate::client::compose` draws a grid running on past its text.
+        let end = match (g, runs_on) {
+            (Some(g), Some(text)) => crate::client::wide::ink_end(text, g.width(), |k| {
+                g.cell(r, k).is_some_and(|c| !c.text.is_blank())
+            }),
+            _ => usize::MAX,
+        };
         for c in 0..width {
             let k = c.checked_sub(pad);
             let own = || {
-                let k = k?;
+                let k = k.filter(|&k| k < end)?;
                 g.and_then(|g| Some((g.cell(r, k)?, g.is_wide(r, k))))
             };
             // Old content where it lines up: from the frame's edge, or

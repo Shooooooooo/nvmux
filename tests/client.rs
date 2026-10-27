@@ -5894,8 +5894,8 @@ fn until_widths(
 }
 
 /// With `centre = "smart"`, the text width is `'textwidth'` if set; else, for
-/// `nowrap`, wide enough for nine in ten lines (up to the whole window); else
-/// `window_width`.
+/// `nowrap`, wide enough for its widest line (up to the whole window), on a
+/// grid running on to the window's edge; else `window_width`.
 #[test]
 fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
     require_nvim!();
@@ -5906,17 +5906,22 @@ fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
         "never drawn:\n{}",
         term.text()
     );
-    for (command, want) in [
-        ("setlocal textwidth=40", columns(160, &[40])),
+    // Each with the column its text starts at.
+    for (command, at, want) in [
+        ("setlocal textwidth=40", 60, columns(160, &[40])),
+        // 100 of text, not the 80 of nine lines in ten.
         (
-            "setlocal textwidth=0 nowrap | call setline(1, repeat([repeat('x', 100)], 9) + ['y'])",
-            columns(160, &[100]),
+            "setlocal textwidth=0 nowrap \
+             | call setline(1, repeat([repeat('x', 80)], 9) + [repeat('x', 100)])",
+            30,
+            columns(160, &[130]),
         ),
         (
             "call setline(1, repeat([repeat('x', 200)], 10)) | setlocal nowrap",
+            0,
             columns(160, &[160]),
         ),
-        ("setlocal wrap", columns(160, &[60])),
+        ("setlocal wrap", 50, columns(160, &[60])),
     ] {
         rpc.command(command).expect(command);
         assert!(
@@ -5924,7 +5929,117 @@ fn a_windows_text_is_as_wide_as_what_it_shows_wants() {
             "after {command}: {} not {want}",
             widths(&mut rpc)
         );
+        let starts = |s: &str| {
+            let first = s.lines().next().unwrap_or("");
+            first.len() - first.trim_start().len() == at
+        };
+        assert!(
+            term.pump_until(Duration::from_secs(5), starts),
+            "after {command}: not {at} in:\n{}",
+            term.text()
+        );
     }
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// Regression: where `'wrap'` is off, a line wider than nine in ten was cut
+/// where the text ended, the window empty beside it, and going to its end
+/// slid the view sideways. A line wider than any measured (changed since, as
+/// by typing) runs on to the window's edge.
+#[test]
+fn a_line_that_does_not_wrap_is_not_cut_where_the_text_ends() {
+    require_nvim!();
+    let scratch = Scratch::new("client-nowrap");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-nowrap");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    // 140 columns, a letter to each ten, among 11 short lines.
+    let long: String = (0..140u8).map(|i| char::from(b'a' + i / 10)).collect();
+    rpc.command(&format!(
+        "setlocal nowrap | call setline(1, ['{long}'] + map(range(1, 11), '\"short \" . v:val'))"
+    ))
+    .expect("a long line");
+    // 140 of text, 10 in of 160.
+    let pad = " ".repeat(10);
+    let (whole, short) = (format!("{pad}{long}"), format!("{pad}short 1"));
+    let laid = |s: &str| {
+        let mut rows = s.lines();
+        rows.next() == Some(whole.as_str()) && rows.next() == Some(short.as_str())
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), laid),
+        "cut short:\n{}",
+        term.text()
+    );
+    rpc.command("call cursor(1, 140)")
+        .expect("to the line's end");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.contains("1,140") && laid(s)),
+        "slid sideways:\n{}",
+        term.text()
+    );
+    assert_eq!(
+        rpc.eval("winsaveview().leftcol").expect("the view"),
+        Value::from(0),
+        "slid sideways"
+    );
+
+    rpc.command(&format!("call setline(2, '{}')", "z".repeat(155)))
+        .expect("a longer line");
+    let on = format!("{pad}{}", "z".repeat(150));
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.lines().nth(1)
+            == Some(on.as_str())),
+        "not run on to the window's edge:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// Where `'wrap'` is off. Past the text a row is drawn only as far as it has
+/// text, so `'cursorline'` on a short line spans just the text.
+#[test]
+fn a_line_wider_than_fixed_text_runs_on_to_the_windows_edge() {
+    require_nvim!();
+    let scratch = Scratch::new("client-fixed-nowrap");
+    let (mut term, mut rpc, _) = wide_with(&scratch, "client-fixed-nowrap", "fixed");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command(
+        "setlocal nowrap cursorline | hi CursorLine guibg=#ff0000 \
+         | call setline(1, ['short', repeat('x', 140)])",
+    )
+    .expect("a long line");
+    let pad = " ".repeat(50);
+    let (short, on) = (format!("{pad}short"), format!("{pad}{}", "x".repeat(110)));
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.starts_with(&short)
+            && s.lines().nth(1) == Some(on.as_str())),
+        "not run on to the window's edge:\n{}",
+        term.text()
+    );
+    let lit = |t: &Terminal| -> Vec<u16> {
+        (0..160)
+            .filter(|&c| {
+                t.parser
+                    .screen()
+                    .cell(0, c)
+                    .is_some_and(|cell| cell.bgcolor() == vt100::Color::Rgb(255, 0, 0))
+            })
+            .collect()
+    };
+    let over: Vec<u16> = (50..110).collect();
+    assert!(
+        term.pump(Duration::from_secs(5), |t| lit(t) == over),
+        "the cursor line not lit over the text alone: {:?}",
+        lit(&term)
+    );
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 

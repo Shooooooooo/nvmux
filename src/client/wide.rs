@@ -11,6 +11,11 @@
 //! exit the client asks for each window's width back and briefly waits for it
 //! ([`super::run`]).
 //!
+//! A window that does not wrap gets a grid from where its centred text starts
+//! to its right edge ([`run_on`]), so a line wider than the text runs on
+//! rather than being cut where the text ends, the window empty beside it.
+//! Past the text a row is drawn only as far as it has text ([`ink_end`]).
+//!
 //! The client cuts its own grid copy as soon as it asks, so a new split is
 //! centred from its first frame rather than a round trip later. If a grid is
 //! asked for again, narrower, before Neovim answers (a split gets
@@ -50,12 +55,13 @@ use super::redraw;
 ///   narrower grid they would be centred twice.
 /// - `'winfixwidth'` windows want their width.
 /// - Others want the given width. With `smart`: `'textwidth'` if set, and at
-///   least enough for 90% of unwrapped lines (all with `'nowrap'`, otherwise
-///   Markdown tables and code blocks via tree-sitter) among the first 4000,
-///   plus the gutter.
+///   least enough for their unwrapped lines among the first 4000, plus the
+///   gutter: with `'nowrap'` the widest, otherwise 90% of Markdown tables and
+///   code blocks (via tree-sitter).
 ///
-/// Returns `{ 'laststatus', { { window, wanted }, ... } }`; `'laststatus'`
-/// tells which windows have their own status line ([`realign`]).
+/// Returns `{ 'laststatus', { { window, wanted, nowrap }, ... } }`;
+/// `'laststatus'` tells which windows have their own status line
+/// ([`realign`]), `nowrap` which run their lines on ([`run_on`]).
 ///
 /// With a channel, it stays installed and sends `measure` on `nvmux_client`
 /// with the same two values whenever they change (window, buffer, tab and
@@ -143,7 +149,9 @@ local function long(win, buf)
     end
   end
   table.sort(widths)
-  local width = widths[math.ceil(#widths * 0.9)] or 0
+  -- Every unwrapped line gets room, else one may run on past the window's
+  -- edge; a Markdown block wider than nine in ten only wraps.
+  local width = widths[wrap and math.ceil(#widths * 0.9) or #widths] or 0
   seen[buf] = { key = key, width = width }
   return width
 end
@@ -170,7 +178,7 @@ local function measure()
   local each = {}
   for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
     if api.nvim_win_get_config(win).relative == '' then
-      each[#each + 1] = { win, of(win) }
+      each[#each + 1] = { win, of(win), not vim.wo[win].wrap }
     end
   end
   return { vim.o.laststatus, each }
@@ -478,10 +486,35 @@ for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
 end
 pcall(report)";
 
-/// Left offset centring a `grid`-wide grid in a `slot`-wide window; odd slack
+/// Left offset centring `text` columns in a `slot`-wide window; odd slack
 /// goes to the right.
-pub fn inset(slot: usize, grid: usize) -> usize {
-    slot.saturating_sub(grid) / 2
+pub fn inset(slot: usize, text: usize) -> usize {
+    slot.saturating_sub(text) / 2
+}
+
+/// What [`MEASURE_LUA`] says a window wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Want {
+    pub width: usize,
+    /// `'nowrap'`: its lines run on past its text ([`run_on`]).
+    pub nowrap: bool,
+}
+
+/// Width of a grid whose `text` columns are centred in a `slot`-wide window
+/// and whose lines run on past them to the window's right edge.
+pub fn run_on(slot: usize, text: usize) -> usize {
+    slot - inset(slot, text)
+}
+
+/// Where a row of a grid running on past `text` columns stops being drawn:
+/// after the last cell past them for which `ink` holds (not blank). Blanks
+/// past the text are left to the margin, so a highlighted line
+/// (`'cursorline'`) spans the text as on a grid that wide.
+pub fn ink_end(text: usize, width: usize, ink: impl Fn(usize) -> bool) -> usize {
+    (text..width)
+        .rev()
+        .find(|&c| ink(c))
+        .map_or(text, |c| c + 1)
 }
 
 /// Move a full-width status line's words over the text (`text` columns,
@@ -719,6 +752,24 @@ mod tests {
             0,
             "a grid wider than its window is not inset"
         );
+    }
+
+    #[test]
+    fn a_grid_running_on_reaches_the_windows_edge() {
+        assert_eq!(run_on(160, 140), 150);
+        assert_eq!(run_on(161, 140), 151, "odd slack to the right");
+        assert_eq!(run_on(100, 120), 100, "text wider than the window");
+    }
+
+    #[test]
+    fn a_row_running_on_ends_after_its_last_non_blank() {
+        let end = |text: &str| {
+            let row = drawn(text);
+            ink_end(4, row.len(), |c| !row[c].text.is_blank())
+        };
+        assert_eq!(end("abcdef  gh  "), 10);
+        assert_eq!(end("ab          "), 4, "nothing past the text");
+        assert_eq!(end("abcd日  "), 6, "a wide character whole");
     }
 
     #[test]

@@ -379,6 +379,9 @@ pub struct Model {
     /// Past-end-of-line text that does not fit in a narrowed window grid, by
     /// grid and row (see [`super::wide`]).
     pub tails: HashMap<u64, BTreeMap<usize, Tail>>,
+    /// Text widths of window grids whose lines run on past their text to the
+    /// window's edge (see [`super::wide::run_on`]), by grid.
+    pub runs_on: HashMap<u64, usize>,
     /// Where the message area last rested, unscrolled: `'cmdheight'` rows
     /// from the bottom.
     cmdline_top: Option<usize>,
@@ -425,6 +428,7 @@ impl Model {
             groups: HashMap::new(),
             laststatus: None,
             tails: HashMap::new(),
+            runs_on: HashMap::new(),
             cmdline_top: None,
             highlights: Highlights::default(),
             styles: Vec::new(),
@@ -584,6 +588,23 @@ impl Model {
         }
     }
 
+    /// Replace [`Model::runs_on`].
+    pub fn set_runs_on(&mut self, runs_on: HashMap<u64, usize>) {
+        if runs_on != self.runs_on {
+            self.runs_on = runs_on;
+            self.changed = super::grid::tick();
+        }
+    }
+
+    /// Width of the text in window `grid`: its grid's, unless the grid runs
+    /// on past it.
+    pub fn text_width(&self, grid: u64) -> usize {
+        match self.runs_on.get(&grid) {
+            Some(&text) => text,
+            None => self.grids.get(&grid).map_or(0, Grid::width),
+        }
+    }
+
     /// `(rgb, cterm)` of client highlight `id`.
     pub fn attrs(&self, id: u32) -> Option<&(Attrs, Attrs)> {
         self.highlights.defs.get(id as usize)?.as_ref()
@@ -630,14 +651,14 @@ impl Model {
     }
 
     /// Horizontal offset at which `grid` is drawn (see [`super::wide`]): a
-    /// window grid narrower than its window is centred, and a float anchored
-    /// to it shifts by as much, but not off the screen. Zero otherwise.
+    /// window grid narrower than its window is centred, by its text if it
+    /// runs on past it, and a float anchored to it shifts by as much, but not
+    /// off the screen. Zero otherwise.
     pub fn inset(&self, grid: u64) -> usize {
         let window = |grid: u64| match self.layout.get(&grid).map(|p| &p.place) {
-            Some(Place::Window { width, .. }) => self
-                .grids
-                .get(&grid)
-                .map_or(0, |g| super::wide::inset(*width, g.width())),
+            Some(Place::Window { width, .. }) if self.grids.contains_key(&grid) => {
+                super::wide::inset(*width, self.text_width(grid))
+            }
             _ => 0,
         };
         match self.layout.get(&grid).map(|p| &p.place) {
