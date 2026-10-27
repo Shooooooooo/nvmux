@@ -188,6 +188,9 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
         let mut highest = ui::highest_num(&listing);
         // Started under a switch's dissolve; never outlives the trip.
         let mut begun: Option<Begun> = None;
+        // The client a floating picker switched to in place, on screen already
+        // (see `pty::Others::hand_over`); relayed next.
+        let mut chosen: Option<pty::Attachment> = None;
         let mut from_picker = true;
         // A `<prefix> n`/`p` switch's direction and origin, for the card.
         let mut stepped: Option<(nvmux::keys::Direction, nvmux::session::Session)> = None;
@@ -208,13 +211,35 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             {
                 revival = None;
             }
-            let opened = match attached.take() {
-                Some(a) if a.session_id == current.id => Ok(Some(a)),
+            // The client a floating picker switched to in place, its screen up
+            // already; one for any other session goes back.
+            let lit = chosen.take().and_then(|c| {
+                if c.session_id == current.id && hand_off.is_none() {
+                    pool.took(&c.session_id);
+                    Some(c)
+                } else {
+                    pool.give_back(c);
+                    None
+                }
+            });
+            let opened = match (lit, attached.take()) {
+                // As `resume_or_attach` would take it from the pool. A held
+                // client is another session's, not kept: retired.
+                (Some(mut lit), other) => {
+                    if lit.started_ahead() {
+                        lit.announce_on_arrival(announce::label(&current.name));
+                    } else {
+                        warm = true;
+                    }
+                    drop(other);
+                    Ok(Some(lit))
+                }
+                (None, Some(a)) if a.session_id == current.id => Ok(Some(a)),
                 // Retiring a client leaves its headless server running.
                 // Hung up first and reaped after the new spawn, so the two
                 // run in parallel. Nothing reads the old pty again, so its
                 // restore sequence never reaches the terminal.
-                Some(mut other) => {
+                (None, Some(mut other)) => {
                     other.hang_up();
                     let spawned = resume_or_attach(
                         transport,
@@ -230,7 +255,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     drop(other);
                     spawned
                 }
-                None => resume_or_attach(
+                (None, None) => resume_or_attach(
                     transport,
                     &mut pool,
                     &current,
@@ -323,54 +348,17 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                 attachment.float_the_picker();
             }
 
-            // `begin_next` fires on a `<prefix>` switch before the fade, so
-            // the next client starts while this session dissolves, and returns
-            // the landing card. Scoped so its borrows end before the match.
+            // Scoped so its borrows end before the match.
             let ended = {
-                let mut begin_next = |target: pty::Target| {
-                    // A target naming nothing is left to the path below,
-                    // which can afford a re-list. Resolved among the rows as
-                    // they stand: a floating picker or prompt may have changed
-                    // them since, and `listing` takes that in only after the
-                    // relay.
-                    let rows = ui::picker::rows();
-                    let session = pick_from(&rows, target, &current)?;
-                    // A second client on the same server would shrink its
-                    // screen to the smaller UI, only to be dropped.
-                    if session.id == current.id {
-                        return None;
-                    }
-                    let step = match target {
-                        pty::Target::Step(dir) => Some((dir, &current)),
-                        pty::Target::Number(_) | pty::Target::Session(_) => None,
-                    };
-                    let landing = nvmux::card::Card::arrival(
-                        nvmux::card::next_id(),
-                        &announce::label(&session.name),
-                        false,
-                    )
-                    .in_row(row_of(&rows, session, step));
-                    // Not for a session with a kept client, live or exited:
-                    // an exited one may need the link recovered first (see
-                    // `resume_or_attach`). Revived clients are collected
-                    // first so they count as kept.
-                    if let Some(r) = &revival {
-                        r.collect(&mut pool, Some(&current.id));
-                    }
-                    if !pool.has(&session.id) {
-                        match begin_attachment(transport, session) {
-                            Ok(b) => begun = Some(b),
-                            // Not reported: the path below retries.
-                            Err(e) => tracing::debug!(
-                                id = %session.id,
-                                error = %e,
-                                "could not start the next client early"
-                            ),
-                        }
-                    }
-                    Some(landing)
+                let mut neighbours = Neighbours {
+                    transport,
+                    pool: &mut pool,
+                    revival: &revival,
+                    current: &current,
+                    begun: &mut begun,
+                    chosen: &mut chosen,
                 };
-                pty::relay(attachment, highest, &mut begin_next)?
+                pty::relay(attachment, highest, &mut neighbours)?
             };
             // The rows as a floating picker or prompt left them.
             if let Some(rows) = ui::picker::take_changed() {
@@ -515,7 +503,12 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     }
                     // Held, so a switch to nowhere returns the user.
                     attached = pool.set_aside(held);
-                    new_kind |= settle(&mut clients, &mut attached, &mut pool);
+                    let changed = settle(&mut clients, &mut attached, &mut pool);
+                    new_kind |= changed;
+                    // Of the kind just retired: the attach starts afresh.
+                    if let Some(old) = chosen.take_if(|_| changed) {
+                        pool.took(&old.session_id);
+                    }
                     stepped = match target {
                         pty::Target::Step(dir) => Some((dir, current.clone())),
                         pty::Target::Number(_) | pty::Target::Session(_) => None,
@@ -560,6 +553,10 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             }
         }
 
+        // Handed over to a switch that ended on the picker instead.
+        if let Some(lit) = chosen.take() {
+            pool.give_back(lit);
+        }
         // Every exit from the relay loop was showing `current`: focus it.
         focus = Some(current.id.clone());
     }
@@ -826,6 +823,82 @@ fn begin_attachment(
         attachment,
         probe,
     })
+}
+
+/// The other sessions as a relay reaches them (see `pty::Others`): a switch's
+/// next client begun under the fade, and kept clients lent to the floating
+/// picker.
+struct Neighbours<'a> {
+    transport: &'a dyn transport::Transport,
+    pool: &'a mut pool::Pool,
+    revival: &'a Option<Revival>,
+    current: &'a nvmux::session::Session,
+    begun: &'a mut Option<Begun>,
+    chosen: &'a mut Option<pty::Attachment>,
+}
+
+impl Neighbours<'_> {
+    /// Revived clients count as kept.
+    fn collect_revived(&mut self) {
+        if let Some(r) = self.revival {
+            r.collect(self.pool, Some(&self.current.id));
+        }
+    }
+}
+
+impl pty::Others for Neighbours<'_> {
+    fn begin_next(&mut self, target: pty::Target) -> Option<nvmux::card::Card> {
+        // A target naming nothing is left to the session loop, which can
+        // afford a re-list. Resolved among the rows as they stand: a floating
+        // picker or prompt may have changed them since, and `listing` takes
+        // that in only after the relay.
+        let rows = ui::picker::rows();
+        let current = self.current;
+        let session = pick_from(&rows, target, current)?;
+        // A second client on the same server would shrink its screen to the
+        // smaller UI, only to be dropped.
+        if session.id == current.id {
+            return None;
+        }
+        let step = match target {
+            pty::Target::Step(dir) => Some((dir, current)),
+            pty::Target::Number(_) | pty::Target::Session(_) => None,
+        };
+        let landing = nvmux::card::Card::arrival(
+            nvmux::card::next_id(),
+            &announce::label(&session.name),
+            false,
+        )
+        .in_row(row_of(&rows, session, step));
+        // Not for a session with a kept client, live or exited: an exited one
+        // may need the link recovered first (see `resume_or_attach`).
+        self.collect_revived();
+        if !self.pool.has(&session.id) {
+            match begin_attachment(self.transport, session) {
+                Ok(b) => *self.begun = Some(b),
+                // Not reported: the session loop retries.
+                Err(e) => tracing::debug!(
+                    id = %session.id,
+                    error = %e,
+                    "could not start the next client early"
+                ),
+            }
+        }
+        Some(landing)
+    }
+
+    fn lend(&mut self, session_id: &str) -> Option<pty::Attachment> {
+        self.collect_revived();
+        self.pool.lend(session_id)
+    }
+
+    fn give_back(&mut self, client: pty::Attachment) {
+        self.pool.give_back(client);
+    }
+
+    fn hand_over(&mut self, client: pty::Attachment) {
+        *self.chosen = Some(client);
+    }
 }
 
 /// Start a client for every session and hold each in the pool until its first

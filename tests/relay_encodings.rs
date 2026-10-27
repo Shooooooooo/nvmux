@@ -108,6 +108,15 @@ const CHILD_FADE_MS: &str = "NVMUX_TEST_RELAY_FADE_MS";
 /// the terminal. An OSC no terminal acts on.
 const PARKED: &[u8] = b"\x1b]9999;parked\x07";
 
+/// A second session, started ahead in the child's pool, for the picker to
+/// show behind it: the floating picker then floats, and a switch is relayed
+/// on as `main` does (see [`preview_relays`]). Needs [`CHILD_KEEP`].
+const CHILD_OTHER_ID: &str = "NVMUX_TEST_RELAY_OTHER_ID";
+const CHILD_OTHER_SOCK: &str = "NVMUX_TEST_RELAY_OTHER_SOCK";
+
+/// Written by a [`CHILD_OTHER_ID`] child after each switch.
+const SWITCHED: &[u8] = b"\x1b]9999;switched\x07";
+
 /// Pty size for a [`Terminal`] unless its [`Asks`] give one; tests must agree
 /// with the child on which row is the last (the hint bar's).
 const ROWS: u16 = 40;
@@ -149,9 +158,12 @@ fn relay_child() {
     }
     let keep = std::env::var_os(CHILD_KEEP).is_some();
     settings.client.per_session = keep;
+    let other = std::env::var(CHILD_OTHER_ID)
+        .ok()
+        .zip(std::env::var_os(CHILD_OTHER_SOCK));
     // A full-screen picker ends the relay, which is where these tests park
     // and observe moved picker keys; a floating one stays in the relay.
-    settings.style.float = false;
+    settings.style.float = other.is_some();
     if let Ok(bind) = std::env::var(CHILD_BIND) {
         let moved: nvmux::config::Settings =
             toml::from_str(&format!("[keys.bind]\n{bind}\n")).expect("a [keys.bind] table");
@@ -227,6 +239,15 @@ fn relay_child() {
             let _ = out.flush();
         });
     }
+    if let Some((other_id, other_sock)) = other {
+        let other_sock = std::path::PathBuf::from(other_sock);
+        std::process::exit(preview_relays(
+            attachment,
+            &id,
+            (&other_id, &other_sock),
+            &mut pool,
+        ));
+    }
     let parked_for = std::env::var(CHILD_PARKED_MS)
         .ok()
         .and_then(|ms| ms.parse().ok())
@@ -283,6 +304,96 @@ fn relay_child() {
         }
     };
     std::process::exit(code);
+}
+
+/// The relay's way to the pool, as `main` gives it: lent clients, and the
+/// one a floating picker switched to in place.
+struct Neighbours<'a> {
+    pool: &'a mut nvmux::pool::Pool,
+    chosen: &'a mut Option<nvmux::pty::Attachment>,
+}
+
+impl nvmux::pty::Others for Neighbours<'_> {
+    fn begin_next(&mut self, _: nvmux::pty::Target) -> Option<nvmux::card::Card> {
+        None
+    }
+
+    fn lend(&mut self, session_id: &str) -> Option<nvmux::pty::Attachment> {
+        self.pool.lend(session_id)
+    }
+
+    fn give_back(&mut self, client: nvmux::pty::Attachment) {
+        self.pool.give_back(client);
+    }
+
+    fn hand_over(&mut self, client: nvmux::pty::Attachment) {
+        *self.chosen = Some(client);
+    }
+}
+
+/// The [`CHILD_OTHER_ID`] child: relay `front` with `other` started ahead in
+/// `pool`, both rows of the floating picker, and on a switch park the
+/// session left and relay the one chosen, as `main` does. Returns the exit
+/// code: 0 for a detach.
+fn preview_relays(
+    mut attachment: nvmux::pty::Attachment,
+    front: &str,
+    (other, other_sock): (&str, &Path),
+    pool: &mut nvmux::pool::Pool,
+) -> i32 {
+    let ahead = nvmux::pty::spawn_client(other, other_sock, "").expect("start");
+    let probe = nvmux::pty::Probe::start(other, other_sock).expect("probe");
+    pool.start_ahead(ahead, Some(probe));
+    let rows: Vec<nvmux::session::Session> = [front, other]
+        .into_iter()
+        .zip(1..)
+        .map(|(id, num)| {
+            let mut s = nvmux::session::Session::new(id.into(), format!("s{num}"), 0, num);
+            s.state.num = num;
+            s
+        })
+        .collect();
+    loop {
+        nvmux::ui::picker::hand(&rows, None);
+        let mut chosen = None;
+        let ended = {
+            let mut neighbours = Neighbours {
+                pool: &mut *pool,
+                chosen: &mut chosen,
+            };
+            nvmux::pty::relay(attachment, 0, &mut neighbours)
+        };
+        match ended {
+            Ok((nvmux::pty::Outcome::Detached, _)) => return 0,
+            Ok((nvmux::pty::Outcome::Switch(nvmux::pty::Target::Session(to)), held)) => {
+                assert!(
+                    pool.set_aside(held).is_none(),
+                    "the client left was not parked"
+                );
+                attachment = match chosen {
+                    Some(lit) => {
+                        pool.took(to.as_str());
+                        lit
+                    }
+                    None => match pool.take(to.as_str()) {
+                        nvmux::pool::Taken::Kept(next) => *next,
+                        other => panic!("nothing to switch to: {other:?}"),
+                    },
+                };
+                let mut out = std::io::stdout();
+                let _ = out.write_all(SWITCHED);
+                let _ = out.flush();
+            }
+            Ok((other, _)) => {
+                eprintln!("relay ended with {other:?}");
+                return 3;
+            }
+            Err(e) => {
+                eprintln!("relay failed: {e}");
+                return 4;
+            }
+        }
+    }
 }
 
 /// Start a client ahead as `main` does, pool it for [`AHEAD_FOR`] (or
@@ -362,6 +473,8 @@ struct Asks {
     steps: bool,
     bind: Option<&'static str>,
     painted: bool,
+    /// [`CHILD_OTHER_ID`] and [`CHILD_OTHER_SOCK`].
+    other: Option<(String, std::path::PathBuf)>,
     /// Rows and columns, if not [`ROWS`] by [`COLS`].
     size: Option<(u16, u16)>,
 }
@@ -447,6 +560,7 @@ impl Terminal {
             steps,
             bind,
             painted,
+            other,
             size,
         } = asks;
         let (pty, pts) = pty_process::blocking::open().expect("open a pty");
@@ -505,6 +619,9 @@ impl Terminal {
         }
         if painted {
             cmd = cmd.env(CHILD_PAINTED, "1");
+        }
+        if let Some((id, sock)) = other {
+            cmd = cmd.env(CHILD_OTHER_ID, id).env(CHILD_OTHER_SOCK, sock);
         }
         // Moves the slave in, or the master never sees EOF after the child
         // exits.
@@ -2650,6 +2767,196 @@ fn neovims_own_client_is_sent_no_card() {
         !answers.contains("\\27_~"),
         "the editor was handed a card as the terminal's answer: {answers}"
     );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// Floating, the picker shows the session under its cursor behind it: one
+/// started ahead, then, after a switch, the one left, parked. Each change dips
+/// through the background. `Esc` goes back to the session floated over;
+/// `Enter` brings the one shown up where it is, with nothing else shown on the
+/// way, and keys go to it. `j` and `Enter` read together do the same once the
+/// dip gets there.
+#[test]
+fn the_floating_picker_shows_the_session_under_its_cursor() {
+    require_nvim!();
+    let scratch = Scratch::new("preview");
+    let t = scratch.transport();
+    let session = |tag: &str, marker: &str| {
+        let session = t
+            .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+            .expect("create");
+        let sock = t.local_socket_for(&session).expect("socket path");
+        let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(3)).expect("connect");
+        // No swap file: these run in parallel and would race for the same one.
+        rpc.command(&format!(
+            "setlocal noswapfile | call setline(1, '{marker}')"
+        ))
+        .expect("setline");
+        (session, sock)
+    };
+    let (front, other) = ("the session floated over", "the session under the cursor");
+    let (a, a_sock) = session("preview-front", front);
+    let (b, b_sock) = session("preview-other", other);
+    let mut term = Terminal::spawn_child(
+        &a_sock,
+        &a.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: true,
+            keep: true,
+            fade_ms: Some(100),
+            other: Some((b.id.clone(), b_sock.clone())),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| row_on_screen(out, 0)
+            .contains(front)),
+        "the session never painted; got: {}",
+        term.since(0)
+    );
+    // Parked by the switch only once its DA1 is answered (see
+    // `a_kept_clients_screen_comes_back`).
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
+        "the client never asked its DA1; got: {}",
+        term.since(0)
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+
+    let floating = |out: &[u8]| row_on_screen(out, ROWS - 1).contains("esc back");
+    // Row 1 is empty at some moment after `from`, before `to` first shows on
+    // it: the dip's bottom.
+    let dips = |out: &[u8], from: usize, to: &str| {
+        presented(out, 0)
+            .into_iter()
+            .filter(|(at, _)| *at > from)
+            .take_while(|(_, row)| !row.contains(to))
+            .any(|(_, row)| row.is_empty())
+    };
+    let float = |term: &mut Terminal| {
+        let mark = term.output.len();
+        term.type_bytes(&[nvmux::keys::PREFIX, b' ']);
+        assert!(
+            term.pump_until(Duration::from_secs(5), floating),
+            "the picker never floated; the child wrote: {}",
+            term.since(mark)
+        );
+    };
+    let open = |term: &mut Terminal, key: &[u8], shown: &str| {
+        float(term);
+        let keyed = term.output.len();
+        term.type_bytes(key);
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| row_on_screen(out, 0)
+                .contains(shown)),
+            "{shown:?} never showed behind the picker; row 1 says {:?}",
+            row_on_screen(&term.output, 0)
+        );
+        assert!(
+            dips(&term.output, keyed, shown),
+            "{shown:?} came up without dipping through the background; the child wrote: {}",
+            term.since(keyed)
+        );
+    };
+    // Through the hand-over after `entered`, and the first paint its relay
+    // writes over it.
+    let painted = |out: &[u8], entered: usize| {
+        let from = entered + find(&out[entered.min(out.len())..], SWITCHED)? + SWITCHED.len();
+        find(&out[from..], nvmux::fade::SYNC_END).map(|at| from + at + nvmux::fade::SYNC_END.len())
+    };
+    let reaches = |term: &mut Terminal, sock: &Path, to: &str, typed: char| {
+        term.type_bytes(format!("i{typed}\x1b").as_bytes());
+        let line = || {
+            common::lua(sock, "return vim.api.nvim_get_current_line()")
+                .as_str()
+                .map(str::to_string)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !line().is_some_and(|l| l.starts_with(typed)) && Instant::now() < deadline {
+            term.pump_until(Duration::from_millis(50), |_| false);
+        }
+        assert!(
+            line().is_some_and(|l| l.starts_with(typed)),
+            "keys did not reach {to:?}: its line is {:?}",
+            line()
+        );
+    };
+
+    open(&mut term, b"j", other);
+    let mark = term.output.len();
+    term.type_bytes(b"\x1b");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| !floating(out)
+            && row_on_screen(out, 0).contains(front)),
+        "Esc did not go back to the session floated over; the child wrote: {}",
+        term.since(mark)
+    );
+    assert!(
+        dips(&term.output, mark, front),
+        "Esc went back without dipping through the background; the child wrote: {}",
+        term.since(mark)
+    );
+
+    for (key, to, sock) in [(b"j", other, &b_sock), (b"k", front, &a_sock)] {
+        term.pump_until(Duration::from_millis(300), |_| false);
+        open(&mut term, key, to);
+        let entered = term.output.len();
+        term.type_bytes(b"\r");
+        assert!(
+            term.pump_until(Duration::from_secs(5), |out| painted(out, entered)
+                .is_some()
+                && !floating(out)),
+            "Enter did not bring {to:?} up; the child wrote: {}",
+            term.since(entered)
+        );
+        let upto = painted(&term.output, entered).expect("painted");
+        let shown: Vec<_> = presented(&term.output[..upto], 0)
+            .into_iter()
+            .filter(|(at, _)| *at > entered)
+            .collect();
+        assert!(
+            shown.iter().all(|(_, row)| row.contains(to)),
+            "something else showed as {to:?} came up: {shown:#?}"
+        );
+        assert!(row_on_screen(&term.output[..upto], 0).contains(to));
+        assert!(
+            find(&term.output[entered..], b"\x1b[?1003l\x1b[?1002h").is_some(),
+            "its mouse reporting was not put back; the child wrote: {}",
+            term.since(entered)
+        );
+        reaches(&mut term, sock, to, 'x');
+    }
+
+    // Read together, so the switch comes before the dip has left the session
+    // floated over.
+    term.pump_until(Duration::from_millis(300), |_| false);
+    float(&mut term);
+    let entered = term.output.len();
+    term.type_bytes(b"j\r");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| painted(out, entered)
+            .is_some()
+            && !floating(out)),
+        "j and Enter did not bring {other:?} up; the child wrote: {}",
+        term.since(entered)
+    );
+    let upto = painted(&term.output, entered).expect("painted");
+    assert!(
+        dips(&term.output[..upto], entered, other),
+        "{other:?} came up without dipping through the background; the child wrote: {}",
+        term.since(entered)
+    );
+    let shown: Vec<_> = presented(&term.output[..upto], 0)
+        .into_iter()
+        .filter(|(at, _)| *at > entered)
+        .skip_while(|(_, row)| !row.contains(other))
+        .collect();
+    assert!(
+        !shown.is_empty() && shown.iter().all(|(_, row)| row.contains(other)),
+        "something else showed once {other:?} was up: {shown:#?}"
+    );
+    reaches(&mut term, &b_sock, other, 'y');
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 

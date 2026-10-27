@@ -7,6 +7,9 @@
 //!
 //! Clients started ahead of a session's first visit (`[client] lazy = false`)
 //! are held here too, whatever `per_session` says.
+//!
+//! The floating picker borrows one to show its session ([`Pool::lend`]) and
+//! gives it back as it was, or switches to it in place.
 
 use crate::pty::{Attachment, Parked, Probe};
 use crate::session::Session;
@@ -29,6 +32,9 @@ pub struct Pool {
     keeps: bool,
     /// At most one per session; few enough that a `Vec` serves as the map.
     parked: Vec<Parked>,
+    /// The session whose client is lent (see [`Pool::lend`]), held still: a
+    /// second client for it, one revived say, is turned away.
+    lent: Option<String>,
 }
 
 impl Pool {
@@ -36,6 +42,7 @@ impl Pool {
         Self {
             keeps,
             parked: Vec::new(),
+            lent: None,
         }
     }
 
@@ -117,6 +124,55 @@ impl Pool {
         }
     }
 
+    /// Lend the live client held for a session, for the floating picker to
+    /// show its screen, until [`Pool::give_back`] or [`Pool::took`]. One that
+    /// exited stays, to be taken as [`Taken::Left`].
+    pub fn lend(&mut self, session_id: &str) -> Option<Attachment> {
+        let at = self
+            .parked
+            .iter()
+            .position(|p| p.session_id() == session_id && p.is_alive())?;
+        match self.parked.remove(at).unpark() {
+            Some(attachment) => {
+                self.lent = Some(session_id.to_string());
+                Some(attachment)
+            }
+            // It left as it was asked for.
+            None => {
+                self.parked.push(Parked::gone(session_id));
+                None
+            }
+        }
+    }
+
+    /// Hold a lent client again as it was held: started ahead, with all it
+    /// said and its probe, or parked.
+    pub fn give_back(&mut self, mut attachment: Attachment) {
+        self.lent = None;
+        if attachment.started_ahead() {
+            let probe = attachment.take_probe();
+            self.start_ahead(attachment, probe);
+            return;
+        }
+        // Not kept now, it is retired, as `set_aside` would.
+        if !self.keeps {
+            return;
+        }
+        let id = attachment.session_id.clone();
+        self.retire(&id);
+        if let Some(parked) = attachment.park_again() {
+            tracing::debug!(id = %id, parked = self.parked.len() + 1, "client given back");
+            self.parked.push(parked);
+        }
+    }
+
+    /// The lent client went to the front instead of back.
+    pub fn took(&mut self, session_id: &str) {
+        if self.lent.as_deref() == Some(session_id) {
+            self.lent = None;
+        }
+    }
+
     /// Retire clients of sessions missing from a fresh listing: they can
     /// never be returned to, and where the host could not inspect a session,
     /// its client may still hold the session's screen to its size.
@@ -125,16 +181,19 @@ impl Pool {
             .retain(|p| listing.iter().any(|s| s.id == p.session_id()));
     }
 
-    /// Whether a live client is parked for this session.
+    /// Whether a live client is parked, or lent, for this session.
     pub fn holds(&self, session_id: &str) -> bool {
-        self.parked
-            .iter()
-            .any(|p| p.session_id() == session_id && p.is_alive())
+        self.lent.as_deref() == Some(session_id)
+            || self
+                .parked
+                .iter()
+                .any(|p| p.session_id() == session_id && p.is_alive())
     }
 
-    /// Whether anything is parked for this session, alive or not.
+    /// Whether anything is parked for this session, alive or not, or lent.
     pub fn has(&self, session_id: &str) -> bool {
-        self.parked.iter().any(|p| p.session_id() == session_id)
+        self.lent.as_deref() == Some(session_id)
+            || self.parked.iter().any(|p| p.session_id() == session_id)
     }
 
     pub fn len(&self) -> usize {
@@ -360,6 +419,100 @@ mod tests {
             panic!("the one visited was let go of");
         };
         assert_eq!(back.pid_for_test(), visited_pid);
+    }
+
+    /// Lent, it still counts as held: a client revived meanwhile is turned
+    /// away rather than kept beside it.
+    #[test]
+    fn a_lent_client_is_held_again_once_given_back() {
+        let mut pool = Pool::new(true);
+        let a = kept_standin("s1", "exec sleep 30");
+        let pid = a.pid_for_test();
+        assert!(pool.set_aside(Some(a)).is_none(), "parked");
+        let lent = pool.lend("s1").expect("lent");
+        assert_eq!(lent.pid_for_test(), pid);
+        assert!(pool.holds("s1") && pool.has("s1"));
+        let revived = kept_standin("s1", "exec sleep 30")
+            .start_ahead(None)
+            .expect("held");
+        assert!(pool.adopt(revived).is_some(), "kept beside the lent one");
+        pool.give_back(lent);
+        let Taken::Kept(back) = pool.take("s1") else {
+            panic!("not held again");
+        };
+        assert_eq!(back.pid_for_test(), pid);
+        assert!(!back.started_ahead());
+        assert!(!pool.has("s1"));
+    }
+
+    #[test]
+    fn a_lent_client_taken_to_the_front_is_held_no_more() {
+        let mut pool = Pool::new(true);
+        pool.set_aside(Some(kept_standin("s1", "exec sleep 30")));
+        let lent = pool.lend("s1").expect("lent");
+        pool.took("s2");
+        assert!(pool.holds("s1"), "another session's taken");
+        pool.took("s1");
+        assert!(!pool.holds("s1") && !pool.has("s1"));
+        drop(lent);
+    }
+
+    /// As one whose thread saw it go.
+    #[test]
+    fn a_client_gone_as_it_was_lent_is_taken_as_left() {
+        let mut pool = Pool::new(true);
+        assert!(pool.adopt(Parked::gone("s1")).is_none());
+        assert!(!pool.holds("s1") && pool.has("s1"));
+        assert!(pool.lend("s1").is_none());
+        assert_eq!(pool.take_left(), ["s1"]);
+        assert!(pool.adopt(Parked::gone("s1")).is_none());
+        assert!(matches!(pool.take("s1"), Taken::Left));
+    }
+
+    #[test]
+    fn a_client_given_back_once_clients_are_not_kept_is_retired() {
+        let mut pool = Pool::new(true);
+        let a = kept_standin("s1", "exec sleep 30");
+        let pid = a.pid_for_test();
+        pool.set_aside(Some(a));
+        let lent = pool.lend("s1").expect("lent");
+        pool.keep(false);
+        pool.give_back(lent);
+        assert!(!pool.has("s1"));
+        assert!(gone(pid), "the client lived on");
+    }
+
+    /// Lent, it would be forgotten: its session's next visit must recover the
+    /// link first.
+    #[test]
+    fn a_client_that_left_is_not_lent() {
+        let mut pool = Pool::new(true);
+        pool.set_aside(Some(kept_standin("s1", "sleep 0.1; exit 0")));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.holds("s1") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pool.lend("s1").is_none());
+        assert!(matches!(pool.take("s1"), Taken::Left));
+        assert!(pool.lend("s2").is_none(), "none held");
+    }
+
+    #[test]
+    fn a_client_started_ahead_is_given_back_started_ahead() {
+        for keeps in [true, false] {
+            let mut pool = Pool::new(keeps);
+            let a = kept_standin("s1", "exec sleep 30");
+            let pid = a.pid_for_test();
+            pool.start_ahead(a, None);
+            let lent = pool.lend("s1").expect("lent");
+            assert!(lent.started_ahead());
+            pool.give_back(lent);
+            let Taken::Kept(back) = pool.take("s1") else {
+                panic!("keeps = {keeps}: not held again");
+            };
+            assert_eq!(back.pid_for_test(), pid);
+            assert!(back.started_ahead(), "keeps = {keeps}: given back as shown");
+        }
     }
 
     #[test]
