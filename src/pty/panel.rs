@@ -2,11 +2,12 @@
 //! `<prefix> ,`, `<prefix> ?`, `<prefix> Space`, `<prefix> c`, and the
 //! picker's `c` and `r`.
 //!
-//! The screen draws into a panel (see [`crate::ui::float`]) while the session
-//! keeps running behind it, dimmed half way to the background, more near the
-//! panel by the cards' falloff ([`crate::falloff`]), and blank under it. The
-//! hint row does not float: it stays on the terminal's last row, full width
-//! ([`Floating::draw_hints`]), and the session is blank under it too.
+//! The screen draws into a panel with round corners (see [`crate::ui::float`])
+//! while the session keeps running behind it, dimmed half way to the
+//! background, more near the panel by the cards' falloff ([`crate::falloff`]),
+//! and blank under it. The hint row does not float: it stays on the
+//! terminal's last row, full width ([`Floating::draw_hints`]), and the session
+//! is blank under it too.
 //!
 //! The relay draws it, not the client, so it also works with
 //! `[client] ui = "nvim"`: each frame paints the session from its copy of the
@@ -75,9 +76,9 @@ const SESSION_FRAME: Duration = Duration::from_millis(33);
 /// Past this, a sequence that never ends is written out as is.
 const HELD_MAX: usize = 8 << 20;
 
-/// The blank margin round the panel when there are no colours.
-const MARGIN_COLS: u16 = 2;
-const MARGIN_ROWS: u16 = 1;
+/// The blank margin round the panel when there are no colours, in columns:
+/// two, or a row.
+const MARGIN: f32 = falloff::ASPECT;
 
 #[derive(Debug, Clone, Copy)]
 enum Look {
@@ -101,9 +102,9 @@ impl Look {
     /// panel, but the row has no falloff of its own.
     fn shade(self, row: u16, col: u16, panel: Rect, hints: Rect, dim: f32, away: f32) -> Shade {
         let under_hints = hints.contains(Position::new(col, row));
+        let d = float::distance(panel, col, row);
         match self {
             Look::Dimmed(_) => {
-                let d = falloff::distance(col, row, panel.x, panel.y, panel.width, panel.height);
                 let amount = if d == 0.0 || under_hints {
                     1.0
                 } else {
@@ -113,19 +114,8 @@ impl Look {
                 Shade::Toward(dimmed + (1.0 - dimmed) * away)
             }
             Look::Faint if away > 0.0 => Shade::Blank,
-            Look::Faint => {
-                let left = panel.x.saturating_sub(MARGIN_COLS);
-                let top = panel.y.saturating_sub(MARGIN_ROWS);
-                let inside = col >= left
-                    && col < panel.right() + MARGIN_COLS
-                    && row >= top
-                    && row < panel.bottom() + MARGIN_ROWS;
-                if inside || under_hints {
-                    Shade::Blank
-                } else {
-                    Shade::Faint
-                }
-            }
+            Look::Faint if d <= MARGIN || under_hints => Shade::Blank,
+            Look::Faint => Shade::Faint,
         }
     }
 }
@@ -417,29 +407,27 @@ impl Glimpse {
     }
 
     fn resize_to(&mut self, size: PtySize) {
-        let was = pty_size(&self.client.master);
-        let resized = was != Some(size);
+        let resized = pty_size(&self.client.master) != Some(size);
         self.client.resize_to(size);
         if let Some(copy) = self.copy.as_mut() {
             copy.resize(size.rows, size.cols);
         }
-        // Untold (its input full), it keeps its old size: so does the pty,
-        // or its resume would find nothing to tell it.
-        if !self.client.tell_its_size(size, resized) {
-            if let Some(was) = was {
-                let _ = self.client.master.resize(was.into());
-            }
-        }
+        self.client.tell_its_size(size, resized);
         if resized {
             self.come_back();
         }
     }
 
-    /// Read what it wrote if `readable`, and look at a started-ahead client's
-    /// probe, as its thread would. `false` once it has gone or is to be
-    /// retired: it then goes back for its thread to see to.
-    fn keep(&mut self, readable: bool, buf: &mut [u8]) -> bool {
+    /// Read what it wrote if `readable`, send it input left waiting for room
+    /// if `writable`, and look at a started-ahead client's probe, as its
+    /// thread would. `false` once it has gone or is to be retired: it then
+    /// goes back for its thread to see to.
+    fn keep(&mut self, readable: bool, writable: bool, buf: &mut [u8]) -> bool {
         if !self.client.kept_by_its_probe() {
+            self.client.hang_up();
+            return false;
+        }
+        if writable && self.client.input.send().is_err() {
             self.client.hang_up();
             return false;
         }
@@ -626,12 +614,16 @@ fn float_with(
                 .div_ceil(1000)
                 .min(super::IDLE_POLL_MS as u128) as libc::c_int
         });
-        // Without a glimpse its fd is -1, which `poll` skips.
+        // Stdin is read even while the client is behind on its input: only
+        // terminal replies go to it from here. Without a glimpse its fd is
+        // -1, which `poll` skips.
         let mut fds = [
             pollfd(stdin_fd),
-            pollfd(master_fd),
+            a.master_pollfd(),
             pollfd(winch.fd()),
-            pollfd(glimpse.as_ref().map_or(-1, Glimpse::fd)),
+            glimpse
+                .as_ref()
+                .map_or_else(|| pollfd(-1), |g| g.client.master_pollfd()),
         ];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
@@ -656,11 +648,15 @@ fn float_with(
                 }
             }
         }
+        if n > 0 && fds[1].revents & libc::POLLOUT != 0 {
+            a.input.send()?;
+        }
 
         let readable = n > 0 && ready(&fds[3]);
+        let writable = n > 0 && fds[3].revents & libc::POLLOUT != 0;
         if glimpse
             .as_mut()
-            .is_some_and(|g| !g.keep(readable, &mut buf))
+            .is_some_and(|g| !g.keep(readable, writable, &mut buf))
         {
             if let Some(gone) = glimpse.take() {
                 gone.close(others);
@@ -1055,16 +1051,21 @@ fn paint(
         return Ok(false);
     }
     let (text, dim, away) = levels(there, away, out);
+    let faded = |mut buf| {
+        if let (Some(palette), true) = (look.palette(), text < 1.0) {
+            fade::apply(&mut buf, palette, 1.0 - text);
+        }
+        buf
+    };
     let laid: Vec<Laid> = (text > 0.0)
-        .then(|| [panel.draw(area), panel.draw_hints(hints)])
+        .then(|| {
+            [
+                Laid::rounded(&faded(panel.draw(area)), float::RADIUS),
+                Laid::from_buffer(&faded(panel.draw_hints(hints))),
+            ]
+        })
         .into_iter()
         .flatten()
-        .map(|mut buf| {
-            if let (Some(palette), true) = (look.palette(), text < 1.0) {
-                fade::apply(&mut buf, palette, 1.0 - text);
-            }
-            Laid::from_buffer(&buf)
-        })
         .collect();
     let Some(copy) = copy else {
         return Ok(false);
@@ -1097,8 +1098,7 @@ fn behind<'s>(
 }
 
 fn on_the_session(area: Rect, hints: Rect, column: u16, row: u16) -> bool {
-    let at = Position::new(column, row);
-    !area.contains(at) && !hints.contains(at)
+    float::distance(area, column, row) > 0.0 && !hints.contains(Position::new(column, row))
 }
 
 /// A frame's bytes in one synchronized update: client output since the last
@@ -1283,6 +1283,26 @@ mod tests {
         assert_eq!(shade(29, 30), Shade::Blank, "and below");
         assert_eq!(shade(10, 21), Shade::Faint);
         assert_eq!(shade(4, 30), Shade::Faint);
+    }
+
+    #[test]
+    fn the_panels_corners_are_round() {
+        let panel = Rect::new(24, 6, 72, 23);
+        let look = Look::Dimmed(palette());
+        let amount = |row, col| match look.shade(row, col, panel, HINTS, 1.0, 0.0) {
+            Shade::Toward(t) => t,
+            other => panic!("{other:?}"),
+        };
+        assert!(amount(6, 24) < falloff::EMPTIED, "the corner cell shows");
+        assert!(amount(7, 24) < falloff::EMPTIED && amount(28, 95) < falloff::EMPTIED);
+        assert_eq!(amount(6, 28), 1.0, "under it past the curve");
+        assert_eq!(amount(7, 25), 1.0);
+        let faint = |row, col| Look::Faint.shade(row, col, panel, HINTS, 1.0, 0.0);
+        assert_eq!(faint(5, 22), Shade::Faint, "off the margin's corner");
+        assert_eq!(faint(6, 23), Shade::Faint);
+        assert_eq!(faint(6, 24), Shade::Blank, "in the margin");
+        assert!(on_the_session(panel, HINTS, 24, 6), "a press on the corner");
+        assert!(!on_the_session(panel, HINTS, 28, 6));
     }
 
     #[test]
@@ -1850,9 +1870,10 @@ mod tests {
             if Instant::now() > deadline {
                 return false;
             }
-            let mut p = [pollfd(glimpse.fd())];
+            let mut p = [glimpse.client.master_pollfd()];
             unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
-            if !glimpse.keep(ready(&p[0]), &mut buf) {
+            let writable = p[0].revents & libc::POLLOUT != 0;
+            if !glimpse.keep(ready(&p[0]), writable, &mut buf) {
                 return done(glimpse);
             }
         }
@@ -1944,9 +1965,10 @@ mod tests {
         let mut buf = [0u8; 8192];
         let mut kept = true;
         while kept && Instant::now() < deadline {
-            let mut p = [pollfd(glimpse.fd())];
+            let mut p = [glimpse.client.master_pollfd()];
             unsafe { libc::poll(p.as_mut_ptr(), 1, 50) };
-            kept = glimpse.keep(ready(&p[0]), &mut buf);
+            let writable = p[0].revents & libc::POLLOUT != 0;
+            kept = glimpse.keep(ready(&p[0]), writable, &mut buf);
         }
         assert!(!kept, "kept past its client's end");
     }

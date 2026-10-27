@@ -768,6 +768,151 @@ fn a_session_busy_in_cpu_bound_lua_is_never_reaped() {
     );
 }
 
+/// Regression: on Linux a blocking connect to a full accept queue waits until
+/// the server accepts, with no timeout. A stalled session's queue fills with
+/// connections nvmux dropped unaccepted, and a listing then hung in its
+/// probe's connect until the session ran again. macOS refuses that connect
+/// instead.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stalled_session_with_a_full_accept_queue_is_listed_at_once_as_busy() {
+    require_nvim!();
+    // A script run and a probe whose connect fails at once take about 15 ms.
+    const DEADLINE: Duration = Duration::from_secs(5);
+    let scratch = Scratch::new("stalled");
+    let t = scratch.transport();
+    let session = t
+        .create_session("stalled", &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket");
+    let files = [
+        sock.clone(),
+        sock.with_extension("json"),
+        sock.with_extension("log"),
+    ];
+
+    let stopped = Stopped::new(session.pid);
+    let (queued, waiting) = fill_accept_queue(&sock);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dir = scratch.0.clone();
+    let lister = std::thread::spawn(move || {
+        let listed = nvmux::transport::local::LocalTransport::with_dir(dir)
+            .and_then(|t| t.list_sessions())
+            .map_err(|e| e.to_string());
+        let _ = tx.send(listed);
+    });
+    let outcome = rx.recv_timeout(DEADLINE);
+    let held = is_stopped(session.pid);
+    let reaped: Vec<_> = files.iter().filter(|p| !p.exists()).collect();
+
+    // Resumed, Neovim accepts what waits, which ends any connect still waiting.
+    drop(stopped);
+    let ended = common::wait_until(Duration::from_secs(10), || {
+        lister.is_finished() && waiting.is_finished()
+    });
+    drop(queued);
+    assert!(ended, "a connect still waited after the session resumed");
+    lister.join().expect("the listing thread panicked");
+    waiting.join().expect("the connecting thread panicked");
+    t.kill_session(&session).expect("kill");
+
+    assert!(
+        held,
+        "precondition: the session ran before the listing ended"
+    );
+    let listed = outcome
+        .unwrap_or_else(|_| {
+            panic!("the listing still waited after {DEADLINE:?}, on a connect to the full queue")
+        })
+        .expect("list");
+    let s = listed
+        .iter()
+        .find(|s| s.id == session.id)
+        .unwrap_or_else(|| panic!("the stalled session was not listed: {listed:?}"));
+    assert_eq!(s.state.liveness, Liveness::Busy);
+    assert!(
+        reaped.is_empty(),
+        "a stalled session's files were reaped: {reaped:?}"
+    );
+}
+
+/// Neovim's listen backlog (`MAX_CONNECTIONS`). Linux queues one more before
+/// a connect waits.
+#[cfg(target_os = "linux")]
+const NEOVIM_BACKLOG: usize = 32;
+
+/// A process held by SIGSTOP until dropped.
+#[cfg(target_os = "linux")]
+struct Stopped(u32);
+
+#[cfg(target_os = "linux")]
+impl Stopped {
+    fn new(pid: u32) -> Self {
+        use nix::sys::signal::{kill, Signal};
+        kill(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGSTOP).expect("SIGSTOP");
+        let stopped = Self(pid);
+        // Until it stops, Neovim still accepts.
+        assert!(
+            common::wait_until(Duration::from_secs(3), || is_stopped(pid)),
+            "pid {pid} never stopped"
+        );
+        stopped
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        use nix::sys::signal::{kill, Signal};
+        let _ = kill(nix::unistd::Pid::from_raw(self.0 as i32), Signal::SIGCONT);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_stopped(pid: u32) -> bool {
+    // The state follows the command name, which may itself hold a `)`.
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('T'))
+    })
+}
+
+/// Connect to a stopped server until a connect waits on its full queue.
+///
+/// Returns the queued connections and the thread still connecting, which
+/// ends once the server accepts or goes.
+#[cfg(target_os = "linux")]
+fn fill_accept_queue(
+    sock: &std::path::Path,
+) -> (
+    Vec<std::os::unix::net::UnixStream>,
+    std::thread::JoinHandle<()>,
+) {
+    let mut queued = Vec::new();
+    // Far past the backlog, so a server that still accepts fails the test.
+    while queued.len() < 4 * NEOVIM_BACKLOG {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let to = sock.to_path_buf();
+        let connecting = std::thread::spawn(move || {
+            let _ = tx.send(std::os::unix::net::UnixStream::connect(&to));
+        });
+        // A connect the queue has room for returns at once.
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(stream) => queued.push(stream.expect("connect to the stopped session")),
+            Err(_) => {
+                assert!(
+                    queued.len() > NEOVIM_BACKLOG,
+                    "a connect waited after only {} were queued",
+                    queued.len()
+                );
+                return (queued, connecting);
+            }
+        }
+    }
+    panic!("the stopped session queued {} connects", queued.len());
+}
+
 /// Regression: a timed-out read leaves the rest of its frame in the socket
 /// (rmpv decodes incrementally), and the next call would silently return
 /// that leftover as its answer.
@@ -888,7 +1033,7 @@ fn a_session_can_be_killed_on_a_host_with_proc_but_no_ps() {
     let bin = scratch.0.join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
     for tool in [
-        "sh", "tr", "grep", "awk", "rm", "sleep", "kill", "id", "printf", "cut", "dirname",
+        "sh", "tr", "grep", "awk", "rm", "sleep", "kill", "id", "printf", "cut", "dirname", "ls",
     ] {
         if let Ok(real) = which(tool) {
             let _ = std::os::unix::fs::symlink(real, bin.join(tool));
@@ -938,6 +1083,144 @@ fn which(tool: &str) -> Result<std::path::PathBuf, ()> {
         .map(|d| d.join(tool))
         .find(|c| c.is_file())
         .ok_or(())
+}
+
+/// The runtime directory [`hang_up_child`] creates its session in.
+const HANG_UP_DIR: &str = "NVMUX_TEST_HANG_UP_DIR";
+
+/// Comes before the session's socket in [`hang_up_child`]'s report.
+const REPORTED: &str = "NVMUX_TEST_SOCK ";
+
+/// The child half of
+/// [`a_session_outlives_a_hang_up_of_the_terminal_it_was_made_in`]: create a
+/// session, report its socket and wait for the hang-up. Ignored, so only the
+/// parent runs it (`--ignored --exact`); without the environment it does
+/// nothing.
+#[test]
+#[ignore = "the child half of a hang-up test; run by it, not by hand"]
+fn hang_up_child() {
+    let Some(dir) = std::env::var_os(HANG_UP_DIR) else {
+        return;
+    };
+    let t = nvmux::transport::local::LocalTransport::with_dir(dir.into()).expect("build transport");
+    let s = t
+        .create_session("hungup", &common::launch(), common::anywhere())
+        .expect("create");
+    println!(
+        "{REPORTED}{}",
+        t.local_socket_for(&s).expect("socket path").display()
+    );
+    // Keeps the script shell, as nvmux does, until the SIGHUP ends this.
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+/// Reaps its child, hanging it up first if it still runs.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        common::hang_up_and_reap(&mut self.0);
+    }
+}
+
+/// Closing the terminal nvmux runs in must not end its sessions. The PATH
+/// lacks `setsid`, as macOS does, so spawn.sh falls back to `nohup`, whose
+/// SIG_IGN Neovim replaces with a handler that exits.
+#[test]
+fn a_session_outlives_a_hang_up_of_the_terminal_it_was_made_in() {
+    require_nvim!();
+    let scratch = Scratch::new("hangup");
+    let t = scratch.transport();
+
+    // Everything on PATH but `setsid`, the first of each name winning.
+    let bin = scratch.0.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_name() != "setsid" {
+                let _ = std::os::unix::fs::symlink(entry.path(), bin.join(entry.file_name()));
+            }
+        }
+    }
+
+    let (pty, pts) = pty_process::blocking::open().expect("open a pty");
+    let child = pty_process::blocking::Command::new(std::env::current_exe().expect("current exe"))
+        // `--nocapture`, or the report stays in libtest's capture buffer.
+        .args(["--ignored", "--exact", "hang_up_child", "--nocapture"])
+        .env(HANG_UP_DIR, &scratch.0)
+        .env("PATH", &bin)
+        // Runs setsid and TIOCSCTTY in the child, so it leads the pty's
+        // session and is its foreground job.
+        .spawn(pts)
+        .expect("spawn the child");
+    let mut child = Reaped(child);
+
+    // Read here, not on a thread: a second handle on the master would keep
+    // it open past the hang-up.
+    nix::fcntl::fcntl(
+        &pty,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .expect("make the master non-blocking");
+    let mut output = Vec::new();
+    let mut sock = None;
+    common::wait_until(Duration::from_secs(30), || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = std::io::Read::read(&mut &pty, &mut buf) {
+            output.extend_from_slice(&buf[..n]);
+        }
+        sock = String::from_utf8_lossy(&output)
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+            // After libtest's `test hang_up_child ... `, on the same line.
+            .find_map(|line| line.split_once(REPORTED))
+            .map(|(_, path)| std::path::PathBuf::from(path.trim_end()));
+        sock.is_some()
+    });
+    let Some(sock) = sock else {
+        panic!(
+            "the child reported no session: {}",
+            String::from_utf8_lossy(&output)
+        );
+    };
+    let id = sock
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("an id")
+        .to_string();
+    let pid = nix::unistd::Pid::from_raw(scratch.metadata(&id).pid as i32);
+    assert_ne!(
+        nix::unistd::getsid(Some(pid)).expect("getsid"),
+        pid,
+        "spawn.sh used setsid, so the nohup fallback went untested"
+    );
+
+    // As closing a terminal window does: the kernel sends SIGHUP to the
+    // session leader, and on its exit to the foreground process group.
+    drop(pty);
+    assert!(
+        common::wait_until(Duration::from_secs(10), || matches!(
+            child.0.try_wait(),
+            Ok(Some(_))
+        )),
+        "the child outlived the hang-up"
+    );
+
+    let answers = || {
+        nvmux::rpc::Client::connect(&sock, Duration::from_secs(2))
+            .and_then(|mut c| c.eval("1"))
+            .is_ok()
+    };
+    // Neovim takes a moment to act on the signal.
+    common::wait_until(Duration::from_secs(3), || !answers());
+    assert!(
+        answers(),
+        "the session died with the terminal; its log: {}",
+        std::fs::read_to_string(sock.with_extension("log")).unwrap_or_default()
+    );
+
+    let session = common::find_by_id(&t, &id).expect("listed");
+    t.kill_session(&session).expect("kill");
 }
 
 /// The graceful `qa!` goes over the socket, so a stale pid must not turn a

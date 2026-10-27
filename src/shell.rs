@@ -415,6 +415,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// In world-writable /tmp another user can create the runtime directory
+    /// first, and over ssh nothing but the scripts checks it. An owner other
+    /// than us needs a second uid to test; a mode does not.
+    #[test]
+    fn every_script_refuses_a_runtime_directory_others_can_reach() {
+        use crate::transport::protocol;
+        use std::os::unix::fs::PermissionsExt;
+
+        let record = r#"{"id":"aaaaaaaa","name":"a","created":1,"pid":1,"num":1}"#;
+        let changed = r#"{"id":"aaaaaaaa","name":"b","created":1,"pid":1,"num":2}"#;
+        for mode in [0o755, 0o770, 0o703] {
+            let dir = scratch_dir(&format!("shell-open-{mode:o}"));
+            std::fs::write(dir.join("aaaaaaaa.sock"), "").expect("socket stand-in");
+            std::fs::write(dir.join("aaaaaaaa.json"), record).expect("seed metadata");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let arg = dir.to_string_lossy().into_owned();
+
+            let outcomes = [
+                (
+                    "list.sh",
+                    protocol::parse_listing(&run_script(LIST_SCRIPT, &[&arg]).stdout).map(drop),
+                ),
+                (
+                    "write_meta.sh",
+                    protocol::parse_write(
+                        &run_script(WRITE_META_SCRIPT, &[&arg, "aaaaaaaa", changed]).stdout,
+                        "metadata write",
+                    ),
+                ),
+                (
+                    "renumber.sh",
+                    protocol::parse_write(
+                        &run_script(RENUMBER_SCRIPT, &[&arg, "aaaaaaaa", changed]).stdout,
+                        "renumber",
+                    ),
+                ),
+                (
+                    "kill.sh",
+                    protocol::parse_kill(&run_script(KILL_SCRIPT, &[&arg, "aaaaaaaa", ""]).stdout)
+                        .map(drop),
+                ),
+                (
+                    "spawn.sh",
+                    protocol::parse_spawn(
+                        &run_script(SPAWN_SCRIPT, &[&arg, "bbbbbbbb", "/", "/bin/sh", "-c", ":"])
+                            .stdout,
+                    )
+                    .map(drop),
+                ),
+            ];
+            let kept = std::fs::read_to_string(dir.join("aaaaaaaa.json"));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            for (name, outcome) in outcomes {
+                let Err(err) = outcome else {
+                    panic!("{name} used a runtime directory with mode {mode:o}");
+                };
+                assert!(
+                    err.to_string().contains("accessible to other users"),
+                    "{name} under {mode:o}: {err}"
+                );
+            }
+            assert_eq!(
+                kept.ok().as_deref(),
+                Some(record),
+                "the metadata was rewritten or removed under {mode:o}"
+            );
+        }
+    }
+
+    const CHECK_DIR: &str =
+        with_prelude!("if require_private_dir \"$1\"; then echo private; else echo missing; fi\n");
+
+    /// Anyone can create the directory the moment after the check, so a
+    /// caller that took "missing" for "checked" would go on to use a
+    /// directory nobody checked.
+    #[test]
+    fn a_missing_runtime_directory_is_not_reported_as_private() {
+        let missing = scratch_path("shell-dir-missing");
+        let private = scratch_dir("shell-dir-private");
+        let gone = run_script(CHECK_DIR, &[&missing.to_string_lossy()]).stdout;
+        let ours = run_script(CHECK_DIR, &[&private.to_string_lossy()]).stdout;
+        let _ = std::fs::remove_dir_all(&private);
+
+        assert_eq!(gone, "missing\n");
+        assert_eq!(ours, "private\n");
+    }
+
+    /// As in `paths::ensure_dir_secure`. A directory made in a setgid parent
+    /// inherits the bit, and neither bit lets anyone else in.
+    #[test]
+    fn a_setgid_or_sticky_runtime_directory_is_still_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for mode in [0o2700, 0o1700] {
+            let dir = scratch_dir(&format!("shell-dir-{mode:o}"));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let set = std::fs::metadata(&dir).expect("stat").mode() & 0o7777;
+            let out = run_script(CHECK_DIR, &[&dir.to_string_lossy()]).stdout;
+            let _ = std::fs::remove_dir_all(&dir);
+
+            assert_eq!(set, mode, "chmod {mode:o} did not stick");
+            assert_eq!(out, "private\n", "under {mode:o}");
+        }
+    }
+
+    /// The cause, such as a full disk or a file in the way, is what the user
+    /// can act on.
+    #[test]
+    fn a_runtime_directory_that_cannot_be_made_is_refused_with_the_cause() {
+        use crate::transport::protocol;
+
+        let parent = scratch_path("shell-not-a-dir");
+        std::fs::write(&parent, "").expect("a file where a directory goes");
+        let arg = parent.join("nvmux").to_string_lossy().into_owned();
+        let outcomes = [
+            (
+                "spawn.sh",
+                protocol::parse_spawn(
+                    &run_script(SPAWN_SCRIPT, &[&arg, "bbbbbbbb", "/", "/bin/sh", "-c", ":"])
+                        .stdout,
+                )
+                .map(drop),
+            ),
+            (
+                "write_meta.sh",
+                protocol::parse_write(
+                    &run_script(WRITE_META_SCRIPT, &[&arg, "aaaaaaaa", "{}"]).stdout,
+                    "metadata write",
+                ),
+            ),
+        ];
+        let _ = std::fs::remove_file(&parent);
+
+        let bare = format!("could not create runtime directory {arg}: ");
+        for (name, outcome) in outcomes {
+            let err = outcome
+                .expect_err("made a directory under a file")
+                .to_string();
+            assert!(
+                err.strip_prefix(&bare)
+                    .is_some_and(|cause| !cause.is_empty()),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    /// `$$` shows in `ps`, so the temp name can be known before the write.
+    #[test]
+    fn a_symlink_planted_at_the_temp_name_is_not_written_through() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let dir = scratch_dir("shell-planted");
+        let target = dir.join("precious");
+        let json = dir.join("aaaaaaaa.json");
+        let arg = dir.to_string_lossy().into_owned();
+        let record = r#"{"id":"aaaaaaaa","name":"a","created":1,"pid":1,"num":2}"#;
+
+        for (name, script) in [
+            ("write_meta.sh", WRITE_META_SCRIPT),
+            ("renumber.sh", RENUMBER_SCRIPT),
+        ] {
+            std::fs::write(&target, "precious\n").expect("target");
+            let _ = std::fs::remove_file(&json);
+            std::fs::write(&json, record).expect("seed metadata");
+
+            let mut sh = Command::new("/bin/sh")
+                .arg("-s")
+                .args([arg.as_str(), "aaaaaaaa", record])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start sh");
+            let planted = dir.join(format!("aaaaaaaa.json.tmp{}", sh.id()));
+            std::os::unix::fs::symlink(&target, &planted).expect("plant");
+            sh.stdin
+                .take()
+                .expect("stdin")
+                .write_all(script.as_bytes())
+                .expect("feed the script");
+            let out = sh.wait_with_output().expect("run the script");
+            let _ = std::fs::remove_file(&planted);
+
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read the target"),
+                "precious\n",
+                "{name} wrote through the symlink: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(
+                !std::fs::symlink_metadata(&json)
+                    .expect("stat the metadata")
+                    .file_type()
+                    .is_symlink(),
+                "{name} renamed the symlink into place"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The greeting runs in the user's login shell, whose environment is
     /// arbitrary. From a checkout `hello.sh` execs `list.sh` by a path in a
     /// variable; read with a `:-` default, an inherited value would be exec'd

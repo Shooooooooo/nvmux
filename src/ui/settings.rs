@@ -68,8 +68,6 @@ const TAB_GAP: &str = "   ";
 
 const CURSOR: &str = "▋";
 
-const ELLIPSIS: &str = "…";
-
 /// Names of ANSI colours 1 to 6, which `←`/`→` step `[style] color` through
 /// after `terminal`.
 const COLOUR_NAMES: [&str; 6] = ["red", "green", "yellow", "blue", "magenta", "cyan"];
@@ -1388,19 +1386,9 @@ fn hint_row(buf: &mut Buffer, row: Rect, text: &str, dim: bool) {
 
 /// `text` centred on row `y`, cut to the screen with a `…` where it is cut.
 fn centred(buf: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) {
-    let text = clip(text, usize::from(area.width));
+    let text = draw::clip(text, usize::from(area.width));
     let x = area.x + area.width.saturating_sub(text.width() as u16) / 2;
     buf.set_stringn(x, y, &text, usize::from(area.width), style);
-}
-
-/// `text` cut to `max` columns, its last one a `…` where anything was cut.
-fn clip(text: &str, max: usize) -> String {
-    if text.width() <= max {
-        return text.to_string();
-    }
-    let mut cut = draw::truncate(text, max.saturating_sub(ELLIPSIS.width()));
-    cut.push_str(ELLIPSIS);
-    cut
 }
 
 fn draw_tabs(buf: &mut Buffer, area: Rect, y: u16, state: &State) {
@@ -1483,7 +1471,7 @@ fn draw_row(
             (text, Some(at))
         }
         _ => (
-            clip(
+            draw::clip(
                 &state.shown(setting, &setting.value(&state.live)),
                 room.min(VALUE_WIDTH),
             ),
@@ -1524,7 +1512,7 @@ fn draw_row(
             buf.set_stringn(
                 x + GAP.width() as u16,
                 y,
-                clip(why, room - used),
+                draw::clip(why, room - used),
                 room - used,
                 DIM,
             );
@@ -2556,6 +2544,7 @@ mod tests {
         let area = panel_area(screen).expect("floats on 80x24");
         let buf = panel.draw(area);
         assert_eq!(buf.area, area);
+        test_support::assert_corners_blank(&buf);
         let rows = rows_of(&buf);
         assert_eq!(rows.len(), 17);
         assert!(rows[0].is_empty(), "a clear row over the sections");
@@ -2565,7 +2554,11 @@ mod tests {
         );
         let help = panel.state.current().expect("a setting").help;
         let width = usize::from(inside(area).width);
-        assert_eq!(rows[15].trim(), clip(help, width), "its help: {rows:?}");
+        assert_eq!(
+            rows[15].trim(),
+            draw::clip(help, width),
+            "its help: {rows:?}"
+        );
         assert!(rows[16].is_empty(), "a clear row under it");
         assert!(
             !rows

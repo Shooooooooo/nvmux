@@ -1034,15 +1034,17 @@ mod tests {
     }
 
     /// The editor queries the terminal at every start and resume, so a reply
-    /// can land between a prefix typed at startup and its command.
+    /// can land between a prefix typed at startup and its command. So can a
+    /// size report, sent as a held paint turns in-band sizes on.
     #[test]
     fn a_terminal_reply_between_the_prefix_and_its_command_is_not_a_key() {
-        let da1 = b"\x1b[?62;22c";
-        let mut p = Prefix::new(12);
-        p.feed(KITTY);
-        assert_eq!(forwarded(&p.feed(da1)), da1, "the answer goes through");
-        assert_eq!(p.wait(), Some(Wait::Command), "still armed");
-        assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach]);
+        for reply in [&b"\x1b[?62;22c"[..], b"\x1b[48;30;120;0;0t"] {
+            let mut p = Prefix::new(12);
+            p.feed(KITTY);
+            assert_eq!(forwarded(&p.feed(reply)), reply, "the answer goes through");
+            assert_eq!(p.wait(), Some(Wait::Command), "still armed");
+            assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach]);
+        }
 
         let mut p = Prefix::new(12);
         p.feed(&[PREFIX, b'1']);

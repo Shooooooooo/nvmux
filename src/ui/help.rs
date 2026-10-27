@@ -584,6 +584,7 @@ mod tests {
         let area = panel.area(screen).expect("floats");
         let buf = panel.draw(area);
         assert_eq!(buf.area, area);
+        test_support::assert_corners_blank(&buf);
         let lines = rows_of(&buf);
         let last = lines.len() - 1;
         assert!(lines[0].trim().is_empty(), "a clear row over the table");

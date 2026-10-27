@@ -87,7 +87,7 @@ use self::grid::{Cell, Text};
 use self::input::{Input, Mouse, Parser, Reply};
 use self::model::{Changes, Model, Place, Placement};
 use self::predict::{Command, Mode, Pos, Predictor, Proof, Rest, Side, Unseen, Want};
-use self::redraw::Event;
+use self::redraw::{Event, FloatAt};
 use self::screen::Screen;
 use self::wire::{Arg, Inbox, Outbox};
 use crate::config::{Centre, Predictions};
@@ -150,9 +150,10 @@ const REPLY_WAIT: Duration = Duration::from_secs(1);
 
 /// Max ms a lone `ESC` is held for the rest of a sequence, whatever
 /// `'ttimeoutlen'` says ([`input`]). The relay already held it as long
-/// (`crate::pty`'s `SEQUENCE_TIMEOUT`); a key's bytes split only at buffer
-/// boundaries. Waiting `'ttimeoutlen'` (50 ms default) on top would delay
-/// every `<Esc>` leaving Insert mode.
+/// (`crate::pty`'s `SEQUENCE_TIMEOUT`) and forwards whole keys; only a pty
+/// left full by a backlog splits one, and its tail can then come late.
+/// Waiting `'ttimeoutlen'` (50 ms default) on top would delay every `<Esc>`
+/// leaving Insert mode.
 const RELAYED_ESCAPE: u64 = 10;
 
 /// Delay before listing UIs again after finding one only passing through
@@ -758,8 +759,10 @@ if predict then
         soon()
       end,
     }, true)
+    -- Its buffer may be gone: a wipe under :noautocmd skips BufWipeout.
     pushed[buf] = function()
-      if followed[buf] == tree and hearing == api.nvim_buf_get_changedtick(buf) then
+      if followed[buf] == tree and api.nvim_buf_is_valid(buf)
+          and hearing == api.nvim_buf_get_changedtick(buf) then
         heard = hearing
       end
     end
@@ -1003,7 +1006,7 @@ if predict then
     end
     -- Stop hearing reports at this b:changedtick (see follow).
     for _, done in pairs(pushed) do
-      done()
+      pcall(done)
     end
   end
   soon = function()
@@ -1218,6 +1221,11 @@ if predict then
   au('WinClosed', {}, function(ev)
     local win = tonumber(ev.match)
     have[win], shapes[win], looked[win] = nil, nil, nil
+  end)
+  -- `edits` and `attached` go on detach (see attach): every unload detaches.
+  au('BufWipeout', {}, function(ev)
+    local buf = ev.buf
+    followed[buf], pushed[buf], stale[buf], maps[buf], ticks[buf] = nil, nil, nil, nil, nil
   end)
   -- A new reach as the round trip changes; resend what acks depend on.
   au('User', { pattern = 'nvmux_client_reach_' .. chan }, function(ev)
@@ -2700,24 +2708,38 @@ impl App {
                     });
                 }
                 2 => {
-                    let compindex = match self.model.layout.get(&grid).map(|p| &p.place) {
-                        Some(Place::Float { compindex, .. }) => *compindex,
-                        _ => 0,
+                    let (compindex, placed) = match self.model.layout.get(&grid).map(|p| &p.place) {
+                        Some(Place::Float {
+                            compindex,
+                            at,
+                            anchor,
+                            ..
+                        }) => (*compindex, Some((*at, *anchor))),
+                        _ => (0, None),
                     };
-                    let anchor = self
-                        .model
-                        .wins
-                        .iter()
-                        .find(|(_, w)| **w == at(9))
-                        .map(|(g, _)| *g);
+                    // Neovim 0.11 sends no screen position, and its position
+                    // here is the anchor point, so its own placement stands.
+                    let (to, anchor) = match placed {
+                        Some(corner @ (FloatAt::Corner { .. }, _)) => corner,
+                        _ => (
+                            FloatAt::Screen {
+                                row: at(1),
+                                col: at(2),
+                            },
+                            self.model
+                                .wins
+                                .iter()
+                                .find(|(_, w)| **w == at(9))
+                                .map(|(g, _)| *g),
+                        ),
+                    };
                     events.push(Event::WinFloatPos {
                         grid,
                         win: Some(win),
                         mouse: at(8) != 0,
                         zindex: at(7),
-                        compindex,
-                        row: at(1),
-                        col: at(2),
+                        compindex: Some(compindex),
+                        at: to,
                         anchor,
                     });
                     events.push(Event::WinViewportMargins {
@@ -5956,7 +5978,7 @@ fn refresh(sock: &Path, size: (usize, usize)) {
 
 fn refresh_now(sock: &Path, (w, h): (usize, usize)) -> std::io::Result<()> {
     let deadline = Instant::now() + REFRESH_TIMEOUT;
-    let stream = UnixStream::connect(sock)?;
+    let stream = crate::rpc::connect_now(sock)?;
     stream.set_read_timeout(Some(REFRESH_TIMEOUT))?;
     stream.set_write_timeout(Some(REFRESH_TIMEOUT))?;
     let mut line = Line {
@@ -6736,6 +6758,40 @@ mod tests {
                 2.into(),
             ],
         )
+    }
+
+    /// Under multigrid, Neovim 0.11's `nvim_win_get_position` is a float's
+    /// anchor point, not its corner, so [`LAYOUT_LUA`] must not move a float
+    /// its `win_float_pos` placed.
+    #[test]
+    fn a_layout_answer_leaves_a_float_where_neovim_0_11_anchored_it() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let anchored = (
+            "win_float_pos",
+            vec![
+                5.into(),
+                1005.into(),
+                "SW".into(),
+                1.into(),
+                Value::F64(5.0),
+                Value::F64(3.0),
+                true.into(),
+                50.into(),
+            ],
+        );
+        redraw(&mut a, vec![resize(5, 4, 2), anchored], t0);
+        let origin = |a: &App| a.model.layout.get(&5).map(Placement::origin);
+        assert_eq!(origin(&a), Some((3, 3)), "its foot on row 5");
+
+        let answer = Value::Array(
+            [2, 5, 3, 0, 0, 0, 0, 50, 1, -1]
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+        );
+        a.placed(&[(5, 1005)], &[answer.as_ref()], t0);
+        assert_eq!(origin(&a), Some((3, 3)));
     }
 
     fn random_batch(w: &mut Walk) -> Vec<(&'static str, Vec<Value>)> {

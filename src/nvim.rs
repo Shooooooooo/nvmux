@@ -84,6 +84,12 @@ pub fn parse_version(banner: &str) -> Option<Version> {
     })
 }
 
+/// The local `nvim`'s version, asked once; `None` if it could not be.
+pub fn local_version() -> Option<&'static Version> {
+    static LOCAL: std::sync::OnceLock<Option<Version>> = std::sync::OnceLock::new();
+    LOCAL.get_or_init(|| check_local().ok()).as_ref()
+}
+
 /// Check the local `nvim`, used for local sessions and as the `--remote-ui`
 /// client.
 pub fn check_local() -> Result<Version, NvimError> {

@@ -15,8 +15,9 @@
 //! Also covered here, since they need a real client painting a real screen:
 //! the hint bar ([`nvmux::hint`]) covering and restoring the last row (also
 //! while the editor redraws it), resuming a parked client (`[client]
-//! per_session`) with a busy server, and a client started ahead (`[client]
-//! lazy = false`) answering its startup queries on first visit.
+//! per_session`) with a busy server, a client started ahead (`[client]
+//! lazy = false`) answering its startup queries on first visit, and a large
+//! paste reaching the editor while the client draws.
 
 #[macro_use]
 mod common;
@@ -116,8 +117,8 @@ const CHILD_OTHER_SOCK: &str = "NVMUX_TEST_RELAY_OTHER_SOCK";
 /// Written by a [`CHILD_OTHER_ID`] child after each switch.
 const SWITCHED: &[u8] = b"\x1b]9999;switched\x07";
 
-/// Pty size for every [`Terminal`]; tests must agree with the child on which
-/// row is the last (the hint bar's).
+/// Pty size for a [`Terminal`] unless its [`Asks`] give one; tests must agree
+/// with the child on which row is the last (the hint bar's).
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 
@@ -454,7 +455,8 @@ struct Terminal {
 }
 
 /// The `CHILD_*` switches for a [`Terminal`]'s child (`shadow` is
-/// [`CHILD_PALETTE`]; `in_band` is the terminal's), all off by default.
+/// [`CHILD_PALETTE`]; `in_band` and `size` are the terminal's), all off by
+/// default.
 #[derive(Default)]
 struct Asks {
     shadow: bool,
@@ -473,6 +475,8 @@ struct Asks {
     painted: bool,
     /// [`CHILD_OTHER_ID`] and [`CHILD_OTHER_SOCK`].
     other: Option<(String, std::path::PathBuf)>,
+    /// Rows and columns, if not [`ROWS`] by [`COLS`].
+    size: Option<(u16, u16)>,
 }
 
 impl Terminal {
@@ -557,9 +561,11 @@ impl Terminal {
             bind,
             painted,
             other,
+            size,
         } = asks;
         let (pty, pts) = pty_process::blocking::open().expect("open a pty");
-        pty.resize(pty_process::Size::new(ROWS, COLS))
+        let (rows, cols) = size.unwrap_or((ROWS, COLS));
+        pty.resize(pty_process::Size::new(rows, cols))
             .expect("size the pty");
 
         let mut cmd = Command::new(std::env::current_exe().expect("current exe"))
@@ -722,6 +728,17 @@ impl Terminal {
             }
             panic!("write to pty: {err}");
         }
+    }
+
+    /// Read output for `within` without keeping or answering it, for a client
+    /// drawing megabytes a second that asks nothing meanwhile.
+    fn drop_output_for(&mut self, within: Duration) {
+        let deadline = Instant::now() + within;
+        while self
+            .incoming
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
+        {}
     }
 
     fn type_bytes(&mut self, bytes: &[u8]) {
@@ -2941,4 +2958,178 @@ fn the_floating_picker_shows_the_session_under_its_cursor() {
     );
     reaches(&mut term, &b_sock, other, 'y');
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// A terminal whose frames are several times what a pty holds (about 14 KB
+/// on Linux), with [`BUSY_LUA`] drawing.
+const BIG: (u16, u16) = (100, 300);
+
+/// Every cell of a window on the left half changes digit, and so colour,
+/// every 5 ms, as a busy `:terminal` might: about 90 KB a frame at [`BIG`].
+/// With smaller or slower frames the client is often free to read the paste
+/// even from a relay that blocks.
+const BUSY_LUA: &str = r#"
+-- The paste's target; its swap file would outlive the killed server.
+vim.bo.swapfile = false
+local busy = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_open_win(busy, false, { split = 'left', win = 0 })
+vim.api.nvim_buf_call(busy, function()
+  for d = 0, 9 do
+    vim.cmd(('syntax match Digit%d /%d/'):format(d, d))
+    -- gui colours too, for 'termguicolors'.
+    vim.cmd(('highlight Digit%d ctermfg=%d ctermbg=%d guifg=#%02x%02x00 guibg=#0000%02x')
+      :format(d, 160 + d * 7, 16 + d * 3, d * 25, 255 - d * 25, d * 13))
+  end
+end)
+local tick = 0
+vim.fn.timer_start(5, function()
+  tick = tick + 1
+  local lines = {}
+  for r = 1, vim.o.lines do
+    local row = {}
+    for c = 1, vim.o.columns do
+      row[c] = string.char(48 + (r * 3 + c * 7 + tick) % 10)
+    end
+    lines[r] = table.concat(row)
+  end
+  vim.api.nvim_buf_set_lines(busy, 0, -1, false, lines)
+end, { ['repeat'] = -1 })
+"#;
+
+/// About a megabyte of distinct lines of code.
+fn paste_lines() -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut bytes = 0;
+    while bytes < 1 << 20 {
+        let i = lines.len();
+        let line = format!(
+            "static int v{i} = f({i}, 'c', \"s{i}\") * {}; /* {}*/",
+            i % 97,
+            "w ".repeat(i % 23)
+        );
+        bytes += line.len() + 1;
+        lines.push(line);
+    }
+    lines
+}
+
+fn adler32(text: &[u8]) -> u64 {
+    let (mut a, mut b) = (1u64, 0u64);
+    for &byte in text {
+        a = (a + u64::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    b << 16 | a
+}
+
+/// The current buffer's line count and, once it has `lines`, its text's
+/// [`adler32`].
+fn pasted(sock: &Path, lines: usize) -> (u64, Option<u64>) {
+    let got = common::lua(
+        sock,
+        &format!(
+            r#"local n = vim.api.nvim_buf_line_count(0)
+if n ~= {lines} then return {{ n }} end
+local text = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, true), '\n')
+local a, b = 1, 0
+for i = 1, #text do
+  a = (a + text:byte(i)) % 65521
+  b = (b + a) % 65521
+end
+return {{ n, b * 65536 + a }}"#
+        ),
+    );
+    (got[0].as_u64().unwrap_or(0), got[1].as_u64())
+}
+
+/// Regression: a client writing a frame reads no input, and the relay blocked
+/// writing it the paste, so neither moved again and nothing could detach.
+fn a_large_paste_arrives_while_the_screen_keeps_changing(tag: &str, own: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    common::lua(&sock, BUSY_LUA);
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            own,
+            size: Some(BIG),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, DA1).is_some()),
+        "the client never started; the child wrote: {}",
+        term.since(0)
+    );
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .input("i")
+        .expect("start Insert mode");
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            common::mode(&sock).is_some_and(|m| m.mode == "i")
+        }),
+        "the editor never went into Insert mode"
+    );
+    // Let the frames come at full size and rate.
+    term.pump_until(Duration::from_secs(1), |_| false);
+
+    let lines = paste_lines();
+    let text = lines.join("\n");
+    let want = adler32(text.as_bytes());
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.extend_from_slice(text.as_bytes());
+    paste.extend_from_slice(b"\x1b[201~");
+    // From a thread, as a relay that stops reading leaves the write waiting.
+    let mut keyboard = common::reader(&term.pty);
+    let (typed_tx, typed) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = typed_tx.send(keyboard.write_all(&paste).is_ok());
+    });
+
+    // Generous: the client takes input only between frames, and nvmux's own
+    // takes up to about 2 s for the paste here.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut got = pasted(&sock, lines.len());
+    while got != (lines.len() as u64, Some(want)) && Instant::now() < deadline {
+        term.drop_output_for(Duration::from_millis(100));
+        got = pasted(&sock, lines.len());
+    }
+    assert_eq!(
+        got,
+        (lines.len() as u64, Some(want)),
+        "the paste of {} lines did not arrive whole (line count, checksum)",
+        lines.len()
+    );
+    // Typing more is safe only once the terminal took the whole paste.
+    assert_eq!(
+        typed.recv_timeout(Duration::from_secs(5)),
+        Ok(true),
+        "the relay left the paste's end unread"
+    );
+    // Stop drawing, so the detach is quick.
+    common::lua(&sock, "vim.fn.timer_stopall()");
+    assert_eq!(
+        detach(&mut term),
+        Some(0),
+        "the relay did not survive the paste"
+    );
+}
+
+#[test]
+fn a_large_paste_arrives_while_the_screen_keeps_changing_under_neovims_client() {
+    a_large_paste_arrives_while_the_screen_keeps_changing("paste-nvim", false);
+}
+
+#[test]
+fn a_large_paste_arrives_while_the_screen_keeps_changing_under_its_own_client() {
+    a_large_paste_arrives_while_the_screen_keeps_changing("paste-own", true);
 }

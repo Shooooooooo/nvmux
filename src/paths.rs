@@ -41,9 +41,9 @@ pub fn runtime_dir() -> PathBuf {
 
 /// Resolve, create if needed, and security-check the runtime directory.
 ///
-/// Run at startup and when a transport is built, not per operation: only a
-/// socket's creation matters, and `scripts/spawn.sh` repeats the check before
-/// every spawn.
+/// Run at startup and when a transport is built, not per operation: every
+/// script that uses it repeats the check (`require_private_dir` in
+/// `scripts/_prelude.sh`).
 pub fn ensure_runtime_dir() -> Result<PathBuf, PathError> {
     let dir = runtime_dir();
     ensure_dir_secure(&dir)?;

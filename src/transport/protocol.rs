@@ -31,6 +31,19 @@ pub fn require_terminator(stdout: &str, what: &str) -> Result<()> {
     )))
 }
 
+/// The reason a script gave with `fail`, if it did.
+///
+/// Only the line `fail` prints just before the terminator, or last if the
+/// output was cut short: anywhere else it may be shell noise.
+fn refusal(stdout: &str) -> Option<String> {
+    let last = stdout
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .take_while(|line| *line != TERMINATOR)
+        .last()?;
+    Some(last.strip_prefix("ERROR ")?.trim().to_string())
+}
+
 /// One row from `list.sh`, before liveness is probed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
@@ -43,7 +56,12 @@ pub struct Listed {
     pub json: String,
 }
 
+/// An `ERROR` line wins, as in [`parse_write`]; read as rows, a refusal
+/// would be an empty listing.
 pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
+    if let Some(reason) = refusal(stdout) {
+        return Err(script_failed(reason));
+    }
     require_terminator(stdout, "session listing")?;
     let mut rows = Vec::new();
 
@@ -85,22 +103,20 @@ pub struct Spawned {
 }
 
 pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
+    // The script's reason first: it is more specific than "did not complete"
+    // and survives a pipe cut before the terminator.
+    if let Some(reason) = refusal(stdout) {
+        return Err(script_failed(reason));
+    }
     let mut out = Spawned::default();
-    let mut error = None;
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
         match line.split_once(' ') {
             Some(("PID", v)) => out.pid = v.trim().parse().ok().filter(|p| *p > 1),
             Some(("SOCK", v)) => out.socket_appeared = v.trim() == "ok",
-            Some(("ERROR", v)) => error = Some(v.trim().to_string()),
             _ if line == TERMINATOR => {}
             _ => tracing::debug!(line, "ignoring unrecognised line from spawn.sh"),
         }
-    }
-    // The script's reason first: it is more specific than "did not complete"
-    // and survives a pipe cut before the terminator.
-    if let Some(msg) = error {
-        return Err(script_failed(msg));
     }
     require_terminator(stdout, "spawn command")?;
     Ok(out)
@@ -112,10 +128,8 @@ pub fn parse_spawn(stdout: &str) -> Result<Spawned> {
 /// An `ERROR` line wins, as in [`parse_spawn`]; without one a failed write
 /// would reach `ssh::classify` and be reported as a connection problem.
 pub fn parse_write(stdout: &str, what: &str) -> Result<()> {
-    for line in stdout.lines() {
-        if let Some(("ERROR", reason)) = line.trim_end_matches('\r').split_once(' ') {
-            return Err(script_failed(reason.trim().to_string()));
-        }
+    if let Some(reason) = refusal(stdout) {
+        return Err(script_failed(reason));
     }
     require_terminator(stdout, what)
 }
@@ -203,6 +217,9 @@ pub enum KillOutcome {
 }
 
 pub fn parse_kill(stdout: &str) -> Result<KillOutcome> {
+    if let Some(reason) = refusal(stdout) {
+        return Err(script_failed(reason));
+    }
     require_terminator(stdout, "kill command")?;
     let mut outcome = None;
     for line in stdout.lines() {
@@ -481,6 +498,44 @@ mod tests {
             let out = format!("RESULT {text}\nNVMUX_END\n");
             assert_eq!(parse_kill(&out).expect("parse"), want);
         }
+    }
+
+    /// Shaped as the greeting delivers it: the probe, then `list.sh`'s refusal.
+    #[test]
+    fn a_refused_listing_is_reported_in_the_scripts_own_words() {
+        let err = parse_listing(
+            "DIR /tmp/nvmux-1000\nHOME /home/u\nNVIM NVIM v0.11.0\n\
+             ERROR runtime directory /tmp/nvmux-1000 is not owned by us\nNVMUX_END\n",
+        )
+        .expect_err("a refusal is not a listing");
+        assert_eq!(
+            err.to_string(),
+            "runtime directory /tmp/nvmux-1000 is not owned by us"
+        );
+    }
+
+    /// Shell noise can share the greeting's stdout; only `fail`'s line, just
+    /// before the terminator, is a refusal.
+    #[test]
+    fn an_error_line_in_shell_noise_is_not_a_refusal() {
+        let rows = parse_listing(
+            "ERROR loading nvm: node not found\nDIR /tmp/nvmux-1000\nHOME /home/u\n\
+             NVIM NVIM v0.11.0\nS\tabcdefgh\t1\t{}\nNVMUX_END\n",
+        )
+        .expect("noise is not a refusal");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn a_refused_kill_is_reported_in_the_scripts_own_words() {
+        let err = parse_kill(
+            "ERROR runtime directory /tmp/nvmux-1000 is accessible to other users\nNVMUX_END\n",
+        )
+        .expect_err("a refusal is not an outcome");
+        assert_eq!(
+            err.to_string(),
+            "runtime directory /tmp/nvmux-1000 is accessible to other users"
+        );
     }
 
     #[test]

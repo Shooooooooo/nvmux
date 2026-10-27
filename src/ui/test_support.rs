@@ -9,7 +9,7 @@ use std::rc::Rc;
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
@@ -116,6 +116,27 @@ pub(super) fn assert_no_borders(lines: &[String]) {
     for line in lines {
         for ch in "┌┐└┘─│├┤┬┴┼╭╮╰╯═║".chars() {
             assert!(!line.contains(ch), "found border char {ch:?} in {line:?}");
+        }
+    }
+}
+
+/// The round corners of a floating panel drawn as `buf` cut off only blank
+/// cells (see [`super::float::RADIUS`]).
+pub(super) fn assert_corners_blank(buf: &Buffer) {
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &buf[(x, y)];
+            if super::float::distance(area, x, y) > 0.0 {
+                assert!(
+                    cell.symbol() == " "
+                        && cell.bg == Color::Reset
+                        && !cell
+                            .modifier
+                            .intersects(Modifier::REVERSED | Modifier::UNDERLINED),
+                    "({x},{y}) is cut off: {cell:?}"
+                );
+            }
         }
     }
 }

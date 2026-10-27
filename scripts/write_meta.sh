@@ -4,7 +4,7 @@
 # Usage: sh write_meta.sh <runtime_dir> <id> <json>
 #
 # Output:
-#   ERROR <reason>   (on a write that failed)
+#   ERROR <reason>   (on a refused runtime directory or a failed write)
 #   NVMUX_END
 #
 # For ssh only; locally nvmux writes the file itself. The JSON is a positional
@@ -17,7 +17,8 @@ id="${2:?usage: write_meta.sh <runtime_dir> <id> <json>}"
 json="${3:?usage: write_meta.sh <runtime_dir> <id> <json>}"
 
 umask 077
-mkdir -p "$dir" 2>/dev/null || true
+why=$(mkdir -p "$dir" 2>&1)
+require_private_dir "$dir" || fail "could not create runtime directory $dir${why:+: $why}"
 
 write_json "$dir" "$id" "$json" || fail "could not write metadata for $id"
 

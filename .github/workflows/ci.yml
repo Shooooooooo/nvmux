@@ -13,7 +13,7 @@ env:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}, nvim ${{ matrix.nvim }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -21,8 +21,14 @@ jobs:
         include:
           - os: ubuntu-latest
             test-threads: 32
+            nvim: latest
           - os: macos-latest
             test-threads: 12
+            nvim: latest
+          # The oldest release README supports.
+          - os: ubuntu-latest
+            test-threads: 32
+            nvim: v0.11.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,8 +41,12 @@ jobs:
       - name: Install Neovim (Linux)
         if: runner.os == 'Linux'
         run: |
+          case "${{ matrix.nvim }}" in
+            latest) release=latest/download ;;
+            *) release=download/${{ matrix.nvim }} ;;
+          esac
           curl -fsSL -o nvim.tar.gz \
-            https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.tar.gz
+            "https://github.com/neovim/neovim/releases/$release/nvim-linux-x86_64.tar.gz"
           sudo tar -C /opt -xzf nvim.tar.gz
           echo /opt/nvim-linux-x86_64/bin >> "$GITHUB_PATH"
       - name: Install Neovim (macOS)

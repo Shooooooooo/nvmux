@@ -2560,6 +2560,8 @@ mod tests {
             "#7aa2f7 ",
             "#ffff88880000",
             "rgb:7a/a2/f7",
+            "#èa",
+            "#€abc",
         ] {
             let err = ThemeColor::parse(bad).expect_err(bad);
             assert!(

@@ -840,7 +840,9 @@ mod tests {
         )]));
         let area = panel.area(Rect::new(0, 0, 80, 24)).expect("room to float");
         assert_eq!(area.width, MIN_WIDTH, "a list narrower than its note");
-        let rows = rows_of(&panel.draw(area), area);
+        let buf = panel.draw(area);
+        crate::ui::test_support::assert_corners_blank(&buf);
+        let rows = rows_of(&buf, area);
         let caption = "Claude Code · Claude needs your permission · 59m";
         assert!(rows.iter().any(|r| r.contains(caption)), "{rows:#?}");
         hand(&[], None);

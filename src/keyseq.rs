@@ -27,7 +27,10 @@
 //!
 //! Replies are `CSI` sequences starting with a private marker (`?`, `>`,
 //! `=`), which no key has: kitty and `modifyOtherKeys` answers, DA1, DA2,
-//! DECRPM. String replies (DCS, OSC) pass through as ordinary input.
+//! DECRPM. Also DEC mode 2048's size report, `CSI 48 ; … t`, which a
+//! terminal sends as a client's output turns the mode on, so as a held
+//! first paint is shown. String replies (DCS, OSC) pass through as ordinary
+//! input.
 //!
 //! # The kitty form
 //!
@@ -122,6 +125,7 @@ fn complete(params: &[u8], fin: u8, code: u8) -> Option<Sequence> {
     match fin {
         b'u' => kitty(params, code),
         b'~' => xterm(params, code),
+        b't' if params.starts_with(b"48;") && !params.contains(&b':') => Some(Sequence::Reply),
         _ => None,
     }
 }
@@ -313,7 +317,8 @@ mod tests {
         }
     }
 
-    /// Kitty query reply, DA1 (short and long), DA2, DECRPM.
+    /// Kitty query reply, DA1 (short and long), DA2, DECRPM, an in-band size
+    /// report.
     #[test]
     fn a_terminal_reply_is_recognised_whole() {
         for reply in [
@@ -323,6 +328,7 @@ mod tests {
             b"\x1b[>0;95;0c",
             b"\x1b[?2026;2$y",
             b"\x1b[=0c",
+            b"\x1b[48;30;120;600;1200t",
         ] {
             for n in 1..reply.len() {
                 assert_eq!(
