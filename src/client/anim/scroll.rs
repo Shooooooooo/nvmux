@@ -127,8 +127,9 @@ pub struct Ahead {
     pub col: Option<(usize, usize)>,
     /// Set while `col` is still to be computed.
     pub land: Option<Land>,
-    /// Dropped if Neovim has not made it by then; extended while Neovim is
-    /// still processing typed-ahead keys (see [`Scroll::defer`]).
+    /// Dropped if Neovim has not made it by then, once it has taken the key
+    /// if `seq` is known (see `super::Animator::idle`); extended while Neovim
+    /// is still processing typed-ahead keys (see [`Scroll::defer`]).
     pub until: Instant,
     pub scrolloff: usize,
     /// Client sequence number of the key or wheel turn that made it, when the
@@ -264,9 +265,27 @@ impl Scroll {
         self.drawn < self.ahead.len()
     }
 
-    /// Deadline of the oldest prediction.
-    pub fn until(&self) -> Option<Instant> {
-        self.ahead.front().map(|a| a.until)
+    /// Whether any scroll is ahead of Neovim, drawn or not.
+    pub fn predicted(&self) -> bool {
+        !self.ahead.is_empty()
+    }
+
+    /// Deadline of the oldest prediction, unless it is for a key after
+    /// `idle`, which Neovim may not have taken yet.
+    pub fn until(&self, idle: u64) -> Option<Instant> {
+        self.ahead
+            .front()
+            .filter(|a| a.seq.is_none_or(|s| s <= idle))
+            .map(|a| a.until)
+    }
+
+    /// Deadline of the oldest prediction if it is for a key after `idle`:
+    /// past it, the client asks Neovim whether it has taken the key.
+    pub fn waiting(&self, idle: u64) -> Option<Instant> {
+        self.ahead
+            .front()
+            .filter(|a| a.seq.is_some_and(|s| s > idle))
+            .map(|a| a.until)
     }
 
     /// Neovim scrolled `delta` more rows, taking out `gone` (the rows
@@ -543,8 +562,8 @@ impl Scroll {
         }
     }
 
-    pub fn expire(&mut self, now: Instant) {
-        if self.until().is_some_and(|until| until <= now) {
+    pub fn expire(&mut self, now: Instant, idle: u64) {
+        if self.until(idle).is_some_and(|until| until <= now) {
             self.give_up();
         }
     }
@@ -848,9 +867,9 @@ mod tests {
             [12, 13, 14, 15, 16].map(Some),
             "to the prediction"
         );
-        s.expire(until - std::time::Duration::from_millis(1));
+        s.expire(until - std::time::Duration::from_millis(1), 0);
         assert_eq!(s.ahead(), 2, "not yet");
-        s.expire(until);
+        s.expire(until, 0);
         assert_eq!(s.ahead(), 0);
         assert_eq!(
             shows(&s, &lines(10..15)),
@@ -872,14 +891,35 @@ mod tests {
             assert!(s.predict(go, &mut fill(10, 99), &mut |_, _| None));
         }
         s.defer(t0 + ms(900));
-        s.expire(t0 + ms(500));
+        s.expire(t0 + ms(500), 0);
         assert_eq!(s.ahead(), 4, "still at work");
         s.defer(t0 + ms(100));
-        s.expire(t0 + ms(899));
+        s.expire(t0 + ms(899), 0);
         assert_eq!(s.ahead(), 4, "not brought sooner");
-        s.expire(t0 + ms(900));
+        s.expire(t0 + ms(900), 0);
         assert_eq!(s.ahead(), 0, "given up on");
         assert_eq!(shows(&s, &lines(10..15)), [10, 11, 12, 13, 14].map(Some));
+    }
+
+    /// A sequenced scroll outlives its deadline until Neovim has taken its
+    /// key, then lapses at once if still unmade.
+    #[test]
+    fn a_scroll_for_a_key_neovim_has_not_taken_waits_for_it() {
+        let t0 = Instant::now();
+        let until = t0 + std::time::Duration::from_millis(500);
+        let mut s = Scroll::still((0, 5, 0, 1), false);
+        let go = Ahead {
+            until,
+            seq: Some(7),
+            ..go(2)
+        };
+        assert!(s.predict(go, &mut fill(10, 99), &mut |_, _| None));
+        assert_eq!((s.until(6), s.waiting(6)), (None, Some(until)));
+        s.expire(until, 6);
+        assert_eq!(s.ahead(), 2, "Neovim may be busy");
+        assert_eq!((s.until(7), s.waiting(7)), (Some(until), None));
+        s.expire(until, 7);
+        assert_eq!(s.ahead(), 0);
     }
 
     /// Bounded by [`HOLD`]; a scroll whose lines are missing is made but

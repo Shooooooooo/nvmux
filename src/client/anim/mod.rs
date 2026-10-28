@@ -223,6 +223,9 @@ pub struct Animator {
     /// The mode last drawn; a change restarts the blink's wait.
     mode: usize,
     predicting: bool,
+    /// The last client key number Neovim is known to have taken (see
+    /// [`Animator::idle`]).
+    idle: u64,
 }
 
 impl Animator {
@@ -248,6 +251,7 @@ impl Animator {
             cell: None,
             mode: 0,
             predicting: false,
+            idle: 0,
         }
     }
 
@@ -770,13 +774,15 @@ impl Animator {
         grids
     }
 
-    /// Drop chains whose oldest step Neovim has not answered by `now`;
-    /// returns each grid with its steps' client key numbers.
+    /// Drop chains with a step past its deadline whose key Neovim has taken
+    /// ([`Animator::idle`]); returns each grid with its steps' client key
+    /// numbers.
     pub fn lapsed(&mut self, model: &Model, now: Instant) -> Vec<(u64, Vec<u64>)> {
+        let idle = self.idle;
         let grids: Vec<u64> = self
             .chains
             .iter()
-            .filter(|(_, c)| c.until().is_some_and(|until| until <= now))
+            .filter(|(_, c)| c.until(idle).is_some_and(|until| until <= now))
             .map(|(g, _)| *g)
             .collect();
         let lapsed: Vec<(u64, Vec<u64>)> = grids
@@ -848,6 +854,25 @@ impl Animator {
         seqs
     }
 
+    /// Neovim has taken every key up to client number `k`: a fence sent
+    /// after them was answered, which Neovim does only with no keys left to
+    /// take. Predictions for later keys do not lapse, since Neovim busy or
+    /// behind on its keys sends nothing that says they are wrong.
+    pub fn idle(&mut self, k: u64) {
+        self.idle = self.idle.max(k);
+    }
+
+    /// The earliest deadline of a scroll ahead or step for a key Neovim may
+    /// not have taken yet ([`Animator::idle`]).
+    pub fn waiting(&self) -> Option<Instant> {
+        let idle = self.idle;
+        self.scrolls
+            .values()
+            .filter_map(|s| s.waiting(idle))
+            .chain(self.chains.values().filter_map(|c| c.waiting(idle)))
+            .min()
+    }
+
     /// Keep every scroll ahead and chain step until at least `until`: Neovim
     /// is still working on their keys.
     pub fn defer(&mut self, until: Instant) {
@@ -882,7 +907,7 @@ impl Animator {
 
     /// Whether `grid` was scrolled vertically ahead of Neovim, drawn or not.
     pub fn scrolled_ahead(&self, grid: u64) -> bool {
-        self.scrolls.get(&grid).is_some_and(|s| s.until().is_some())
+        self.scrolls.get(&grid).is_some_and(Scroll::predicted)
     }
 
     /// Window grids whose rows show other lines than their grid this frame.
@@ -1152,12 +1177,13 @@ impl Animator {
             .moving()
             .then(|| self.last.map_or(now, |last| last + FRAME));
         // Wake to expire predictions Neovim has not confirmed.
+        let idle = self.idle;
         let expiry = self
             .scrolls
             .values()
-            .filter_map(Scroll::until)
+            .filter_map(|s| s.until(idle))
             .chain(self.sides.values().filter_map(Side::until))
-            .chain(self.chains.values().filter_map(Chain::until))
+            .chain(self.chains.values().filter_map(|c| c.until(idle)))
             .min();
         [frame, self.blink_due(model, now), expiry]
             .into_iter()
@@ -1173,8 +1199,9 @@ impl Animator {
         self.smear.step(dt);
         self.vfx.step(dt);
         let duration = self.effects.scroll.map_or(0.0, |(duration, _)| duration);
+        let idle = self.idle;
         self.scrolls.retain(|_, s| {
-            s.expire(now);
+            s.expire(now, idle);
             s.step(dt, duration)
         });
         self.sides
