@@ -4350,10 +4350,11 @@ impl App {
     }
 
     /// Whether Neovim drew `line` as the client would lay out `text`: the
-    /// text cells from the gutter to the line's or window's end match. A
-    /// mismatch means an unheard edit, or virtual text, concealing or a
-    /// width the client does not know. `None` if not in view or too long for
-    /// a wrapping window. Only text is compared, not colours.
+    /// text cells from the gutter to the line's or window's end match, but
+    /// for what is drawn over blanks ([`chain::shows`]). A mismatch means an
+    /// unheard edit, or virtual text, concealing or a width the client does
+    /// not know. `None` if not in view or too long for a wrapping window.
+    /// Only text is compared, not colours.
     ///
     /// Blank virtual text among blanks is invisible, so unless `measured`
     /// (Neovim's width agrees, [`predict::Ack::blanks`]) a line whose last
@@ -4382,7 +4383,7 @@ impl App {
                 && ours[from..end]
                     .iter()
                     .zip(&theirs[from..end])
-                    .all(|(a, b)| a.text == b.text),
+                    .all(|(a, b)| chain::shows(&a.text, &b.text)),
         )
     }
 
@@ -10053,6 +10054,43 @@ mod tests {
             notify(&mut a, "nvmux_client", params, t1);
             a.keys(keys, t1);
             assert_eq!(drawn(&a), at, "{:?}", String::from_utf8_lossy(keys));
+        }
+    }
+
+    /// Indent guides a decoration provider draws, as snacks.nvim's, are no
+    /// extmark the agent can report: `j` from under them once waited for
+    /// Neovim.
+    #[test]
+    fn a_line_neovim_draws_guides_over_is_stepped_from() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let text = ["    foo", "    bar", "    baz"];
+        for (rows, at) in [
+            (["    foo", "    bar", "    baz"], (1, 0)),
+            (["▏   foo", "▏ ▏ bar", "▏   baz"], (1, 0)),
+            (["    fox", "    bar", "    baz"], (0, 0)),
+        ] {
+            let mut a = stepping(Duration::from_millis(200));
+            lined(&mut a, &text, &rows, t1);
+            let params: Vec<Value> = vec![
+                "ack".into(),
+                0.into(),
+                "".into(),
+                "n".into(),
+                1000.into(),
+                1.into(),
+                1.into(),
+                50.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                0.into(),
+                7.into(),
+                Value::Array(vec![]),
+            ];
+            notify(&mut a, "nvmux_client", params, t1);
+            a.keys(b"j", t1);
+            assert_eq!(drawn(&a), at, "{rows:?}");
         }
     }
 

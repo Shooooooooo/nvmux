@@ -26,8 +26,9 @@
 //! All steps and scrolls are dropped when a Neovim frame moves the view any
 //! other way, or changes the text of a row showing a visited line (an unseen
 //! edit, inline virtual text). A line scrolled into view must be drawn as the
-//! client laid it out. Changes to other rows or to gutters, and a typed line
-//! drawn as a step typed it, keep the steps.
+//! client laid it out, give or take what is drawn over its blanks
+//! ([`shows`]). Changes to other rows or to gutters, and a typed line drawn as
+//! a step typed it, keep the steps.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -49,16 +50,30 @@ pub struct Seen {
 
 impl Seen {
     /// Whether Neovim's row `now` still matches: equal, or (not `whole`)
-    /// starting with the client's layout. `None` (out of view) agrees.
+    /// starting with the client's layout as [`shows`] reads it. `None` (out
+    /// of view) agrees.
     pub fn agrees(&self, now: Option<&[Text]>) -> bool {
         now.is_none_or(|t| {
             if self.whole {
                 t == self.text.as_slice()
             } else {
-                t.starts_with(&self.text)
+                t.len() >= self.text.len()
+                    && self
+                        .text
+                        .iter()
+                        .zip(t)
+                        .all(|(laid, drawn)| shows(laid, drawn))
             }
         })
     }
+}
+
+/// Whether a cell Neovim drew as `drawn` shows the client's layout `laid`:
+/// the same, or anything over a blank. An overlay drawn by a decoration
+/// provider, such as snacks.nvim's indent guides, is no extmark the agent
+/// can report, and moves no text.
+pub fn shows(laid: &Text, drawn: &Text) -> bool {
+    laid == drawn || *laid == Text::Char(' ')
 }
 
 /// Max keys predicted ahead of Neovim in a window, only a bound on growth:
@@ -272,6 +287,35 @@ mod tests {
             hidden,
             until,
         }
+    }
+
+    fn texts(s: &str) -> Vec<Text> {
+        s.chars().map(Text::Char).collect()
+    }
+
+    #[test]
+    fn a_line_still_agrees_with_what_neovim_draws_over_its_blanks() {
+        let laid = Seen {
+            text: texts("  foo"),
+            whole: false,
+        };
+        assert!(laid.agrees(Some(&texts("  foo  "))));
+        assert!(
+            laid.agrees(Some(&texts("▏ foo x"))),
+            "a guide, text past the end"
+        );
+        assert!(!laid.agrees(Some(&texts("  fox  "))));
+        assert!(!laid.agrees(Some(&texts(" foo   "))), "moved");
+        assert!(!laid.agrees(Some(&texts("  fo"))), "cut short");
+        assert!(laid.agrees(None), "out of view");
+        let whole = Seen {
+            text: texts("  foo  "),
+            whole: true,
+        };
+        assert!(
+            !whole.agrees(Some(&texts("▏ foo  "))),
+            "Neovim's own row, redrawn otherwise"
+        );
     }
 
     #[test]

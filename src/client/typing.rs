@@ -17,6 +17,7 @@
 use rmpv::ValueRef;
 use unicode_width::UnicodeWidthChar;
 
+use super::anim::chain;
 use super::grid::{Cell, Text};
 use super::predict::{self, Look, Shape};
 use super::redraw;
@@ -617,11 +618,12 @@ pub fn sits(text: &str, shape: &Shape, byte: usize) -> usize {
 /// Past the end ([`Past`]), virtual text moves with the end; fill,
 /// `'cursorline'` and `'colorcolumn'` stay put.
 ///
-/// `None` if `old` does not match the row; if `new` would wrap (or put the
-/// cursor) onto the next row, or the view is or would be scrolled sideways;
-/// or if colours are unknowable: a `'colorcolumn'` among moved or new
-/// characters or non-blank past the end ([`Past::of`]), or end content
-/// crossing one or needing more room than the row had.
+/// `None` if `old` does not match the row, but for what Neovim drew over its
+/// blanks before the edit ([`chain::shows`]), which is kept; if `new` would
+/// wrap (or put the cursor) onto the next row, or the view is or would be
+/// scrolled sideways; or if colours are unknowable: a `'colorcolumn'` among
+/// moved or new characters or non-blank past the end ([`Past::of`]), or end
+/// content crossing one or needing more room than the row had.
 pub fn relayout(
     row: &[Cell],
     (old, new): (&str, &str),
@@ -652,11 +654,16 @@ pub fn relayout(
     };
     let (was, mut out) = (lay(old), lay(new));
     let (old_end, new_end) = (was.len(), out.len());
-    if row.len() < old_end || row.iter().zip(&was).any(|(a, b)| a.text != b.text) {
+    let edited = sits(old, shape, from);
+    let over: Vec<bool> = (0..old_end.min(row.len()))
+        .map(|k| row[k].text != was[k].text)
+        .collect();
+    // Past the edit, what is drawn over a blank may move with the text.
+    let stays = |k: usize| k < edited && chain::shows(&was[k].text, &row[k].text);
+    if row.len() < old_end || over.iter().enumerate().any(|(k, o)| *o && !stays(k)) {
         return None;
     }
     let cc = colorcolumn(shape);
-    let edited = sits(old, shape, from);
     if cc
         .iter()
         .any(|c| (edited..old_end.max(new_end)).contains(c))
@@ -744,7 +751,7 @@ pub fn relayout(
             _ => look.specialkey,
         };
         (0..old_end)
-            .find(|k| was[*k].hl == kind && !cc.contains(k))
+            .find(|k| was[*k].hl == kind && !cc.contains(k) && !over[*k])
             .map_or(window, |k| row[k].hl)
     };
     let kind: Vec<u32> = out[..new_end].iter().map(|c| c.hl).collect();
@@ -755,6 +762,9 @@ pub fn relayout(
             (None, TEXT) => unset[n] = true,
             (None, k) => out[n].hl = own(k),
         }
+    }
+    for k in (0..over.len()).filter(|&k| over[k]) {
+        out[k] = row[k].clone();
     }
     let new_cs = predict::chars(new, shape);
     let fill = past.fill.unwrap_or(look.text);
@@ -771,7 +781,7 @@ pub fn relayout(
             // Neighbours must be already-coloured text: not `'list'` glyphs
             // (window colours) nor `'colorcolumn'` cells.
             let by = |k: usize| {
-                let glyph = kind.get(k).is_some_and(|k| *k != TEXT);
+                let glyph = kind.get(k).is_some_and(|k| *k != TEXT) || over.get(k) == Some(&true);
                 let later = unset.get(k).copied().unwrap_or(false);
                 (!glyph && !later && !cc.contains(&k)).then(|| &out[k])
             };
@@ -1140,6 +1150,33 @@ mod tests {
                 seen("abcxy <-E", "111111666"),
                 seen("abcx <-E", "11111666"),
             ]
+        );
+    }
+
+    /// Guides drawn over the indent, as snacks.nvim's are (8, 9), stay; the
+    /// text after them is laid out as without.
+    #[test]
+    fn guides_drawn_over_the_indent_stay_as_text_is_typed() {
+        let rows = typed(
+            &shape(true),
+            ("    ab", 6),
+            row("▏ ▏ ab", "819111"),
+            &["c", "<BS>", "<BS>"],
+        );
+        assert_eq!(
+            rows,
+            [
+                seen("▏ ▏ abc", "8191111"),
+                seen("▏ ▏ ab", "819111"),
+                seen("▏ ▏ a", "81911"),
+            ]
+        );
+        // Typed into the indent, or onto what was drawn over the text.
+        let drawn = row("▏ ▏ ab", "819111");
+        assert_eq!(laid(&shape(true), ("    ab", 1), &drawn, "x"), None);
+        assert_eq!(
+            laid(&shape(true), ("    ab", 6), &row("▏ ▏ xb", ""), "c"),
+            None
         );
     }
 
