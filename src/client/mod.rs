@@ -570,17 +570,17 @@ if predict then
         vim.wo.conceallevel > 0 and not vim.wo.concealcursor:find('n'),
         colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0, classes(buf),
         vim.bo[buf].iminsert == 1, vim.o.sections, vim.o.paragraphs,
-        vim.wo.wrap and vim.wo.smoothscroll })
+        vim.wo.wrap and vim.wo.smoothscroll, tonumber(vim.wo.foldcolumn) or -1 })
     end
     return s
   end
   -- With acks, per window as of its last shape: the options that affect how
   -- the cursor line is drawn and how far motions past 'scrolloff' scroll,
-  -- plus the buffer's line count, 'iskeyword' and 'iminsert'. Options set
-  -- from other autocommands (e.g. 'relativenumber' toggled in Insert mode),
-  -- a window highlight namespace and <C-^> fire no OptionSet, so these are
-  -- re-read when Neovim waits for a key and changed shapes resent before
-  -- the ack.
+  -- plus the buffer's line count, 'iskeyword', 'iminsert' and the gutter's
+  -- width. Options set from other autocommands (e.g. 'relativenumber'
+  -- toggled in Insert mode), a window highlight namespace, <C-^> and an auto
+  -- sign column appearing fire no OptionSet, so these are re-read when Neovim
+  -- waits for a key and changed shapes resent before the ack.
   local looked = {}
   local function looks(win)
     local out = { pcall(api.nvim_get_hl_ns, { winid = win }) }
@@ -590,6 +590,7 @@ if predict then
       out[#out + 1] = api.nvim_get_option_value(name, { win = win })
     end
     out[#out + 1] = vim.o.scrolljump
+    out[#out + 1] = vim.fn.getwininfo(win)[1].textoff
     out[#out + 1] = table.concat(colorcolumn(win), ' ')
     local buf = api.nvim_win_get_buf(win)
     out[#out + 1] = api.nvim_buf_line_count(buf)
@@ -1066,7 +1067,7 @@ if predict then
   -- (predict::Predictor::fresh). The ack carries Neovim's widths of the
   -- cursor line and of blank-ended lines in view, since blank virtual text
   -- is invisible on screen. Mappings are rechecked a second later.
-  local wanted, said, fixed, decorated, recheck, rehooked
+  local wanted, said, fixed, decorated, signed, recheck, rehooked
   local function remapped()
     recheck = false
     local buf = api.nvim_get_current_buf()
@@ -1110,24 +1111,117 @@ if predict then
         blanks[#blanks + 1] = { view.topline + i - 2, vim.fn.virtcol({ view.topline + i - 1, #l }) }
       end
     end
-    -- Lines around the view with virtual text, signs or sign highlights,
-    -- which the client leaves to Neovim when scrolling ahead
+    -- Lines around the view with virtual text, or signs the client does not
+    -- draw, which it leaves to Neovim when scrolling ahead
     -- (predict::Predictor::decorated): half-open runs plus the range
-    -- searched, cut at the last mark when a kind hits the 1000 limit. Sent
-    -- before the ack, when changed.
+    -- searched, cut at the last mark when a kind hits the 1000 limit. Not
+    -- drawn: a line highlight, a sign over several lines, a tie in Neovim's
+    -- order (priority, then id, both descending), or a namespace shown in
+    -- some windows only. The others go as changes to what was sent for the
+    -- window (predict::Signs): per line, its first number and cursor-line
+    -- groups, then each text and group in that order. Sent before the ack,
+    -- when changed.
     local m = math.min(reach * api.nvim_win_get_height(win) + 10, 1000)
     local from = math.max(view.topline - 1 - m, 0)
     local to = math.min(vim.fn.line('w$') + m, api.nvim_buf_line_count(buf))
-    local rows = {}
-    for _, kind in ipairs({ 'virt_text', 'sign' }) do
-      local marks = api.nvim_buf_get_extmarks(buf, -1, { from, 0 }, { math.max(to - 1, 0), -1 },
-        { type = kind, limit = 1000 })
+    local last = { math.max(to - 1, 0), -1 }
+    local texts = api.nvim_buf_get_extmarks(buf, -1, { from, 0 }, last,
+      { type = 'virt_text', limit = 1000 })
+    local signs = api.nvim_buf_get_extmarks(buf, -1, { from, 0 }, last,
+      { type = 'sign', limit = 1000, details = true, hl_name = false, overlap = true })
+    for _, marks in ipairs({ texts, signs }) do
       if #marks >= 1000 then
         to = math.min(to, marks[#marks][2] + 1)
       end
-      for _, m in ipairs(marks) do
-        rows[#rows + 1] = m[2]
+    end
+    local rows, lined, scoped, fresh = {}, {}, {}, {}
+    for _, m in ipairs(texts) do
+      rows[#rows + 1] = m[2]
+    end
+    for _, m in ipairs(signs) do
+      local row, d = m[2], m[4]
+      if scoped[d.ns_id] == nil then
+        local ok, ns = pcall(api.nvim__ns_get, d.ns_id)
+        scoped[d.ns_id] = ok and #(ns.wins or {}) > 0
       end
+      if d.invalid then
+        -- Deleted with its text: Neovim draws nothing for it.
+      elseif d.line_hl_group or scoped[d.ns_id] or (d.end_row or row) ~= row then
+        for r = math.max(row, from), math.min(d.end_row or row, to - 1) do
+          rows[#rows + 1] = r
+        end
+      elseif row >= from and row < to then
+        local l = lined[row]
+        if l then
+          l[#l + 1] = m
+        else
+          lined[row] = { m }
+        end
+      end
+    end
+    local function group(gid)
+      if gid > 0 and groups[gid] == nil then
+        local some, rgb, cterm = attrs(gid)
+        groups[gid] = some
+        if some then
+          fresh[#fresh + 1] = { gid, rgb, cterm }
+        end
+      end
+      return gid
+    end
+    local function before(a, b)
+      local p, q = a[4].priority or 0, b[4].priority or 0
+      return p > q or (p == q and a[1] > b[1])
+    end
+    local anew = not (signed and signed.win == win and signed.buf == buf)
+    if anew then
+      signed = { win = win, buf = buf, rows = {} }
+    end
+    local drawn, changed = {}, {}
+    for row, l in pairs(lined) do
+      if #l > 1 then
+        table.sort(l, before)
+      end
+      local e, tie = { 0, 0 }, false
+      for i, m in ipairs(l) do
+        local d = m[4]
+        tie = tie or (i > 1 and not before(l[i - 1], m))
+        if e[1] == 0 then
+          e[1] = group(d.number_hl_group or 0)
+        end
+        if e[2] == 0 then
+          e[2] = group(d.cursorline_hl_group or 0)
+        end
+        if d.sign_text then
+          e[#e + 1] = d.sign_text
+          e[#e + 1] = group(d.sign_hl_group or 0)
+        end
+      end
+      if tie then
+        rows[#rows + 1] = row
+      else
+        drawn[row] = e
+        local was = signed.rows[row]
+        local same = was ~= nil and #was == #e
+        for i = 1, same and #e or 0 do
+          same = same and was[i] == e[i]
+        end
+        if not same then
+          signed.rows[row] = e
+          changed[#changed + 1] = { row, unpack(e) }
+        end
+      end
+    end
+    for row in pairs(signed.rows) do
+      if not drawn[row] then
+        signed.rows[row] = nil
+        if row >= from and row < to then
+          changed[#changed + 1] = { row }
+        end
+      end
+    end
+    if #fresh > 0 then
+      send('colours', fresh)
     end
     table.sort(rows)
     local runs = {}
@@ -1140,9 +1234,9 @@ if predict then
       end
     end
     local over = from .. ',' .. to .. ',' .. table.concat(runs, ' ')
-    if not (decorated and decorated[1] == win and decorated[2] == over) then
+    if anew or #changed > 0 or not (decorated and decorated[1] == win and decorated[2] == over) then
       decorated = { win, over }
-      send('decorated', win, from, to, runs)
+      send('decorated', win, from, to, runs, changed, anew)
     end
     -- With typing prediction, in-view lines whose virtual text would not
     -- move with the line's end as text is typed (predict::Predictor::pinned).
@@ -1232,7 +1326,7 @@ if predict then
   -- A new reach as the round trip changes; resend what acks depend on.
   au('User', { pattern = 'nvmux_client_reach_' .. chan }, function(ev)
     reach = tonumber(ev.data) or reach
-    said, fixed, decorated = nil, nil, nil
+    said, fixed, decorated, signed = nil, nil, nil, nil
     soon()
   end)
   au('UILeave', {}, function()
@@ -1475,7 +1569,13 @@ fn drawn_afresh(
     let cul = shape.stepping.as_ref()?.cursorline;
     let mut row = p.row(win, line, width, look, cursor)?;
     let textoff = shape.textoff.min(width);
-    let numbers = predict::numbers(line, cursor, shape, h, ids).unwrap_or_default();
+    let mut numbers = predict::numbers(line, cursor, shape, h, ids).unwrap_or_default();
+    // In a sign's number group, as the row has them.
+    if let Some((signs, _)) = p.signs_at(win, line, h).filter(|(s, _)| s.numhl != 0) {
+        for n in &mut numbers {
+            n.hl = model::syntax_hl(n.hl, signs.numhl);
+        }
+    }
     let marks = textoff.checked_sub(numbers.len())?;
     row.splice(marks..textoff, numbers);
     if line != cursor {
@@ -3529,14 +3629,20 @@ impl App {
 
     /// Whether line `l`, shown by a scroll ahead, is laid out as Neovim
     /// would: in Neovim's view it is Neovim's; out of it, the client must
-    /// have it whole with no virtual text or signs
-    /// ([`Predictor::decorated`]) and no concealing
+    /// have it whole with no virtual text or signs it does not draw
+    /// ([`Predictor::decorated`]), any signs drawable in this window
+    /// ([`Predictor::signs_at`]), and no concealing
     /// ([`predict::Stepping::concealing`]).
     fn brought<'a>(&self, on: &Onward, l: i64, text: &dyn Fn(i64) -> Option<&'a str>) -> bool {
         let Some((p, _, _, stepping)) = self.stepped_by(on.win) else {
             return false;
         };
-        on.neovims(l) || (text(l).is_some() && !p.decorated(on.win, l) && !stepping.concealing)
+        let rows = (on.rect.1 - on.rect.0) as i64;
+        let signs = p.signs(on.win, l).is_none()
+            || (p.signs_at(on.win, l, rows).is_some()
+                && predict::Gutter::of(|name| self.model.groups.get(name).copied()).is_some());
+        on.neovims(l)
+            || (text(l).is_some() && !p.decorated(on.win, l) && !stepping.concealing && signs)
     }
 
     /// The predictor, last ack, shape and stepping that steps in `win` use.
@@ -4233,7 +4339,9 @@ impl App {
             let gutter = (decided && from != to)
                 .then(|| {
                     let drawn = drawn.get(..textoff)?;
-                    let now = predict::regutter(drawn, line, (from, to), shape, h as i64, &ids?)?;
+                    let signs = p.signs_at(win, line, h as i64);
+                    let now =
+                        predict::regutter(drawn, line, (from, to), shape, h as i64, &ids?, signs)?;
                     (now != drawn).then_some(now)
                 })
                 .flatten();
@@ -4327,7 +4435,8 @@ impl App {
             self.model.wins.get(&grid)?,
             self.model.viewports.get(&grid)?,
         );
-        let shape = self.predict.as_ref()?.shape(*win)?;
+        let p = self.predict.as_ref()?;
+        let shape = p.shape(*win)?;
         let ids = predict::Gutter::of(|name| self.model.groups.get(name).copied())?;
         let (top, bot, left, _) = anim::text_rect(&self.model, grid)?;
         let g = self.model.grids.get(&grid)?;
@@ -4343,7 +4452,9 @@ impl App {
                 g.row(top + r)
                     .get(left..left + shape.textoff)
                     .is_none_or(|drawn| {
-                        predict::regutter(drawn, lnum, cursor, shape, h as i64, &ids).is_some()
+                        let signs = p.signs_at(*win, lnum, h as i64);
+                        predict::regutter(drawn, lnum, cursor, shape, h as i64, &ids, signs)
+                            .is_some()
                     })
             });
         Some(all)
@@ -9660,6 +9771,133 @@ mod tests {
         notify(&mut a, "nvmux_client", params, t1);
         a.keys(b"j", t1);
         assert_eq!((top_row(&a), drawn(&a)), ("line 0".into(), (4, 0)));
+    }
+
+    /// [`stepping`] with one sign slot before four number columns
+    /// (`'number'`), `'cursorline'` bits `cul`, scrolling ahead as
+    /// [`scrolling`] does, and an `E` sign in group 40 on lines `signs`:
+    /// reported by the agent if `told`, else as decorated, and drawn by
+    /// Neovim in highlight 70 (71 on the cursor's line). Cursor on line
+    /// `cursor`, view from line 0.
+    fn signing(cul: i64, signs: &[i64], told: bool, cursor: i64) -> App {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        let mut shape = shaped(6, (true, false, true), (false, cul), &[], vec![]);
+        shape.extend([
+            false.into(),
+            false.into(),
+            Value::Array(vec![]),
+            1.into(),
+            false.into(),
+            "".into(),
+            false.into(),
+            Value::Nil,
+            Value::Nil,
+            false.into(),
+            0.into(),
+        ]);
+        reshape(&mut a, shape, t1);
+        let changes = signs
+            .iter()
+            .filter(|_| told)
+            .map(|&l| Value::Array(vec![l.into(), 0.into(), 0.into(), "E ".into(), 40.into()]))
+            .collect();
+        let runs = signs
+            .iter()
+            .filter(|_| !told)
+            .flat_map(|&l| [Value::from(l), Value::from(l + 1)])
+            .collect();
+        let params = vec![
+            "decorated".into(),
+            1000.into(),
+            0.into(),
+            20.into(),
+            Value::Array(runs),
+            Value::Array(changes),
+            true.into(),
+        ];
+        notify(&mut a, "nvmux_client", params, t1);
+        let n = Value::from;
+        let mut events: Vec<(&str, Vec<Value>)> = GUTTER
+            .iter()
+            .map(|(name, id)| ("hl_group_set", vec![(*name).into(), (*id).into()]))
+            .collect();
+        for r in 0..5i64 {
+            let on = r == cursor && cul & 1 != 0;
+            let (sign, hl) = match (signs.contains(&r), on) {
+                (true, on) => ("E ", if on { 71 } else { 70 }),
+                (false, on) => ("  ", if on { 15 } else { 14 }),
+            };
+            events.push(line_hl(2, r as u64, 0, sign, hl));
+            let number = format!("{:>3} ", r + 1);
+            events.push(line_hl(2, r as u64, 2, &number, if on { 13 } else { 10 }));
+            events.push(line_hl(
+                2,
+                r as u64,
+                6,
+                &format!("{:14}", format!("line {r}")),
+                0,
+            ));
+        }
+        events.push(("grid_cursor_goto", vec![n(2), n(cursor), n(6)]));
+        events.push((
+            "win_viewport",
+            vec![n(2), n(1000), n(0), n(6), n(cursor), n(0), n(50), n(0)],
+        ));
+        redraw(&mut a, events, t1);
+        ack(&mut a, 0, "", "n", (cursor, 0, 0, 0), t1);
+        a
+    }
+
+    /// With `'cursorline'` numbering, Neovim draws a sign on the cursor's
+    /// line over `CursorLineSign`, which the client can follow only knowing
+    /// the sign's group.
+    #[test]
+    fn j_onto_a_line_with_a_sign_draws_it_in_the_cursor_lines_groups() {
+        use crate::client::model::syntax_hl;
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = signing(1, &[2], false, 1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 6), "left to Neovim untold");
+        let mut a = signing(1, &[2], true, 1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (2, 6));
+        let groups = repainted(&mut a);
+        assert_eq!(
+            groups[1],
+            Some(vec![14, 14, 10, 10, 10, 10]),
+            "the line left"
+        );
+        let mut entered = vec![syntax_hl(15, 40); 2];
+        entered.extend([13; 4]);
+        assert_eq!(groups[2], Some(entered));
+        // Off it, Neovim's drawing is right again.
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (3, 6));
+        let groups = repainted(&mut a);
+        assert_eq!(groups[2], None);
+        assert_eq!(groups[3], Some(vec![15, 15, 13, 13, 13, 13]));
+    }
+
+    #[test]
+    fn j_past_the_bottom_onto_a_line_with_a_sign_draws_it_ahead() {
+        use crate::client::model::syntax_hl;
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = signing(1, &[5], false, 4);
+        a.keys(b"j", t1);
+        assert_eq!(
+            (drawn(&a), a.anim.ahead(2)),
+            ((4, 6), (0, 0)),
+            "left to Neovim untold"
+        );
+        let mut a = signing(1, &[5], true, 4);
+        a.keys(b"j", t1);
+        assert_eq!((drawn(&a), a.anim.ahead(2)), ((4, 6), (1, 1)));
+        assert_eq!(composed(&mut a)[4], "E   6 line 5");
+        let groups = repainted(&mut a);
+        let mut entered = vec![syntax_hl(15, 40); 2];
+        entered.extend([13; 4]);
+        assert_eq!(groups[4].as_ref().map(|g| g[..6].to_vec()), Some(entered));
     }
 
     #[test]

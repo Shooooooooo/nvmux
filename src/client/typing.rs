@@ -918,6 +918,7 @@ mod tests {
                 sections: None,
                 paragraphs: None,
                 smoothscroll: false,
+                foldcolumn: Some(0),
             }),
         }
     }

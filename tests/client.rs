@@ -2843,57 +2843,8 @@ fn holding_j_past_the_bottom_keeps_up() {
     require_nvim!();
     let scratch = Scratch::new("client-held-j");
     let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-held-j", SCROLLING, MOTIONS);
-    let start = line_on(term.parser.screen()).expect("the first line");
-    let mut seen: Vec<(Instant, Option<u32>)> = vec![(Instant::now(), Some(start))];
-    let mut typed_at = Vec::new();
-    let mut note = |screen: &vt100::Screen| {
-        let on = line_on(screen);
-        if seen.last().map(|s| s.1) != Some(on) {
-            seen.push((Instant::now(), on));
-        }
-        false
-    };
-    for k in 0..40 {
-        let at = Instant::now();
-        typed_at.push(at);
-        term.type_bytes(b"j");
-        // Wait for its line before the next `j`: a client delayed past
-        // 30 ms (busy machine) would read both and draw one frame two lines on.
-        let line = start + k + 1;
-        term.frames(SLOW, |screen| {
-            note(screen);
-            line_on(screen) == Some(line)
-        });
-        term.frames(
-            Duration::from_millis(30).saturating_sub(at.elapsed()),
-            &mut note,
-        );
-    }
-    term.frames(4 * SLOW, &mut note);
-    let when: Vec<(Duration, Option<u32>)> = seen
-        .iter()
-        .map(|(t, l)| (t.saturating_duration_since(typed_at[0]), *l))
-        .collect();
-    let lines: Vec<u32> = seen.iter().filter_map(|s| s.1).collect();
-    assert_eq!(lines.len(), seen.len(), "every sight a line: {when:?}");
-    assert!(
-        lines.windows(2).all(|w| w[1] == w[0] + 1),
-        "a line at a time: {when:?}"
-    );
-    for (k, at) in typed_at.iter().enumerate() {
-        let line = start + k as u32 + 1;
-        let drawn = seen.iter().find(|s| s.1 == Some(line)).map(|s| s.0);
-        assert!(
-            drawn.is_some_and(|d| d < *at + SLOW),
-            "the {}th `j` waited: {when:?}",
-            k + 1
-        );
-    }
-    let at = rpc
-        .call("nvim_win_get_cursor", vec![0.into()])
-        .expect("Neovim's cursor");
-    let line = at.as_array().and_then(|a| a[0].as_u64()).expect("its line");
-    assert_eq!(line, u64::from(start) + 40, "Neovim's");
+    let start = held_j(&mut term, 40, 4 * SLOW, line_on);
+    assert_eq!(neovims_line(&mut rpc), u64::from(start) + 40, "Neovim's");
     assert_eq!(line_on(term.parser.screen()), Some(start + 40));
     assert_eq!(top_line(&term.text()), Some(start + 40 - 21), "scrolled");
 }
@@ -2905,7 +2856,6 @@ fn holding_j_while_neovim_is_busy_keeps_up() {
     require_nvim!();
     let scratch = Scratch::new("client-busy-j");
     let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-busy-j", SCROLLING, MOTIONS);
-    let start = line_on(term.parser.screen()).expect("the first line");
     let busy = "vim.defer_fn(function()
         local t = vim.uv.hrtime()
         while vim.uv.hrtime() - t < 2.5e9 do end
@@ -2915,31 +2865,61 @@ fn holding_j_while_neovim_is_busy_keeps_up() {
         vec![busy.into(), Vec::<Value>::new().into()],
     )
     .expect("busy");
+    let start = held_j(&mut term, 90, Duration::from_secs(2) + 4 * SLOW, line_on);
+    assert_eq!(neovims_line(&mut rpc), u64::from(start) + 90, "Neovim's");
+    assert_eq!(line_on(term.parser.screen()), Some(start + 90));
+}
+
+/// [`holding_j_past_the_bottom_keeps_up`] over [`SIGNED`]'s lines, whose
+/// signs the client draws as Neovim does ([`lines_with_signs_are_drawn_as_neovim_draws_them`]),
+/// in groups that change with the cursor's line.
+#[test]
+fn holding_j_over_lines_with_signs_keeps_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-signs-j");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-signs-j", &signed(), MOTIONS);
+    let start = held_j(&mut term, 40, 4 * SLOW, line_at_cursor);
+    assert_eq!(neovims_line(&mut rpc), u64::from(start) + 40, "Neovim's");
+    assert_eq!(line_at_cursor(term.parser.screen()), Some(start + 40));
+}
+
+/// Type `j` `keys` times 30 ms apart, from the line `line_of` reads off the
+/// screen, then watch `settle` for Neovim's last frames. Each must be drawn
+/// before Neovim has it, a line at a time, none taken back. Returns the
+/// line it started from.
+fn held_j(
+    term: &mut Terminal,
+    keys: u32,
+    settle: Duration,
+    line_of: fn(&vt100::Screen) -> Option<u32>,
+) -> u32 {
+    let start = line_of(term.parser.screen()).expect("the first line");
     let mut seen: Vec<(Instant, Option<u32>)> = vec![(Instant::now(), Some(start))];
     let mut typed_at = Vec::new();
     let mut note = |screen: &vt100::Screen| {
-        let on = line_on(screen);
+        let on = line_of(screen);
         if seen.last().map(|s| s.1) != Some(on) {
             seen.push((Instant::now(), on));
         }
         false
     };
-    const KEYS: u32 = 90;
-    for k in 0..KEYS {
+    for k in 0..keys {
         let at = Instant::now();
         typed_at.push(at);
         term.type_bytes(b"j");
+        // Wait for its line before the next `j`: a client delayed past
+        // 30 ms (busy machine) would read both and draw one frame two lines on.
         let line = start + k + 1;
         term.frames(SLOW, |screen| {
             note(screen);
-            line_on(screen) == Some(line)
+            line_of(screen) == Some(line)
         });
         term.frames(
             Duration::from_millis(30).saturating_sub(at.elapsed()),
             &mut note,
         );
     }
-    term.frames(Duration::from_secs(2) + 4 * SLOW, &mut note);
+    term.frames(settle, &mut note);
     let when: Vec<(Duration, Option<u32>)> = seen
         .iter()
         .map(|(t, l)| (t.saturating_duration_since(typed_at[0]), *l))
@@ -2959,12 +2939,22 @@ fn holding_j_while_neovim_is_busy_keeps_up() {
             k + 1
         );
     }
+    start
+}
+
+/// Neovim's cursor line, from 1.
+fn neovims_line(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>) -> u64 {
     let at = rpc
         .call("nvim_win_get_cursor", vec![0.into()])
         .expect("Neovim's cursor");
-    let line = at.as_array().and_then(|a| a[0].as_u64()).expect("its line");
-    assert_eq!(line, u64::from(start + KEYS), "Neovim's");
-    assert_eq!(line_on(term.parser.screen()), Some(start + KEYS));
+    at.as_array().and_then(|a| a[0].as_u64()).expect("its line")
+}
+
+/// The `N` of `line N` on the cursor's row, whatever the gutter before it.
+fn line_at_cursor(screen: &vt100::Screen) -> Option<u32> {
+    let row = screen.cursor_position().0;
+    let text = screen.contents_between(row, 0, row, COLS);
+    text.split("line ").nth(1)?.split(' ').next()?.parse().ok()
 }
 
 /// Type `keys` the client leaves to Neovim: nothing changes within one link
@@ -4142,6 +4132,43 @@ fn lines_with_signs_or_virtual_text_are_not_scrolled_into_view_without_them() {
     keys.push((b"H".to_vec(), "H".into()));
     keys.extend((0..30).map(|_| (b"k".to_vec(), "k".to_string())));
     sights_are_neovims("client-signs", &setline, MOTIONS, &keys, Lcg(9));
+}
+
+/// [`SCROLLING`] with `'number'`, `'cursorline'` numbering the cursor's
+/// line, and two sign slots: signs in groups of their own, with a number
+/// group and a cursor-line group, two to a line, a double-width one, and
+/// one placed with `sign_place()`.
+const SIGNED: &str = "set number cursorline signcolumn=yes:2 | exe 'lua \
+    local api, ns = vim.api, vim.api.nvim_create_namespace(\"t\") \
+    api.nvim_set_hl(0, \"Add\", { fg = \"#00ff00\", bold = true }) \
+    api.nvim_set_hl(0, \"Err\", { fg = \"#ff0000\", bg = \"#200000\" }) \
+    api.nvim_set_hl(0, \"Cul\", { fg = \"#ffff00\", underline = true }) \
+    vim.fn.sign_define(\"S\", { text = \">>\", texthl = \"Add\", numhl = \"Add\" }) \
+    for l = 3, 299, 5 do api.nvim_buf_set_extmark(0, ns, l, 0, \
+      { sign_text = \"+\", sign_hl_group = \"Add\" }) end \
+    for l = 4, 299, 5 do api.nvim_buf_set_extmark(0, ns, l, 0, { sign_text = \"E\", \
+      sign_hl_group = \"Err\", number_hl_group = \"Err\", cursorline_hl_group = \"Cul\", \
+      priority = 20 }) end \
+    for l = 4, 299, 10 do api.nvim_buf_set_extmark(0, ns, l, 0, \
+      { sign_text = \"日\", priority = 5 }) end \
+    for l = 25, 300, 5 do vim.fn.sign_place(0, \"g\", \"S\", \"%\", { lnum = l }) end'";
+
+/// [`SIGNED`] after [`SCROLLING`]'s lines.
+fn signed() -> String {
+    format!("{SCROLLING} | {SIGNED}")
+}
+
+/// [`lines_with_signs_or_virtual_text_are_not_scrolled_into_view_without_them`]
+/// in colour, over [`SIGNED`]'s lines.
+#[test]
+fn lines_with_signs_are_drawn_as_neovim_draws_them() {
+    require_nvim!();
+    let setline = format!("set termguicolors | exe 'NoMatchParen' | {}", signed());
+    let mut keys: Vec<(Vec<u8>, String)> = vec![(b"L".to_vec(), "L".into())];
+    keys.extend((0..40).map(|_| (b"j".to_vec(), "j".to_string())));
+    keys.push((b"H".to_vec(), "H".into()));
+    keys.extend((0..30).map(|_| (b"k".to_vec(), "k".to_string())));
+    sights_compared("client-signs-hl", &setline, MOTIONS, &keys, Lcg(5), true);
 }
 
 /// Type `keys` (terminal bytes, Neovim name) in `rng`-timed bursts over a

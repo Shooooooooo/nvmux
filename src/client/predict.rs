@@ -14,8 +14,9 @@
 //! The agent (`super::AGENT_LUA`) sends each window's lines around its view,
 //! as far as a held key pages in a round trip ([`Predictor::reach`]), as
 //! incremental splices, with drawing options ([`Shape`]) and tree-sitter and
-//! extmark highlights. A predicted row shows only text, number and those
-//! colours (no signs, virtual text or `:syntax`) until Neovim's row arrives.
+//! extmark highlights, and with acks the signs of lines around the view
+//! ([`Signs`]). A predicted row shows only text, number, signs and those
+//! colours (no virtual text or `:syntax`) until Neovim's row arrives.
 //! Highlighting costs Neovim ~60 µs a line, so a newly shown buffer gets two
 //! windows each way first and the rest later in batches.
 //!
@@ -157,6 +158,8 @@ pub struct Stepping {
     pub paragraphs: Option<String>,
     /// In a wrapping window: Neovim centres views by rows.
     pub smoothscroll: bool,
+    /// `'foldcolumn'` width; `None` for `auto`, which follows the folds.
+    pub foldcolumn: Option<usize>,
 }
 
 /// `'cursorlineopt'` parts drawn (none when off); `number` covers
@@ -323,6 +326,7 @@ impl Shape {
                 sections: v.get(42).and_then(redraw::as_str).map(String::from),
                 paragraphs: v.get(43).and_then(redraw::as_str).map(String::from),
                 smoothscroll: flag(44),
+                foldcolumn: size(45),
             }),
         })
     }
@@ -603,6 +607,8 @@ pub struct Look {
     pub whitespace: u32,
     /// Text rows; sets the number width with `'relativenumber'` alone.
     pub rows: i64,
+    /// The gutter groups, which signs are drawn over ([`paint_signs`]).
+    pub ids: Option<Gutter>,
 }
 
 impl Look {
@@ -641,6 +647,7 @@ impl Look {
             specialkey: group("SpecialKey").unwrap_or(text),
             whitespace: group("Whitespace").unwrap_or(text),
             rows: rows.len() as i64,
+            ids: Gutter::of(&group),
         }
     }
 }
@@ -728,6 +735,127 @@ pub fn render(
         },
     );
     Some(row)
+}
+
+/// What a line's signs draw (see `super::AGENT_LUA`): their texts, in the
+/// order Neovim fills the sign slots, each with its group (0 for none); and
+/// the number and cursor-line groups of the first sign that has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signs {
+    pub texts: Vec<([Text; 2], u32)>,
+    pub numhl: u32,
+    pub culhl: u32,
+    /// All texts ASCII, so measured as Neovim measures them whatever its
+    /// width settings ([`Stepping::widths`]).
+    pub ascii: bool,
+}
+
+impl Signs {
+    /// From the agent's `[numhl, culhl, text, group, ...]`; `None` if a text
+    /// is not two cells as the client measures it.
+    fn read(v: &[ValueRef<'_>]) -> Option<Self> {
+        let group = |v: &ValueRef<'_>| redraw::int(v).and_then(|g| u32::try_from(g).ok());
+        let mut texts = Vec::new();
+        let mut ascii = true;
+        for pair in v.get(2..)?.chunks(2) {
+            let [text, hl] = pair else {
+                return None;
+            };
+            let text = redraw::as_str(text)?;
+            ascii &= text.is_ascii();
+            texts.push((sign_cells(text)?, group(hl)?));
+        }
+        Some(Self {
+            texts,
+            numhl: group(v.first()?)?,
+            culhl: group(v.get(1)?)?,
+            ascii,
+        })
+    }
+
+    /// Whether the client measures the texts as Neovim does in `shape`.
+    pub fn drawable(&self, shape: &Shape) -> bool {
+        self.ascii || shape.stepping.as_ref().is_some_and(|s| !s.widths)
+    }
+}
+
+/// A sign's text as its two cells, as Neovim pads it; `None` if not two
+/// cells wide.
+fn sign_cells(text: &str) -> Option<[Text; 2]> {
+    let mut cells: Vec<(String, bool)> = Vec::new();
+    for c in text.chars() {
+        match c.width()? {
+            0 => cells.iter_mut().rev().find(|(_, half)| !half)?.0.push(c),
+            w => {
+                cells.push((c.to_string(), false));
+                if w == 2 {
+                    cells.push((String::new(), true));
+                }
+            }
+        }
+    }
+    let [a, b] = <[(String, bool); 2]>::try_from(cells).ok()?;
+    Some([Text::new(&a.0), Text::new(&b.0)])
+}
+
+/// Where the sign slots start in `shape`'s gutter, and how many there are:
+/// Neovim draws the fold column, the slots, then the number column. `None`
+/// where the client cannot lay them out: a `'statuscolumn'`, signs in the
+/// number column, window highlights, an `auto` fold column, or widths that
+/// do not add up.
+pub fn sign_slots(shape: &Shape, rows: i64) -> Option<(usize, usize)> {
+    let s = shape.stepping.as_ref()?;
+    if !shape.plain_gutter || s.number_signs || s.own_highlights {
+        return None;
+    }
+    let fold = s.foldcolumn?;
+    let cells = shape
+        .textoff
+        .checked_sub(fold + number_width(shape, rows)?)?;
+    cells.is_multiple_of(2).then_some((fold, cells / 2))
+}
+
+/// Draw `signs` in `row`'s sign slots `(at, slots)` as Neovim's `draw_sign`
+/// does: each text in its group over `SignColumn`, or on the cursor's line
+/// (`cursor`, with `'cursorline'` numbering it) the cursor-line group, else
+/// its own, over `CursorLineSign`; empty slots blank in the column's group.
+pub fn paint_signs(
+    row: &mut [Cell],
+    signs: &Signs,
+    (at, slots): (usize, usize),
+    cursor: bool,
+    ids: &Gutter,
+) {
+    let base = if cursor { ids.cursor_sign } else { ids.sign };
+    for slot in 0..slots {
+        let Some(cells) = row.get_mut(at + 2 * slot..at + 2 * slot + 2) else {
+            return;
+        };
+        match signs.texts.get(slot) {
+            Some((text, group)) => {
+                let group = if cursor && signs.culhl != 0 {
+                    signs.culhl
+                } else {
+                    *group
+                };
+                let hl = super::model::syntax_hl(base, group);
+                for (cell, t) in cells.iter_mut().zip(text) {
+                    *cell = Cell {
+                        text: t.clone(),
+                        hl,
+                    };
+                }
+            }
+            None => {
+                for cell in cells {
+                    *cell = Cell {
+                        text: Text::Char(' '),
+                        hl: base,
+                    };
+                }
+            }
+        }
+    }
 }
 
 /// Client ids (see `super::model::Model::groups`) of the gutter groups that
@@ -842,10 +970,14 @@ pub fn numbers(
 /// Redraw gutter `drawn` of line `lnum` for the cursor moving from `from` to
 /// `to`: renumber it per [`numbers`] and, when `'cursorline'` numbers the
 /// cursor line, switch the sign and fold groups of the lines left and
-/// entered. A number off the rules' highlight is a sign's `numhl` and keeps
-/// its colours. `None` if the number column is not laid out as the client
-/// would, or a sign is on a line left or entered with `'cursorline'`
-/// numbering, where Neovim blends highlights the client has no id for.
+/// entered. With the line's `signs` (and where they go, [`sign_slots`]),
+/// their slots are drawn afresh ([`paint_signs`]) and a number in their
+/// group follows the rules' group under it. Otherwise a number off the
+/// rules' highlight is a sign's `numhl` and keeps its colours. `None` if the
+/// number column is not laid out as the client would, `signs` are not what
+/// Neovim drew, or a sign the client was not told of is on a line left or
+/// entered with `'cursorline'` numbering, where Neovim blends highlights
+/// the client has no id for.
 pub fn regutter(
     drawn: &[Cell],
     lnum: i64,
@@ -853,10 +985,12 @@ pub fn regutter(
     shape: &Shape,
     rows: i64,
     ids: &Gutter,
+    signs: Option<(&Signs, (usize, usize))>,
 ) -> Option<Vec<Cell>> {
     let numbered = shape.stepping.as_ref()?.cursorline.number;
     let marks = drawn.len().checked_sub(number_width(shape, rows)?)?;
     let at_cursor = lnum == from || lnum == to;
+    let numhl = signs.map_or(0, |(s, _)| s.numhl);
     let mut out = drawn.to_vec();
     if let (Some(was), Some(now)) = (
         numbers(lnum, from, shape, rows, ids),
@@ -867,26 +1001,53 @@ pub fn regutter(
             return None;
         }
         let ruled = cells.iter().zip(&was).all(|(a, b)| a.hl == b.hl);
-        if !ruled && at_cursor && numbered {
+        if !ruled && numhl == 0 && at_cursor && numbered {
             return None;
         }
-        for (cell, n) in cells.iter_mut().zip(now) {
-            cell.text = n.text;
+        for ((cell, n), w) in cells.iter_mut().zip(now).zip(&was) {
             if ruled {
                 cell.hl = n.hl;
+            } else if numhl != 0 && n.hl != w.hl {
+                cell.hl = super::model::syntax_hl(n.hl, numhl);
             }
+            cell.text = n.text;
         }
     }
     if numbered && at_cursor && from != to {
-        // Plain groups on the line left, cursor-line groups on the line
-        // entered; any other highlight is a sign's, so give up.
+        // The slots of signs the client knows, drawn as on the line now;
+        // Neovim's text in them must be theirs.
+        let (at, slots) = match signs {
+            Some((signs, (at, slots))) => {
+                let shown = signs.texts.iter().map(|(t, _)| t.as_slice());
+                let blank = [Text::Char(' '), Text::Char(' ')];
+                for (slot, text) in shown
+                    .chain(std::iter::repeat(&blank[..]))
+                    .take(slots)
+                    .enumerate()
+                {
+                    let cells = out.get(at + 2 * slot..at + 2 * slot + 2)?;
+                    if cells.iter().map(|c| &c.text).ne(text) {
+                        return None;
+                    }
+                }
+                paint_signs(&mut out, signs, (at, slots), lnum == to, ids);
+                (at, slots)
+            }
+            None => (0, 0),
+        };
+        // Elsewhere plain groups on the line left, cursor-line groups on the
+        // line entered; any other highlight is a sign's, so give up.
         let pairs = [(ids.cursor_sign, ids.sign), (ids.cursor_fold, ids.fold)];
         let swaps: Vec<(u32, u32)> = if lnum == from {
             pairs.to_vec()
         } else {
             pairs.iter().map(|&(a, b)| (b, a)).collect()
         };
-        for cell in &mut out[..marks] {
+        let painted = at..at + 2 * slots;
+        for (c, cell) in out[..marks].iter_mut().enumerate() {
+            if painted.contains(&c) {
+                continue;
+            }
             let mut onto = swaps.iter().filter(|(a, _)| *a == cell.hl).map(|(_, b)| *b);
             let first = onto.next()?;
             if onto.any(|b| b != first) {
@@ -3176,6 +3337,9 @@ pub struct Predictor {
     /// Per window, the lines scanned around the view and the decorated runs
     /// among them (see [`Predictor::decorated`]).
     decorated: HashMap<i64, (std::ops::Range<i64>, Vec<std::ops::Range<i64>>)>,
+    /// Per window, the signs of the lines scanned, by line; `None` for those
+    /// the client cannot draw.
+    signs: HashMap<i64, HashMap<i64, Option<Signs>>>,
     /// Per window, the `'scroll'` a counted `<C-d>`/`<C-u>` set and that key's
     /// number; it overrides shapes sent before Neovim took the key.
     scrolls_set: HashMap<i64, (u64, i64)>,
@@ -3398,6 +3562,22 @@ impl Predictor {
                     (int(0), int(1), int(2), runs)
                 {
                     self.decorated.insert(win, (from..to, runs));
+                    // Changes to the signs sent: a line alone has none now.
+                    let signs = self.signs.entry(win).or_default();
+                    if matches!(v.get(5), Some(ValueRef::Boolean(true))) {
+                        signs.clear();
+                    }
+                    let changes = v.get(4).and_then(ValueRef::as_array);
+                    for change in changes.into_iter().flatten().filter_map(ValueRef::as_array) {
+                        let Some(line) = change.first().and_then(redraw::int) else {
+                            continue;
+                        };
+                        match change.get(1..).filter(|rest| !rest.is_empty()) {
+                            Some(rest) => signs.insert(line, Signs::read(rest)),
+                            None => signs.remove(&line),
+                        };
+                    }
+                    signs.retain(|line, _| (from..to).contains(line));
                 }
                 true
             }
@@ -3411,6 +3591,7 @@ impl Predictor {
         self.wants.remove(&win);
         self.pinned.remove(&win);
         self.decorated.remove(&win);
+        self.signs.remove(&win);
         self.scrolls_set.remove(&win);
     }
 
@@ -3422,6 +3603,7 @@ impl Predictor {
         self.facts.clear();
         self.pinned.clear();
         self.decorated.clear();
+        self.signs.clear();
         self.scrolls_set.clear();
         self.base = None;
         self.queue.clear();
@@ -3705,12 +3887,31 @@ impl Predictor {
     }
 
     /// Whether Neovim may draw line `lnum` with more than its coloured text
-    /// (virtual text, signs, sign highlights), which is all the client draws
-    /// for an uncovered line (see [`Predictor::row`]). True if unreported.
+    /// and the signs the client draws ([`Predictor::row`]): virtual text, or
+    /// signs it does not draw. True if unreported.
     pub fn decorated(&self, win: i64, lnum: i64) -> bool {
-        self.decorated.get(&win).is_none_or(|(over, runs)| {
-            !over.contains(&lnum) || runs.iter().any(|r| r.contains(&lnum))
-        })
+        let undrawn = self
+            .signs
+            .get(&win)
+            .is_some_and(|signs| matches!(signs.get(&lnum), Some(None)));
+        undrawn
+            || self.decorated.get(&win).is_none_or(|(over, runs)| {
+                !over.contains(&lnum) || runs.iter().any(|r| r.contains(&lnum))
+            })
+    }
+
+    /// Line `lnum`'s signs in `win`, if it has any the client draws.
+    pub fn signs(&self, win: i64, lnum: i64) -> Option<&Signs> {
+        self.signs.get(&win)?.get(&lnum)?.as_ref()
+    }
+
+    /// [`Predictor::signs`] with where they go in a window of `rows` text
+    /// rows ([`sign_slots`]), if the client can draw them there.
+    pub fn signs_at(&self, win: i64, lnum: i64, rows: i64) -> Option<(&Signs, (usize, usize))> {
+        let shape = self.shapes.get(&win)?;
+        let signs = self.signs(win, lnum)?;
+        let slots = sign_slots(shape, rows)?;
+        signs.drawable(shape).then_some((signs, slots))
     }
 
     /// A key typed while `win` has the cursor, read with its mappings; an
@@ -3825,7 +4026,21 @@ impl Predictor {
         } else {
             Some(self.coloured(win, lnum)?)
         };
-        render(text, shape, lnum, width, look, cursor)
+        let mut row = render(text, shape, lnum, width, look, cursor)?;
+        if let (Some((signs, slots)), Some(ids)) =
+            (self.signs_at(win, lnum, look.rows), look.ids.as_ref())
+        {
+            let numbered = shape.stepping.as_ref().is_some_and(|s| s.cursorline.number);
+            paint_signs(&mut row, signs, slots, numbered && lnum == cursor, ids);
+            if signs.numhl != 0 {
+                let numbers = numbers(lnum, cursor, shape, look.rows, ids).unwrap_or_default();
+                let start = shape.textoff.saturating_sub(numbers.len());
+                for (cell, n) in row.iter_mut().skip(start).zip(numbers) {
+                    cell.hl = super::model::syntax_hl(n.hl, signs.numhl);
+                }
+            }
+        }
+        Some(row)
     }
 }
 
@@ -3935,6 +4150,7 @@ mod tests {
             specialkey: 20,
             whitespace: 21,
             rows: 22,
+            ids: None,
         }
     }
 
@@ -4027,6 +4243,7 @@ mod tests {
                 sections: None,
                 paragraphs: None,
                 smoothscroll: false,
+                foldcolumn: Some(0),
             }),
             ..shape()
         }
@@ -4160,8 +4377,9 @@ mod tests {
             ..numbering((true, true), 4, 30, 0)
         };
         let plain = |n: &str, nr: u32| gutter_row(&format!("   {n}"), &[(16, 1), (14, 2), (nr, 4)]);
-        let again =
-            |row: &[Cell], lnum: i64, shape: &Shape| regutter(row, lnum, (2, 3), shape, 6, &IDS);
+        let again = |row: &[Cell], lnum: i64, shape: &Shape| {
+            regutter(row, lnum, (2, 3), shape, 6, &IDS, None)
+        };
         assert_eq!(again(&plain("  2 ", 11), 0, &both), Some(plain("  3 ", 11)));
         assert_eq!(again(&plain("3   ", 10), 2, &both), Some(plain("  1 ", 11)));
         assert_eq!(again(&plain("  1 ", 12), 3, &both), Some(plain("4   ", 10)));
@@ -4219,10 +4437,14 @@ mod tests {
             ..IDS
         };
         assert_eq!(
-            regutter(&plain("  1 ", 12), 3, (2, 3), &cul, 6, &same),
+            regutter(&plain("  1 ", 12), 3, (2, 3), &cul, 6, &same, None),
             Some(gutter_row("   4   ", &[(16, 1), (14, 2), (13, 4)]))
         );
-        assert_eq!(regutter(&onto, 3, (2, 3), &cul, 6, &same), None, "a sign");
+        assert_eq!(
+            regutter(&onto, 3, (2, 3), &cul, 6, &same, None),
+            None,
+            "a sign"
+        );
         assert_eq!(
             regutter(
                 &gutter_row(" >>  2 ", &[(16, 1), (70, 2), (12, 4)]),
@@ -4230,7 +4452,8 @@ mod tests {
                 (2, 3),
                 &cul,
                 6,
-                &same
+                &same,
+                None
             ),
             Some(gutter_row(" >>  1 ", &[(16, 1), (70, 2), (12, 4)])),
             "a sign on a line neither left nor gone to"
@@ -4241,6 +4464,287 @@ mod tests {
             ..numbering((true, false), 4, 30, 0)
         };
         assert_eq!(again(&plain("  1 ", 10), 0, &nu), Some(plain("  1 ", 10)));
+    }
+
+    #[test]
+    fn a_sign_text_is_two_cells_as_neovim_pads_it() {
+        let cells = |t: &str| sign_cells(t).map(|c| c.to_vec());
+        let c = Text::Char;
+        assert_eq!(cells("W "), Some(vec![c('W'), c(' ')]));
+        assert_eq!(cells(">>"), Some(vec![c('>'), c('>')]));
+        assert_eq!(cells("日"), Some(vec![c('日'), Text::Half]));
+        assert_eq!(
+            cells("e\u{301}x"),
+            Some(vec![Text::Cluster("e\u{301}".into()), c('x')])
+        );
+        for wrong in ["W", "abc", "日x", "\u{1}x", ""] {
+            assert_eq!(cells(wrong), None, "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn the_sign_slots_lie_between_the_fold_and_number_columns() {
+        // 'number' at 'numberwidth' 4 over 30 lines: four number columns.
+        let with = |textoff: usize, fold: Option<usize>| {
+            let s = numbering((true, false), 4, 30, 0);
+            Shape {
+                textoff,
+                stepping: s.stepping.clone().map(|st| Stepping {
+                    foldcolumn: fold,
+                    ..st
+                }),
+                ..s
+            }
+        };
+        assert_eq!(sign_slots(&with(4, Some(0)), 6), Some((0, 0)));
+        assert_eq!(sign_slots(&with(6, Some(0)), 6), Some((0, 1)));
+        assert_eq!(sign_slots(&with(11, Some(3)), 6), Some((3, 2)));
+        assert_eq!(sign_slots(&with(7, Some(0)), 6), None, "a column over");
+        assert_eq!(sign_slots(&with(3, Some(0)), 6), None, "under the numbers");
+        assert_eq!(sign_slots(&with(6, None), 6), None, "an auto fold column");
+        let stc = Shape {
+            plain_gutter: false,
+            ..with(6, Some(0))
+        };
+        assert_eq!(sign_slots(&stc, 6), None, "'statuscolumn'");
+    }
+
+    #[test]
+    fn signs_are_drawn_in_their_groups_over_the_sign_column() {
+        use crate::client::model::syntax_hl;
+        let c = Text::Char;
+        let signs = Signs {
+            texts: vec![
+                ([c('E'), c(' ')], 40),
+                ([c('日'), Text::Half], 0),
+                ([c('+'), c(' ')], 41),
+            ],
+            numhl: 0,
+            culhl: 42,
+            ascii: false,
+        };
+        let texts = |row: &[Cell]| row.iter().map(|x| x.text.clone()).collect::<Vec<_>>();
+        let hls = |row: &[Cell]| row.iter().map(|x| x.hl).collect::<Vec<_>>();
+        // Two slots after a fold column: no room for the third.
+        let mut off = vec![Cell::default(); 7];
+        paint_signs(&mut off, &signs, (1, 2), false, &IDS);
+        assert_eq!(texts(&off[1..5]), [c('E'), c(' '), c('日'), Text::Half]);
+        assert_eq!(
+            hls(&off[1..5]),
+            [syntax_hl(14, 40), syntax_hl(14, 40), 14, 14]
+        );
+        assert_eq!((&off[0], &off[5]), (&Cell::default(), &Cell::default()));
+        // The cursor's line: the cursor-line group in every slot.
+        let mut on = vec![Cell::default(); 7];
+        paint_signs(&mut on, &signs, (1, 2), true, &IDS);
+        assert_eq!(hls(&on[1..5]), [syntax_hl(15, 42); 4]);
+        // Slots past the signs are blank.
+        let one = Signs {
+            texts: signs.texts[..1].to_vec(),
+            culhl: 0,
+            ..signs.clone()
+        };
+        let mut wide = vec![Cell::default(); 6];
+        paint_signs(&mut wide, &one, (0, 3), true, &IDS);
+        assert_eq!(
+            texts(&wide),
+            [c('E'), c(' '), c(' '), c(' '), c(' '), c(' ')]
+        );
+        assert_eq!(
+            hls(&wide),
+            [syntax_hl(15, 40), syntax_hl(15, 40), 15, 15, 15, 15]
+        );
+    }
+
+    #[test]
+    fn signs_come_as_changes_to_those_sent() {
+        let mut p = Predictor::default();
+        let sign = |line: i64, text: &str, hl: i64| -> Value {
+            Value::Array(vec![
+                line.into(),
+                0.into(),
+                0.into(),
+                text.into(),
+                hl.into(),
+            ])
+        };
+        let told = |p: &mut Predictor, (from, to): (i64, i64), changes: Vec<Value>, anew: bool| {
+            let args = vec![
+                1000.into(),
+                from.into(),
+                to.into(),
+                Value::Array(vec![]),
+                Value::Array(changes),
+                anew.into(),
+            ];
+            said(p, "decorated", args);
+        };
+        let numbered = Value::Array(vec![5.into(), 44.into(), 45.into()]);
+        told(
+            &mut p,
+            (0, 20),
+            vec![sign(3, "E ", 40), sign(7, "+ ", 41), numbered],
+            true,
+        );
+        assert_eq!(p.signs(1000, 3).map(|s| s.texts[0].1), Some(40));
+        assert!(!p.decorated(1000, 3), "drawn by the client");
+        assert_eq!(
+            p.signs(1000, 5).map(|s| (s.texts.len(), s.numhl, s.culhl)),
+            Some((0, 44, 45))
+        );
+        // Changes only: a line alone has none now.
+        told(
+            &mut p,
+            (0, 20),
+            vec![Value::Array(vec![3.into()]), sign(9, "日", 0)],
+            false,
+        );
+        assert!(p.signs(1000, 3).is_none());
+        assert_eq!(p.signs(1000, 7).map(|s| s.texts[0].1), Some(41), "kept");
+        assert_eq!(
+            p.signs(1000, 9).map(|s| (s.texts[0].0.clone(), s.ascii)),
+            Some(([Text::Char('日'), Text::Half], false))
+        );
+        // A text the client measures otherwise is left to Neovim until it
+        // changes.
+        told(&mut p, (0, 20), vec![sign(11, "W", 40)], false);
+        assert!(p.signs(1000, 11).is_none());
+        told(&mut p, (0, 20), vec![], false);
+        assert!(p.decorated(1000, 11), "still");
+        // Out of the lines searched, forgotten; afresh, all of them.
+        told(&mut p, (8, 30), vec![], false);
+        assert!(p.signs(1000, 7).is_none());
+        assert!(p.signs(1000, 9).is_some());
+        told(&mut p, (8, 30), vec![], true);
+        assert!(p.signs(1000, 9).is_none());
+        assert!(!p.decorated(1000, 11));
+    }
+
+    #[test]
+    fn a_row_drawn_ahead_wears_its_signs() {
+        use crate::client::model::syntax_hl;
+        let mut p = Predictor::default();
+        // One sign slot before four number columns, 'cursorline' numbering.
+        let gutter = |textoff: usize| Shape {
+            textoff,
+            ..numbering((true, false), 4, 30, 1)
+        };
+        p.shapes.insert(1000, gutter(6));
+        let mut run = lines(1000, 1, 0, &["a", "b", "c"], true);
+        run.push(64.into());
+        said(&mut p, "lines", run);
+        let signed = Value::Array(vec![1.into(), 44.into(), 0.into(), "E ".into(), 40.into()]);
+        let args = vec![
+            1000.into(),
+            0.into(),
+            30.into(),
+            Value::Array(vec![]),
+            Value::Array(vec![signed]),
+            true.into(),
+        ];
+        said(&mut p, "decorated", args);
+        let look = Look {
+            gutter: vec![14, 14, 10, 10, 10, 10],
+            rows: 5,
+            ids: Some(IDS),
+            ..look()
+        };
+        let gutter_of = |row: Vec<Cell>| {
+            let text: String = row[..6]
+                .iter()
+                .map(|x| match &x.text {
+                    Text::Char(ch) => *ch,
+                    _ => '?',
+                })
+                .collect();
+            (text, row[..6].iter().map(|x| x.hl).collect::<Vec<_>>())
+        };
+        let mut off = vec![syntax_hl(14, 40); 2];
+        off.extend([syntax_hl(10, 44); 4]);
+        assert_eq!(
+            gutter_of(p.row(1000, 1, 10, &look, 0).expect("drawn")),
+            ("E   2 ".to_string(), off)
+        );
+        let mut on = vec![syntax_hl(15, 40); 2];
+        on.extend([syntax_hl(13, 44); 4]);
+        assert_eq!(
+            gutter_of(p.row(1000, 1, 10, &look, 1).expect("drawn")),
+            ("E   2 ".to_string(), on),
+            "the cursor on it"
+        );
+        // Without the gutter's groups, or a layout the client can place, as
+        // the rows Neovim drew.
+        let blank = ("    2 ".to_string(), vec![14, 14, 10, 10, 10, 10]);
+        let unknown = Look {
+            ids: None,
+            ..look.clone()
+        };
+        assert_eq!(
+            gutter_of(p.row(1000, 1, 10, &unknown, 0).expect("drawn")),
+            blank
+        );
+        p.shapes.insert(1000, gutter(7));
+        let look = Look {
+            gutter: vec![14, 14, 14, 10, 10, 10, 10],
+            ..look
+        };
+        let row = p.row(1000, 1, 10, &look, 0).expect("drawn");
+        assert_eq!(
+            row[..7].iter().map(|x| x.hl).collect::<Vec<_>>(),
+            look.gutter
+        );
+    }
+
+    /// As [`a_gutter_is_drawn_again_for_the_cursor_moved`], with what the
+    /// agent says of a line's signs.
+    #[test]
+    fn a_gutter_with_signs_the_client_knows_is_drawn_again_for_the_cursor_moved() {
+        use crate::client::model::syntax_hl;
+        // A fold column, two sign slots and four number columns.
+        let cul = Shape {
+            textoff: 9,
+            ..numbering((true, true), 4, 30, 1)
+        };
+        let signs = Signs {
+            texts: vec![([Text::Char('E'), Text::Char(' ')], 40)],
+            numhl: 44,
+            culhl: 0,
+            ascii: true,
+        };
+        let at = Some((&signs, (1, 2)));
+        let hls = |row: &[Cell]| row.iter().map(|x| x.hl).collect::<Vec<_>>();
+        let text = |row: &[Cell]| -> String {
+            row.iter()
+                .map(|x| match x.text {
+                    Text::Char(ch) => ch,
+                    _ => '?',
+                })
+                .collect()
+        };
+        // Entered: cursor-line groups under the sign and its number; Neovim
+        // drew them in highlights of its own (70, 68).
+        let drawn = gutter_row(" E     1 ", &[(16, 1), (70, 2), (14, 2), (68, 4)]);
+        let now = regutter(&drawn, 3, (2, 3), &cul, 6, &IDS, at).expect("entered");
+        assert_eq!(text(&now), " E   4   ");
+        let mut entered = vec![17, syntax_hl(15, 40), syntax_hl(15, 40), 15, 15];
+        entered.extend([syntax_hl(13, 44); 4]);
+        assert_eq!(hls(&now), entered);
+        // Left: plain groups again.
+        let drawn = gutter_row(" E   3   ", &[(17, 1), (71, 2), (15, 2), (69, 4)]);
+        let now = regutter(&drawn, 2, (2, 3), &cul, 6, &IDS, at).expect("left");
+        assert_eq!(text(&now), " E     1 ");
+        let mut left = vec![16, syntax_hl(14, 40), syntax_hl(14, 40), 14, 14];
+        left.extend([syntax_hl(11, 44); 4]);
+        assert_eq!(hls(&now), left);
+        // Neither: renumbered, its own colours kept where the rules agree.
+        let drawn = gutter_row(" E     2 ", &[(16, 1), (70, 2), (14, 2), (68, 4)]);
+        let now = regutter(&drawn, 4, (2, 3), &cul, 6, &IDS, at).expect("neither");
+        assert_eq!((text(&now), hls(&now)), (" E     1 ".into(), hls(&drawn)));
+        // Not the signs Neovim drew, or none known: refused.
+        let other = gutter_row(" +     1 ", &[(16, 1), (70, 2), (14, 2), (68, 4)]);
+        assert_eq!(regutter(&other, 3, (2, 3), &cul, 6, &IDS, at), None);
+        let drawn = gutter_row(" E     1 ", &[(16, 1), (70, 2), (14, 2), (68, 4)]);
+        assert_eq!(regutter(&drawn, 3, (2, 3), &cul, 6, &IDS, None), None);
     }
 
     #[test]
