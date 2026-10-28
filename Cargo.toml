@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["neovim", "nvim", "session", "tmux", "ssh"]
 categories = ["command-line-utilities", "development-tools"]
 # Not needed to build: the README links its images by URL.
-exclude = ["assets/", "tools/", ".github/"]
+exclude = ["assets/", "tools/", ".github/", "CLAUDE.md"]
 
 [dependencies]
 anyhow = "1"
