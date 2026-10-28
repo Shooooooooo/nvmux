@@ -2635,6 +2635,9 @@ impl App {
                             self.floor(upto, now);
                         }
                         self.forget_unsure(now);
+                        // Neovim answers only once it has taken every key
+                        // sent before, so predictions for them may lapse.
+                        self.anim.idle(fenced.seq);
                     }
                     Some(Ask::Ping) | None => {}
                 }
@@ -3066,7 +3069,7 @@ impl App {
             }
         }
         self.forget_unsure(now);
-        self.fence();
+        self.fence(now);
     }
 
     /// Feeds typed keys to the predictions, making any predictable scroll at
@@ -3092,14 +3095,16 @@ impl App {
         }
     }
 
-    /// Sends a fence if the predictions want one ([`predict::Typed`]),
-    /// after all queued keys, so Neovim answers once it has taken them. With
-    /// acks the answer is the agent's key count ([`predict::Sync`]), or -1
-    /// before the agent exists.
-    fn fence(&mut self) {
+    /// Sends a fence if the predictions want one ([`predict::Typed`]) or one
+    /// is past its deadline for a key Neovim may not have taken
+    /// ([`anim::Animator::idle`]); after all queued keys, so Neovim answers
+    /// once it has taken them. With acks the answer is the agent's key count
+    /// ([`predict::Sync`]), or -1 before the agent exists.
+    fn fence(&mut self, now: Instant) {
         let chan = self.chan;
+        let waited = self.anim.waiting().is_some_and(|at| at <= now);
         if let Some(p) = self.predict.as_mut() {
-            if p.wants_fence() {
+            if p.wants_fence() || (waited && !p.typed.fencing()) {
                 let sent = p.typed.fenced();
                 let fenced = p.sync.fenced(p.typed.seq());
                 let ask = match chan.filter(|_| p.acks()) {
@@ -5543,7 +5548,7 @@ impl App {
                 self.asked_at.insert(id, now);
             }
         }
-        self.fence();
+        self.fence(now);
         if self.recheck_at.is_some_and(|at| at <= now) {
             self.recheck_at = None;
             if self.checking {
@@ -5588,11 +5593,19 @@ impl App {
             .flatten()
             .min()
         };
+        // Once, to ask whether Neovim has taken a waiting prediction's key
+        // ([`App::fence`]); its answer wakes the loop after that.
+        let ask = self
+            .predict
+            .as_ref()
+            .filter(|p| !p.typed.fencing())
+            .and_then(|_| self.anim.waiting());
         [
             self.escape_deadline(),
             frame,
             self.recheck_at,
             self.tails_since.map(|since| since + TAILS_WAIT),
+            ask,
         ]
         .into_iter()
         .flatten()
@@ -8895,7 +8908,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scroll_no_ack_covers_is_given_up_at_its_deadline() {
+    fn a_scroll_no_ack_covers_is_given_up_once_neovim_has_taken_its_key() {
         let ms = Duration::from_millis;
         let t1 = Instant::now() + Duration::from_secs(1);
         let mut a = acking(ms(200));
@@ -8903,7 +8916,13 @@ mod tests {
         let made = a.predict.as_ref().expect("predicting").deadline(t1);
         a.frame(made - ms(1));
         assert_eq!(a.anim.ahead(2), (3, 3));
+        calls(&mut a);
+        a.tick(made);
         a.frame(made);
+        assert_eq!(a.anim.ahead(2), (3, 3), "Neovim may be busy");
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        answer(&mut a, fence, Value::from(1), made + ms(400));
+        a.frame(made + ms(400));
         assert_eq!(a.anim.ahead(2), (0, 0), "not heard from");
     }
 
@@ -10419,7 +10438,7 @@ mod tests {
 
     /// Like a scroll ahead, then blind until the next ack.
     #[test]
-    fn no_ack_gives_up_at_the_deadline() {
+    fn no_ack_gives_up_once_neovim_has_taken_the_key() {
         let ms = Duration::from_millis;
         let t1 = Instant::now() + Duration::from_secs(1);
         let mut a = stepping(ms(200));
@@ -10430,10 +10449,47 @@ mod tests {
         assert_eq!(a.wake_at(t1 + ms(1)), Some(until), "woken for it");
         a.frame(until - ms(1));
         assert_eq!(drawn(&a), (0, 1));
+        calls(&mut a);
+        a.tick(until);
         a.frame(until);
+        assert_eq!(drawn(&a), (0, 1), "Neovim may be busy");
+        let fence = request(&calls(&mut a), "nvim_eval", "luaeval");
+        assert_eq!(a.wake_at(until + ms(1)), None, "woken by the answer");
+        let later = until + ms(400);
+        answer(&mut a, fence, Value::from(1), later);
+        a.frame(later);
         assert_eq!(drawn(&a), (0, 0), "given up on");
-        a.keys(b"l", until);
+        a.keys(b"l", later);
         assert_eq!(drawn(&a), (0, 0), "blind till Neovim says");
+    }
+
+    /// One fence asks; keys typed meanwhile go on from the steps.
+    #[test]
+    fn steps_outlive_their_deadline_while_neovim_is_busy() {
+        let ms = Duration::from_millis;
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(ms(200));
+        a.keys(b"l", t1);
+        let until = a.predict.as_ref().expect("predicting").deadline(t1);
+        calls(&mut a);
+        let mut fences = 0;
+        for k in 0..4 {
+            let at = until + ms(300 * k);
+            a.tick(at);
+            a.frame(at);
+            a.keys(b"l", at);
+            fences += calls(&mut a)
+                .iter()
+                .filter(|(id, m, _)| id.is_some() && m == "nvim_eval")
+                .count();
+        }
+        assert_eq!(drawn(&a), (0, 5), "on from the steps");
+        assert_eq!(fences, 1, "asked once");
+        let caught_up = until + ms(1000);
+        ack(&mut a, 5, "llll", "n", (0, 5, 5, 0), caught_up);
+        redraw(&mut a, cursor_to(0, 5), caught_up);
+        assert_eq!(drawn(&a), (0, 5));
+        assert!(a.anim.chain(2).is_none(), "every step made");
     }
 
     #[test]

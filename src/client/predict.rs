@@ -25,7 +25,9 @@
 //! Neovim always wins: an unconfirmed prediction is dropped after two round
 //! trips plus a margin ([`Predictor::deadline`]). Neovim sends no frame while
 //! working through typed-ahead keys, so the agent reports its view moves and
-//! waiting predictions get a fresh deadline.
+//! waiting predictions get a fresh deadline; with acks, one past its deadline
+//! waits until a fence says Neovim has taken its key, however long Neovim is
+//! busy (see `super::anim::Animator::idle`).
 //!
 //! # Acks, motions and typing
 //!
@@ -3223,10 +3225,12 @@ impl Predictor {
         i64::try_from(pages).map_or(MOST_REACH, |p| (p + 2).clamp(2, MOST_REACH))
     }
 
-    /// When a prediction made `now` is dropped unconfirmed: two round trips
-    /// plus [`GRACE`] (or 4× the variation) plus [`LOSS`]. With acks, at least
-    /// the smoothed ack lag plus [`GRACE`] (or 4× its variation), since keys
-    /// typed faster than Neovim takes them wait in its typeahead.
+    /// When a prediction made `now` is dropped unconfirmed (with acks, once
+    /// Neovim has taken its key: see `super::anim::Animator::idle`): two
+    /// round trips plus [`GRACE`] (or 4× the variation) plus [`LOSS`]. With
+    /// acks, at least the smoothed ack lag plus [`GRACE`] (or 4× its
+    /// variation), since keys typed faster than Neovim takes them wait in its
+    /// typeahead.
     pub fn deadline(&self, now: Instant) -> Instant {
         let (srtt, rttvar) = (
             self.srtt.unwrap_or_default(),

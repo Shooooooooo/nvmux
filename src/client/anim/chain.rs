@@ -8,10 +8,11 @@
 //! screen's.
 //!
 //! The agent reports where each key left the cursor. A matching step is
-//! dropped when Neovim's frame for it arrives; a mismatch or timeout drops all
-//! steps. Hidden steps, made only to be checked while a kind of prediction
-//! regains trust (`crate::client::predict::Trust`), are never drawn, nor any
-//! after them.
+//! dropped when Neovim's frame for it arrives; a mismatch drops all steps, and
+//! so does a timeout once Neovim has taken the key (see
+//! `super::Animator::idle`). Hidden steps, made only to be checked while a
+//! kind of prediction regains trust (`crate::client::predict::Trust`), are
+//! never drawn, nor any after them.
 //!
 //! Insert-mode steps (`crate::client::typing`) also keep the edited line's text
 //! and cells, drawn over Neovim's row while the step is drawn; Neovim's ack
@@ -60,9 +61,12 @@ impl Seen {
     }
 }
 
-/// Max keys predicted ahead of Neovim in a window; more means Neovim is not
-/// keeping up or not replying.
-pub const LONGEST: usize = 64;
+/// Max keys predicted ahead of Neovim in a window, only a bound on growth:
+/// a key held while Neovim is busy chains as far as the lines sent ahead go
+/// (see `crate::client::predict::Predictor::reach`). Under
+/// `crate::client::predict`'s `QUEUE`, past which the keys are in doubt and
+/// every step is dropped.
+pub const LONGEST: usize = 256;
 
 /// Predicted steps in the cursor's window, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,7 +111,8 @@ pub struct Step {
     pub insstart: Option<crate::client::predict::Stop>,
     /// Made only to be checked against Neovim; never drawn.
     pub hidden: bool,
-    /// Dropped at this time if Neovim has not answered for the key.
+    /// Dropped at this time if Neovim has not answered for the key, once it
+    /// has taken the key (see `super::Animator::idle`).
     pub until: Instant,
 }
 
@@ -210,9 +215,24 @@ impl Chain {
         self.steps.iter().map(|s| s.seq).collect()
     }
 
-    /// When the first step expires unconfirmed.
-    pub fn until(&self) -> Option<Instant> {
-        self.steps.iter().map(|s| s.until).min()
+    /// When the first step for a key up to `idle` (one Neovim has taken)
+    /// expires unconfirmed.
+    pub fn until(&self, idle: u64) -> Option<Instant> {
+        self.steps
+            .iter()
+            .filter(|s| s.seq <= idle)
+            .map(|s| s.until)
+            .min()
+    }
+
+    /// When the first step for a later key passes its deadline, and the
+    /// client asks Neovim whether it has taken the key.
+    pub fn waiting(&self, idle: u64) -> Option<Instant> {
+        self.steps
+            .iter()
+            .filter(|s| s.seq > idle)
+            .map(|s| s.until)
+            .min()
     }
 
     /// Keep every step until at least `until`, while Neovim reports it is
@@ -302,11 +322,26 @@ mod tests {
         let t = Instant::now();
         let ms = Duration::from_millis;
         let mut c = Chain::new((1000, 0, 0), 0, None);
-        assert_eq!(c.until(), None);
+        assert_eq!(c.until(9), None);
         c.push(step(1, 1, 0, false, t + ms(500)));
         c.push(step(2, 2, 0, false, t + ms(530)));
-        assert_eq!(c.until(), Some(t + ms(500)));
+        assert_eq!(c.until(9), Some(t + ms(500)));
         c.drop_upto(1);
-        assert_eq!(c.until(), Some(t + ms(530)));
+        assert_eq!(c.until(9), Some(t + ms(530)));
+    }
+
+    #[test]
+    fn steps_for_keys_neovim_has_not_taken_wait_for_it() {
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        let mut c = Chain::new((1000, 0, 0), 0, None);
+        c.push(step(1, 1, 0, false, t + ms(500)));
+        c.push(step(2, 2, 0, false, t + ms(530)));
+        assert_eq!((c.until(0), c.waiting(0)), (None, Some(t + ms(500))));
+        assert_eq!(
+            (c.until(1), c.waiting(1)),
+            (Some(t + ms(500)), Some(t + ms(530)))
+        );
+        assert_eq!((c.until(2), c.waiting(2)), (Some(t + ms(500)), None));
     }
 }

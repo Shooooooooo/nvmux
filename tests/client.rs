@@ -2898,6 +2898,75 @@ fn holding_j_past_the_bottom_keeps_up() {
     assert_eq!(top_line(&term.text()), Some(start + 40 - 21), "scrolled");
 }
 
+/// [`holding_j_past_the_bottom_keeps_up`] with Neovim busy for longer than
+/// a prediction's deadline over this link (two round trips and 450 ms).
+#[test]
+fn holding_j_while_neovim_is_busy_keeps_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-busy-j");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-busy-j", SCROLLING, MOTIONS);
+    let start = line_on(term.parser.screen()).expect("the first line");
+    let busy = "vim.defer_fn(function()
+        local t = vim.uv.hrtime()
+        while vim.uv.hrtime() - t < 2.5e9 do end
+      end, 100)";
+    rpc.call(
+        "nvim_exec_lua",
+        vec![busy.into(), Vec::<Value>::new().into()],
+    )
+    .expect("busy");
+    let mut seen: Vec<(Instant, Option<u32>)> = vec![(Instant::now(), Some(start))];
+    let mut typed_at = Vec::new();
+    let mut note = |screen: &vt100::Screen| {
+        let on = line_on(screen);
+        if seen.last().map(|s| s.1) != Some(on) {
+            seen.push((Instant::now(), on));
+        }
+        false
+    };
+    const KEYS: u32 = 90;
+    for k in 0..KEYS {
+        let at = Instant::now();
+        typed_at.push(at);
+        term.type_bytes(b"j");
+        let line = start + k + 1;
+        term.frames(SLOW, |screen| {
+            note(screen);
+            line_on(screen) == Some(line)
+        });
+        term.frames(
+            Duration::from_millis(30).saturating_sub(at.elapsed()),
+            &mut note,
+        );
+    }
+    term.frames(Duration::from_secs(2) + 4 * SLOW, &mut note);
+    let when: Vec<(Duration, Option<u32>)> = seen
+        .iter()
+        .map(|(t, l)| (t.saturating_duration_since(typed_at[0]), *l))
+        .collect();
+    let lines: Vec<u32> = seen.iter().filter_map(|s| s.1).collect();
+    assert_eq!(lines.len(), seen.len(), "every sight a line: {when:?}");
+    assert!(
+        lines.windows(2).all(|w| w[1] == w[0] + 1),
+        "a line at a time, none taken back: {when:?}"
+    );
+    for (k, at) in typed_at.iter().enumerate() {
+        let line = start + k as u32 + 1;
+        let drawn = seen.iter().find(|s| s.1 == Some(line)).map(|s| s.0);
+        assert!(
+            drawn.is_some_and(|d| d < *at + SLOW),
+            "the {}th `j` waited: {when:?}",
+            k + 1
+        );
+    }
+    let at = rpc
+        .call("nvim_win_get_cursor", vec![0.into()])
+        .expect("Neovim's cursor");
+    let line = at.as_array().and_then(|a| a[0].as_u64()).expect("its line");
+    assert_eq!(line, u64::from(start + KEYS), "Neovim's");
+    assert_eq!(line_on(term.parser.screen()), Some(start + KEYS));
+}
+
 /// Type `keys` the client leaves to Neovim: nothing changes within one link
 /// delay, and then Neovim's frame changes the window.
 fn left_to_neovim(term: &mut Terminal, name: &str, keys: &[u8]) {
