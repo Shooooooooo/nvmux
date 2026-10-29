@@ -48,12 +48,21 @@ pub(crate) fn quietly<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Leave a socket at `path` that refuses every connection, like a dead
-/// server's. Not a bound-and-dropped listener: a child forked by a parallel
-/// test could inherit it (on macOS for its whole life, as std cannot create
-/// it close-on-exec atomically) and connects would land in its backlog. A
-/// stream connect to a datagram socket is refused whoever holds it.
+/// server's. A child forked by a parallel test can hold a copy until it
+/// execs, and until then a stream connect fails with `EPROTOTYPE`, which
+/// [`crate::rpc::probe`] reads as inconclusive; so wait for the refusal.
 pub(crate) fn dead_socket(path: &Path) {
     drop(std::os::unix::net::UnixDatagram::bind(path).expect("bind"));
+    let mut last = Ok(());
+    let refused = wait_until(Duration::from_secs(2), || {
+        last = crate::rpc::connect_now(path).map(drop);
+        matches!(&last, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused)
+    });
+    assert!(
+        refused,
+        "a connect to {} still gets {last:?} after 2 s",
+        path.display()
+    );
 }
 
 /// Poll `cond` for up to `within`; returns whether it held.
