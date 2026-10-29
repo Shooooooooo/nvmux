@@ -2512,6 +2512,13 @@ impl Ack {
         })
     }
 
+    /// Whether this ack, for later keys, finds Neovim as `was` did.
+    pub fn unchanged(&self, was: &Ack) -> bool {
+        self.pos == was.pos
+            && (self.buf, self.tick, self.line_count) == (was.buf, was.tick, was.line_count)
+            && (self.width, &self.blanks, self.insstart) == (was.width, &was.blanks, was.insstart)
+    }
+
     /// Layout width of `line`, if measured.
     pub fn width_of(&self, line: i64) -> Option<usize> {
         if line == self.pos.line {
@@ -3515,6 +3522,17 @@ impl Predictor {
     /// [`Sent::once`] for input `seq` as last read; false if no longer kept.
     fn once(&self, seq: u64) -> bool {
         self.queue.iter().any(|s| s.seq == seq && s.once)
+    }
+
+    /// Whether the inputs after `from` up to `to`, all still kept, leave
+    /// window grid `grid` as it was: wheel turns over other windows.
+    pub fn passes(&self, grid: u64, (from, to): (u64, u64)) -> bool {
+        let between = || self.queue.iter().filter(|s| s.seq > from && s.seq <= to);
+        between().count() as u64 == to.saturating_sub(from)
+            && between().all(|s| match &s.input {
+                Input::Wheel(t) => t.grid != grid,
+                Input::Key(_) | Input::Click => false,
+            })
     }
 
     /// Whether every input up to `k` was readable when sent (see

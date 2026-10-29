@@ -217,6 +217,11 @@ impl Chain {
         self.steps.iter().find(|s| s.seq == seq)
     }
 
+    /// The newest step for a key before `seq`.
+    pub fn before(&self, seq: u64) -> Option<&Step> {
+        self.steps.iter().rev().find(|s| s.seq < seq)
+    }
+
     /// Drop the steps up to `seq`, whose frame from Neovim has arrived, and
     /// the lines only they visited.
     pub fn drop_upto(&mut self, seq: u64) {
