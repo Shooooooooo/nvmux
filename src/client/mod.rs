@@ -338,13 +338,13 @@ if predict then
   -- Insstart_orig, reset before each key to `began` (Insstart: the cursor
   -- on entry, or the line start for o and O), except that after the <C-g>u
   -- Neovim's default <C-w>/<C-u> mappings type it `sticks` there, moving
-  -- back only as keys delete before it. Typed characters, <CR> and <Tab>
-  -- move neither; other keys (arrows, clicks, completion), a joined line or
-  -- a re-indent may, so both are unknown (began false) until Insert mode is
-  -- entered again. `entering` is the Normal-mode key that entered it. The
-  -- last Insert key's effect is known only once Neovim has taken it: it
-  -- deleted (rubbed), was typed past the indent (typed_at: line, indent
-  -- end), or was the <C-g> of a pair (ctrl_g).
+  -- back only as keys delete before it. Typed characters, <CR>, <Tab> and
+  -- mouse moves move neither; other keys (arrows, clicks, completion), a
+  -- joined line or a re-indent may, so both are unknown (began false) until
+  -- Insert mode is entered again. `entering` is the Normal-mode key that
+  -- entered it. The last Insert key's effect is known only once Neovim has
+  -- taken it: it deleted (rubbed), was typed past the indent (typed_at:
+  -- line, indent end), or was the <C-g> of a pair (ctrl_g).
   local began, orig, sticks, entering = false, false, false, nil
   local rubbed, typed_at, ctrl_g = false, nil, false
   local function indent_of()
@@ -373,7 +373,7 @@ if predict then
     end
     local still = {}
     for k, rubs in pairs({ ['<BS>'] = true, ['<C-h>'] = true, ['<C-w>'] = true,
-        ['<C-u>'] = true, ['<CR>'] = false, ['<Tab>'] = false }) do
+        ['<C-u>'] = true, ['<CR>'] = false, ['<Tab>'] = false, ['<MouseMove>'] = false }) do
       still[vim.keycode(k)] = rubs
     end
     vim.on_key(function(key, typed)
@@ -1663,6 +1663,11 @@ pub struct App {
     /// The grid a mouse button went down on; its drag and release go there
     /// too.
     pressed: Option<u64>,
+    /// Grid, row and column of the last mouse report sent other than the
+    /// wheel's, from 0, 0, 0 as in Neovim. Neovim drops a move there
+    /// uncounted (`check_multiclick`), so the client, which would count it,
+    /// sends none.
+    pointed: (u64, i64, i64),
     /// Mouse reporting as last set: (on, with motion).
     mouse: (bool, bool),
     dirty: bool,
@@ -1786,6 +1791,7 @@ impl App {
             hold_since: None,
             escape_since: None,
             pressed: None,
+            pointed: (0, 0, 0),
             mouse: (false, false),
             dirty: false,
             last_frame: None,
@@ -3148,7 +3154,8 @@ impl App {
     ///
     /// Beside a centred window's text ([`wide`]), presses and moves are
     /// dropped and the wheel scrolls that window; drags and releases clamp
-    /// to the text's edge so selections are not cut short.
+    /// to the text's edge so selections are not cut short. So is a move to
+    /// where the mouse already is ([`App::pointed`]).
     fn mouse_input(&mut self, m: Mouse, now: Instant) {
         let carried = matches!(m.action, "drag" | "release");
         let (grid, row, col) = if !self.multigrid() {
@@ -3173,6 +3180,13 @@ impl App {
             };
             (grid, m.row as i64 - r0, col)
         };
+        let at = (grid, row.max(0), col.max(0));
+        if m.button != "wheel" {
+            if m.button == "move" && at == self.pointed {
+                return;
+            }
+            self.pointed = at;
+        }
         // Counted as one key, as the agent counts it, before any scroll it
         // predicts (see `predict::Sync`).
         if let Some(p) = self.predict.as_mut() {
@@ -3186,6 +3200,10 @@ impl App {
                     };
                     p.turned(seq, turn, now);
                 }
+                "move" => {
+                    let win = self.model.wins.get(&self.model.cursor.grid).copied();
+                    p.hovered(win, seq, now);
+                }
                 _ => p.sent(seq, None, now),
             }
         }
@@ -3198,6 +3216,7 @@ impl App {
             ("wheel", way @ ("down" | "up" | "right" | "left")) => {
                 self.predict_wheel(grid, way, &m.mods, now);
             }
+            ("move", _) => {}
             _ => {
                 // A click or drag may move the cursor or change mode.
                 if let Some(p) = self.predict.as_mut() {
@@ -3212,8 +3231,8 @@ impl App {
                 Arg::str(m.action),
                 Arg::str(&m.mods),
                 Arg::Int(grid as i64),
-                Arg::Int(row.max(0)),
-                Arg::Int(col.max(0)),
+                Arg::Int(at.1),
+                Arg::Int(at.2),
             ],
         );
     }
@@ -5417,6 +5436,10 @@ impl App {
                     p.typed.clicked();
                     (None, None)
                 }
+                predict::Input::Move => {
+                    p.hover(win);
+                    (None, None)
+                }
             };
             p.remade(seq);
             // Insert mode entered by an unmade key is not known to be plain
@@ -5454,8 +5477,13 @@ impl App {
                     };
                     self.make(grid, command, cause, now)
                 }
-                // Nothing to make yet: a count, or `z` awaiting its second key.
-                (None, _) if matches!(sent.input, predict::Input::Key(_)) => continue,
+                // Nothing to make yet: a count, or `z` awaiting its second key;
+                // or ever, a mouse move.
+                (None, _)
+                    if matches!(sent.input, predict::Input::Key(_) | predict::Input::Move) =>
+                {
+                    continue;
+                }
                 _ => false,
             };
             if let Some(p) = self.predict.as_mut() {
@@ -11094,6 +11122,63 @@ mod tests {
         assert_eq!(a.anim.chain(2).map(chain::Chain::len), Some(1));
         assert!(a.anim.side_left(2).is_none(), "not sideways");
         assert!(!a.predict.as_ref().is_some_and(Predictor::known));
+    }
+
+    /// With `'mousemoveevent'`, moving the mouse while `j` is held sends
+    /// moves between the keys, which Neovim counts as keys but makes nothing
+    /// of. They once left the client blind; an ack ending on one now judges
+    /// the step before it.
+    #[test]
+    fn keys_after_a_mouse_move_are_drawn_ahead() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"j\x1b[<35;5;2Mj", t1);
+        assert_eq!(drawn(&a), (2, 0), "both drawn ahead");
+        let was = a.predict.as_ref().expect("predicting").trust.tally;
+        ack(&mut a, 2, "j<MouseMove>", "n", (1, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(1, 0), t1);
+        assert_eq!(a.anim.chain(2).map(chain::Chain::seqs), Some(vec![3]));
+        assert_eq!(drawn(&a), (2, 0));
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!((tally.made, tally.unjudged), (was.made + 1, was.unjudged));
+        // In Insert mode too.
+        let mut a = typing(Duration::from_millis(200));
+        a.keys(b"a\x1b[<35;5;2Mb", t1);
+        assert_eq!(composed(&mut a)[0], "abline 0");
+    }
+
+    /// Mapped, a move does what its mapping does.
+    #[test]
+    fn a_mapped_mouse_move_waits_for_neovim() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping_with(Duration::from_millis(200), &["<MouseMove>"]);
+        a.keys(b"j\x1b[<35;5;2Mj", t1);
+        assert_eq!(drawn(&a), (1, 0));
+    }
+
+    /// Neovim drops a move to where the last report other than the wheel's
+    /// was, uncounted; the client counted it, putting the counts in doubt.
+    #[test]
+    fn a_mouse_move_to_where_the_mouse_was_is_not_sent() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        let moves = |a: &mut App| {
+            calls(a)
+                .iter()
+                .filter(|(_, m, args)| m == "nvim_input_mouse" && args[0] == Value::from("move"))
+                .count()
+        };
+        let seq = |a: &App| a.predict.as_ref().map(|p| p.typed.seq());
+        a.keys(b"\x1b[<35;5;2M\x1b[<35;5;2M", t1);
+        assert_eq!((moves(&mut a), seq(&a)), (1, Some(1)));
+        a.keys(b"\x1b[<65;5;2M\x1b[<35;5;2M", t1);
+        assert_eq!(
+            (moves(&mut a), seq(&a)),
+            (0, Some(2)),
+            "a turn of the wheel"
+        );
+        a.keys(b"\x1b[<0;7;2M\x1b[<0;7;2m\x1b[<35;7;2M\x1b[<35;8;2M", t1);
+        assert_eq!((moves(&mut a), seq(&a)), (1, Some(5)), "a click");
     }
 
     /// Even with smear: travelling back would show a move no key made.

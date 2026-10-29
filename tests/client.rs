@@ -2967,6 +2967,68 @@ fn holding_j_while_neovim_is_busy_keeps_up() {
     assert_eq!(line_on(term.parser.screen()), Some(start + KEYS));
 }
 
+/// [`holding_j_past_the_bottom_keeps_up`] with the mouse moving between the
+/// keys under `'mousemoveevent'`. Neovim counts each move as a key and
+/// makes nothing of it; the keys after one once waited for its ack.
+#[test]
+fn holding_j_while_the_mouse_moves_keeps_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-hover-j");
+    let setline = format!("{SCROLLING} | set mouse=a mousemoveevent");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-hover-j", &setline, MOTIONS);
+    let start = line_on(term.parser.screen()).expect("the first line");
+    let mut seen: Vec<(Instant, Option<u32>)> = vec![(Instant::now(), Some(start))];
+    let mut typed_at = Vec::new();
+    let mut note = |screen: &vt100::Screen| {
+        let on = line_on(screen);
+        if seen.last().map(|s| s.1) != Some(on) {
+            seen.push((Instant::now(), on));
+        }
+        false
+    };
+    for k in 0..40 {
+        let at = Instant::now();
+        typed_at.push(at);
+        term.type_bytes(b"j");
+        term.type_bytes(format!("\x1b[<35;{};3M", 2 + k % 20).as_bytes());
+        let line = start + k + 1;
+        term.frames(SLOW, |screen| {
+            note(screen);
+            line_on(screen) == Some(line)
+        });
+        term.frames(
+            Duration::from_millis(30).saturating_sub(at.elapsed()),
+            &mut note,
+        );
+    }
+    term.frames(4 * SLOW, &mut note);
+    let when: Vec<(Duration, Option<u32>)> = seen
+        .iter()
+        .map(|(t, l)| (t.saturating_duration_since(typed_at[0]), *l))
+        .collect();
+    let lines: Vec<u32> = seen.iter().filter_map(|s| s.1).collect();
+    assert_eq!(lines.len(), seen.len(), "every sight a line: {when:?}");
+    assert!(
+        lines.windows(2).all(|w| w[1] == w[0] + 1),
+        "a line at a time, none taken back: {when:?}"
+    );
+    for (k, at) in typed_at.iter().enumerate() {
+        let line = start + k as u32 + 1;
+        let drawn = seen.iter().find(|s| s.1 == Some(line)).map(|s| s.0);
+        assert!(
+            drawn.is_some_and(|d| d < *at + SLOW),
+            "the {}th `j` waited: {when:?}",
+            k + 1
+        );
+    }
+    let at = rpc
+        .call("nvim_win_get_cursor", vec![0.into()])
+        .expect("Neovim's cursor");
+    let line = at.as_array().and_then(|a| a[0].as_u64()).expect("its line");
+    assert_eq!(line, u64::from(start) + 40, "Neovim's");
+    assert_eq!(line_on(term.parser.screen()), Some(start + 40));
+}
+
 /// Lines indented 2, 4 or 6 blanks, with a `|` over every other leading
 /// blank drawn as snacks.nvim draws its indent guides: by a decoration
 /// provider, so with no extmark the agent could report.
