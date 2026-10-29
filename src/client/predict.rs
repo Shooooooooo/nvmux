@@ -327,6 +327,14 @@ impl Shape {
         })
     }
 
+    /// Whether the client redraws the gutter for the cursor's line
+    /// ([`regutter`]): Neovim's own, numbered relative to it or by
+    /// `'cursorline'`. A `'statuscolumn'` is left as Neovim drew it.
+    pub fn renumbered(&self) -> bool {
+        let numbered = self.stepping.as_ref().is_some_and(|s| s.cursorline.number);
+        self.plain_gutter && (self.relativenumber || numbered)
+    }
+
     /// For a line sent cut short as `text`, whether the missing rest may
     /// change how `'listchars'` draws its blanks (`trail` if `text` ends
     /// blank, lead settings if it is all blank).

@@ -3029,6 +3029,77 @@ fn holding_j_while_the_mouse_moves_keeps_up() {
     assert_eq!(line_on(term.parser.screen()), Some(start + 40));
 }
 
+/// Relative numbers in a `'statuscolumn'` 4 columns wide, the cursor line's
+/// absolute.
+const NUMBERED: &str = r"set number relativenumber statuscolumn=%=%{v:relnum?v:relnum:v:lnum}\ ";
+
+/// [`line_on`] for a window with [`NUMBERED`]'s gutter.
+fn line_past_gutter(screen: &vt100::Screen) -> Option<u32> {
+    let contents = screen.contents();
+    let top = top_line(contents.lines().next()?.get(4..)?)?;
+    Some(top + u32::from(screen.cursor_position().0))
+}
+
+/// [`holding_j_past_the_bottom_keeps_up`] in a window with a
+/// `'statuscolumn'`, which the client leaves for Neovim to redraw.
+#[test]
+fn holding_j_with_a_statuscolumn_keeps_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-stc-j");
+    let setline = format!("{SCROLLING} | {NUMBERED}");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-stc-j", &setline, MOTIONS);
+    let start = line_past_gutter(term.parser.screen()).expect("the first line");
+    let mut seen: Vec<(Instant, Option<u32>)> = vec![(Instant::now(), Some(start))];
+    let mut typed_at = Vec::new();
+    let mut note = |screen: &vt100::Screen| {
+        let on = line_past_gutter(screen);
+        if seen.last().map(|s| s.1) != Some(on) {
+            seen.push((Instant::now(), on));
+        }
+        false
+    };
+    for k in 0..40 {
+        let at = Instant::now();
+        typed_at.push(at);
+        term.type_bytes(b"j");
+        let line = start + k + 1;
+        term.frames(SLOW, |screen| {
+            note(screen);
+            line_past_gutter(screen) == Some(line)
+        });
+        term.frames(
+            Duration::from_millis(30).saturating_sub(at.elapsed()),
+            &mut note,
+        );
+    }
+    term.frames(4 * SLOW, &mut note);
+    let when: Vec<(Duration, Option<u32>)> = seen
+        .iter()
+        .map(|(t, l)| (t.saturating_duration_since(typed_at[0]), *l))
+        .collect();
+    let lines: Vec<u32> = seen.iter().filter_map(|s| s.1).collect();
+    assert_eq!(lines.len(), seen.len(), "every sight a line: {when:?}");
+    assert!(
+        lines.windows(2).all(|w| w[1] == w[0] + 1),
+        "a line at a time, none taken back: {when:?}"
+    );
+    for (k, at) in typed_at.iter().enumerate() {
+        let line = start + k as u32 + 1;
+        let drawn = seen.iter().find(|s| s.1 == Some(line)).map(|s| s.0);
+        assert!(
+            drawn.is_some_and(|d| d < *at + SLOW),
+            "the {}th `j` waited: {when:?}",
+            k + 1
+        );
+    }
+    let at = rpc
+        .call("nvim_win_get_cursor", vec![0.into()])
+        .expect("Neovim's cursor");
+    let line = at.as_array().and_then(|a| a[0].as_u64()).expect("its line");
+    assert_eq!(line, u64::from(start) + 40, "Neovim's");
+    assert_eq!(line_past_gutter(term.parser.screen()), Some(start + 40));
+}
+
 /// Lines indented 2, 4 or 6 blanks, with a `|` over every other leading
 /// blank drawn as snacks.nvim draws its indent guides: by a decoration
 /// provider, so with no extmark the agent could report.
