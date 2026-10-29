@@ -1816,6 +1816,7 @@ pub fn keys(acks: bool) -> Vec<String> {
         .chain(z)
         .chain(digits)
         .chain(acked.map(String::from))
+        .chain([MOUSE_MOVE.to_string()])
         .collect()
 }
 
@@ -1824,10 +1825,13 @@ pub fn insert_keys() -> Vec<String> {
     INSERT_SCROLLS
         .iter()
         .chain(CTRL_X)
-        .chain(&["<C-x>", "<Esc>", "<C-c>"])
+        .chain(&["<C-x>", "<Esc>", "<C-c>", MOUSE_MOVE])
         .map(|k| k.to_string())
         .collect()
 }
+
+/// A mouse move with no button pressed, as `'mousemoveevent'` reports it.
+const MOUSE_MOVE: &str = "<MouseMove>";
 
 /// The wheel's mapping name for `way` and `mods`, as in [`WHEEL`].
 pub fn wheel(way: &str, mods: &str) -> String {
@@ -2210,6 +2214,16 @@ impl Typed {
         self.clicked();
     }
 
+    /// A mouse move, live or replayed: nothing in any mode, nor to a count
+    /// or command awaiting its next key (Neovim's `plain_vgetc` skips it),
+    /// unless mapped.
+    pub fn hovered(&mut self, mapped: impl Fn(bool, &str) -> bool) {
+        self.lost = mapped(self.inserting(), MOUSE_MOVE);
+        if self.lost {
+            self.other();
+        }
+    }
+
     /// A click, live or replayed: cursor and mode unknown.
     pub fn clicked(&mut self) {
         self.whole = true;
@@ -2510,6 +2524,13 @@ impl Ack {
                 sticks: matches!(v.get(16), Some(ValueRef::Boolean(true))),
             }),
         })
+    }
+
+    /// Whether this ack, for later keys, finds Neovim as `was` did.
+    pub fn unchanged(&self, was: &Ack) -> bool {
+        self.pos == was.pos
+            && (self.buf, self.tick, self.line_count) == (was.buf, was.tick, was.line_count)
+            && (self.width, &self.blanks, self.insstart) == (was.width, &was.blanks, was.insstart)
     }
 
     /// Layout width of `line`, if measured.
@@ -2872,6 +2893,8 @@ pub enum Input {
     Key(Box<str>),
     Wheel(Turn),
     Click,
+    /// A mouse move ([`Typed::hovered`]).
+    Move,
 }
 
 /// A wheel turn as sent, kept so a replay can remake it the same way; `way`
@@ -2887,7 +2910,7 @@ impl Input {
     pub fn key(&self) -> Option<&str> {
         match self {
             Input::Key(key) => Some(key),
-            Input::Wheel(_) | Input::Click => None,
+            Input::Wheel(_) | Input::Click | Input::Move => None,
         }
     }
 }
@@ -3442,8 +3465,7 @@ impl Predictor {
             || (self.acks() && self.sync.wants_fence(self.typed.seq()) && !self.typed.fencing())
     }
 
-    /// Input `seq` sent: `key`, or a mouse report other than the wheel. Kept
-    /// only with acks.
+    /// Input `seq` sent: `key`, or a click. Kept only with acks.
     pub fn sent(&mut self, seq: u64, key: Option<&str>, now: Instant) {
         let input = key.map_or(Input::Click, |k| Input::Key(k.into()));
         self.keep(seq, input, now);
@@ -3452,6 +3474,23 @@ impl Predictor {
     /// Wheel turn `turn` sent as input `seq` at `now`: see [`Predictor::sent`].
     pub fn turned(&mut self, seq: u64, turn: Turn, now: Instant) {
         self.keep(seq, Input::Wheel(turn), now);
+    }
+
+    /// Mouse move `seq` sent while `win` has the cursor: see
+    /// [`Predictor::sent`] and [`Predictor::hover`]. Unless mapped, it is
+    /// made, with nothing to make.
+    pub fn hovered(&mut self, win: Option<i64>, seq: u64, now: Instant) {
+        self.hover(win);
+        self.keep(seq, Input::Move, now);
+        if !self.typed.lost {
+            self.made(seq);
+        }
+    }
+
+    /// A mouse move, read with `win`'s mappings ([`Typed::hovered`]).
+    pub fn hover(&mut self, win: Option<i64>) {
+        let shape = win.and_then(|w| self.shapes.get(&w));
+        self.typed.hovered(mapping(shape, None));
     }
 
     fn keep(&mut self, seq: u64, input: Input, now: Instant) {
@@ -3471,7 +3510,7 @@ impl Predictor {
             self.queue.clear();
         }
         let lost = match input {
-            Input::Key(_) => self.typed.lost,
+            Input::Key(_) | Input::Move => self.typed.lost,
             Input::Wheel(_) => false,
             Input::Click => true,
         };
@@ -3515,6 +3554,19 @@ impl Predictor {
     /// [`Sent::once`] for input `seq` as last read; false if no longer kept.
     fn once(&self, seq: u64) -> bool {
         self.queue.iter().any(|s| s.seq == seq && s.once)
+    }
+
+    /// Whether the inputs after `from` up to `to`, all still kept, leave
+    /// window grid `grid` as it was: mouse moves, and wheel turns over other
+    /// windows.
+    pub fn passes(&self, grid: u64, (from, to): (u64, u64)) -> bool {
+        let between = || self.queue.iter().filter(|s| s.seq > from && s.seq <= to);
+        between().count() as u64 == to.saturating_sub(from)
+            && between().all(|s| match &s.input {
+                Input::Move => !s.lost,
+                Input::Wheel(t) => t.grid != grid,
+                Input::Key(_) | Input::Click => false,
+            })
     }
 
     /// Whether every input up to `k` was readable when sent (see
