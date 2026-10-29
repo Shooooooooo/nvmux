@@ -329,8 +329,8 @@ impl Shape {
 
     /// Whether the client redraws the gutter for the cursor's line
     /// ([`regutter`]): Neovim's own, numbered relative to it or by
-    /// `'cursorline'`. A `'statuscolumn'` can draw anything, so at most it
-    /// is moved (`super::App::patches_of`).
+    /// `'cursorline'`. A `'statuscolumn'` can draw anything: at most its
+    /// number field is redrawn ([`Numbering`]).
     pub fn renumbered(&self) -> bool {
         let numbered = self.stepping.as_ref().is_some_and(|s| s.cursorline.number);
         self.plain_gutter && (self.relativenumber || numbered)
@@ -905,6 +905,150 @@ pub fn regutter(
         }
     }
     Some(out)
+}
+
+/// Where a `'statuscolumn'` shows relative numbers, read off Neovim's rows:
+/// a field at the same columns on every row, blank but for the number, in
+/// that row's number colour. Numbers end at the same column; the cursor's
+/// row shows its line number, or 0, aligned either way. Only this field
+/// depends on the cursor's line: the rest (folds, signs) belongs to lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Numbering {
+    field: std::ops::Range<usize>,
+    end: usize,
+    /// The first column of the cursor row's number if left-aligned, and
+    /// whether it is the line number rather than 0.
+    cursor: (Option<usize>, bool),
+    /// The field's colours above the cursor, below it and on its row.
+    above: Vec<u32>,
+    below: Vec<u32>,
+    at: Vec<u32>,
+}
+
+impl Numbering {
+    /// From the gutters of rows showing lines (`rows`), the cursor on row
+    /// `cursor` and buffer line `line`. `None` unless every row bears it out.
+    pub fn read(rows: &[&[Cell]], cursor: usize, line: i64) -> Option<Self> {
+        let width = rows.first()?.len();
+        let digit = |c: &Cell| matches!(c.text, Text::Char(d) if d.is_ascii_digit());
+        // Whether `n` is a whole run of digits from column `s`, in one colour.
+        let run = |row: &[Cell], s: usize, n: &str| {
+            let cells = row.get(s..s + n.len());
+            cells.is_some_and(|cells| {
+                cells
+                    .iter()
+                    .zip(n.chars())
+                    .all(|(c, d)| c.text == Text::Char(d))
+                    && cells.iter().all(|c| c.hl == cells[0].hl)
+            }) && (s == 0 || !digit(&row[s - 1]))
+                && row.get(s + n.len()).is_none_or(|c| !digit(c))
+        };
+        let away = |r: usize| r.abs_diff(cursor).to_string();
+        let others: Vec<usize> = (0..rows.len()).filter(|&r| r != cursor).collect();
+        if others.is_empty() || rows.iter().any(|row| row.len() != width) {
+            return None;
+        }
+        let end = (1..=width).find(|&e| {
+            others.iter().all(|&r| {
+                let n = away(r);
+                e >= n.len() && run(rows[r], e - n.len(), &n)
+            })
+        })?;
+        let at = rows.get(cursor)?;
+        let (numbered, (s, e)) = [(true, (line + 1).to_string()), (false, "0".to_string())]
+            .into_iter()
+            .find_map(|(numbered, n)| {
+                let starts: Vec<usize> = (0..width).filter(|&s| run(at, s, &n)).collect();
+                let s = starts
+                    .iter()
+                    .copied()
+                    .find(|s| s + n.len() == end)
+                    .or(starts.first().copied())?;
+                Some((numbered, (s, s + n.len())))
+            })?;
+        // Each row's number widened over the blanks either side in its
+        // colour; the field is what all rows share.
+        let mut field = 0..width;
+        for (r, row) in rows.iter().enumerate() {
+            let (s, e) = if r == cursor {
+                (s, e)
+            } else {
+                (end - away(r).len(), end)
+            };
+            let hl = row[s].hl;
+            let blank = |c: &Cell| c.text == Text::Char(' ') && c.hl == hl;
+            let from = (0..s)
+                .rev()
+                .take_while(|&c| blank(&row[c]))
+                .last()
+                .unwrap_or(s);
+            let to = (e..width)
+                .take_while(|&c| blank(&row[c]))
+                .last()
+                .map_or(e, |c| c + 1);
+            field = field.start.max(from)..field.end.min(to);
+        }
+        let inside = |s: usize, e: usize| field.start <= s && e <= field.end;
+        if !inside(s, e) || !others.iter().all(|&r| inside(end - away(r).len(), end)) {
+            return None;
+        }
+        let colours =
+            |r: usize| -> Vec<u32> { rows[r][field.clone()].iter().map(|c| c.hl).collect() };
+        // The commonest colours, the first seen on a tie: a sign's number
+        // colour belongs to its line.
+        let common = |rs: &mut dyn Iterator<Item = usize>| {
+            let mut seen: Vec<(Vec<u32>, usize)> = Vec::new();
+            for r in rs {
+                let c = colours(r);
+                match seen.iter_mut().find(|(s, _)| *s == c) {
+                    Some((_, n)) => *n += 1,
+                    None => seen.push((c, 1)),
+                }
+            }
+            let most = seen.iter().map(|(_, n)| *n).max()?;
+            seen.into_iter().find(|(_, n)| *n == most).map(|(c, _)| c)
+        };
+        let above = common(&mut (0..cursor).rev());
+        let below = common(&mut (cursor + 1..rows.len()));
+        Some(Self {
+            above: above.clone().or_else(|| below.clone())?,
+            below: below.or(above)?,
+            at: colours(cursor),
+            cursor: ((e != end).then_some(s), numbered),
+            end,
+            field,
+        })
+    }
+
+    /// `gutter`, of line `lnum`, with the field showing its number for the
+    /// cursor on line `to`; `None` if the number does not fit.
+    pub fn renumber(&self, gutter: &[Cell], lnum: i64, to: i64) -> Option<Vec<Cell>> {
+        let (colours, n) = match lnum.cmp(&to) {
+            std::cmp::Ordering::Less => (&self.above, (to - lnum).to_string()),
+            std::cmp::Ordering::Greater => (&self.below, (lnum - to).to_string()),
+            std::cmp::Ordering::Equal if self.cursor.1 => (&self.at, (to + 1).to_string()),
+            std::cmp::Ordering::Equal => (&self.at, "0".to_string()),
+        };
+        let start = match self.cursor.0.filter(|_| lnum == to) {
+            Some(s) => s,
+            None => self.end.checked_sub(n.len())?,
+        };
+        if start < self.field.start || start + n.len() > self.field.end {
+            return None;
+        }
+        let mut out = gutter.to_vec();
+        let field = out.get_mut(self.field.clone())?;
+        for (cell, &hl) in field.iter_mut().zip(colours) {
+            *cell = Cell {
+                text: Text::Char(' '),
+                hl,
+            };
+        }
+        for (cell, d) in out[start..].iter_mut().zip(n.chars()) {
+            cell.text = Text::Char(d);
+        }
+        Some(out)
+    }
 }
 
 /// Append a line's cells from display column `shape.leftcol`, at most
@@ -4199,6 +4343,97 @@ mod tests {
         };
         let row = render(plain("x"), &s, 30, 8, &look(), 30).unwrap();
         assert_eq!(text(&row), " 31 x   ", "as it ever was");
+    }
+
+    /// Six `'statuscolumn'` rows as heirline draws them, the cursor on row
+    /// `cursor` and line `line`: a fold column (16) marked on rows `folds`,
+    /// hybrid numbers right-aligned in four columns and a blank (11 above
+    /// the cursor, 12 below, 13 on it), and two sign columns (14).
+    fn heirline(cursor: usize, folds: &[usize], line: i64) -> Vec<Vec<Cell>> {
+        (0..6)
+            .map(|r| {
+                let fold = if folds.contains(&r) { 'v' } else { ' ' };
+                let (n, hl) = match r.cmp(&cursor) {
+                    std::cmp::Ordering::Less => ((cursor - r).to_string(), 11),
+                    std::cmp::Ordering::Greater => ((r - cursor).to_string(), 12),
+                    std::cmp::Ordering::Equal => ((line + 1).to_string(), 13),
+                };
+                gutter_row(&format!("{fold}{n:>4}   "), &[(16, 1), (hl, 5), (14, 2)])
+            })
+            .collect()
+    }
+
+    fn read(rows: &[Vec<Cell>], cursor: usize, line: i64) -> Option<Numbering> {
+        let rows: Vec<&[Cell]> = rows.iter().map(Vec::as_slice).collect();
+        Numbering::read(&rows, cursor, line)
+    }
+
+    /// Only the number field follows the cursor, in the colours Neovim gave
+    /// rows above, below and on it; the folds stay with their lines.
+    #[test]
+    fn a_statuscolumn_is_renumbered_in_its_number_field() {
+        let rows = heirline(3, &[1, 4], 103);
+        let n = read(&rows, 3, 103).expect("read");
+        let moved = heirline(4, &[1, 4], 104);
+        for (r, row) in rows.iter().enumerate() {
+            let lnum = 100 + r as i64;
+            assert_eq!(
+                n.renumber(row, lnum, 104).as_ref(),
+                Some(&moved[r]),
+                "row {r}"
+            );
+        }
+        assert_eq!(
+            n.renumber(&rows[1], 101, 98).map(|r| text(&r)),
+            Some("v   3   ".into()),
+            "below now"
+        );
+        // Neovim's own layout: the cursor's line number left-aligned.
+        let hybrid = |cursor: usize| -> Vec<Vec<Cell>> {
+            (0..4)
+                .map(|r| match r.cmp(&cursor) {
+                    std::cmp::Ordering::Equal => gutter_row(&format!("{:<3} ", r + 1), &[(13, 4)]),
+                    _ => gutter_row(&format!("{:>3} ", r.abs_diff(cursor)), &[(12, 4)]),
+                })
+                .collect()
+        };
+        let n = read(&hybrid(1), 1, 1).expect("left-aligned");
+        assert_eq!(n.renumber(&hybrid(1)[2], 2, 2), Some(hybrid(2)[2].clone()));
+        assert_eq!(
+            n.renumber(&hybrid(1)[1], 1, 2).map(|r| text(&r)),
+            Some("  1 ".into())
+        );
+        // 'relativenumber' alone: 0 on the cursor's line.
+        let zero: Vec<Vec<Cell>> = (0..3usize)
+            .map(|r| gutter_row(&format!("{:>3} ", r.abs_diff(1)), &[(12, 4)]))
+            .collect();
+        let n = read(&zero, 1, 1).expect("zero");
+        assert_eq!(
+            n.renumber(&zero[2], 2, 2).map(|r| text(&r)),
+            Some("  0 ".into())
+        );
+    }
+
+    #[test]
+    fn a_statuscolumn_not_of_relative_numbers_is_not_read() {
+        let absolute: Vec<Vec<Cell>> = (0..3)
+            .map(|r| gutter_row(&format!("{:>3} ", r + 1), &[(10, 4)]))
+            .collect();
+        assert_eq!(read(&absolute, 1, 1), None, "'norelativenumber'");
+        let mut two = heirline(3, &[], 103);
+        two[1][4].hl = 70;
+        assert_eq!(read(&two, 3, 103), None, "a number in two colours");
+        let mut other = heirline(3, &[], 103);
+        other[3] = gutter_row(" >>>    ", &[(16, 1), (13, 5), (14, 2)]);
+        assert_eq!(read(&other, 3, 103), None, "the cursor's row unlike either");
+        assert_eq!(
+            read(&heirline(0, &[], 0)[..1], 0, 0),
+            None,
+            "the cursor's row alone"
+        );
+        // Room for four digits: a fifth does not fit.
+        let n = read(&heirline(3, &[], 103), 3, 103).expect("read");
+        assert_eq!(n.renumber(&heirline(3, &[], 103)[3], 9999, 9999), None);
     }
 
     /// A gutter row of `text`, its cells in runs of the groups in `hls`.

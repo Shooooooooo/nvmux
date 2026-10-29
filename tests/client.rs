@@ -3029,32 +3029,56 @@ fn holding_j_while_the_mouse_moves_keeps_up() {
     assert_eq!(line_on(term.parser.screen()), Some(start + 40));
 }
 
-/// Relative numbers in a `'statuscolumn'` 4 columns wide, the cursor line's
-/// absolute.
-const NUMBERED: &str = r"set number relativenumber statuscolumn=%=%{v:relnum?v:relnum:v:lnum}\ ";
+/// A `'statuscolumn'` 5 columns wide: `*` on every fifth line, then
+/// relative numbers right-aligned in three columns, the cursor line's own.
+const NUMBERED: &str =
+    r"set number relativenumber statuscolumn=%{v:lnum%5?'\ ':'*'}%3{v:relnum?v:relnum:v:lnum}\ ";
+
+/// The buffer line (from 1) on each row of the window (the screen but its
+/// last two rows) with [`NUMBERED`]'s gutter, and its gutter.
+fn numbered_rows(screen: &vt100::Screen) -> Vec<(u16, Option<u32>, String)> {
+    let contents = screen.contents();
+    (0..)
+        .zip(contents.lines().take(usize::from(ROWS - 2)))
+        .map(|(r, row)| {
+            let gutter: String = row.chars().take(5).collect();
+            let text: String = row.chars().skip(5).collect();
+            (r, top_line(&text), gutter)
+        })
+        .collect()
+}
 
 /// [`line_on`] for a window with [`NUMBERED`]'s gutter.
 fn line_past_gutter(screen: &vt100::Screen) -> Option<u32> {
-    let contents = screen.contents();
-    let top = top_line(contents.lines().next()?.get(4..)?)?;
-    Some(top + u32::from(screen.cursor_position().0))
+    let cursor = screen.cursor_position().0;
+    numbered_rows(screen).get(usize::from(cursor))?.1
 }
 
-/// Rows of the window (the screen but its last two rows) whose
-/// [`NUMBERED`] gutter shows a number other than the row's distance from the
-/// cursor's; the cursor's own row and blank gutters are not counted.
+/// Rows with [`NUMBERED`]'s gutter numbered other than Neovim numbers them:
+/// by their distance from the cursor's row, which shows its line's number.
 fn misnumbered(screen: &vt100::Screen) -> Vec<u16> {
     let cursor = screen.cursor_position().0;
-    let contents = screen.contents();
-    let gutters = contents.lines().take(usize::from(ROWS - 2));
-    (0..)
-        .zip(gutters)
-        .filter(|&(r, line)| {
-            let gutter: String = line.chars().take(4).collect();
-            let n = gutter.trim();
-            r != cursor && !n.is_empty() && n.parse() != Ok(r.abs_diff(cursor))
+    let rows = numbered_rows(screen);
+    rows.into_iter()
+        .filter_map(|(r, line, gutter)| {
+            let want = if r == cursor {
+                line?
+            } else {
+                u32::from(r.abs_diff(cursor))
+            };
+            let n = gutter.chars().skip(1).collect::<String>();
+            (n.trim().parse() != Ok(want)).then_some(r)
         })
-        .map(|(r, _)| r)
+        .collect()
+}
+
+/// Rows with [`NUMBERED`]'s `*` on a line it does not mark. A mark missing
+/// is no mistake: a line scrolled in ahead has it once Neovim draws it.
+fn mismarked(screen: &vt100::Screen) -> Vec<u16> {
+    numbered_rows(screen)
+        .into_iter()
+        .filter(|(_, line, gutter)| gutter.starts_with('*') && line.is_some_and(|l| l % 5 != 0))
+        .map(|(r, ..)| r)
         .collect()
 }
 
@@ -3122,23 +3146,29 @@ fn hold_j(
     assert_eq!(line_on(term.parser.screen()), Some(start + keys));
 }
 
-/// [`hold_j`] in a window with a `'statuscolumn'` of relative numbers, which
-/// follow the cursor drawn ahead: none is ever wrong, if missing for rows
-/// Neovim has not numbered.
+/// [`hold_j`] in a window with a `'statuscolumn'` of relative numbers
+/// ([`NUMBERED`]): every frame numbers the rows as Neovim does, and what
+/// else the column shows stays on its line, moving only as the view
+/// scrolls. Moving it all with the cursor once bounced it back.
 #[test]
 fn holding_j_with_a_statuscolumn_keeps_up() {
     require_nvim!();
     let scratch = Scratch::new("client-stc-j");
     let setline = format!("{SCROLLING} | {NUMBERED}");
     let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-stc-j", &setline, MOTIONS);
-    let mut wrong = Vec::new();
+    let (mut wrong, mut moved) = (Vec::new(), Vec::new());
     hold_j(&mut rpc, &mut term, 40, line_past_gutter, |screen| {
         let rows = misnumbered(screen);
         if !rows.is_empty() {
             wrong.push((line_past_gutter(screen), rows));
         }
+        let rows = mismarked(screen);
+        if !rows.is_empty() {
+            moved.push((line_past_gutter(screen), rows));
+        }
     });
     assert_eq!(wrong, [], "lines and rows numbered wrong");
+    assert_eq!(moved, [], "lines and rows marked wrong");
 }
 
 /// Lines indented 2, 4 or 6 blanks, with a `|` over every other leading

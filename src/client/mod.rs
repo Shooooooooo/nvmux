@@ -1513,23 +1513,6 @@ fn drawn_afresh(
     Some(row)
 }
 
-/// The gutter Neovim drew on each row of a window that shows a buffer line,
-/// and a blank one in the gutter's colours ([`predict::Look`]).
-struct Gutters {
-    rows: Vec<Option<Vec<Cell>>>,
-    blank: Vec<Cell>,
-}
-
-impl Gutters {
-    /// Row `r`'s, counted from the window's top; blank where none.
-    fn at(&self, r: i64) -> Vec<Cell> {
-        let drawn = usize::try_from(r)
-            .ok()
-            .and_then(|r| self.rows.get(r)?.as_ref());
-        drawn.unwrap_or(&self.blank).clone()
-    }
-}
-
 /// Where the next predicted cursor step starts ([`App::onward`]): Neovim's
 /// view, the text rectangle in the grid, the window, gutter width and first
 /// display column steps use, the cursor, and the newest step.
@@ -4181,9 +4164,9 @@ impl App {
     /// what Neovim will draw besides the cursor: the typed line; for a
     /// cursor on another line, the gutter ([`predict::regutter`]) and the
     /// `'cursorline'` bar, re-derived from Neovim's last frame (rows it
-    /// cannot derive stay as drawn), or a `'statuscolumn'` of relative
-    /// numbers moved with the cursor; and rows outside Neovim's view, drawn
-    /// afresh.
+    /// cannot derive stay as drawn), or the number field of a
+    /// `'statuscolumn'` of relative numbers; and rows outside Neovim's view,
+    /// drawn afresh.
     fn repaint(&mut self) {
         let mut grids = self.anim.chained();
         if self.predict.as_ref().is_some_and(Predictor::acks) {
@@ -4207,8 +4190,9 @@ impl App {
     /// typed line, the gutter re-derived for the drawn cursor line, and the
     /// moved `'cursorline'` bar ([`model::Derive`]); rows the client brought
     /// into view are drawn afresh ([`drawn_afresh`]). A `'statuscolumn'` of
-    /// relative numbers is moved with the cursor instead. Cursor-line
-    /// drawing is skipped where [`App::redrawn_with`] refuses.
+    /// relative numbers gets its number field redrawn instead
+    /// ([`predict::Numbering`]). Cursor-line drawing is skipped where
+    /// [`App::redrawn_with`] refuses.
     fn patches_of(&mut self, grid: u64) -> Option<BTreeMap<usize, Vec<compose::Patch>>> {
         let view = *self.model.viewports.get(&grid)?;
         let win = *self.model.wins.get(&grid)?;
@@ -4231,19 +4215,16 @@ impl App {
         let decided = redrawn && (shape.renumbered() || cul.is_some_and(|c| c.line));
         let renumbered = decided && shape.renumbered();
         let ahead = self.anim.rows_shown(grid);
-        // A 'statuscolumn' with relative numbers follows the cursor: each row
-        // takes the gutter Neovim drew as far from its own cursor. What
-        // belongs to a line (the cursor line's number, signs, folds) lags a
-        // frame. Rows drawn with the cursor on `to` are right as they are.
-        let follows = redrawn
+        // A 'statuscolumn' of relative numbers gets its number field redrawn
+        // for the cursor drawn; folds and signs stay with their lines, blank
+        // on rows the client drew. Unread, it stays as Neovim drew it.
+        let numbering = (redrawn
             && !shape.plain_gutter
             && shape.relativenumber
-            && to != view.curline
-            && view.one_to_one(h);
-        let gutters = follows
-            .then(|| self.drawn_gutters(grid, rect, &view, shape))
-            .flatten();
-        let shift = view.curline - to + ahead;
+            && (to != view.curline || ahead != 0)
+            && view.one_to_one(h))
+        .then(|| self.numbering(grid, rect, &view, textoff))
+        .flatten();
         // Shared look for the rows drawn afresh, built only where there can
         // be any: rows shown ahead, in a window whose cursor line decides how
         // they are drawn.
@@ -4261,23 +4242,19 @@ impl App {
             // Neovim's cells for the line from the window's first column, and
             // its cursor line when drawn; or the client's.
             let own = usize::try_from(i).ok().filter(|i| *i < h);
-            let by = match own {
-                Some(_) => Some(view.curline),
-                None => match self.anim.kept(grid, i) {
-                    Some(anim::scroll::Kept {
-                        by: anim::scroll::Drawer::Neovim(c),
-                        ..
-                    }) => *c,
-                    Some(_) => None,
-                    None => continue,
-                },
-            };
-            if let Some(g) = gutters.as_ref().filter(|_| by != Some(to)) {
-                let cells = g.at(r as i64 + shift);
-                patches
-                    .entry(row)
-                    .or_default()
-                    .push(compose::Patch { col: left, cells });
+            if let Some(n) = numbering.as_ref() {
+                let gutter = match own {
+                    Some(i) => self.model.grids.get(&grid).map(|g| g.row(top + i)),
+                    None => self.anim.kept(grid, i).map(|k| k.cells.as_slice()),
+                };
+                let gutter = gutter.and_then(|cells| cells.get(..textoff));
+                let renumbered = gutter.and_then(|g| n.renumber(g, line, to).filter(|c| c != g));
+                if let Some(cells) = renumbered {
+                    patches
+                        .entry(row)
+                        .or_default()
+                        .push(compose::Patch { col: left, cells });
+                }
             }
             let (drawn, from): (&[Cell], i64) = match own {
                 Some(i) => {
@@ -4365,31 +4342,23 @@ impl App {
         Some(patches)
     }
 
-    /// The gutters Neovim drew on `grid`'s rows (`rect`, `view`).
-    fn drawn_gutters(
+    /// Where `grid`'s `'statuscolumn'` (`textoff` wide) shows relative
+    /// numbers ([`predict::Numbering`]), read off its rows (`rect`, `view`).
+    fn numbering(
         &self,
         grid: u64,
         rect: (usize, usize, usize, usize),
         view: &model::Viewport,
-        shape: &predict::Shape,
-    ) -> Option<Gutters> {
+        textoff: usize,
+    ) -> Option<predict::Numbering> {
         let (top, bot, left, right) = rect;
         let g = self.model.grids.get(&grid)?;
-        let end = (left + shape.textoff).min(right);
-        let rows = (0..view.lines_shown(bot - top))
-            .map(|r| g.row(top + r).get(left..end).map(<[Cell]>::to_vec))
-            .collect();
-        let look = self.look(grid, rect, view, shape)?;
-        let blank = look
-            .gutter
-            .iter()
-            .take(end - left)
-            .map(|&hl| Cell {
-                text: Text::Char(' '),
-                hl,
-            })
-            .collect();
-        Some(Gutters { rows, blank })
+        let end = (left + textoff).min(right);
+        let rows: Vec<&[Cell]> = (0..view.lines_shown(bot - top))
+            .map(|r| g.row(top + r).get(left..end))
+            .collect::<Option<_>>()?;
+        let cursor = usize::try_from(view.curline - view.topline).ok()?;
+        predict::Numbering::read(&rows, cursor, view.curline)
     }
 
     /// Whether rows of `grid` can be drawn afresh with cursor-line drawing
@@ -4417,9 +4386,9 @@ impl App {
     /// Whether `grid`'s gutter can be redrawn for the cursor on `to`
     /// ([`predict::regutter`]) where the client redraws it
     /// ([`predict::Shape::renumbered`]): every row derivable and no signs
-    /// over numbers. A `'statuscolumn'` can draw anything, so it is not
-    /// redrawn but moved with the cursor or left as drawn
-    /// ([`App::patches_of`]), for Neovim's next frame to fix.
+    /// over numbers. A `'statuscolumn'` can draw anything, so at most its
+    /// number field is redrawn ([`App::patches_of`]); the rest waits for
+    /// Neovim's next frame.
     fn regutters(&self, grid: u64, to: i64) -> bool {
         let shape = self
             .model
@@ -9587,69 +9556,129 @@ mod tests {
         assert_eq!(composed(&mut a)[..5], rows, "past the edge");
     }
 
-    /// With relative numbers a `'statuscolumn'` follows the cursor: each row
-    /// shows the gutter Neovim drew as many rows from its own cursor, in its
-    /// colours, so only the cursor line's own number is behind. Rows with no
-    /// such gutter are blank.
+    /// With relative numbers a `'statuscolumn'` gets its number field redrawn
+    /// for the cursor drawn ([`predict::Numbering`]): here all it shows, so
+    /// the predicted frame is Neovim's next, colours included.
     #[test]
-    fn a_statuscolumn_with_relative_numbers_follows_the_cursor() {
+    fn a_statuscolumn_of_relative_numbers_is_drawn_as_neovim_draws_it_next() {
         let t1 = Instant::now() + Duration::from_secs(1);
         let mut a = statuscolumn(3, true);
-        let mut bar = bar_defined(21, false);
-        bar.push(barred(0));
-        redraw(&mut a, bar, t1);
-        a.keys(b"jj", t1);
-        assert_eq!(drawn(&a), (2, 4), "before Neovim has heard of them");
+        let mut frame = numbers_drawn((2, 0), true, &[]);
+        frame.extend(bar_defined(21, false));
+        frame.push(barred(2));
+        redraw(&mut a, frame, t1);
+        ack(&mut a, 0, "", "n", (2, 0, 0, 0), t1);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (3, 4), "before Neovim has heard of it");
         let predicted = composed_frame(&mut a);
-        let rows = [
-            "    line 0",
-            "    line 1",
-            "1   line 2",
-            "  1 line 3",
-            "  2 line 4",
-        ];
-        assert_eq!(composed(&mut a)[..5], rows);
-        ack(&mut a, 2, "", "n", (2, 0, 0, 0), t1);
-        let mut neovim = numbers_drawn((2, 0), true, &[]);
-        neovim.push(barred(2));
+        ack(&mut a, 1, "j", "n", (3, 0, 0, 0), t1);
+        let mut neovim = numbers_drawn((3, 0), true, &[]);
+        neovim.push(line_hl(2, 2, 4, &format!("{:16}", "line 2"), 0));
+        neovim.push(barred(3));
         redraw(&mut a, neovim, t1);
         assert!(a.anim.chain(2).is_none(), "let go of");
         let drawn_by_neovim = composed_frame(&mut a);
         for r in 0..5 {
             for c in 0..20 {
                 let (p, n) = (predicted.get(r, c), drawn_by_neovim.get(r, c));
-                match (r, c) {
-                    (0 | 1, ..4) => {}
-                    (2, ..4) => assert_eq!(p.map(|o| &o.style), n.map(|o| &o.style)),
-                    _ => assert_eq!(p, n, "row {r}, column {c}"),
-                }
+                assert_eq!(p, n, "row {r}, column {c}");
             }
         }
     }
 
-    /// Past the edge, with Neovim's cursor there already, the gutter stays
-    /// put as the text scrolls ahead under it. So it does for a wheel turn
-    /// pushing the cursor down.
-    #[test]
-    fn a_statuscolumn_with_relative_numbers_stays_put_over_text_scrolled_ahead() {
+    /// Neovim's drawing of [`marked`]'s window with the cursor on `cursor`:
+    /// a 5-column `'statuscolumn'` of a `+` on lines in `marks` (group 14)
+    /// and hybrid numbers right-aligned in 3 columns, then text.
+    fn marked_drawn(cursor: i64, marks: &[i64]) -> Vec<(&'static str, Vec<Value>)> {
+        let n = Value::from;
+        let mut events = Vec::new();
+        for r in 0..5i64 {
+            let (number, hl) = match r.cmp(&cursor) {
+                std::cmp::Ordering::Equal => (r + 1, 13),
+                std::cmp::Ordering::Less => (cursor - r, 11),
+                std::cmp::Ordering::Greater => (r - cursor, 12),
+            };
+            let mark = if marks.contains(&r) { "+" } else { " " };
+            events.push(line_hl(2, r as u64, 0, mark, 14));
+            events.push(line_hl(2, r as u64, 1, &format!("{number:>3} "), hl));
+            events.push(line_hl(
+                2,
+                r as u64,
+                5,
+                &format!("{:15}", format!("line {r}")),
+                0,
+            ));
+        }
+        events.push(("grid_cursor_goto", vec![n(2), n(cursor), n(5)]));
+        events.push((
+            "win_viewport",
+            vec![n(2), n(1000), n(0), n(6), n(cursor), n(0), n(50), n(0)],
+        ));
+        events
+    }
+
+    /// [`stepping`] with [`marked_drawn`]'s `'statuscolumn'` of relative
+    /// numbers, `'scrolljump'` 1 and no decorated lines, drawn and acked
+    /// with the cursor on `cursor`.
+    fn marked(cursor: i64, marks: &[i64]) -> App {
         let t1 = Instant::now() + Duration::from_secs(1);
-        let mut a = statuscolumn(0, true);
-        redraw(&mut a, numbers_drawn((4, 0), false, &[]), t1);
-        ack(&mut a, 0, "", "n", (4, 0, 0, 0), t1);
+        let mut a = stepping(Duration::from_millis(200));
+        let mut shape = shaped(5, (true, true, false), (false, 0), &[], vec![]);
+        shape.extend([
+            false.into(),
+            false.into(),
+            Value::Array(vec![]),
+            1.into(),
+            false.into(),
+        ]);
+        reshape(&mut a, shape, t1);
+        decorated(&mut a, &[], t1);
+        let mut events: Vec<(&str, Vec<Value>)> = GUTTER
+            .iter()
+            .map(|(name, id)| ("hl_group_set", vec![(*name).into(), (*id).into()]))
+            .collect();
+        events.extend(marked_drawn(cursor, marks));
+        redraw(&mut a, events, t1);
+        ack(&mut a, 0, "", "n", (cursor, 0, 0, 0), t1);
+        a
+    }
+
+    /// What else a `'statuscolumn'` of relative numbers shows stays on its
+    /// line: moving in the view moves none of it, as Neovim's next frame
+    /// shows; it scrolls with its line, and a line brought in lacks it until
+    /// Neovim draws it. Moving it all with the cursor once bounced it back.
+    #[test]
+    fn a_statuscolumn_of_relative_numbers_moves_only_with_its_lines() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = marked(2, &[1, 3]);
         a.keys(b"j", t1);
-        assert_eq!((drawn(&a), a.anim.ahead(2)), ((4, 4), (1, 1)));
+        assert_eq!(drawn(&a), (3, 5), "before Neovim has heard of it");
+        let predicted = composed_frame(&mut a);
+        ack(&mut a, 1, "j", "n", (3, 0, 0, 0), t1);
+        redraw(&mut a, marked_drawn(3, &[1, 3]), t1);
+        assert!(a.anim.chain(2).is_none(), "let go of");
+        let drawn_by_neovim = composed_frame(&mut a);
+        for r in 0..5 {
+            for c in 0..20 {
+                let (p, n) = (predicted.get(r, c), drawn_by_neovim.get(r, c));
+                assert_eq!(p, n, "row {r}, column {c}");
+            }
+        }
+        let mut a = marked(4, &[3, 5]);
+        a.keys(b"j", t1);
+        assert_eq!((drawn(&a), a.anim.ahead(2)), ((4, 5), (1, 1)));
         let rows = [
-            "  4 line 1",
-            "  3 line 2",
-            "  2 line 3",
-            "  1 line 4",
-            "5   line 5",
+            "   4 line 1",
+            "   3 line 2",
+            "+  2 line 3",
+            "   1 line 4",
+            "   6 line 5",
         ];
-        assert_eq!(composed(&mut a)[..5], rows);
-        let mut a = statuscolumn(0, true);
+        assert_eq!(composed(&mut a)[..5], rows, "past the edge");
+        let mut a = marked(0, &[1, 3]);
         a.keys(b"\x1b[<65;3;2M", t1);
         assert_eq!(a.anim.ahead(2), (3, 3), "the cursor pushed down");
-        assert_eq!(composed(&mut a)[..2], ["1   line 3", "  1 line 4"]);
+        assert_eq!(composed(&mut a)[..2], ["+  4 line 3", "   1 line 4"]);
     }
 
     /// [`stepping`]'s shape lacks `'scrolljump'` (see [`scrolling`]); a
