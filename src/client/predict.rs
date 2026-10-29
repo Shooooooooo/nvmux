@@ -329,7 +329,8 @@ impl Shape {
 
     /// Whether the client redraws the gutter for the cursor's line
     /// ([`regutter`]): Neovim's own, numbered relative to it or by
-    /// `'cursorline'`. A `'statuscolumn'` is left as Neovim drew it.
+    /// `'cursorline'`. A `'statuscolumn'` can draw anything, so at most it
+    /// is moved (`super::App::patches_of`).
     pub fn renumbered(&self) -> bool {
         let numbered = self.stepping.as_ref().is_some_and(|s| s.cursorline.number);
         self.plain_gutter && (self.relativenumber || numbered)

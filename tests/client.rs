@@ -3040,8 +3040,27 @@ fn line_past_gutter(screen: &vt100::Screen) -> Option<u32> {
     Some(top + u32::from(screen.cursor_position().0))
 }
 
+/// Rows of the window (the screen but its last two rows) whose
+/// [`NUMBERED`] gutter shows a number other than the row's distance from the
+/// cursor's; the cursor's own row and blank gutters are not counted.
+fn misnumbered(screen: &vt100::Screen) -> Vec<u16> {
+    let cursor = screen.cursor_position().0;
+    let contents = screen.contents();
+    let gutters = contents.lines().take(usize::from(ROWS - 2));
+    (0..)
+        .zip(gutters)
+        .filter(|&(r, line)| {
+            let gutter: String = line.chars().take(4).collect();
+            let n = gutter.trim();
+            r != cursor && !n.is_empty() && n.parse() != Ok(r.abs_diff(cursor))
+        })
+        .map(|(r, _)| r)
+        .collect()
+}
+
 /// [`holding_j_past_the_bottom_keeps_up`] in a window with a
-/// `'statuscolumn'`, which the client leaves for Neovim to redraw.
+/// `'statuscolumn'` of relative numbers, which follow the cursor drawn
+/// ahead: none is ever wrong, if missing for rows Neovim has not numbered.
 #[test]
 fn holding_j_with_a_statuscolumn_keeps_up() {
     require_nvim!();
@@ -3051,10 +3070,15 @@ fn holding_j_with_a_statuscolumn_keeps_up() {
     let start = line_past_gutter(term.parser.screen()).expect("the first line");
     let mut seen: Vec<(Instant, Option<u32>)> = vec![(Instant::now(), Some(start))];
     let mut typed_at = Vec::new();
+    let mut wrong = Vec::new();
     let mut note = |screen: &vt100::Screen| {
         let on = line_past_gutter(screen);
         if seen.last().map(|s| s.1) != Some(on) {
             seen.push((Instant::now(), on));
+        }
+        let rows = misnumbered(screen);
+        if !rows.is_empty() {
+            wrong.push((on, rows));
         }
         false
     };
@@ -3098,6 +3122,7 @@ fn holding_j_with_a_statuscolumn_keeps_up() {
     let line = at.as_array().and_then(|a| a[0].as_u64()).expect("its line");
     assert_eq!(line, u64::from(start) + 40, "Neovim's");
     assert_eq!(line_past_gutter(term.parser.screen()), Some(start + 40));
+    assert_eq!(wrong, [], "lines and rows numbered wrong");
 }
 
 /// Lines indented 2, 4 or 6 blanks, with a `|` over every other leading
