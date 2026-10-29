@@ -2797,6 +2797,7 @@ impl App {
         self.tails_since = None;
         self.anim.reset();
         self.anim.take_dropped();
+        self.anim.take_given_up();
         self.flushed = false;
         self.unsettled = false;
         self.placing = 0;
@@ -5034,7 +5035,9 @@ impl App {
         let Some((k, ack)) = self.ack.take() else {
             return;
         };
-        let unmade = self.anim.unmade(k);
+        // Scrolls ahead dropped since the last frame are replayed below.
+        self.forget_dropped();
+        let unmade = self.anim.taken(k);
         for &grid in &unmade {
             tracing::debug!(
                 grid,
@@ -5280,9 +5283,16 @@ impl App {
 
     /// Forgets ([`App::forget`]) steps the animator dropped itself
     /// ([`anim::Animator::take_dropped`]); returns whether there were any.
+    /// Scrolls ahead it dropped ([`anim::Animator::take_given_up`]) are made
+    /// again from the next ack, blind until then.
     fn forget_dropped(&mut self) -> bool {
         let seqs = self.anim.take_dropped();
         self.forget(&seqs);
+        let scrolls = self.anim.take_given_up();
+        if let (Some(p), false) = (self.predict.as_mut(), scrolls.is_empty()) {
+            p.given_up(&scrolls);
+            p.typed.blinded();
+        }
         !seqs.is_empty()
     }
 
@@ -5678,6 +5688,7 @@ impl App {
             self.forget(&seqs);
         }
         self.anim.advance(now);
+        self.forget_dropped();
         self.repaint();
         let (w, h) = self.size;
         self.cards.expire(now);
@@ -9498,6 +9509,82 @@ mod tests {
         );
         assert!(a.anim.chain(2).is_none(), "made");
         assert_eq!((top_row(&a), drawn(&a)), ("line 2".into(), (2, 0)));
+    }
+
+    /// Neovim takes `j`, `j`, `<C-y>`, `j`, `j` at the bottom in one batch
+    /// and scrolls three rows in one frame. Matched by sign, the steps were
+    /// dropped unjudged and remade, the smear sliding from Neovim's cursor
+    /// back to the `k` after them.
+    #[test]
+    fn a_frame_scrolling_back_and_forth_makes_the_steps_it_covers() {
+        let ms = Duration::from_millis;
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(ms(200));
+        let mut s = crate::config::Settings::default();
+        s.effects.smear.enabled = true;
+        s.effects.scroll.enabled = false;
+        s.effects.windows.enabled = false;
+        s.effects.blink.enabled = false;
+        a.anim.set_effects(Effects::from_settings(&s));
+        a.keys(b"4j", t1);
+        ack(&mut a, 2, "4j", "n", (4, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(4, 0), t1);
+        a.keys(b"jj\x19jjk", t1);
+        let t2 = t1 + ms(500);
+        a.frame(t2);
+        assert!(!a.anim.paints_over(), "the smear landed");
+        assert_eq!((top_row(&a), drawn(&a)), ("line 3".into(), (3, 0)));
+        let was = a.predict.as_ref().expect("predicting").trust.tally;
+        ack(&mut a, 7, "j<C-Y>jj", "n", (7, 0, 0, 3), t2);
+        redraw(&mut a, scrolled(0, 3, (7, 0)), t2);
+        assert_eq!(a.anim.chain(2).map(chain::Chain::seqs), Some(vec![8]));
+        assert_eq!(a.anim.ahead(2), (0, 0));
+        assert_eq!((top_row(&a), drawn(&a)), ("line 3".into(), (3, 0)));
+        assert!(!a.anim.paints_over(), "the cursor stays put");
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(
+            (tally.made, tally.unjudged),
+            (was.made + 1, was.unjudged),
+            "judged, not dropped"
+        );
+    }
+
+    /// `<C-e><C-y>` taken in one batch: Neovim's frame scrolls nothing, yet
+    /// their ack finds both scrolls made, and the step after them stays.
+    #[test]
+    fn scrolls_ahead_adding_up_to_nothing_are_made_by_their_ack() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        a.keys(b"\x05\x19j", t1);
+        assert_eq!(drawn(&a), (2, 0));
+        let was = a.predict.as_ref().expect("predicting").trust.tally;
+        ack(&mut a, 2, "<C-E><C-Y>", "n", (1, 0, 0, 0), t1);
+        redraw(&mut a, cursor_to(1, 0), t1);
+        assert_eq!(a.anim.chain(2).map(chain::Chain::seqs), Some(vec![3]));
+        assert_eq!((a.anim.ahead(2), drawn(&a)), ((0, 0), (2, 0)));
+        let tally = a.predict.as_ref().expect("predicting").trust.tally;
+        assert_eq!(tally.unjudged, was.unjudged, "the step after them kept");
+    }
+
+    /// A frame scrolling the other way before Neovim takes two turns of the
+    /// wheel made ahead (a plugin's scroll) gives them up. They once stayed
+    /// marked made, so the next ack's replay skipped them.
+    #[test]
+    fn scrolls_ahead_a_frame_gives_up_are_made_again_from_the_next_ack() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = scrolling(Duration::from_millis(200));
+        let rows: Vec<String> = (5..10).map(|l| format!("line {l}")).collect();
+        let mut events = whole(2, 20, 5, &rows);
+        events.push(("grid_cursor_goto", vec![2.into(), 2.into(), 0.into()]));
+        events.push(at(5, 7, 5));
+        redraw(&mut a, events, t1);
+        ack(&mut a, 0, "", "n", (7, 0, 0, 5), t1);
+        a.keys(b"\x1b[<65;3;2M\x1b[<65;3;2M", t1);
+        assert_eq!(top_row(&a), "line 11");
+        redraw(&mut a, scrolled(5, -1, (7, 0)), t1);
+        assert_eq!(top_row(&a), "line 4", "given up");
+        ack(&mut a, 0, "", "n", (7, 0, 0, 4), t1);
+        assert_eq!(top_row(&a), "line 10", "made again from Neovim's view");
     }
 
     /// Motions alone: scroll keys and the wheel wait for Neovim. Scrolls

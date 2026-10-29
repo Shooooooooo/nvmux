@@ -161,6 +161,9 @@ pub struct Scroll {
     /// received is kept, but it and those after it are drawn only once the
     /// line arrives.
     drawn: usize,
+    /// Client numbers of the inputs behind scrolls ahead dropped unmade (see
+    /// [`Scroll::take_dropped`]).
+    dropped: Vec<u64>,
 }
 
 impl Scroll {
@@ -174,7 +177,7 @@ impl Scroll {
         let mut s = Self::still(rect, true);
         // A new view only has the lines it left, never more than a slide
         // shows.
-        s.scrolled(gone, delta, far, false);
+        s.scrolled(gone, delta, far, false, None);
         s
     }
 
@@ -189,6 +192,7 @@ impl Scroll {
             animate,
             ahead: VecDeque::new(),
             drawn: 0,
+            dropped: Vec::new(),
         }
     }
 
@@ -250,9 +254,62 @@ impl Scroll {
     }
 
     /// Whether Neovim has yet to make a scroll ahead from input `k` or
-    /// earlier.
+    /// earlier. Drawn ones adding up to no move do not count: their frame
+    /// scrolled nothing (see [`Scroll::taken`]).
     pub fn unmade(&self, k: u64) -> bool {
-        self.ahead.iter().any(|a| a.seq.is_some_and(|s| s <= k))
+        let n = self.upto(k);
+        let mut later = self.ahead.iter().skip(n).filter_map(|a| a.seq);
+        !self.even(n) || later.any(|s| s <= k)
+    }
+
+    /// Neovim has taken inputs up to `k`, and its frame for them is in: if
+    /// their scrolls ahead are drawn and add up to no move, as a scroll down
+    /// and back up in one batch does, that frame made them.
+    pub fn taken(&mut self, k: u64) {
+        let n = self.upto(k);
+        if self.even(n) {
+            self.ahead.drain(..n);
+            self.drawn -= n;
+        }
+    }
+
+    /// How many scrolls ahead, oldest first, are for inputs up to `k`.
+    fn upto(&self, k: u64) -> usize {
+        self.ahead
+            .iter()
+            .take_while(|a| a.seq.is_some_and(|s| s <= k))
+            .count()
+    }
+
+    /// Whether the first `n` scrolls ahead are drawn and add up to no move.
+    fn even(&self, n: usize) -> bool {
+        n <= self.drawn && self.ahead.iter().take(n).map(|a| a.rows).sum::<i64>() == 0
+    }
+
+    /// How many scrolls ahead, oldest first, Neovim's scroll by `delta`
+    /// makes: those for inputs up to `judged` and as few more as add up to
+    /// `delta`, back and forth. `None` if none do.
+    fn made_by(&self, delta: i64, judged: Option<u64>) -> Option<usize> {
+        let mut n = judged.map_or(0, |k| self.upto(k));
+        let mut sum: i64 = self.ahead.iter().take(n).map(|a| a.rows).sum();
+        while sum != delta {
+            sum += self.ahead.get(n)?.rows;
+            n += 1;
+        }
+        Some(n)
+    }
+
+    /// Client numbers of the inputs behind scrolls ahead dropped unmade since
+    /// the last call, for the client to make again.
+    pub fn take_dropped(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Drop the scrolls ahead from the `from`th on, unmade.
+    fn drop_from(&mut self, from: usize) {
+        let gone = self.ahead.drain(from..).filter_map(|a| a.seq);
+        self.dropped.extend(gone);
+        self.drawn = self.drawn.min(from);
     }
 
     /// Sequence numbers of the inputs behind the scrolls ahead.
@@ -292,24 +349,41 @@ impl Scroll {
     /// [`leaving`] names). They are kept as Neovim's, and the offset grows by
     /// `delta` less what was already scrolled ahead, which this confirms.
     ///
-    /// Scrolls ahead are confirmed oldest first, as many as `delta` covers
-    /// (Neovim may make two in one redraw). A scroll in the other direction
-    /// was not predicted, so the view first returns to Neovim's.
+    /// Scrolls ahead are confirmed oldest first: those for inputs up to
+    /// `judged`, the last its ack covers (an ack comes before its frame), and
+    /// as few more as add up to `delta`, back and forth (Neovim may make
+    /// several in one redraw). Failing that, as many as `delta` covers one
+    /// way; a scroll the other way was not predicted, so the view first
+    /// returns to Neovim's.
     ///
     /// Only when `predicting` (see [`crate::client::predict::Predictor`]) are
     /// more lines kept than a slide shows.
-    pub fn scrolled(&mut self, gone: impl Into<Gone>, delta: i64, far: usize, predicting: bool) {
+    pub fn scrolled(
+        &mut self,
+        gone: impl Into<Gone>,
+        delta: i64,
+        far: usize,
+        predicting: bool,
+        judged: Option<u64>,
+    ) {
         let gone = gone.into();
-        if self
-            .ahead
-            .front()
-            .is_some_and(|a| a.rows.signum() != delta.signum())
+        let made = self.made_by(delta, judged);
+        if made.is_none()
+            && self
+                .ahead
+                .front()
+                .is_some_and(|a| a.rows.signum() != delta.signum())
         {
             self.give_up();
         }
         let shown = self.shown_ahead();
         // The part of `delta` no scroll ahead predicted.
         let mut left = delta;
+        if let Some(n) = made {
+            self.ahead.drain(..n);
+            self.drawn = self.drawn.saturating_sub(n);
+            left = 0;
+        }
         while left != 0 {
             match self.ahead.front_mut() {
                 Some(a) if a.rows.signum() == left.signum() => {
@@ -332,8 +406,7 @@ impl Scroll {
             // drops the first row at once.
             self.above.clear();
             self.below.clear();
-            self.ahead.clear();
-            self.drawn = 0;
+            self.drop_from(0);
             let rows = if self.animate && far > 0 {
                 far.min(h as usize) as f32 + 1.0
             } else {
@@ -483,7 +556,7 @@ impl Scroll {
                     break;
                 };
                 if landed.is_none() {
-                    self.ahead.truncate(self.drawn);
+                    self.drop_from(self.drawn);
                     let_go = true;
                     break;
                 }
@@ -554,8 +627,7 @@ impl Scroll {
     /// Neovim's.
     pub fn give_up(&mut self) {
         let shown = self.shown_ahead();
-        self.ahead.clear();
-        self.drawn = 0;
+        self.drop_from(0);
         if self.animate {
             self.glide.add(-shown as f32);
             self.shown = self.glide.cells();
@@ -713,7 +785,13 @@ mod tests {
         for (predicting, kept) in [(false, 6), (true, 50)] {
             let mut s = Scroll::still(rect, true);
             for k in 0..10 {
-                s.scrolled(gone(rect, &lines(k * 5..k * 5 + 5), 5), 5, 1, predicting);
+                s.scrolled(
+                    gone(rect, &lines(k * 5..k * 5 + 5), 5),
+                    5,
+                    1,
+                    predicting,
+                    None,
+                );
             }
             assert_eq!(s.above.len(), kept, "predicting: {predicting}");
             let behind = s.offset() as u32;
@@ -748,11 +826,11 @@ mod tests {
     fn a_scroll_on_top_of_a_scroll_carries_on() {
         let mut s = Scroll::new((0, 4, 0, 1), gone((0, 4, 0, 1), &lines(0..4), 2), 2, 1);
         assert_eq!(shows(&s, &lines(2..6)), [1, 2, 3, 4].map(Some));
-        s.scrolled(gone((0, 4, 0, 1), &lines(2..6), 2), 2, 1, false);
+        s.scrolled(gone((0, 4, 0, 1), &lines(2..6), 2), 2, 1, false, None);
         assert_eq!(shows(&s, &lines(4..8)), [1, 2, 3, 4].map(Some));
         // Back again: lines the first scroll put above are found below.
         let mut s = Scroll::new((0, 4, 0, 1), gone((0, 4, 0, 1), &lines(0..4), 2), 2, 1);
-        s.scrolled(gone((0, 4, 0, 1), &lines(2..6), -2), -2, 1, false);
+        s.scrolled(gone((0, 4, 0, 1), &lines(2..6), -2), -2, 1, false, None);
         assert_eq!(s.offset(), 0);
         assert_eq!(shows(&s, &lines(0..4)), [0, 1, 2, 3].map(Some));
     }
@@ -782,7 +860,7 @@ mod tests {
         let mut s = Scroll::still((0, 5, 0, 1), false);
         assert!(s.predict(go(2), &mut fill(10, 99), &mut |_, _| None));
         assert_eq!(shows(&s, &lines(10..15)), [12, 13, 14, 15, 16].map(Some));
-        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 2), 2, 1, true);
+        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 2), 2, 1, true, None);
         assert_eq!(s.ahead(), 0);
         assert_eq!(shows(&s, &lines(12..17)), [12, 13, 14, 15, 16].map(Some));
         assert!(!s.step(0.01, 0.0), "nothing left to do");
@@ -815,14 +893,14 @@ mod tests {
             assert!(s.predict(go(2), &mut fill(0, 99), &mut |_, _| None));
         }
         assert_eq!(shows(&s, &lines(0..8))[0], Some(6));
-        s.scrolled(gone((0, 8, 0, 1), &lines(0..8), 4), 4, 1, true);
+        s.scrolled(gone((0, 8, 0, 1), &lines(0..8), 4), 4, 1, true, None);
         assert_eq!(s.ahead(), 2);
         assert_eq!(
             shows(&s, &lines(4..12))[0],
             Some(6),
             "still where the client put it"
         );
-        s.scrolled(gone((0, 8, 0, 1), &lines(4..12), 2), 2, 1, true);
+        s.scrolled(gone((0, 8, 0, 1), &lines(4..12), 2), 2, 1, true, None);
         assert_eq!(s.ahead(), 0);
         assert_eq!(shows(&s, &lines(6..14))[0], Some(6));
     }
@@ -833,9 +911,9 @@ mod tests {
         s.predict(go(3), &mut fill(10, 99), &mut |_, _| None);
         s.predict(go(-3), &mut fill(10, 99), &mut |_, _| None);
         assert_eq!(shows(&s, &lines(10..15)), [10, 11, 12, 13, 14].map(Some));
-        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 3), 3, 1, true);
+        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 3), 3, 1, true, None);
         assert_eq!(shows(&s, &lines(13..18)), [10, 11, 12, 13, 14].map(Some));
-        s.scrolled(gone((0, 5, 0, 1), &lines(13..18), -3), -3, 1, true);
+        s.scrolled(gone((0, 5, 0, 1), &lines(13..18), -3), -3, 1, true, None);
         assert_eq!(shows(&s, &lines(10..15)), [10, 11, 12, 13, 14].map(Some));
         assert_eq!(s.ahead(), 0);
     }
@@ -844,9 +922,105 @@ mod tests {
     fn a_scroll_the_other_way_takes_the_predictions_with_it() {
         let mut s = Scroll::still((0, 5, 0, 1), false);
         s.predict(go(3), &mut fill(10, 99), &mut |_, _| None);
-        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), -2), -2, 1, true);
+        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), -2), -2, 1, true, None);
         assert_eq!(s.ahead(), 0);
         assert_eq!(shows(&s, &lines(8..13)), [8, 9, 10, 11, 12].map(Some));
+    }
+
+    /// Scrolls ahead for keys 1 to 5, the second back up.
+    fn back_and_forth() -> Scroll {
+        let mut s = Scroll::still((0, 5, 0, 1), false);
+        for (seq, rows) in [(1, 1), (2, -1), (3, 1), (4, 1), (5, 1)] {
+            let go = Ahead {
+                seq: Some(seq),
+                ..go(rows)
+            };
+            assert!(s.predict(go, &mut fill(10, 99), &mut |_, _| None));
+        }
+        assert_eq!(shows(&s, &lines(10..15))[0], Some(13));
+        s
+    }
+
+    /// Neovim's frame for keys 1 to 4 scrolls 2 rows. Taken one way only, it
+    /// once confirmed key 1's scroll and slid the view a row past the rest.
+    #[test]
+    fn a_frame_confirms_scrolls_back_and_forth_by_their_keys() {
+        for judged in [Some(4), None] {
+            let mut s = back_and_forth();
+            s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 2), 2, 1, true, judged);
+            assert!(!s.unmade(4), "{judged:?}");
+            assert_eq!(shows(&s, &lines(12..17))[0], Some(13), "{judged:?}");
+            s.taken(4);
+            assert_eq!(s.seqs(), [5], "{judged:?}");
+        }
+        // Keys 1 to 3: by the key its ack covers, or as few as add up.
+        let mut s = back_and_forth();
+        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 1), 1, 1, true, Some(3));
+        assert_eq!(s.seqs(), [4, 5]);
+        let mut s = back_and_forth();
+        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 1), 1, 1, true, None);
+        assert_eq!(s.seqs(), [2, 3, 4, 5]);
+        assert_eq!(shows(&s, &lines(11..16))[0], Some(13));
+        s.taken(3);
+        assert_eq!(s.seqs(), [4, 5]);
+    }
+
+    /// Neovim's frame for such keys scrolls nothing, so their ack once found
+    /// their scrolls unmade and gave up the window's. Not while one waits for
+    /// its lines: the view would jump.
+    #[test]
+    fn scrolls_ahead_adding_up_to_nothing_are_made_once_taken() {
+        let mut s = back_and_forth();
+        assert!(!s.unmade(2));
+        assert!(s.unmade(3), "a row to make");
+        s.taken(3);
+        assert_eq!(s.seqs(), [1, 2, 3, 4, 5]);
+        s.taken(2);
+        assert_eq!(s.seqs(), [3, 4, 5]);
+        assert_eq!(shows(&s, &lines(10..15))[0], Some(13));
+        assert!(s.take_dropped().is_empty(), "made, not dropped");
+        let mut s = Scroll::still((0, 5, 0, 1), false);
+        for (seq, rows) in [(1, 5), (2, -5)] {
+            let go = Ahead {
+                seq: Some(seq),
+                ..go(rows)
+            };
+            assert!(s.predict(go, &mut fill(10, 16), &mut |_, _| None));
+        }
+        assert!(s.held());
+        assert!(s.unmade(2));
+    }
+
+    /// Their keys once stayed marked made, so the next ack's replay skipped
+    /// them.
+    #[test]
+    fn scrolls_ahead_dropped_unmade_are_told() {
+        let mut s = back_and_forth();
+        s.give_up();
+        assert_eq!(s.take_dropped(), [1, 2, 3, 4, 5]);
+        let mut s = back_and_forth();
+        s.expire(Instant::now() + std::time::Duration::from_secs(61), 5);
+        assert_eq!(s.take_dropped(), [1, 2, 3, 4, 5], "expired");
+        let mut s = back_and_forth();
+        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), -2), -2, 1, true, None);
+        assert_eq!(s.take_dropped(), [1, 2, 3, 4, 5], "a scroll the other way");
+        // Landing out of view lets go of a scroll and those held after it.
+        let mut s = Scroll::still((0, 5, 0, 1), false);
+        let landing = |seq, line| Ahead {
+            seq: Some(seq),
+            land: Some(Land {
+                line,
+                first: false,
+                insert: false,
+            }),
+            ..go(5)
+        };
+        let mut land = |l: Land, _| Some((l.line != 20).then_some((0, 0)));
+        assert!(s.predict(landing(1, 15), &mut fill(10, 99), &mut land));
+        assert!(s.predict(landing(2, 20), &mut fill(10, 19), &mut land));
+        assert!(s.predict(landing(3, 25), &mut fill(10, 19), &mut land));
+        assert!(!s.fill_in(&mut fill(10, 99), &mut land));
+        assert_eq!((s.seqs(), s.take_dropped()), (vec![1], vec![2, 3]));
     }
 
     #[test]
@@ -980,7 +1154,7 @@ mod tests {
         assert!(s.predict(go(5), &mut fill(10, 16), &mut |_, _| None));
         assert!(s.predict(go(1), &mut fill(10, 16), &mut |_, _| None));
         assert_eq!(shows(&s, &lines(10..15)), [10, 11, 12, 13, 14].map(Some));
-        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 5), 5, 1, true);
+        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 5), 5, 1, true, None);
         assert_eq!(s.ahead(), 1);
         assert!(s.held(), "line 20 is still to come");
         assert!(s.fill_in(&mut fill(15, 20), &mut |_, _| None));
@@ -1089,7 +1263,7 @@ mod tests {
         let mut s = Scroll::still((0, 5, 0, 1), false);
         assert!(s.predict(go(8), &mut fill(10, 99), &mut |_, _| None));
         assert_eq!(shows(&s, &lines(10..15)), [18, 19, 20, 21, 22].map(Some));
-        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 8), 8, 1, true);
+        s.scrolled(gone((0, 5, 0, 1), &lines(10..15), 8), 8, 1, true, None);
         assert_eq!(s.ahead(), 0);
         assert_eq!(shows(&s, &lines(18..23)), [18, 19, 20, 21, 22].map(Some));
         assert!(s.predict(go(-8), &mut fill(18, 99), &mut |_, _| None));

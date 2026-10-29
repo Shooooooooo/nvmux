@@ -204,6 +204,8 @@ pub struct Animator {
     /// Client key numbers of steps dropped here unjudged, so the client knows
     /// to redo them (see [`Animator::take_dropped`]).
     dropped: Vec<u64>,
+    /// The same for scrolls ahead (see [`Animator::take_given_up`]).
+    given_up: Vec<u64>,
     motions: HashMap<u64, Motion>,
     /// Text sliding sideways within its window, by grid (see
     /// [`Animator::insets`]).
@@ -239,6 +241,7 @@ impl Animator {
             chains: HashMap::new(),
             patches: HashMap::new(),
             dropped: Vec::new(),
+            given_up: Vec::new(),
             motions: HashMap::new(),
             shifts: HashMap::new(),
             seen: HashMap::new(),
@@ -272,7 +275,9 @@ impl Animator {
     pub fn reset(&mut self) {
         self.smear = Smear::default();
         self.vfx.clear();
-        self.scrolls.clear();
+        for grid in self.scrolls.keys().copied().collect::<Vec<_>>() {
+            self.drop_scroll(grid);
+        }
         self.sides.clear();
         for (_, chain) in self.chains.drain() {
             self.dropped.extend(chain.seqs());
@@ -413,7 +418,7 @@ impl Animator {
     }
 
     /// `judging`: client number of the last key Neovim's reply in this batch
-    /// covers, if any (see [`chain`]).
+    /// covers, if any (see [`chain`], [`Scroll::scrolled`]).
     pub fn after(
         &mut self,
         before: Before,
@@ -426,10 +431,10 @@ impl Animator {
         if !self.moving() {
             self.last = Some(now);
         }
-        for grid in &changes.reshaped {
-            self.scrolls.remove(grid);
-            self.sides.remove(grid);
-            self.motions.remove(grid);
+        for &grid in &changes.reshaped {
+            self.drop_scroll(grid);
+            self.sides.remove(&grid);
+            self.motions.remove(&grid);
         }
         // A window scrolled sideways ahead that scrolls vertically or
         // switches buffer is left to Neovim.
@@ -539,27 +544,33 @@ impl Animator {
                     Some(snap.rect)
                 };
                 if rect != Some(snap.rect) || !drawn {
-                    self.scrolls.remove(&snap.grid);
+                    self.drop_scroll(snap.grid);
                     continue;
                 }
                 match self.scrolls.get_mut(&snap.grid) {
                     Some(s) if s.rect() == snap.rect => {
-                        s.scrolled(snap.gone, snap.delta, far, self.predicting);
+                        s.scrolled(snap.gone, snap.delta, far, self.predicting, judging);
                     }
                     _ if self.effects.scroll.is_some() => {
+                        self.drop_scroll(snap.grid);
                         self.scrolls.insert(
                             snap.grid,
                             Scroll::new(snap.rect, snap.gone, snap.delta, far),
                         );
                     }
-                    _ => {
-                        self.scrolls.remove(&snap.grid);
-                    }
+                    _ => self.drop_scroll(snap.grid),
                 }
             }
             if multigrid {
-                self.scrolls
-                    .retain(|g, _| model.layout.get(g).is_some_and(|p| !p.hidden));
+                let hidden: Vec<u64> = self
+                    .scrolls
+                    .keys()
+                    .filter(|g| model.layout.get(g).is_none_or(|p| p.hidden))
+                    .copied()
+                    .collect();
+                for grid in hidden {
+                    self.drop_scroll(grid);
+                }
             }
         }
 
@@ -608,9 +619,25 @@ impl Animator {
                 s.give_up();
             }
         }
+        self.gather();
 
         // Windows starting to move carry the cursor with them.
         self.cursor_moved(model, drawn && !started && !snap, now);
+    }
+
+    /// Stop scrolling `grid`, its scrolls ahead given up.
+    fn drop_scroll(&mut self, grid: u64) {
+        if let Some(mut s) = self.scrolls.remove(&grid) {
+            s.give_up();
+            self.given_up.extend(s.take_dropped());
+        }
+    }
+
+    /// Collect the scrolls ahead each view dropped ([`Scroll::take_dropped`]).
+    fn gather(&mut self) {
+        for s in self.scrolls.values_mut() {
+            self.given_up.extend(s.take_dropped());
+        }
     }
 
     /// Move the cursor to its new place, animated only if `allowed`.
@@ -658,16 +685,18 @@ impl Animator {
             self.last = Some(now);
         }
         let animate = self.effects.scroll.is_some();
-        let s = match self.scrolls.get_mut(&grid) {
-            Some(s) if s.rect() == rect => s,
-            _ => {
-                self.scrolls.insert(grid, Scroll::still(rect, animate));
-                self.scrolls.get_mut(&grid).expect("just put there")
-            }
-        };
+        if self.scrolls.get(&grid).is_some_and(|s| s.rect() != rect) {
+            self.drop_scroll(grid);
+        }
+        let s = self
+            .scrolls
+            .entry(grid)
+            .or_insert_with(|| Scroll::still(rect, animate));
         let drawn = s.shown_ahead();
         let went = s.predict(go, fill, land);
-        if went && s.shown_ahead() != drawn {
+        let moved = went && s.shown_ahead() != drawn;
+        self.gather();
+        if moved {
             self.cursor_moved(model, true, now);
         }
         went
@@ -822,7 +851,9 @@ impl Animator {
         let Some(s) = self.scrolls.get_mut(&grid) else {
             return;
         };
-        if s.fill_in(fill, land) {
+        let more = s.fill_in(fill, land);
+        self.gather();
+        if more {
             if !self.moving() {
                 self.last = Some(now);
             }
@@ -843,15 +874,29 @@ impl Animator {
         grids
     }
 
+    /// Neovim's frame for client inputs up to `k` is in ([`Scroll::taken`]);
+    /// returns [`Animator::unmade`].
+    pub fn taken(&mut self, k: u64) -> Vec<u64> {
+        for s in self.scrolls.values_mut() {
+            s.taken(k);
+        }
+        self.unmade(k)
+    }
+
     /// Stop scrolling `grid` ahead; returns the client numbers of the inputs
     /// behind the dropped scrolls.
     pub fn give_up(&mut self, grid: u64) -> Vec<u64> {
         let Some(s) = self.scrolls.get_mut(&grid) else {
             return Vec::new();
         };
-        let seqs = s.seqs();
         s.give_up();
-        seqs
+        s.take_dropped()
+    }
+
+    /// Client key numbers of scrolls ahead dropped here since the last call,
+    /// other than by [`Animator::give_up`].
+    pub fn take_given_up(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.given_up)
     }
 
     /// Neovim has taken every key up to client number `k`: a fence sent
@@ -1200,8 +1245,10 @@ impl Animator {
         self.vfx.step(dt);
         let duration = self.effects.scroll.map_or(0.0, |(duration, _)| duration);
         let idle = self.idle;
+        let given_up = &mut self.given_up;
         self.scrolls.retain(|_, s| {
             s.expire(now, idle);
+            given_up.extend(s.take_dropped());
             s.step(dt, duration)
         });
         self.sides
