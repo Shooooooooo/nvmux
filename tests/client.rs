@@ -3058,45 +3058,43 @@ fn misnumbered(screen: &vt100::Screen) -> Vec<u16> {
         .collect()
 }
 
-/// [`holding_j_past_the_bottom_keeps_up`] in a window with a
-/// `'statuscolumn'` of relative numbers, which follow the cursor drawn
-/// ahead: none is ever wrong, if missing for rows Neovim has not numbered.
-#[test]
-fn holding_j_with_a_statuscolumn_keeps_up() {
-    require_nvim!();
-    let scratch = Scratch::new("client-stc-j");
-    let setline = format!("{SCROLLING} | {NUMBERED}");
-    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-stc-j", &setline, MOTIONS);
-    let start = line_past_gutter(term.parser.screen()).expect("the first line");
+/// Holds `j` as [`holding_j_past_the_bottom_keeps_up`] does, `keys` times,
+/// reading the cursor's line with `line_on` and showing `note` every frame:
+/// each must be drawn before Neovim has it, a line at a time, none taken
+/// back, ending where Neovim's cursor is.
+fn hold_j(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    term: &mut Terminal,
+    keys: u32,
+    line_on: fn(&vt100::Screen) -> Option<u32>,
+    mut note: impl FnMut(&vt100::Screen),
+) {
+    let start = line_on(term.parser.screen()).expect("the first line");
     let mut seen: Vec<(Instant, Option<u32>)> = vec![(Instant::now(), Some(start))];
     let mut typed_at = Vec::new();
-    let mut wrong = Vec::new();
-    let mut note = |screen: &vt100::Screen| {
-        let on = line_past_gutter(screen);
+    let mut sees = |screen: &vt100::Screen| {
+        let on = line_on(screen);
         if seen.last().map(|s| s.1) != Some(on) {
             seen.push((Instant::now(), on));
         }
-        let rows = misnumbered(screen);
-        if !rows.is_empty() {
-            wrong.push((on, rows));
-        }
+        note(screen);
         false
     };
-    for k in 0..40 {
+    for k in 0..keys {
         let at = Instant::now();
         typed_at.push(at);
         term.type_bytes(b"j");
         let line = start + k + 1;
         term.frames(SLOW, |screen| {
-            note(screen);
-            line_past_gutter(screen) == Some(line)
+            sees(screen);
+            line_on(screen) == Some(line)
         });
         term.frames(
             Duration::from_millis(30).saturating_sub(at.elapsed()),
-            &mut note,
+            &mut sees,
         );
     }
-    term.frames(4 * SLOW, &mut note);
+    term.frames(4 * SLOW, &mut sees);
     let when: Vec<(Duration, Option<u32>)> = seen
         .iter()
         .map(|(t, l)| (t.saturating_duration_since(typed_at[0]), *l))
@@ -3120,8 +3118,26 @@ fn holding_j_with_a_statuscolumn_keeps_up() {
         .call("nvim_win_get_cursor", vec![0.into()])
         .expect("Neovim's cursor");
     let line = at.as_array().and_then(|a| a[0].as_u64()).expect("its line");
-    assert_eq!(line, u64::from(start) + 40, "Neovim's");
-    assert_eq!(line_past_gutter(term.parser.screen()), Some(start + 40));
+    assert_eq!(line, u64::from(start + keys), "Neovim's");
+    assert_eq!(line_on(term.parser.screen()), Some(start + keys));
+}
+
+/// [`hold_j`] in a window with a `'statuscolumn'` of relative numbers, which
+/// follow the cursor drawn ahead: none is ever wrong, if missing for rows
+/// Neovim has not numbered.
+#[test]
+fn holding_j_with_a_statuscolumn_keeps_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-stc-j");
+    let setline = format!("{SCROLLING} | {NUMBERED}");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-stc-j", &setline, MOTIONS);
+    let mut wrong = Vec::new();
+    hold_j(&mut rpc, &mut term, 40, line_past_gutter, |screen| {
+        let rows = misnumbered(screen);
+        if !rows.is_empty() {
+            wrong.push((line_past_gutter(screen), rows));
+        }
+    });
     assert_eq!(wrong, [], "lines and rows numbered wrong");
 }
 
@@ -4385,18 +4401,52 @@ fn random_scrolls_and_motions_draw_the_bar_as_neovim_does() {
     );
 }
 
-/// `j` past the bottom and `k` past the top: a line with a sign or
-/// virtual text (end-of-line or overlay) is never scrolled in without it.
+/// [`GUIDED`]'s lines with guides that stay as extmarks over their leading
+/// blanks, as indent-blankline sets them, a sign on every fifth line and
+/// end-of-line virtual text on every fifth line after.
+const MARKED: &str = "set signcolumn=yes | call setline(1, map(range(1, 300), \
+     'repeat(\" \", 2 + 2 * (v:val % 3)) . \"line \" . v:val')) \
+     | lua local api, ns = vim.api, vim.api.nvim_create_namespace('marks') \
+     vim.fn.sign_define('S', { text = '>>' }) \
+     for l = 24, 70, 5 do vim.fn.sign_place(0, 'g', 'S', '%', { lnum = l }) end \
+     for l = 25, 70, 5 do api.nvim_buf_set_extmark(0, ns, l, 0, \
+     { virt_text = { { 'E: oops', 'Error' } } }) end \
+     for l = 0, 299 do \
+     for c = 0, #api.nvim_buf_get_lines(0, l, l + 1, false)[1]:match('^ *') - 1, 2 do \
+     api.nvim_buf_set_extmark(0, ns, l, c, { virt_text = { { '|' } }, virt_text_pos = 'overlay' }) \
+     end end";
+
+/// [`hold_j`] past lines with signs, end-of-line virtual text and virtual
+/// text over blanks ([`MARKED`]): they are scrolled in at once, their marks
+/// coming with Neovim's frame. Every `j` past the bottom once waited.
 #[test]
-fn lines_with_signs_or_virtual_text_are_not_scrolled_into_view_without_them() {
+fn holding_j_past_signs_and_virtual_text_keeps_up() {
+    require_nvim!();
+    let scratch = Scratch::new("client-marks-j");
+    let (mut rpc, mut term, _) = drawn_slowly_with(&scratch, "client-marks-j", MARKED, MOTIONS);
+    assert!(
+        term.text().contains("| | line 1"),
+        "guided:\n{}",
+        term.text()
+    );
+    hold_j(&mut rpc, &mut term, 40, guided_line_on, |_| {});
+    let text = term.text();
+    assert!(
+        text.contains(">>| line 39") && text.contains("line 41 E: oops"),
+        "marked by Neovim:\n{text}"
+    );
+}
+
+/// `j` past the bottom and `k` past the top: a line whose virtual text moves
+/// or covers its text is never scrolled in without it.
+#[test]
+fn lines_whose_virtual_text_moves_or_covers_text_are_not_scrolled_in_without_it() {
     require_nvim!();
     let setline = format!(
-        "set signcolumn=yes | {SCROLLING} | \
+        "{SCROLLING} | \
          exe 'lua local api, ns = vim.api, vim.api.nvim_create_namespace(\"t\") \
-         vim.fn.sign_define(\"S\", {{ text = \">>\" }}) \
-         for l = 24, 70, 5 do vim.fn.sign_place(0, \"g\", \"S\", \"%\", {{ lnum = l }}) end \
-         for l = 26, 70, 5 do api.nvim_buf_set_extmark(0, ns, l, 0, \
-         {{ virt_text = {{ {{ \"E: oops\", \"Error\" }} }} }}) end \
+         for l = 26, 70, 5 do api.nvim_buf_set_extmark(0, ns, l, 4, \
+         {{ virt_text = {{ {{ \"<i>\", \"Error\" }} }}, virt_text_pos = \"inline\" }}) end \
          for l = 28, 70, 5 do api.nvim_buf_set_extmark(0, ns, l, 0, \
          {{ virt_text = {{ {{ \"XX\", \"Error\" }} }}, virt_text_pos = \"overlay\" }}) end'"
     );
@@ -4404,7 +4454,7 @@ fn lines_with_signs_or_virtual_text_are_not_scrolled_into_view_without_them() {
     keys.extend((0..40).map(|_| (b"j".to_vec(), "j".to_string())));
     keys.push((b"H".to_vec(), "H".into()));
     keys.extend((0..30).map(|_| (b"k".to_vec(), "k".to_string())));
-    sights_are_neovims("client-signs", &setline, MOTIONS, &keys, Lcg(9));
+    sights_are_neovims("client-hiding", &setline, MOTIONS, &keys, Lcg(9));
 }
 
 /// Type `keys` (terminal bytes, Neovim name) in `rng`-timed bursts over a

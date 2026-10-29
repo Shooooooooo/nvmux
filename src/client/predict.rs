@@ -3765,9 +3765,10 @@ impl Predictor {
         self.pinned.get(&win).is_none_or(|l| l.contains(&lnum))
     }
 
-    /// Whether Neovim may draw line `lnum` with more than its coloured text
-    /// (virtual text, signs, sign highlights), which is all the client draws
-    /// for an uncovered line (see [`Predictor::row`]). True if unreported.
+    /// Whether Neovim may draw line `lnum`'s text moved or partly hidden by
+    /// virtual text (inline, right-aligned, at a window column, or overlaid
+    /// on more than blanks), which the client cannot lay out for an
+    /// uncovered line (see [`Predictor::row`]). True if unreported.
     pub fn decorated(&self, win: i64, lnum: i64) -> bool {
         self.decorated.get(&win).is_none_or(|(over, runs)| {
             !over.contains(&lnum) || runs.iter().any(|r| r.contains(&lnum))

@@ -1110,23 +1110,35 @@ if predict then
         blanks[#blanks + 1] = { view.topline + i - 2, vim.fn.virtcol({ view.topline + i - 1, #l }) }
       end
     end
-    -- Lines around the view with virtual text, signs or sign highlights,
-    -- which the client leaves to Neovim when scrolling ahead
-    -- (predict::Predictor::decorated): half-open runs plus the range
-    -- searched, cut at the last mark when a kind hits the 1000 limit. Sent
-    -- before the ack, when changed.
+    -- Lines around the view whose virtual text moves or may hide text
+    -- (inline, right-aligned, at a window column, overlaid on more than
+    -- blanks), which the client leaves to Neovim when scrolling ahead
+    -- (predict::Predictor::decorated); signs and other virtual text are just
+    -- drawn late. Half-open runs plus the range searched, cut at the last
+    -- mark at the 1000 limit. Sent before the ack, when changed.
     local m = math.min(reach * api.nvim_win_get_height(win) + 10, 1000)
     local from = math.max(view.topline - 1 - m, 0)
     local to = math.min(vim.fn.line('w$') + m, api.nvim_buf_line_count(buf))
-    local rows = {}
-    for _, kind in ipairs({ 'virt_text', 'sign' }) do
-      local marks = api.nvim_buf_get_extmarks(buf, -1, { from, 0 }, { math.max(to - 1, 0), -1 },
-        { type = kind, limit = 1000 })
-      if #marks >= 1000 then
-        to = math.min(to, marks[#marks][2] + 1)
+    local marks = api.nvim_buf_get_extmarks(buf, -1, { from, 0 }, { math.max(to - 1, 0), -1 },
+      { type = 'virt_text', details = true, limit = 1000 })
+    if #marks >= 1000 then
+      to = math.min(to, marks[#marks][2] + 1)
+    end
+    local rows, texts = {}, {}
+    for _, mark in ipairs(marks) do
+      local l, d = mark[2], mark[4]
+      local pos = d.virt_text_pos
+      local hides = pos ~= 'eol' and pos ~= 'eol_right_align'
+      if pos == 'overlay' then
+        local w = 0
+        for _, chunk in ipairs(d.virt_text or {}) do
+          w = w + api.nvim_strwidth(chunk[1] or '')
+        end
+        texts[l] = texts[l] or api.nvim_buf_get_lines(buf, l, l + 1, false)[1] or ''
+        hides = texts[l]:sub(mark[3] + 1, mark[3] + w):find('%S') ~= nil
       end
-      for _, m in ipairs(marks) do
-        rows[#rows + 1] = m[2]
+      if hides then
+        rows[#rows + 1] = l
       end
     end
     table.sort(rows)
@@ -3569,9 +3581,10 @@ impl App {
 
     /// Whether line `l`, shown by a scroll ahead, is laid out as Neovim
     /// would: in Neovim's view it is Neovim's; out of it, the client must
-    /// have it whole with no virtual text or signs
+    /// have it whole with no virtual text moving or hiding its text
     /// ([`Predictor::decorated`]) and no concealing
-    /// ([`predict::Stepping::concealing`]).
+    /// ([`predict::Stepping::concealing`]). Its signs and other virtual text
+    /// come with Neovim's frame.
     fn brought<'a>(&self, on: &Onward, l: i64, text: &dyn Fn(i64) -> Option<&'a str>) -> bool {
         let Some((p, _, _, stepping)) = self.stepped_by(on.win) else {
             return false;
