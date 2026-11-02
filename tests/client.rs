@@ -6119,6 +6119,40 @@ fn a_window_coming_in_has_its_width_from_its_first_frame() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// Regression: Neovim takes an ask for a grid only while its window is on
+/// the current tab page. One asked as the tab page was left was dropped,
+/// and the window came back with its text at its edge, the client taking
+/// it for narrowed. One command leaves the tab page while the client's ask,
+/// made for the switch it draws, waits behind it.
+#[test]
+fn a_window_whose_ask_its_tab_page_lost_comes_back_centred() {
+    require_nvim!();
+    let scratch = Scratch::new("client-tab-lost");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-tab-lost");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    let long = long_lines(&mut term, &mut rpc);
+    rpc.command(&format!("buffer {long}"))
+        .expect("the long lines");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |s| s.starts_with('x')),
+        "not the whole width:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(500), |_| false);
+    rpc.command("buffer 1 | redraw | tabnew")
+        .expect("back, and another tab page");
+    term.pump_until(Duration::from_millis(500), |_| false);
+    rpc.command("tabprevious").expect("the first tab page");
+    // Row 0 is the tab line.
+    let seen = columns_seen(&mut term, Duration::from_millis(800), 1, "the left window");
+    assert_eq!(seen, [50]);
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// While a UI without `ext_multigrid` is attached, the client re-attaches
 /// without it and releases its narrowed windows; once that UI goes, it
 /// narrows them again.

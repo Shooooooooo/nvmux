@@ -2942,6 +2942,13 @@ impl App {
                     self.cut.remove(grid);
                     self.unanswered.remove(grid);
                 }
+                // Neovim takes an ask only for a window on the current tab
+                // page, so one unanswered as its window is hidden may be lost:
+                // it is asked again once the window is shown.
+                Event::WinHide { grid } if self.unanswered.contains_key(grid) => {
+                    self.unanswered.remove(grid);
+                    self.narrowed.remove(grid);
+                }
                 _ => {}
             }
         }
@@ -12921,6 +12928,45 @@ mod tests {
         assert!(grids_asked(&calls(&mut a)).is_empty(), "still waiting");
         a.tick(t1 + AHEAD_WAIT);
         assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
+    }
+
+    /// Neovim takes an ask only for a window on the current tab page; one
+    /// still unanswered as its tab page is left may be lost. One whose answer
+    /// came is not asked again.
+    #[test]
+    fn an_ask_unanswered_as_its_window_is_hidden_is_asked_again() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        let back = || {
+            vec![
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                line(2, 0, "text"),
+            ]
+        };
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+                line(2, 0, "text"),
+            ],
+            t0,
+        );
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(8), n(0)]]);
+        redraw(&mut a, vec![("win_hide", vec![n(2)])], t0);
+        redraw(&mut a, back(), t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(8), n(0)]]);
+        a.screen.invalidate();
+        assert_eq!(shown(&mut a, t0)[0], "      text", "in its middle");
+
+        redraw(&mut a, vec![resize(2, 8, 5), line(2, 0, "text")], t0);
+        redraw(&mut a, vec![("win_hide", vec![n(2)])], t0);
+        redraw(&mut a, vec![place(2, 1000, 0, 0, 20, 5)], t0);
+        assert!(grids_asked(&calls(&mut a)).is_empty(), "answered, kept");
     }
 
     /// Re-attaching without multigrid for a foreign UI releases narrowed
