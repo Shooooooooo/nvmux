@@ -21,7 +21,9 @@
 //! asked for again, narrower, before Neovim answers (a split gets
 //! `window_width` before the measure, then the measured width), the copy
 //! keeps the narrower width (see `App::grid_resized`). Inset changes slide
-//! ([`super::anim::Animator::insets`]).
+//! ([`super::anim::Animator::insets`]), except under a buffer switch's fade,
+//! which takes the old text out where it was and brings the new up where it
+//! goes ([`super::anim::switch`]).
 //!
 //! A killed client restores nothing, and Neovim keeps a grid as asked until
 //! some UI asks for the full width. So once per attach the client asks for
@@ -68,6 +70,10 @@ use super::redraw;
 /// relevant option events), but not on text changes, which would make the
 /// width jump while typing. It removes itself on this UI's `UILeave` or once
 /// the channel is gone.
+///
+/// A window, buffer or tab page coming in is measured at once, ahead of the
+/// redraw that shows it (a third value, `true`), so the client gives the
+/// window its width from its first frame; otherwise once the command is done.
 pub const MEASURE_LUA: &str = "local most, smart, chan = ...
 local api = vim.api
 local whole = 1073741824
@@ -187,14 +193,20 @@ local last = measure()
 if chan then
   local group = api.nvim_create_augroup('nvmux_centre_' .. chan, { clear = true })
   local queued = false
+  local function tell(now, ahead)
+    last = now
+    if not pcall(vim.rpcnotify, chan, 'nvmux_client', 'measure', now[1], now[2], ahead) then
+      pcall(api.nvim_del_augroup_by_id, group)
+    end
+  end
+  local function changed(now)
+    return now[1] ~= last[1] or not vim.deep_equal(now[2], last[2])
+  end
   local function check()
     queued = false
     local now = measure()
-    if now[1] ~= last[1] or not vim.deep_equal(now[2], last[2]) then
-      last = now
-      if not pcall(vim.rpcnotify, chan, 'nvmux_client', 'measure', now[1], now[2]) then
-        pcall(api.nvim_del_augroup_by_id, group)
-      end
+    if changed(now) then
+      tell(now, false)
     end
   end
   local function soon()
@@ -203,9 +215,20 @@ if chan then
       vim.schedule(check)
     end
   end
+  -- Mid-command a window may be half made: the check after reports it whole.
+  local function ahead()
+    local ok, now = pcall(measure)
+    if ok and changed(now) then
+      tell(now, true)
+    end
+    soon()
+  end
+  api.nvim_create_autocmd({ 'WinNew', 'TabEnter', 'BufWinEnter', 'TermOpen' }, {
+    group = group,
+    callback = ahead,
+  })
   api.nvim_create_autocmd({
-    'WinNew', 'WinClosed', 'WinResized', 'TabEnter', 'VimResized', 'BufWinEnter', 'TermOpen',
-    'FileType', 'BufReadPost', 'BufWritePost',
+    'WinClosed', 'WinResized', 'VimResized', 'FileType', 'BufReadPost', 'BufWritePost',
   }, { group = group, callback = soon })
   api.nvim_create_autocmd('OptionSet', {
     group = group,

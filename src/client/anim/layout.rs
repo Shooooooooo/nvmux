@@ -2801,4 +2801,102 @@ mod tests {
         assert!(wrote.contains('a') && wrote.contains('c'), "{wrote:?}");
         assert!(!wrote.contains(' '), "a blank written: {wrote:?}");
     }
+
+    /// Grid 2's rows, `width` of `fill`.
+    fn filled(fill: char, width: usize) -> Vec<Event> {
+        let text = fill.to_string().repeat(width);
+        (0..4).map(|r| line(2, r, 0, &text)).collect()
+    }
+
+    /// Grid 2 as Neovim draws it the whole window wide, full of `c`.
+    fn whole_of_c() -> Vec<Event> {
+        let mut events = vec![Event::GridResize {
+            grid: 2,
+            width: W,
+            height: 4,
+        }];
+        events.extend(filled('c', W));
+        events
+    }
+
+    /// Grid 2 with 9 columns of `a` centred in its window, settled, its
+    /// inset seen as the client sees it after each flush.
+    fn centred_window() -> Scene {
+        let mut s = Scene::new(Options::default());
+        s.batch(centred(2, 0, (W, 9), 'a'));
+        s.settle();
+        s.anim.insets(&s.model, s.now);
+        assert_eq!(s.rows(0)[0], "      aaaaaaaaa      ");
+        s
+    }
+
+    /// Regression: the new text slid in from where the old was, its fade
+    /// given up as the grid widened. Neovim draws the switch in the old
+    /// grid, then the window whole (as for a terminal) once the client asks.
+    #[test]
+    fn a_switch_to_wider_text_brings_it_up_where_it_goes() {
+        let mut s = centred_window();
+        s.switched(filled('c', 9), &[2]);
+        s.batch(whole_of_c());
+        s.anim.insets(&s.model, s.now);
+        assert_eq!(s.anim.shift_of(2), 0, "not sliding");
+        for ms in (0..100).step_by(10) {
+            assert_eq!(s.rows(ms)[0], "      aaaaaaaaa      ", "at {ms} ms");
+        }
+        assert_eq!(s.rows(130)[0], "c".repeat(W), "coming up");
+        assert!(s.red(130, 0, 0) < 255, "faded");
+    }
+
+    /// The client cuts the grid as it asks Neovim for it narrower (see
+    /// `crate::client::App::narrow_windows`).
+    #[test]
+    fn a_switch_to_narrower_text_brings_it_up_where_it_goes() {
+        let mut s = Scene::new(Options::default());
+        s.anim.insets(&s.model, s.now);
+        s.switched(filled('c', W), &[2]);
+        s.model.grids.get_mut(&2).expect("grid 2").resize(9, 4);
+        s.anim.insets(&s.model, s.now);
+        assert_eq!(s.anim.shift_of(2), 0, "not sliding");
+        let mut answer = vec![Event::GridResize {
+            grid: 2,
+            width: 9,
+            height: 4,
+        }];
+        answer.extend(filled('c', 9));
+        s.batch(answer);
+        for ms in (0..100).step_by(10) {
+            assert_eq!(s.rows(ms)[0], "a".repeat(W), "at {ms} ms");
+        }
+        assert_eq!(s.rows(130)[0], "      ccccccccc      ", "coming up");
+    }
+
+    /// Neovim draws the window wider a round trip after the switch, which
+    /// over a slow link is past the fade's midpoint.
+    #[test]
+    fn a_switch_waits_blank_for_its_window_drawn_wider() {
+        let blank = " ".repeat(W);
+        let mut s = centred_window();
+        s.switched(filled('c', 9), &[2]);
+        s.anim.widening(vec![2]);
+        for ms in [100, 200, 400] {
+            assert_eq!(s.rows(ms)[0], blank, "at {ms} ms");
+        }
+        s.now += Duration::from_millis(400);
+        s.batch(whole_of_c());
+        s.anim.widening(Vec::new());
+        s.anim.insets(&s.model, s.now);
+        assert_eq!(s.anim.shift_of(2), 0, "not sliding");
+        assert_eq!(s.rows(30)[0], "c".repeat(W), "coming up where it goes");
+
+        // Past the wait, the text comes up where it is and, on show, slides.
+        let mut s = centred_window();
+        s.switched(filled('c', 9), &[2]);
+        s.anim.widening(vec![2]);
+        let late = 100 + (super::super::switch::WAIT * 1000.0) as u64 + 30;
+        assert_eq!(s.rows(late)[0], "      ccccccccc      ");
+        s.now += Duration::from_millis(late);
+        s.batch(whole_of_c());
+        s.anim.insets(&s.model, s.now);
+        assert_eq!(s.anim.shift_of(2), 6, "drawn where it was");
+    }
 }
