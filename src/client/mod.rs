@@ -1945,7 +1945,11 @@ impl App {
     ) {
         if let Some(w) = wants.filter(|w| *w != self.wants) {
             self.wants = w;
-            self.narrow_windows(now);
+            // Over RPC a switch is measured before Neovim draws it: narrowing
+            // waits for its flush, so its fade starts from the window as drawn.
+            if !self.switching() {
+                self.narrow_windows(now);
+            }
             self.dirty = true;
         }
         if let Some(l) = laststatus {
@@ -1954,6 +1958,16 @@ impl App {
                 self.dirty = true;
             }
         }
+    }
+
+    /// Whether a window on show switched buffer since the last flush.
+    fn switching(&self) -> bool {
+        self.switched.iter().any(|win| {
+            self.model
+                .wins
+                .iter()
+                .any(|(grid, w)| w == win && self.model.layout.get(grid).is_some_and(|p| !p.hidden))
+        })
     }
 
     /// When centring, asks for each window wider than it wants to get a grid
@@ -2087,6 +2101,17 @@ impl App {
             );
             self.unanswered.entry(grid).or_default().push(to);
         }
+        let widening = self
+            .unanswered
+            .iter()
+            .filter(|(grid, asks)| {
+                let shown = self.model.layout.get(grid).is_some_and(|p| !p.hidden);
+                let width = self.model.grids.get(grid).map_or(0, |g| g.width());
+                shown && asks.last().is_some_and(|&to| to > width)
+            })
+            .map(|(grid, _)| *grid)
+            .collect();
+        self.anim.widening(widening);
         // Text that moved in or out of its window slides there.
         self.anim.insets(&self.model, now);
         asked
@@ -12780,6 +12805,48 @@ mod tests {
         );
         assert_eq!(a.model.grids[&2].width(), 6, "cut");
         assert!(!a.model.tails.contains_key(&2), "let go of");
+    }
+
+    /// Regression: a switch made over RPC is measured before Neovim draws it.
+    /// Cut then, the old text slid in to the middle and the switch faded from
+    /// it cut short; the switch's flush narrows instead.
+    #[test]
+    fn a_measure_ahead_of_a_switch_narrows_once_the_switch_is_drawn() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        let wants = |width: i64| {
+            let each = Value::Array(vec![Value::Array(vec![1000.into(), width.into()])]);
+            vec!["measure".into(), 2.into(), each]
+        };
+        let buf = |b: i64| vec!["buf".into(), 1000.into(), b.into()];
+        notify(&mut a, "nvmux_client", wants(1 << 30), t0);
+        notify(&mut a, "nvmux_client", buf(1), t0);
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+                line(2, 0, "old"),
+            ],
+            t0,
+        );
+        calls(&mut a);
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(shown(&mut a, t1)[0], "old");
+
+        notify(&mut a, "nvmux_client", buf(2), t1);
+        notify(&mut a, "nvmux_client", wants(8), t1);
+        assert_eq!(a.model.grids[&2].width(), 20, "not cut ahead of the switch");
+        assert!(grids_asked(&calls(&mut a)).is_empty(), "nor asked");
+        redraw(&mut a, vec![line(2, 0, "new")], t1);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(8), n(0)]]);
+        assert_eq!(a.model.grids[&2].width(), 8, "cut with its flush");
+        assert_eq!(shown(&mut a, t1)[0], "old", "fading where it was");
+        let t2 = t1 + Duration::from_secs(1);
+        assert_eq!(shown(&mut a, t2)[0], "      new");
     }
 
     /// Re-attaching without multigrid for a foreign UI releases narrowed

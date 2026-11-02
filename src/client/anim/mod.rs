@@ -214,6 +214,9 @@ pub struct Animator {
     seen: HashMap<u64, Inset>,
     transition: Option<Transition>,
     switches: HashMap<u64, Switch>,
+    /// Grids of windows Neovim is yet to draw wider (see
+    /// [`Animator::widening`]).
+    widening: Vec<u64>,
     options: layout::Options,
     blink: Blink,
     /// See [`Animator::hold_blink`].
@@ -247,6 +250,7 @@ impl Animator {
             seen: HashMap::new(),
             transition: None,
             switches: HashMap::new(),
+            widening: Vec::new(),
             options: layout::Options::default(),
             blink: Blink::new(Instant::now()),
             blink_held: false,
@@ -288,6 +292,7 @@ impl Animator {
         self.seen.clear();
         self.transition = None;
         self.switches.clear();
+        self.widening.clear();
         self.cell = None;
     }
 
@@ -400,7 +405,7 @@ impl Animator {
         let mut switched: Vec<switch::Was> = match windows {
             Some(w) if w.switch > 0.0 => switched
                 .iter()
-                .filter_map(|grid| switch::Was::take(model, *grid))
+                .filter_map(|grid| switch::Was::take(model, *grid, self.shift_of(*grid)))
                 .collect(),
             _ => Vec::new(),
         };
@@ -476,10 +481,12 @@ impl Animator {
             self.switches.clear();
         }
 
-        // Buffer switches fade, unless windows are moving.
+        // Buffer switches fade, unless windows are moving. The new text comes
+        // up where it goes, not sliding there.
         if let (Some(w), true, false) = (self.effects.windows, live, started) {
             for was in before.switched {
                 if let Some(s) = Switch::start(was, model, w.switch) {
+                    self.shifts.remove(&s.grid());
                     self.switches.insert(s.grid(), s);
                 }
             }
@@ -1260,7 +1267,9 @@ impl Animator {
         if self.transition.as_mut().is_some_and(|t| !t.step(dt)) {
             self.transition = None;
         }
-        self.switches.retain(|_, s| s.step(dt));
+        let widening = &self.widening;
+        self.switches
+            .retain(|grid, s| s.step(dt, widening.contains(grid)));
     }
 
     /// Whether [`Animator::paint`] paints over the frame (not just placing
@@ -1318,7 +1327,8 @@ impl Animator {
     /// Record each visible grid's text inset. Text moving in or out within
     /// an unchanged window (its grid resized for centred text; see
     /// `crate::client::wide`) slides there ([`motion`]); a new or moved grid
-    /// gets no shift, as its window's own animation moves it.
+    /// gets no shift, as its window's own animation moves it, nor does text
+    /// a buffer switch's fade hides ([`switch`]).
     pub fn insets(&mut self, model: &Model, now: Instant) {
         // Step from now, not from when the last animation ended.
         if !self.moving() {
@@ -1339,7 +1349,11 @@ impl Animator {
                 inset: model.inset(grid),
             };
             if let (Some(was), Some(_)) = (self.seen.get(&grid), self.effects.windows) {
-                if (was.origin, was.width) == (here.origin, here.width) && was.inset != here.inset {
+                let hidden = self.switches.get(&grid).is_some_and(Switch::hiding);
+                if (was.origin, was.width) == (here.origin, here.width)
+                    && was.inset != here.inset
+                    && !hidden
+                {
                     let by = here.inset as i64 - was.inset as i64;
                     self.shifts.entry(grid).or_default().moved((0, by));
                 }
@@ -1349,6 +1363,13 @@ impl Animator {
         self.seen = seen;
         let seen = &self.seen;
         self.shifts.retain(|grid, _| seen.contains_key(grid));
+    }
+
+    /// The grids of windows asked wider than Neovim has drawn them: their
+    /// text moves a round trip from now, and a switch there waits blank
+    /// ([`switch::Switch::step`]).
+    pub fn widening(&mut self, grids: Vec<u64>) {
+        self.widening = grids;
     }
 
     /// Columns `grid`'s text is from its target while sliding.

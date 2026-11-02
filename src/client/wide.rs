@@ -21,7 +21,9 @@
 //! asked for again, narrower, before Neovim answers (a split gets
 //! `window_width` before the measure, then the measured width), the copy
 //! keeps the narrower width (see `App::grid_resized`). Inset changes slide
-//! ([`super::anim::Animator::insets`]).
+//! ([`super::anim::Animator::insets`]), except under a buffer switch's fade,
+//! which takes the old text out where it was and brings the new up where it
+//! goes ([`super::anim::switch`]).
 //!
 //! A killed client restores nothing, and Neovim keeps a grid as asked until
 //! some UI asks for the full width. So once per attach the client asks for
