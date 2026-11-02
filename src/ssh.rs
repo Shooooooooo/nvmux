@@ -28,6 +28,11 @@ use crate::shell;
 const MIN_SSH_VERSION: &str = "6.7";
 const MIN_SSH: (u64, u64) = (6, 7);
 
+/// 7.6 added `RemoteCommand`; to an older ssh even `RemoteCommand=none` is a
+/// fatal bad option. `IgnoreUnknown` cannot stand in: given on the command
+/// line, it replaces the user's own, such as one for macOS's `UseKeychain`.
+const REMOTE_COMMAND_SSH: (u64, u64) = (7, 6);
+
 /// Parse the version out of `ssh -V` output, e.g. `OpenSSH_9.6p1 Ubuntu-3...`.
 fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
     let token = banner.split_whitespace().next()?;
@@ -45,21 +50,25 @@ fn parse_ssh_version(banner: &str) -> Option<(u64, u64)> {
 /// Start `ssh -V` so a missing or too-old `ssh` is refused early with a clear
 /// error; judged later by [`LocalCheck::verdict`].
 pub fn check_local() -> LocalCheck {
-    LocalCheck(
-        Command::new("ssh")
-            .arg("-V")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn(),
-    )
+    LocalCheck::start(Command::new("ssh").arg("-V"))
 }
 
 /// An `ssh -V` in progress; see [`check_local`].
 pub struct LocalCheck(std::io::Result<std::process::Child>);
 
 impl LocalCheck {
-    pub fn verdict(self) -> Result<(), SshError> {
+    /// `cmd` is `ssh -V`, or a test's stand-in for it.
+    fn start(cmd: &mut Command) -> Self {
+        Self(
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn(),
+        )
+    }
+
+    /// The local `ssh`'s version, or `None` if it is not OpenSSH.
+    pub fn verdict(self) -> Result<Option<(u64, u64)>, SshError> {
         let out = self
             .0
             .and_then(std::process::Child::wait_with_output)
@@ -68,7 +77,7 @@ impl LocalCheck {
     }
 }
 
-fn judge_version(out: &std::process::Output) -> Result<(), SshError> {
+fn judge_version(out: &std::process::Output) -> Result<Option<(u64, u64)>, SshError> {
     // `ssh -V` writes to stderr.
     let banner = if out.stderr.is_empty() {
         String::from_utf8_lossy(&out.stdout).into_owned()
@@ -76,13 +85,13 @@ fn judge_version(out: &std::process::Output) -> Result<(), SshError> {
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
     match parse_ssh_version(&banner) {
-        Some(v) if v >= MIN_SSH => Ok(()),
+        Some(v) if v >= MIN_SSH => Ok(Some(v)),
         Some((major, minor)) => Err(SshError::TooOld {
             found: format!("{major}.{minor}"),
             min: MIN_SSH_VERSION,
         }),
         // Unknown banners (forks) are allowed; a forward would fail clearly.
-        None => Ok(()),
+        None => Ok(None),
     }
 }
 
@@ -271,18 +280,25 @@ fn forward_all_args(host: &str, ctl: &Path, pairs: &[(PathBuf, PathBuf)]) -> Vec
 /// `ClearAllForwardings=yes` because a mux client asks the master for every
 /// forward in the config: the master binds those it lacks, and if one fails
 /// the shell connects without the master.
-fn shell_args(host: &str, ctl: &Path) -> Vec<String> {
-    shell_args_with(common(ctl), host)
+///
+/// `RemoteCommand=none` because with a `RemoteCommand` in the config (such as
+/// `tmux new -A`) ssh refuses to run any other command. It is given only to
+/// an ssh whose `version` has the option (see [`REMOTE_COMMAND_SSH`]).
+fn shell_args(host: &str, ctl: &Path, version: Option<(u64, u64)>) -> Vec<String> {
+    shell_args_with(common(ctl), host, version)
 }
 
 /// [`shell_args`] with the [`unattended`] options; otherwise identical, so
 /// the same program runs on the host, reached the same way.
-fn unattended_shell_args(host: &str, ctl: &Path) -> Vec<String> {
-    shell_args_with(unattended(ctl), host)
+fn unattended_shell_args(host: &str, ctl: &Path, version: Option<(u64, u64)>) -> Vec<String> {
+    shell_args_with(unattended(ctl), host, version)
 }
 
-fn shell_args_with(mut args: Vec<String>, host: &str) -> Vec<String> {
+fn shell_args_with(mut args: Vec<String>, host: &str, version: Option<(u64, u64)>) -> Vec<String> {
     args.extend(["-o".into(), "ClearAllForwardings=yes".into(), "-T".into()]);
+    if version.is_some_and(|v| v >= REMOTE_COMMAND_SSH) {
+        args.extend(["-o".into(), "RemoteCommand=none".into()]);
+    }
     args.extend([host.to_string(), remote_shell_command()]);
     args
 }
@@ -374,11 +390,24 @@ enum Cleared {
 pub struct Ssh {
     host: String,
     control_path: PathBuf,
+    /// The local `ssh`'s; `None` if not known, or not OpenSSH.
+    version: Option<(u64, u64)>,
 }
 
 impl Ssh {
+    /// Its shells get only options every supported `ssh` knows until
+    /// [`Self::with_version`] says which one this is.
     pub fn new(host: String, control_path: PathBuf) -> Self {
-        Self { host, control_path }
+        Self {
+            host,
+            control_path,
+            version: None,
+        }
+    }
+
+    /// `version` is the local `ssh`'s, as [`LocalCheck::verdict`] gives it.
+    pub fn with_version(self, version: Option<(u64, u64)>) -> Self {
+        Self { version, ..self }
     }
 
     pub fn host(&self) -> &str {
@@ -389,6 +418,11 @@ impl Ssh {
     /// without recomputing it (see [`crate::dirs::DirSource`]).
     pub fn control_path(&self) -> &Path {
         &self.control_path
+    }
+
+    /// Exposed, like [`Self::control_path`], for [`crate::dirs::DirSource`].
+    pub fn version(&self) -> Option<(u64, u64)> {
+        self.version
     }
 
     /// For commands that do not background: `output` also waits for whatever
@@ -678,13 +712,22 @@ impl Ssh {
     /// spawned; the first run reads the handshake, so an unreachable host is
     /// reported by that run, classified from ssh's stderr.
     pub fn start_shell(&self) -> Result<proc::Shell, SshError> {
-        self.start(shell_args(&self.host, &self.control_path))
+        self.start(self.shell_argv())
     }
 
     /// Like [`Self::start_shell`], for scripts nvmux runs on its own: never
     /// prompts and gives up on an unreachable host (see [`unattended`]).
     pub fn start_unattended_shell(&self) -> Result<proc::Shell, SshError> {
-        self.start(unattended_shell_args(&self.host, &self.control_path))
+        self.start(self.unattended_shell_argv())
+    }
+
+    /// [`Self::start_shell`]'s arguments, apart so that a test can read them.
+    fn shell_argv(&self) -> Vec<String> {
+        shell_args(&self.host, &self.control_path, self.version)
+    }
+
+    fn unattended_shell_argv(&self) -> Vec<String> {
+        unattended_shell_args(&self.host, &self.control_path, self.version)
     }
 
     fn start(&self, argv: Vec<String>) -> Result<proc::Shell, SshError> {
@@ -741,6 +784,7 @@ mod tests {
     }
 
     const CTL: &str = "/tmp/nvmux-501/cm-abcdefgh";
+    const CURRENT: Option<(u64, u64)> = Some((9, 6));
 
     fn joined(args: &[String]) -> String {
         args.join(" ")
@@ -750,14 +794,14 @@ mod tests {
     /// touch; without it the completion worker blocks on an invisible prompt.
     #[test]
     fn only_an_unattended_shell_refuses_to_prompt() {
-        let interactive = shell_args("myhost", Path::new(CTL));
+        let interactive = shell_args("myhost", Path::new(CTL), CURRENT);
         assert!(
             !interactive.iter().any(|a| a.contains("BatchMode")),
             "the shell the user's commands run in must still be able to prompt: {interactive:?}"
         );
         assert!(!interactive.iter().any(|a| a.contains("ConnectTimeout")));
 
-        let unattended = unattended_shell_args("myhost", Path::new(CTL));
+        let unattended = unattended_shell_args("myhost", Path::new(CTL), CURRENT);
         assert!(
             unattended.iter().any(|a| a == "BatchMode=yes"),
             "a shell nobody is watching must never prompt: {unattended:?}"
@@ -772,8 +816,8 @@ mod tests {
 
     #[test]
     fn the_two_option_sets_differ_in_nothing_but_the_options() {
-        let interactive = shell_args("myhost", Path::new(CTL));
-        let unattended = unattended_shell_args("myhost", Path::new(CTL));
+        let interactive = shell_args("myhost", Path::new(CTL), CURRENT);
+        let unattended = unattended_shell_args("myhost", Path::new(CTL), CURRENT);
         assert_eq!(
             interactive.last(),
             unattended.last(),
@@ -1103,7 +1147,11 @@ mod tests {
             stderr: stderr.into(),
         };
         let current = said("", "OpenSSH_9.6p1 Ubuntu-3ubuntu13.19, OpenSSL 3.0.13\n");
-        assert!(judge_version(&current).is_ok());
+        assert!(matches!(judge_version(&current), Ok(Some((9, 6)))));
+        assert!(matches!(
+            judge_version(&said("OpenSSH_7.6p1\n", "")),
+            Ok(Some((7, 6)))
+        ));
         assert!(matches!(
             judge_version(&said("", "OpenSSH_6.6p1, OpenSSL 1.0.1f 6 Jan 2014\n")),
             Err(SshError::TooOld { .. })
@@ -1112,10 +1160,28 @@ mod tests {
             judge_version(&said("OpenSSH_5.3p1\n", "")),
             Err(SshError::TooOld { .. })
         ));
-        assert!(judge_version(&said("", "Dropbear v2022.83\n")).is_ok());
+        assert!(matches!(
+            judge_version(&said("", "Dropbear v2022.83\n")),
+            Ok(None)
+        ));
 
         let missing = LocalCheck(Err(std::io::Error::from(ErrorKind::NotFound)));
         assert!(matches!(missing.verdict(), Err(SshError::NotFound)));
+    }
+
+    /// Through real pipes, as CI skips `tests/ssh_lifecycle.rs`: a banner lost
+    /// on the way would leave the shells without `RemoteCommand=none`.
+    #[test]
+    fn a_check_returns_the_version_its_child_prints() {
+        let check =
+            |script: &str| LocalCheck::start(Command::new("sh").args(["-c", script])).verdict();
+        // On stderr, as OpenSSH prints it.
+        assert!(matches!(
+            check("echo 'OpenSSH_7.6p1 Ubuntu-4ubuntu0.7, OpenSSL 1.0.2n  7 Dec 2017' >&2"),
+            Ok(Some((7, 6)))
+        ));
+        assert!(matches!(check("echo OpenSSH_9.6p1"), Ok(Some((9, 6)))));
+        assert!(matches!(check("echo 'Dropbear v2022.83' >&2"), Ok(None)));
     }
 
     /// A mux client sends the master every forward it holds, the config's
@@ -1124,8 +1190,8 @@ mod tests {
     fn the_master_and_its_shells_take_no_forwards_from_the_config() {
         for args in [
             master_args("myhost", Path::new(CTL), None, None),
-            shell_args("myhost", Path::new(CTL)),
-            unattended_shell_args("myhost", Path::new(CTL)),
+            shell_args("myhost", Path::new(CTL), CURRENT),
+            unattended_shell_args("myhost", Path::new(CTL), CURRENT),
         ] {
             let s = joined(&args);
             assert!(s.contains("-o ClearAllForwardings=yes"), "{s}");
@@ -1135,6 +1201,37 @@ mod tests {
                 at("ClearAllForwardings=yes") < at("myhost"),
                 "not an option before the host: {s}"
             );
+        }
+    }
+
+    /// Given one in the config, ssh refuses to run the shell's own command.
+    /// Built by an `Ssh`, as its shells are, from the version it was given.
+    #[test]
+    fn the_shells_clear_the_configs_remote_command_where_ssh_knows_the_option() {
+        let ssh = || Ssh::new("myhost".into(), CTL.into());
+        let both = |ssh: Ssh| [ssh.shell_argv(), ssh.unattended_shell_argv()];
+        for version in [(7, 6), (8, 0), (9, 6), (10, 2)] {
+            for args in both(ssh().with_version(Some(version))) {
+                let s = joined(&args);
+                assert!(s.contains("-o RemoteCommand=none"), "{version:?}: {s}");
+                let at = |word: &str| args.iter().position(|a| a == word);
+                assert!(
+                    at("RemoteCommand=none") < at("myhost"),
+                    "not an option before the host: {s}"
+                );
+            }
+        }
+        // Before 7.6 it is a fatal bad option; an ssh that is not OpenSSH may
+        // say the same.
+        for version in [Some((7, 5)), Some((6, 7)), None] {
+            for args in both(ssh().with_version(version)) {
+                let s = joined(&args);
+                assert!(!s.contains("RemoteCommand"), "{version:?}: {s}");
+            }
+        }
+        for args in both(ssh()) {
+            let s = joined(&args);
+            assert!(!s.contains("RemoteCommand"), "never told its version: {s}");
         }
     }
 
@@ -1179,7 +1276,7 @@ mod tests {
 
     #[test]
     fn the_remote_command_runs_through_a_login_shell() {
-        let args = shell_args("myhost", Path::new(CTL));
+        let args = shell_args("myhost", Path::new(CTL), CURRENT);
         let remote = args.last().expect("remote command");
         assert!(
             remote.contains(r#" -l -c "exec sh -s""#),
@@ -1203,8 +1300,8 @@ mod tests {
     /// a value.
     #[test]
     fn the_command_line_carries_no_script_and_no_arguments() {
-        let a = shell_args("myhost", Path::new(CTL));
-        assert_eq!(a, shell_args("myhost", Path::new(CTL)));
+        let a = shell_args("myhost", Path::new(CTL), CURRENT);
+        assert_eq!(a, shell_args("myhost", Path::new(CTL), CURRENT));
         assert!(
             !joined(&a).contains("\"$@\""),
             "arguments on the command line: {a:?}"
@@ -1213,7 +1310,7 @@ mod tests {
 
     #[test]
     fn the_shell_is_started_without_dash_n_and_without_a_tty() {
-        let args = shell_args("myhost", Path::new(CTL));
+        let args = shell_args("myhost", Path::new(CTL), CURRENT);
         assert!(
             !args.iter().any(|a| a == "-n"),
             "-n would empty every script: {args:?}"
@@ -1222,7 +1319,7 @@ mod tests {
             args.iter().any(|a| a == "-T"),
             "a forced tty would echo the scripts: {args:?}"
         );
-        let args = unattended_shell_args("myhost", Path::new(CTL));
+        let args = unattended_shell_args("myhost", Path::new(CTL), CURRENT);
         assert!(!args.iter().any(|a| a == "-n"));
         assert!(args.iter().any(|a| a == "-T"));
     }

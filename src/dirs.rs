@@ -24,11 +24,16 @@ use crate::ssh::Ssh;
 use crate::transport::protocol::{self, Listing};
 
 /// A `Send` handle that can list directories on one session host. Cheap: the
-/// ssh arm is a hostname and a path, not a connection.
+/// ssh arm is a hostname, a path and a version, not a connection.
 #[derive(Debug, Clone)]
 pub enum DirSource {
     Local,
-    Ssh { host: String, control_path: PathBuf },
+    Ssh {
+        host: String,
+        control_path: PathBuf,
+        /// The local `ssh`'s (see [`Ssh::with_version`]).
+        version: Option<(u64, u64)>,
+    },
 }
 
 impl DirSource {
@@ -38,9 +43,13 @@ impl DirSource {
     pub fn start_shell(&self) -> Result<Shell> {
         Ok(match self {
             DirSource::Local => Shell::local()?,
-            DirSource::Ssh { host, control_path } => {
-                Ssh::new(host.clone(), control_path.clone()).start_unattended_shell()?
-            }
+            DirSource::Ssh {
+                host,
+                control_path,
+                version,
+            } => Ssh::new(host.clone(), control_path.clone())
+                .with_version(*version)
+                .start_unattended_shell()?,
         })
     }
 }

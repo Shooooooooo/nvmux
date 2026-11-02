@@ -11,7 +11,8 @@
 //! ```
 //!
 //! Localhost still exercises the real ssh client, ControlMaster, unix-socket
-//! forwarding and remote login shell; only latency is missing.
+//! forwarding and remote login shell; only latency is missing. A host whose
+//! config sets `RemoteCommand` also tests that nvmux clears it.
 
 #[macro_use]
 mod common;
@@ -27,9 +28,31 @@ fn host() -> String {
     std::env::var("NVMUX_TEST_SSH_HOST").unwrap_or_else(|_| "selftest".to_string())
 }
 
+/// OpenSSH 7.6 added `RemoteCommand`.
+const REMOTE_COMMAND_SSH: (u64, u64) = (7, 6);
+
+fn knows_remote_command() -> bool {
+    nvmux::ssh::check_local()
+        .verdict()
+        .ok()
+        .flatten()
+        .is_some_and(|v| v >= REMOTE_COMMAND_SSH)
+}
+
+/// `ssh` for the suite's own commands on the host. Like nvmux's shells it
+/// clears the config's `RemoteCommand`, or ssh would refuse to run them, but
+/// only where ssh knows the option: to an older one it is a fatal bad option.
+fn ssh() -> std::process::Command {
+    let mut ssh = std::process::Command::new("ssh");
+    if knows_remote_command() {
+        ssh.args(["-o", "RemoteCommand=none"]);
+    }
+    ssh
+}
+
 /// ssh's output is captured on purpose: a skip prints one line.
 fn reachable() -> bool {
-    std::process::Command::new("ssh")
+    ssh()
         .args([
             "-o",
             "BatchMode=yes",
@@ -413,9 +436,8 @@ impl PrivateDir {
         found
     }
 
-    /// Master processes using this directory, linked to the `ControlPath` or
-    /// not.
-    fn masters_running(&self) -> usize {
+    /// Command lines of the ssh processes using this directory.
+    fn ssh_running(&self) -> Vec<String> {
         let needle = format!("ControlPath={}/", self.0.display());
         let out = std::process::Command::new("ps")
             .args(["-A", "-o", "command="])
@@ -423,7 +445,17 @@ impl PrivateDir {
             .expect("ps");
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter(|l| l.starts_with("ssh ") && l.contains(" -M ") && l.contains(&needle))
+            .filter(|l| l.starts_with("ssh ") && l.contains(&needle))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Master processes using this directory, linked to the `ControlPath` or
+    /// not.
+    fn masters_running(&self) -> usize {
+        self.ssh_running()
+            .iter()
+            .filter(|l| l.contains(" -M "))
             .count()
     }
 }
@@ -462,8 +494,11 @@ impl PrivateMaster {
     fn up(tag: &str) -> Self {
         let dir = PrivateDir::new(tag);
         std::fs::create_dir_all(&dir.0).expect("scratch directory");
+        // Told the version, as the transport's is, or ssh refuses its shells
+        // on a host whose config sets `RemoteCommand`.
+        let version = nvmux::ssh::check_local().verdict().expect("ssh -V");
         // Short: a ControlPath is subject to the socket path limit.
-        let ssh = Ssh::new(host(), dir.0.join("cm"));
+        let ssh = Ssh::new(host(), dir.0.join("cm")).with_version(version);
         ssh.ensure_master().expect("bring up a master");
         assert!(ssh.is_master_alive(), "the master did not come up");
         Self { ssh, dir }
@@ -641,6 +676,38 @@ fn two_masters_brought_up_at_once_leave_one_running() {
     );
 }
 
+/// A shell not told the local ssh's version goes without `RemoteCommand=none`,
+/// which `selftest`, setting no `RemoteCommand`, would not show; so `ps` says
+/// what each shell was given.
+#[test]
+fn both_shells_clear_the_configs_remote_command_where_ssh_knows_the_option() {
+    require_ssh!();
+    let dir = PrivateDir::new("remote-command");
+    let t = SshTransport::with_dir(host(), dir.0.clone()).expect("connect");
+    let mut completion = nvmux::dirs::Lister::new(t.dir_source());
+    let listing = completion.children("/").expect("list /");
+    assert!(listing.names.iter().any(|n| n == "tmp"), "{listing:?}");
+
+    let shells: Vec<String> = dir
+        .ssh_running()
+        .into_iter()
+        .filter(|l| l.contains(" -T "))
+        .collect();
+    assert_eq!(
+        shells.len(),
+        2,
+        "the transport's and completion's: {shells:?}"
+    );
+    // The suite needs ControlMaster, so its ssh is OpenSSH and nvmux must read
+    // its version. `knows_remote_command` would pass with it lost.
+    let local = nvmux::ssh::check_local().verdict().expect("ssh -V");
+    let local = local.expect("nvmux read no version from ssh -V");
+    let clears = local >= REMOTE_COMMAND_SSH;
+    for shell in &shells {
+        assert_eq!(shell.contains(" -o RemoteCommand=none "), clears, "{shell}");
+    }
+}
+
 #[test]
 fn a_chosen_command_runs_on_the_remote_host_with_its_arguments_intact() {
     require_ssh!();
@@ -653,7 +720,7 @@ fn a_chosen_command_runs_on_the_remote_host_with_its_arguments_intact() {
         .create_session(&name, &launch, common::anywhere())
         .expect("create");
 
-    let remote = std::process::Command::new("ssh")
+    let remote = ssh()
         .args([
             "-o",
             "BatchMode=yes",
