@@ -12,7 +12,9 @@
 //! expand to unpredictable lengths (see [`crate::paths`]). Each master binds
 //! its own socket and is linked to the `ControlPath` once up, so no master can
 //! remove another's (see [`Ssh::ensure_master_within`]).
+use std::ffi::OsStr;
 use std::io::ErrorKind;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -389,6 +391,8 @@ impl Ssh {
         &self.control_path
     }
 
+    /// For commands that do not background: `output` also waits for whatever
+    /// ssh leaves holding its stdout or stderr (see [`Self::start_master`]).
     fn run(&self, args: &[String]) -> std::io::Result<std::process::Output> {
         tracing::debug!(args = ?args, "ssh");
         Command::new("ssh")
@@ -443,19 +447,66 @@ impl Ssh {
         })?;
         let own = paths::master_socket(&self.control_path, &nonce);
         let ipqos = self.ipqos();
-        // `-f` backgrounds ssh once authenticated, so this blocks only for a
-        // key touch or passphrase.
-        let out = self
-            .run(&master_args(&self.host, &own, connect_timeout, ipqos))
-            .map_err(|e| spawn_error(e, &self.host))?;
-        if !out.status.success() {
-            return Err(classify(
-                &self.host,
-                out.status.code().unwrap_or(-1),
-                &String::from_utf8_lossy(&out.stderr),
-            ));
-        }
+        let args = master_args(&self.host, &own, connect_timeout, ipqos);
+        self.start_master(OsStr::new("ssh"), &args, &own)?;
         self.publish(&own)
+    }
+
+    /// Run a master's foreground `ssh` (`program`, which tests replace) and
+    /// classify its failure. `-f` backgrounds ssh once authenticated, so this
+    /// blocks only for a key touch or passphrase.
+    ///
+    /// Before OpenSSH 8.5 the backgrounded master keeps ssh's stderr, so a
+    /// pipe there would see EOF only when the master exits, and once closed
+    /// would leave it writing to a broken pipe. Hence a file, unlinked at once
+    /// so that nothing is left behind.
+    fn start_master(&self, program: &OsStr, args: &[String], own: &Path) -> Result<(), SshError> {
+        tracing::debug!(args = ?args, "ssh");
+        let path = paths::master_stderr(own);
+        let unopened = |e: std::io::Error| SshError::Failed {
+            code: -1,
+            stderr: format!(
+                "starting a master connection to {}: {}: {e}",
+                self.host,
+                path.display()
+            ),
+        };
+        let stderr = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(unopened)?;
+        let _ = std::fs::remove_file(&path);
+        let status = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr.try_clone().map_err(unopened)?)
+            .status()
+            .map_err(|e| spawn_error(e, &self.host))?;
+        if status.success() {
+            return Ok(());
+        }
+        // Read at 0 without moving the offset this file shares with whatever
+        // inherited ssh's stderr: a ProxyCommand before OpenSSH 8.0 may still
+        // write there.
+        let said = stderr
+            .metadata()
+            .and_then(|meta| {
+                let mut said = vec![0; meta.len() as usize];
+                stderr.read_exact_at(&mut said, 0).map(|()| said)
+            })
+            .unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "could not read why a master failed to start");
+                Vec::new()
+            });
+        Err(classify(
+            &self.host,
+            status.code().unwrap_or(-1),
+            &String::from_utf8_lossy(&said),
+        ))
     }
 
     /// Make room on the `ControlPath` for a new master, or find a live one
@@ -879,6 +930,146 @@ mod tests {
         let err = ssh.clear_control_path().expect_err("refused");
         assert!(err.to_string().contains("not a socket"), "{err}");
         assert_eq!(std::fs::read(&ctl).expect("still there"), b"not a socket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sh -c script sh args...`, run in place of ssh. Not a script file: a
+    /// child a parallel test forks can hold one just written open, and then
+    /// it fails to exec.
+    fn sh_c(script: &str, args: &[String]) -> Vec<String> {
+        let mut argv = vec!["-c".into(), script.into(), "sh".into()];
+        argv.extend_from_slice(args);
+        argv
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read the directory")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Before OpenSSH 8.5 the master `-f` leaves behind keeps ssh's stderr
+    /// (before 7.7 its stdout too) and may write to it at any time, as the
+    /// `sh` left behind here does. Waiting for it to close hung every connect
+    /// until `ControlPersist` ended the master.
+    #[test]
+    fn a_master_is_up_once_ssh_backgrounds_it_and_can_still_write() {
+        let dir = crate::test_support::scratch_dir("ssh-master-stdio");
+        let ssh = Ssh::new("h".into(), dir.join("cm"));
+        let own = paths::master_socket(ssh.control_path(), "abcdefgh");
+        let (go, wrote) = (dir.join("go"), dir.join("wrote"));
+        // Lingers long past the 10 s wait below, so a start that waits for it
+        // fails.
+        let master = r#"(
+            n=0
+            until [ -e "$1" ] || [ "$n" -ge 3000 ]; do sleep 0.01; n=$((n + 1)); done
+            echo out && echo err >&2 && : > "$2"
+        ) & exit 0"#;
+        let argv = sh_c(
+            master,
+            &[go.display().to_string(), wrote.display().to_string()],
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ssh.start_master(OsStr::new("/bin/sh"), &argv, &own));
+        });
+        let started = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let left = names_in(&dir);
+        std::fs::write(&go, b"").expect("let the master write");
+
+        assert!(
+            matches!(started, Ok(Ok(()))),
+            "still waiting, or failed: {started:?}"
+        );
+        assert!(left.is_empty(), "left behind: {left:?}");
+        assert!(
+            crate::test_support::wait_until(std::time::Duration::from_secs(5), || wrote.exists()),
+            "the master could not write to the stdio ssh left it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_master_that_fails_to_start_is_classified_by_what_ssh_said() {
+        let dir = crate::test_support::scratch_dir("ssh-master-fails");
+        let ssh = Ssh::new("h".into(), dir.join("cm"));
+        let own = paths::master_socket(ssh.control_path(), "abcdefgh");
+        let start = |says: &str| {
+            let argv = sh_c(r#"printf '%s\n' "$1" >&2; exit 255"#, &[says.into()]);
+            ssh.start_master(OsStr::new("/bin/sh"), &argv, &own)
+        };
+
+        assert!(matches!(
+            start("Permission denied (publickey)."),
+            Err(SshError::AuthFailed(_))
+        ));
+        match start("Host key verification failed.") {
+            Err(SshError::Failed { code, stderr }) => {
+                assert_eq!(code, 255);
+                assert_eq!(stderr, "Host key verification failed.");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(names_in(&dir), Vec::<String>::new(), "left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Before OpenSSH 8.0 a ProxyCommand keeps ssh's stderr, and ssh SIGHUPs
+    /// it on exit; an `ssh -W` before 7.6 then says "Killed by signal 1."
+    /// there. Such a write races the read, so this ssh exits only once its
+    /// proxy is writing, 20 times over.
+    #[test]
+    fn a_proxy_writing_after_ssh_exits_does_not_garble_what_ssh_said() {
+        let dir = crate::test_support::scratch_dir("ssh-master-proxy");
+        let ssh = Ssh::new("h".into(), dir.join("cm"));
+        let own = paths::master_socket(ssh.control_path(), "abcdefgh");
+        let writing = dir.join("writing");
+        let argv = sh_c(
+            r#"printf 'Permission denied (publickey).\n' >&2
+            (
+                : > "$1"
+                i=0
+                while [ "$i" -lt 1000 ]; do
+                    printf 'Killed by signal 1.\n' >&2
+                    i=$((i + 1))
+                done
+            ) &
+            n=0
+            until [ -e "$1" ] || [ "$n" -ge 100000 ]; do n=$((n + 1)); done
+            exit 255"#,
+            &[writing.display().to_string()],
+        );
+        for _ in 0..20 {
+            let _ = std::fs::remove_file(&writing);
+            let started = ssh.start_master(OsStr::new("/bin/sh"), &argv, &own);
+            assert!(
+                matches!(started, Err(SshError::AuthFailed(_))),
+                "{started:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_directory_is_not_reported_as_a_missing_ssh() {
+        let dir = crate::test_support::scratch_dir("ssh-master-nowhere");
+        let ssh = Ssh::new("h".into(), dir.join("cm"));
+        let own = paths::master_socket(ssh.control_path(), "abcdefgh");
+        assert!(matches!(
+            ssh.start_master(OsStr::new("nvmux-no-such-ssh"), &[], &own),
+            Err(SshError::NotFound)
+        ));
+
+        let gone = Ssh::new("h".into(), dir.join("gone/cm"));
+        let own = paths::master_socket(gone.control_path(), "abcdefgh");
+        match gone.start_master(OsStr::new("/bin/sh"), &sh_c("exit 0", &[]), &own) {
+            Err(SshError::Failed { code: -1, stderr }) => {
+                assert!(stderr.contains("gone"), "{stderr}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
