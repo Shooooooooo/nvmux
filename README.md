@@ -284,7 +284,7 @@ help     = "?"       # show these keys
 settings = ","       # change nvmux's settings while it runs
 
 [session]
-command = "nvim --headless --listen {sock}"   # {sock} is required
+command = "nvim --headless --listen {sock}"   # {sock} is required; {name} becomes the session's name
 
 [client]
 ui              = "nvmux"  # who draws a session: nvmux's own client, animated; or "nvim"
@@ -346,3 +346,9 @@ enabled = false   # a blinking block cursor fades out and back in
 ```
 
 </details>
+
+In `[session] command`, as in the create prompt's `nvim command`, `{sock}`
+becomes the new session's socket and `{name}` its name:
+`--cmd "let g:session = '{name}'"`, say. The name goes in as typed, and its
+spaces do not split the argument it is in. A later rename does not reach the
+running session.

@@ -80,8 +80,8 @@ pub struct KeySettings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionSettings {
-    /// `{sock}` stands for the session's socket. Parsed and validated by
-    /// [`crate::launch::Launch`].
+    /// `{sock}` stands for the session's socket, `{name}` for its name.
+    /// Parsed and validated by [`crate::launch::Launch`].
     pub command: String,
     /// Retired: listings now always wait 0.25 s, not 3 s, on a session that
     /// cannot answer (see [`crate::rpc::QUICK_PROBE_TIMEOUT`]). Parsed so old
@@ -1351,7 +1351,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          {bind}\
          \n\
          [session]\n\
-         # command = {command}   # {{sock}} is required\n\
+         # command = {command}   # {{sock}} is required; {{name}} becomes the session's name\n\
          \n\
          [client]\n\
          # ui              = {ui:<8}   # nvmux's own animated client, or \"nvim\" for Neovim's\n\

@@ -1497,6 +1497,31 @@ fn a_chosen_command_is_what_runs_and_the_session_behaves_normally() {
     assert!(t.list_sessions().expect("list").is_empty());
 }
 
+#[test]
+fn the_session_name_reaches_neovim_in_place_of_its_placeholder() {
+    require_nvim!();
+    let scratch = Scratch::new("name-placeholder");
+    let t = scratch.transport();
+
+    let launch = common::launch_with("--cmd \"let g:nvmux_name = '{name}'\"");
+    let session = t
+        .create_session("two words", &launch, common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+
+    assert_eq!(
+        common::lua(&sock, "return vim.g.nvmux_name").as_str(),
+        Some("two words")
+    );
+    assert_eq!(
+        scratch.metadata(&session.id).command,
+        launch.line(),
+        "the record keeps the placeholder, for the next session's name"
+    );
+
+    t.kill_session(&session).expect("kill");
+}
+
 /// Must fail fast with the command named, not after the readiness budget.
 #[test]
 fn a_command_that_names_nothing_fails_at_once_and_says_so() {

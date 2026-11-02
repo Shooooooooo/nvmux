@@ -45,7 +45,7 @@ pub trait Transport {
     /// Every session on the host, liveness determined, in one script run.
     fn list_sessions(&self) -> Result<Vec<Session>>;
 
-    /// Spawn a session running `launch`, with `{sock}` replaced by its socket.
+    /// Spawn a session running `launch`, with its socket and `name` filled in.
     /// `directory` is absolute, on the transport's host; the spawn script
     /// checks it exists, avoiding a round trip and a race.
     fn create_session(&self, name: &str, launch: &Launch, directory: &str) -> Result<Session>;
@@ -186,8 +186,8 @@ pub(crate) fn create(
     let (id, rank) = plan_create(&existing, name)?;
     let host_sock = h.host_sock(&id)?;
 
-    // Substituted here, where the path's length was checked.
-    let argv = launch.argv_for(&host_sock.to_string_lossy());
+    // Filled in here, where the path's length and the name were checked.
+    let argv = launch.argv_for(&host_sock.to_string_lossy(), name);
     let mut args: Vec<&str> = vec![h.dir(), &id, directory];
     args.extend(argv.iter().map(String::as_str));
 

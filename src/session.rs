@@ -60,9 +60,9 @@ pub struct Session {
     /// `0` means unranked (legacy metadata, orphans) and sorts last.
     #[serde(default)]
     pub num: u32,
-    /// The launch command as [`crate::launch`] validated it, `{sock}` still in
-    /// it. A record only: never re-run or shown. Empty for legacy metadata and
-    /// orphans.
+    /// The launch command as [`crate::launch`] validated it, placeholders
+    /// still in it. A record only: never re-run or shown. Empty for legacy
+    /// metadata and orphans.
     #[serde(default)]
     pub command: String,
     /// Absolute start directory on the session host. A record only, like

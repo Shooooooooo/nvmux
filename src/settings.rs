@@ -306,7 +306,7 @@ static ROWS: LazyLock<Vec<Setting>> = LazyLock::new(|| {
             "session",
             "command",
             Tab::Session,
-            "what a new session runs; {sock} becomes its socket",
+            "what a new session runs; {sock} becomes its socket, {name} its name",
             Kind::Command,
         ),
         row(

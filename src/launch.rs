@@ -1,15 +1,20 @@
 //! The command line a session's Neovim is launched with.
 //!
-//! It must contain [`PLACEHOLDER`] exactly once: listings and kills find a
-//! session by `--listen <sock>` in its command line (`scripts/_prelude.sh`,
-//! `scripts/kill.sh`). The line is split here and passed as separate
-//! arguments (see [`crate::shell`]); no shell expands globs, `$VAR`, `~` or
-//! `VAR=value` prefixes.
+//! It must contain [`SOCK`] exactly once: listings and kills find a session
+//! by `--listen <sock>` in its command line (`scripts/_prelude.sh`,
+//! `scripts/kill.sh`). [`NAME`] is optional. The line is split here and
+//! passed as separate arguments (see [`crate::shell`]); no shell expands
+//! globs, `$VAR`, `~` or `VAR=value` prefixes. Placeholders are filled in
+//! after the split, so a name's spaces never split a word.
 
 use crate::error::SessionError;
 
 /// Replaced by the session's socket path, unknown until it has an id.
-pub const PLACEHOLDER: &str = "{sock}";
+pub const SOCK: &str = "{sock}";
+
+/// Replaced by the session's name as created; a rename does not reach the
+/// running editor.
+pub const NAME: &str = "{name}";
 
 /// Also the default `command` of [`crate::config::SessionSettings`].
 pub const DEFAULT: &str = "nvim --headless --listen {sock}";
@@ -65,7 +70,7 @@ impl Launch {
             );
         }
 
-        match words.iter().map(|w| w.matches(PLACEHOLDER).count()).sum() {
+        match words.iter().map(|w| w.matches(SOCK).count()).sum() {
             1 => {}
             0 => {
                 return invalid(
@@ -86,13 +91,32 @@ impl Launch {
         &self.line
     }
 
-    /// The words with [`PLACEHOLDER`] replaced by `sock`.
-    pub fn argv_for(&self, sock: &str) -> Vec<String> {
-        self.words
-            .iter()
-            .map(|w| w.replace(PLACEHOLDER, sock))
-            .collect()
+    /// The words with [`SOCK`] and [`NAME`] filled in.
+    pub fn argv_for(&self, sock: &str, name: &str) -> Vec<String> {
+        self.words.iter().map(|w| fill(w, sock, name)).collect()
     }
+}
+
+/// `word` with its placeholders replaced in one pass: what is put in is not
+/// searched again, so a name holding `{sock}` stays as typed.
+fn fill(word: &str, sock: &str, name: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(at) = rest.find('{') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let (with, len) = if rest.starts_with(SOCK) {
+            (sock, SOCK.len())
+        } else if rest.starts_with(NAME) {
+            (name, NAME.len())
+        } else {
+            ("{", 1)
+        };
+        out.push_str(with);
+        rest = &rest[len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Split into words like a POSIX shell, without expansion: `'…'` is literal,
@@ -188,7 +212,7 @@ mod tests {
     fn words(line: &str) -> Vec<String> {
         Launch::parse(line)
             .unwrap_or_else(|e| panic!("{line:?} should parse: {e}"))
-            .argv_for("/tmp/s.sock")
+            .argv_for("/tmp/s.sock", "notes")
     }
 
     fn reason(line: &str) -> String {
@@ -203,7 +227,7 @@ mod tests {
     fn the_default_is_a_valid_command() {
         let l = Launch::parse(DEFAULT).expect("the built-in default must parse");
         assert_eq!(
-            l.argv_for("/tmp/nvmux-501/abcdefgh.sock"),
+            l.argv_for("/tmp/nvmux-501/abcdefgh.sock", "notes"),
             [
                 "nvim",
                 "--headless",
@@ -307,7 +331,7 @@ mod tests {
     fn the_placeholder_is_replaced_only_where_it_appears() {
         let l = Launch::parse("nvim --listen {sock} --cmd 'set title'").expect("parses");
         assert_eq!(
-            l.argv_for("/tmp/x.sock"),
+            l.argv_for("/tmp/x.sock", "notes"),
             ["nvim", "--listen", "/tmp/x.sock", "--cmd", "set title"]
         );
     }
@@ -317,6 +341,62 @@ mod tests {
         assert_eq!(
             words("nvim --listen={sock}"),
             ["nvim", "--listen=/tmp/s.sock"]
+        );
+    }
+
+    #[test]
+    fn the_name_placeholder_may_appear_any_number_of_times() {
+        assert_eq!(
+            words(r#"nvim --cmd 'let g:session = "{name}"' -c 'set titlestring={name}' {sock}"#),
+            [
+                "nvim",
+                "--cmd",
+                r#"let g:session = "notes""#,
+                "-c",
+                "set titlestring=notes",
+                "/tmp/s.sock"
+            ]
+        );
+    }
+
+    /// Filling in before the split would cut the name at its spaces.
+    #[test]
+    fn a_name_with_spaces_and_quotes_stays_one_word() {
+        let l = Launch::parse("nvim -c {name} --listen {sock}").expect("parses");
+        assert_eq!(
+            l.argv_for("/tmp/s.sock", r#"it's "my" notes"#),
+            [
+                "nvim",
+                "-c",
+                r#"it's "my" notes"#,
+                "--listen",
+                "/tmp/s.sock"
+            ]
+        );
+    }
+
+    #[test]
+    fn what_is_filled_in_is_not_searched_again() {
+        let l = Launch::parse("nvim -c {name} --listen {sock}").expect("parses");
+        assert_eq!(
+            l.argv_for("/tmp/{name}.sock", "{sock}"),
+            ["nvim", "-c", "{sock}", "--listen", "/tmp/{name}.sock"]
+        );
+    }
+
+    /// Lua tables and Vim dicts in `-c` are braces too.
+    #[test]
+    fn braces_that_are_not_a_placeholder_are_kept() {
+        assert_eq!(
+            words("nvim -c 'lua t = { {} }' {sock} {{name}} {nam"),
+            [
+                "nvim",
+                "-c",
+                "lua t = { {} }",
+                "/tmp/s.sock",
+                "{notes}",
+                "{nam"
+            ]
         );
     }
 
@@ -346,9 +426,9 @@ mod tests {
 
     #[test]
     fn an_absurdly_long_command_is_refused() {
-        let long = format!("nvim {} {}", "x".repeat(MAX_LEN), PLACEHOLDER);
+        let long = format!("nvim {} {}", "x".repeat(MAX_LEN), SOCK);
         assert!(reason(&long).contains("512 bytes"));
-        let ok = format!("nvim {} {}", "x".repeat(MAX_LEN - 20), PLACEHOLDER);
+        let ok = format!("nvim {} {}", "x".repeat(MAX_LEN - 20), SOCK);
         Launch::parse(&ok).expect("just inside the cap");
     }
 

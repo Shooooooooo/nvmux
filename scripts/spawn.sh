@@ -3,9 +3,10 @@
 #
 # Usage: sh spawn.sh <runtime_dir> <id> <cwd> <cmd> [args...]
 #
-# The command is one word per argument, with the socket path already in it
-# (validated and split by src/launch.rs). It runs as-is: no shell, no
-# expansion. <cwd> arrives absolute with `~` already expanded (src/session.rs).
+# The command is one word per argument, with the socket path and session name
+# already in it (validated and split by src/launch.rs). It runs as-is: no
+# shell, no expansion. <cwd> arrives absolute with `~` already expanded
+# (src/session.rs).
 #
 # Output:
 #   PID <pid>        the *validated* pid of the new nvim, or empty if we could
