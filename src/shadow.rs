@@ -21,6 +21,12 @@
 //! - [`Shadow::frame_under`]: a floating screen and its hint row over the
 //!   shaded session (see `crate::pty::panel`).
 //!
+//! A cell a terminal may draw at another width than the parser holds it
+//! (`crate::client::screen::ambiwidth`) is painted as the client's writer
+//! draws it: over two spaces if it takes two columns, the next cell placed
+//! absolutely. A flag, which the parser holds in two cells, is painted as
+//! one wide character (see `flag`).
+//!
 //! Frames are diffs (only `t` changes), so a whole fade costs about one full
 //! repaint. Runs of empty cells are erased with `EL` or `ECH` under a pen
 //! with no background, so they show the terminal's own background whether it
@@ -38,6 +44,7 @@
 
 use std::io::Write;
 
+use crate::client::screen::ambiwidth;
 use crate::fade::{SYNC_BEGIN, SYNC_END};
 use crate::falloff;
 use crate::palette::{Palette, Rgb};
@@ -313,6 +320,11 @@ impl Painted {
     fn shows_nothing(&self) -> bool {
         self.bg.is_none() && !self.underline
     }
+
+    /// Whether a space in this pen looks as one in `other` does.
+    fn looks_like(&self, other: &Self) -> bool {
+        self == other || (self.shows_nothing() && other.shows_nothing())
+    }
 }
 
 pub struct Shadow {
@@ -506,24 +518,43 @@ impl Shadow {
         let mut bare = vec![false; usize::from(cols)];
         for row in 0..rows {
             let t = dissolve(row);
-            let mut at: Option<u16> = None;
-            let mut run = Run::default();
-            for col in 0..cols {
+            let painted_at = |col| {
                 let cell = screen.cell(row, col);
-                let index = next.len();
-                let painted = if kept.holds(row, col) {
+                if kept.holds(row, col) {
                     standing(cell, palette, t)
                 } else {
                     resolve(cell, palette, t)
-                };
+                }
+            };
+            let mut at = At::Off;
+            let mut run = Run::default();
+            // This cell was written with the one before: the blank that was
+            // drawn over (see `pads`), or a flag's second half (see `flag`).
+            let mut joined = false;
+            for col in 0..cols {
+                let cell = screen.cell(row, col);
+                let index = next.len();
+                let painted = painted_at(col);
                 next.push(painted);
+                if std::mem::take(&mut joined) {
+                    bare[usize::from(col)] = false;
+                    continue;
+                }
                 // The second half of a wide character, covered by the first.
                 let wide_rest = cell.is_some_and(vt100::Cell::is_wide_continuation);
                 let (text, width) = match cell {
                     Some(c) if c.has_contents() => (c.contents(), if c.is_wide() { 2 } else { 1 }),
                     _ => (" ", 1),
                 };
-                let same = diff && self.painted[index] == painted;
+                let drifting = cell.is_some_and(drifts);
+                let rest = drifting.then(|| flag(screen, row, col)).flatten();
+                let padded = drifting && cell.is_some_and(|c| pads(c, screen.cell(row, col + 1)));
+                // The next cell's paint, if written with this one: either
+                // changing writes both.
+                let with = (padded || rest.is_some()).then(|| painted_at(col + 1));
+                let same = diff
+                    && self.painted[index] == painted
+                    && with.is_none_or(|p| self.painted[index + 1] == p);
                 bare[usize::from(col)] = !wide_rest && text == " " && painted.shows_nothing();
                 // An owed run absorbs the unchanged blanks after it: one erase,
                 // not several.
@@ -534,19 +565,37 @@ impl Shadow {
                 run.flush(&mut out, (row, cols), &mut at, |out| {
                     blank_sgr(out, &mut sgr, palette);
                 });
+                joined = with.is_some();
                 if wide_rest || same {
                     continue;
                 }
-                if at != Some(col) {
+                if at != At::Col(col) {
                     let over = sgr.is_some_and(|p| p.shows_nothing());
                     move_to(&mut out, (row, col), at, over, &bare);
+                }
+                if drifting && (with.is_some() || (width == 2 && col + 2 <= cols)) {
+                    // A pad in its own pen if spaces in the cell's show
+                    // otherwise, as when only one of them stands.
+                    let blank = with
+                        .filter(|pad| padded && !pad.looks_like(&painted))
+                        .unwrap_or(painted);
+                    if sgr != Some(blank) {
+                        write_sgr(&mut out, blank);
+                        sgr = Some(blank);
+                    }
+                    clear_two(&mut out, col, cols);
                 }
                 if sgr != Some(painted) {
                     write_sgr(&mut out, painted);
                     sgr = Some(painted);
                 }
                 out.extend_from_slice(text.as_bytes());
-                at = Some(col + width);
+                out.extend_from_slice(rest.unwrap_or_default().as_bytes());
+                at = if drifting {
+                    At::Astray
+                } else {
+                    At::Col(col + width)
+                };
             }
             run.flush(&mut out, (row, cols), &mut at, |out| {
                 blank_sgr(out, &mut sgr, palette);
@@ -604,14 +653,24 @@ impl Shadow {
             return Vec::new();
         }
         let screen = self.parser.screen();
+        let cols = screen.size().1;
         let mut out = SAVE_CURSOR.to_vec();
         let mut drawn = false;
         for &(row, from, to) in &kept.spans {
+            // This cell was written with the one before (see
+            // `Shadow::frame_with`).
+            let mut joined = false;
             for col in from..=to {
                 let Some(cell) = screen.cell(row, col) else {
                     continue;
                 };
-                if !cell.has_contents() || cell.is_wide_continuation() {
+                // A flag the span's start cuts is left, as a wide character
+                // is.
+                if std::mem::take(&mut joined)
+                    || !cell.has_contents()
+                    || cell.is_wide_continuation()
+                    || (col == from && flag_end(screen, row, col))
+                {
                     continue;
                 }
                 let painted = Painted {
@@ -620,7 +679,15 @@ impl Shadow {
                 };
                 let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
                 write_sgr(&mut out, painted);
+                let drifting = drifts(cell);
+                let rest = drifting.then(|| flag(screen, row, col)).flatten();
+                joined = rest.is_some()
+                    || (drifting && col < to && pads(cell, screen.cell(row, col + 1)));
+                if joined || (drifting && cell.is_wide() && col + 2 <= cols) {
+                    clear_two(&mut out, col, cols);
+                }
                 out.extend_from_slice(cell.contents().as_bytes());
+                out.extend_from_slice(rest.unwrap_or_default().as_bytes());
                 drawn = true;
             }
         }
@@ -648,6 +715,9 @@ impl Shadow {
             let mut pen: Option<Pen> = None;
             for row in 0..rows {
                 let _ = write!(out, "\x1b[{};1H", row + 1);
+                // The last cell written may have left the cursor elsewhere on
+                // the row.
+                let mut astray = false;
                 let mut col = 0;
                 while col < cols {
                     let cell = screen.cell(row, col);
@@ -656,6 +726,9 @@ impl Shadow {
                     if cell.is_some_and(vt100::Cell::is_wide_continuation) {
                         col += 1;
                         continue;
+                    }
+                    if std::mem::take(&mut astray) {
+                        column(&mut out, col);
                     }
                     let this = Pen::of(cell);
                     if pen != Some(this) {
@@ -667,8 +740,17 @@ impl Shadow {
                         // narrowing) is blanked: it would wrap, and on the
                         // last row scroll the screen.
                         Some(c) if c.has_contents() && !(c.is_wide() && col + 2 > cols) => {
+                            astray = drifts(c);
+                            let rest = astray.then(|| flag(screen, row, col)).flatten();
+                            // With the next cell (see `Shadow::frame_with`).
+                            let joined =
+                                rest.is_some() || (astray && pads(c, screen.cell(row, col + 1)));
+                            if astray && (c.is_wide() || joined) {
+                                clear_two(&mut out, col, cols);
+                            }
                             out.extend_from_slice(c.contents().as_bytes());
-                            col += if c.is_wide() { 2 } else { 1 };
+                            out.extend_from_slice(rest.unwrap_or_default().as_bytes());
+                            col += if c.is_wide() || joined { 2 } else { 1 };
                         }
                         _ => {
                             out.push(b' ');
@@ -744,6 +826,7 @@ impl Shadow {
         beneath: &dyn Fn(u16) -> f32,
     ) {
         let screen = self.parser.screen();
+        let cols = screen.size().1;
         // The overlay's glyphs while more visible, then the session's cells.
         let overlaid = t < CROSSOVER;
         let ink = Painted {
@@ -761,43 +844,80 @@ impl Shadow {
                 break;
             };
             let laid = laid_out(row, over.width);
-            let mut at: Option<u16> = None;
+            let glyph = |c: u16| {
+                laid[usize::from(c)]
+                    .as_deref()
+                    .filter(|g| overlaid && !is_blank(g))
+            };
+            let mut at = At::Off;
             let mut c = 0u16;
             while c < over.width {
                 let col = over.left + c;
-                let glyph = laid[usize::from(c)]
-                    .as_deref()
-                    .filter(|g| overlaid && !is_blank(g));
-                let (text, painted, width) = match glyph {
+                let mut drifting = false;
+                // A flag's second half, written with its first.
+                let mut rest = "";
+                let (text, painted, width) = match glyph(c) {
                     // The overlay's glyph in its one colour; the notice sets
                     // no background, so the box keeps the reset's.
                     Some(g) => (g, ink, glyph_width(g)),
-                    // The session's cell. A wide character the rectangle cuts
-                    // is blanked: half would be a broken glyph, and the other
-                    // half is outside the rectangle.
+                    // The session's cell. A wide character or flag the
+                    // rectangle cuts is blanked: half would be a broken
+                    // glyph, and the other half is outside the rectangle.
                     None => {
                         let cell = screen.cell(line, col);
                         let painted = resolve(cell, palette, beneath(line));
+                        // The next cell is the rectangle's, and not under a
+                        // glyph of the overlay's.
+                        let room = c + 1 < over.width && glyph(c + 1).is_none();
                         match cell {
-                            Some(cell) if cell.is_wide_continuation() => (" ", painted, 1),
+                            Some(cell)
+                                if cell.is_wide_continuation() || flag_end(screen, line, col) =>
+                            {
+                                (" ", painted, 1)
+                            }
                             Some(cell) if cell.is_wide() && c + 2 > over.width => (" ", painted, 1),
                             Some(cell) if cell.has_contents() => {
-                                let w = if cell.is_wide() { 2 } else { 1 };
-                                (cell.contents(), painted, w)
+                                drifting = drifts(cell);
+                                let half = drifting.then(|| flag(screen, line, col)).flatten();
+                                match half {
+                                    Some(half) if room => {
+                                        rest = half;
+                                        (cell.contents(), painted, 2)
+                                    }
+                                    Some(_) => {
+                                        drifting = false;
+                                        (" ", painted, 1)
+                                    }
+                                    None => {
+                                        let padded = drifting
+                                            && room
+                                            && pads(cell, screen.cell(line, col + 1));
+                                        let w = if cell.is_wide() || padded { 2 } else { 1 };
+                                        (cell.contents(), painted, w)
+                                    }
+                                }
                             }
                             _ => (" ", painted, 1),
                         }
                     }
                 };
-                if at != Some(col) {
-                    let _ = write!(out, "\x1b[{};{}H", line + 1, col + 1);
-                }
+                place(out, (line, col), at);
                 if sgr != Some(painted) {
                     write_sgr(out, painted);
                     sgr = Some(painted);
                 }
+                // In the cell's pen, which a pad's looks like here: the same
+                // pen and dissolve.
+                if drifting && width == 2 {
+                    clear_two(out, col, cols);
+                }
                 out.extend_from_slice(text.as_bytes());
-                at = Some(col + width);
+                out.extend_from_slice(rest.as_bytes());
+                at = if drifting {
+                    At::Astray
+                } else {
+                    At::Col(col + width)
+                };
                 c += width;
             }
         }
@@ -842,35 +962,66 @@ impl Shadow {
         // Which of the row's cells show nothing (see `Run`).
         let mut bare = vec![false; usize::from(cols)];
         for row in 0..rows {
-            let mut at: Option<u16> = None;
+            let mut at = At::Off;
             let mut run = Run::default();
-            // The previous cell was a session wide character written whole;
-            // this is its second half.
+            // The previous cell was a session wide character, or a flag's
+            // first half (see `flag`), written whole; this is its second half.
             let mut wide_before = false;
+            // This cell is the blank the one before was drawn over, written
+            // with it (see `pads`).
+            let mut padded = false;
+            // The previous cell began a flag, whatever was drawn there.
+            let mut flagged = false;
+            // A drifting cell was just written beside a rectangle: drawn two
+            // wide it ran over this cell, so this one is written again.
+            let mut again = false;
             for col in 0..cols {
                 let cell = screen.cell(row, col);
-                let drawn = match laid.iter().find_map(|l| l.at(row, col)) {
+                let inside = laid.iter().find_map(|l| l.at(row, col));
+                let rewrite = std::mem::take(&mut again);
+                let second = std::mem::take(&mut flagged);
+                let rest = if second { None } else { flag(screen, row, col) };
+                flagged = rest.is_some();
+                let drawn = match inside {
                     Some(inside) => {
                         wide_before = false;
                         inside
                     }
-                    None if cell.is_some_and(vt100::Cell::is_wide_continuation) => {
+                    None if second || cell.is_some_and(vt100::Cell::is_wide_continuation) => {
                         let written = std::mem::take(&mut wide_before);
                         (!written).then_some((" ", Pen::BLANK))
                     }
                     None => {
-                        let wide = cell.is_some_and(vt100::Cell::is_wide);
+                        let wide = rest.is_some() || cell.is_some_and(vt100::Cell::is_wide);
                         let cut =
                             wide && (col + 2 > cols || laid.iter().any(|l| l.holds(row, col + 1)));
-                        wide_before = wide && !cut;
-                        Some(shaded(cell, shade(row, col), palette, cut))
+                        let drawn = shaded(cell, shade(row, col), palette, cut);
+                        // A flag's blank leaves its second half to blank too,
+                        // as that is a cell of its own on some terminals.
+                        wide_before = wide && !cut && (rest.is_none() || drawn.0 != " ");
+                        Some(drawn)
                     }
                 };
                 let index = usize::from(row) * usize::from(cols) + usize::from(col);
-                let same = diff && self.under[index].is(drawn);
+                let same = diff && self.under[index].is(drawn) && !rewrite;
                 if !same {
                     self.under[index] = Drawn::of(drawn);
                 }
+                if std::mem::take(&mut padded) {
+                    bare[usize::from(col)] = false;
+                    continue;
+                }
+                // A session cell drawn as its text.
+                let drifting = inside.is_none()
+                    && drawn.is_some_and(|(text, _)| text != " ")
+                    && cell.is_some_and(drifts);
+                let next = screen.cell(row, col + 1);
+                let pad = (drifting
+                    && !laid.iter().any(|l| l.holds(row, col + 1))
+                    && cell.is_some_and(|c| pads(c, next)))
+                .then(|| shaded(next, shade(row, col + 1), palette, false));
+                let same = same && pad.is_none_or(|pad| self.under[index + 1].is(Some(pad)));
+                padded = pad.is_some();
                 bare[usize::from(col)] =
                     drawn.is_some_and(|(text, this)| text == " " && this.shows_nothing());
                 // An owed run absorbs the unchanged blanks after it: one erase,
@@ -888,17 +1039,42 @@ impl Shadow {
                 if same {
                     continue;
                 }
-                if at != Some(col) {
+                if at != At::Col(col) {
                     let over = pen.is_some_and(|p| p.shows_nothing());
                     move_to(&mut out, (row, col), at, over, &bare);
+                }
+                // Blanked in the blank's own pen where spaces in the cell's
+                // look otherwise, as shades differ cell to cell.
+                let clear = match pad {
+                    Some((_, blank)) if !blank.looks_like(&this) => Some(blank),
+                    Some(_) => Some(this),
+                    None => {
+                        let two = rest.is_some() || cell.is_some_and(vt100::Cell::is_wide);
+                        (drifting && two).then_some(this)
+                    }
+                };
+                if let Some(blank) = clear {
+                    if pen != Some(blank) {
+                        blank.write(&mut out);
+                        pen = Some(blank);
+                    }
+                    clear_two(&mut out, col, cols);
                 }
                 if pen != Some(this) {
                     this.write(&mut out);
                     pen = Some(this);
                 }
                 out.extend_from_slice(text.as_bytes());
+                if drifting {
+                    out.extend_from_slice(rest.unwrap_or_default().as_bytes());
+                    again = laid.iter().any(|l| l.holds(row, col + 1));
+                }
                 let width = u16::try_from(UnicodeWidthStr::width(text).max(1)).unwrap_or(1);
-                at = Some(col + width);
+                at = if drifting {
+                    At::Astray
+                } else {
+                    At::Col(col + width)
+                };
             }
             run.flush(&mut out, (row, cols), &mut at, |out| {
                 blank_pen(out, &mut pen)
@@ -988,6 +1164,11 @@ impl Pen {
     /// inverse, no underline.
     fn shows_nothing(&self) -> bool {
         self.bg == vt100::Color::Default && !self.underline && !self.inverse
+    }
+
+    /// Whether a space in this pen looks as one in `other` does.
+    fn looks_like(&self, other: &Self) -> bool {
+        self == other || (self.shows_nothing() && other.shows_nothing())
     }
 
     /// A fade cell in its interpolated colours, a default background left to
@@ -1155,6 +1336,18 @@ const ECH_FROM: u16 = 12;
 /// than a `CUP`, which costs about as much.
 const GAP: u16 = 7;
 
+/// Where a painter has left the cursor on the row it paints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum At {
+    /// Not on the row yet.
+    Off,
+    /// On the row, after a cell a terminal may draw at another width
+    /// ([`drifts`]).
+    Astray,
+    /// At this column.
+    Col(u16),
+}
+
 /// Empty cells a frame owes the terminal: start column and count, flushed
 /// when a visible cell comes or the row ends (see [`Run::flush`]). The pen is
 /// first set to one with no background, so an erase gives the terminal's own
@@ -1183,43 +1376,123 @@ impl Run {
         &mut self,
         out: &mut Vec<u8>,
         (row, cols): (u16, u16),
-        at: &mut Option<u16>,
+        at: &mut At,
         blank: impl FnOnce(&mut Vec<u8>),
     ) {
         let Some((start, n)) = self.0.take() else {
             return;
         };
-        if *at != Some(start) {
-            let _ = write!(out, "\x1b[{};{}H", row + 1, start + 1);
-        }
+        place(out, (row, start), *at);
         blank(out);
         if start + n == cols && n > 3 {
             out.extend_from_slice(b"\x1b[K");
-            *at = Some(start);
+            *at = At::Col(start);
         } else if n >= ECH_FROM {
             let _ = write!(out, "\x1b[{n}X");
-            *at = Some(start);
+            *at = At::Col(start);
         } else {
             out.extend(std::iter::repeat_n(b' ', usize::from(n)));
-            *at = Some(start + n);
+            *at = At::Col(start + n);
         }
     }
 }
 
 /// Move the cursor from `at` to `col` on `row`: by writing spaces over the
 /// cells between if they all show nothing (`bare`), the pen does too
-/// (`over`), and there are at most [`GAP`]; otherwise with a `CUP`.
-fn move_to(out: &mut Vec<u8>, (row, col): (u16, u16), at: Option<u16>, over: bool, bare: &[bool]) {
-    let gap = at.filter(|&from| {
-        over && from < col
-            && col - from <= GAP
-            && bare[usize::from(from)..usize::from(col)].iter().all(|&b| b)
-    });
-    match gap {
-        Some(from) => out.extend(std::iter::repeat_n(b' ', usize::from(col - from))),
-        None => {
+/// (`over`), and there are at most [`GAP`]; otherwise as [`place`] does.
+fn move_to(out: &mut Vec<u8>, (row, col): (u16, u16), at: At, over: bool, bare: &[bool]) {
+    match at {
+        At::Col(from)
+            if over
+                && from < col
+                && col - from <= GAP
+                && bare[usize::from(from)..usize::from(col)].iter().all(|&b| b) =>
+        {
+            out.extend(std::iter::repeat_n(b' ', usize::from(col - from)));
+        }
+        _ => place(out, (row, col), at),
+    }
+}
+
+/// Put the cursor at `col` on `row`: nothing if `at` is there, by CHA from
+/// [`At::Astray`], else by CUP.
+fn place(out: &mut Vec<u8>, (row, col): (u16, u16), at: At) {
+    match at {
+        At::Col(c) if c == col => {}
+        At::Astray => column(out, col),
+        _ => {
             let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
         }
+    }
+}
+
+/// CHA: column `col` of the cursor's row, also ending a pending wrap.
+fn column(out: &mut Vec<u8>, col: u16) {
+    let _ = write!(out, "\x1b[{}G", col + 1);
+}
+
+/// Whether a terminal may draw `cell` at another width than the shadow holds
+/// it, as the client's writer tests it ([`ambiwidth`]). Painters then place
+/// the next cell absolutely, as the writer does.
+fn drifts(cell: &vt100::Cell) -> bool {
+    cell.has_contents() && ambiwidth(cell.contents(), cell.is_wide())
+}
+
+/// Whether `next` is the blank a narrow drifting `cell` was drawn over: a
+/// blank in its pen, as the writer draws a cell Neovim makes wide but vt100
+/// counts narrow (❤️). Painters write the two together, the blank first, as
+/// a space over the right half of a `cell` drawn wide would break it.
+fn pads(cell: &vt100::Cell, next: Option<&vt100::Cell>) -> bool {
+    !cell.is_wide()
+        && next.is_some_and(|next| {
+            !next.is_wide_continuation()
+                && (!next.has_contents() || next.contents() == " ")
+                && Pen::of(Some(next)) == Pen::of(Some(cell))
+        })
+}
+
+/// The second half of the flag whose first is at (`row`, `col`), if one is.
+///
+/// Neovim's grid has a flag in one wide cell, and vt100 in two narrow ones,
+/// one regional indicator each (a lone one has a pad, see [`pads`]).
+/// Painters treat the two as one wide character, written with nothing
+/// between its halves, as WezTerm joins code points only within a run of
+/// text. Indicators pair from the start of a run, as Unicode pairs them.
+fn flag(screen: &vt100::Screen, row: u16, col: u16) -> Option<&str> {
+    let indicator = |col| {
+        screen.cell(row, col).filter(|cell| {
+            let mut chars = cell.contents().chars();
+            chars
+                .next()
+                .is_some_and(|c| ('\u{1f1e6}'..='\u{1f1ff}').contains(&c))
+                && chars.next().is_none()
+        })
+    };
+    let rest = indicator(col + 1)?;
+    indicator(col)?;
+    let before = (0..col)
+        .rev()
+        .take_while(|&c| indicator(c).is_some())
+        .count();
+    (before % 2 == 0).then(|| rest.contents())
+}
+
+/// Whether (`row`, `col`) holds the second half of a flag ([`flag`]).
+fn flag_end(screen: &vt100::Screen, row: u16, col: u16) -> bool {
+    col.checked_sub(1)
+        .is_some_and(|first| flag(screen, row, first).is_some())
+}
+
+/// Two spaces from `col`, the cursor's column, and back: a cell then drawn
+/// there narrower than two columns leaves no stale right half.
+fn clear_two(out: &mut Vec<u8>, col: u16, cols: u16) {
+    out.extend_from_slice(b"  ");
+    // Up to the last column leaves a wrap pending, where terminals disagree
+    // on BS.
+    if cols.saturating_sub(col) > 2 {
+        out.extend_from_slice(b"\x08\x08");
+    } else {
+        column(out, col);
     }
 }
 
@@ -2781,6 +3054,631 @@ mod tests {
         let cells = screen_of(&frame);
         assert_eq!(cells[&(1, 1)], ("0;1;7;38;2;1;2;3".into(), "a".into()));
         assert_eq!(cells[&(1, 3)], ("0;2;4".into(), "c".into()));
+    }
+
+    /// A terminal drawing a VS16 sequence two columns wide, as kitty,
+    /// WezTerm and foot do, and a regional indicator, alone or in a flag, as
+    /// WezTerm does; vt100 draws each in one. As in WezTerm, code points join
+    /// a cell only within a run of text. Text only.
+    struct Graphemes {
+        rows: usize,
+        cols: usize,
+        /// Row-major; "" for a wide character's right half.
+        cells: Vec<String>,
+        at: (usize, usize),
+        /// Written to the last column, the cursor left there.
+        pending: bool,
+        /// The cell written last, which a zero-width code point or a second
+        /// regional indicator joins.
+        last: Option<usize>,
+    }
+
+    impl Graphemes {
+        fn new(rows: usize, cols: usize) -> Self {
+            Self {
+                rows,
+                cols,
+                cells: vec![" ".into(); rows * cols],
+                at: (0, 0),
+                pending: false,
+                last: None,
+            }
+        }
+
+        /// Blank cell `i`, and the rest of a wide character it is half of.
+        fn erase(&mut self, i: usize) {
+            if self.cells[i].is_empty() {
+                self.cells[i - 1] = " ".into();
+            } else if self.cells.get(i + 1).is_some_and(String::is_empty) {
+                self.cells[i + 1] = " ".into();
+            }
+            self.cells[i] = " ".into();
+        }
+
+        /// The cursor to `col` of its row, or kept at the last column.
+        fn go(&mut self, col: usize) {
+            self.pending = col >= self.cols;
+            self.at.1 = col.min(self.cols - 1);
+        }
+
+        fn line_feed(&mut self) {
+            if self.at.0 + 1 == self.rows {
+                self.cells.drain(..self.cols);
+                self.cells.resize(self.rows * self.cols, " ".into());
+            } else {
+                self.at.0 += 1;
+            }
+        }
+
+        fn put(&mut self, ch: char) {
+            let indicator = |c: char| ('\u{1f1e6}'..='\u{1f1ff}').contains(&c);
+            // Into a flag with a lone indicator before it.
+            let pairs = indicator(ch)
+                && self.last.is_some_and(|i| {
+                    let mut held = self.cells[i].chars();
+                    held.next().is_some_and(indicator) && held.next().is_none()
+                });
+            let width = if indicator(ch) {
+                Some(2)
+            } else {
+                UnicodeWidthChar::width(ch)
+            };
+            let Some(width) = width else {
+                return;
+            };
+            if width == 0 || pairs {
+                let Some(i) = self.last else {
+                    return;
+                };
+                self.cells[i].push(ch);
+                let col = i % self.cols;
+                let narrow = !self.cells.get(i + 1).is_some_and(String::is_empty);
+                if narrow && col + 1 < self.cols && UnicodeWidthStr::width(&*self.cells[i]) == 2 {
+                    self.erase(i + 1);
+                    self.cells[i + 1] = String::new();
+                    self.go(col + 2);
+                }
+                return;
+            }
+            if self.pending || (width == 2 && self.at.1 + 1 == self.cols) {
+                self.line_feed();
+                self.go(0);
+            }
+            let i = self.at.0 * self.cols + self.at.1;
+            self.erase(i);
+            self.cells[i] = ch.to_string();
+            if width == 2 {
+                self.erase(i + 1);
+                self.cells[i + 1] = String::new();
+            }
+            self.last = Some(i);
+            self.go(self.at.1 + width);
+        }
+
+        /// Text, CR, LF, BS, CUP, CHA, CUF, EL, ECH and `DECSTBM`'s home;
+        /// other sequences change no text.
+        fn process(&mut self, bytes: &[u8]) {
+            let mut chars = std::str::from_utf8(bytes).expect("utf-8").chars();
+            while let Some(ch) = chars.next() {
+                if ch != '\x1b' {
+                    match ch {
+                        '\r' => self.go(0),
+                        '\n' => self.line_feed(),
+                        '\x08' => self.go(self.at.1.saturating_sub(1)),
+                        ch => self.put(ch),
+                    }
+                    if ch.is_control() {
+                        self.last = None;
+                    }
+                    continue;
+                }
+                self.last = None;
+                match chars.next() {
+                    Some('[') => {}
+                    Some(']') => {
+                        while let Some(c) = chars.next() {
+                            if c == '\x07' || (c == '\x1b' && chars.next().is_some()) {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                }
+                let mut params = String::new();
+                let Some(fin) = chars.by_ref().find(|c| {
+                    let fin = ('\x40'..='\x7e').contains(c);
+                    if !fin {
+                        params.push(*c);
+                    }
+                    fin
+                }) else {
+                    return;
+                };
+                let n: Vec<usize> = params
+                    .split(';')
+                    .map(|p| p.parse().unwrap_or(1).max(1))
+                    .collect();
+                let row = self.at.0 * self.cols;
+                match fin {
+                    'H' => {
+                        self.at.0 = (n[0] - 1).min(self.rows - 1);
+                        self.go((n.get(1).map_or(0, |c| c - 1)).min(self.cols - 1));
+                    }
+                    'G' => self.go((n[0] - 1).min(self.cols - 1)),
+                    'C' => self.go((self.at.1 + n[0]).min(self.cols - 1)),
+                    'K' => (self.at.1..self.cols).for_each(|c| self.erase(row + c)),
+                    'X' => (self.at.1..(self.at.1 + n[0]).min(self.cols))
+                        .for_each(|c| self.erase(row + c)),
+                    'r' => {
+                        self.at.0 = 0;
+                        self.go(0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn rows(&self) -> Vec<String> {
+            self.cells
+                .chunks(self.cols)
+                .map(|row| row.concat().trim_end().to_string())
+                .collect()
+        }
+    }
+
+    /// Each row's text as vt100 shows it.
+    fn rows_on_vt100(bytes: &[u8], rows: u16, cols: u16) -> Vec<String> {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(bytes);
+        parser
+            .screen()
+            .rows(0, cols)
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// The client draws ❤️, two cells to Neovim, over two spaces, placing
+    /// the next cell by CHA; vt100 holds it in one column, the blank after.
+    const HEART: &str = "\x1b[1;1H\x1b[0ma  \x08\x08\u{2764}\u{fe0f}\x1b[4Gbcdef\x1b[2;1HABCDEFGH";
+
+    /// Written adjacent, the rest of the row would land a column right on a
+    /// terminal drawing ❤️ two wide, and the blank after it would break it.
+    #[test]
+    fn an_emoji_is_painted_where_the_grid_has_it_however_wide_it_is_drawn() {
+        let heart = "\u{2764}\u{fe0f}";
+        let mut s = Shadow::new(2, 8);
+        s.feed(HEART.as_bytes());
+        let mut fade = s.frame(0.0, &palette(), Cursor::Hidden);
+        fade.extend(s.frame(0.5, &palette(), Cursor::Hidden));
+        let mut under = s.frame_under(&|_, _| Shade::Faint, None, &[], Cursor::Hidden);
+        let falloff = |_, col| Shade::Toward(f32::from(col) / 10.0);
+        under.extend(s.frame_under(&falloff, Some(&palette()), &[], Cursor::Hidden));
+        let over = Over {
+            top: 0,
+            left: 0,
+            width: 8,
+            rows: vec![" ".repeat(8); 2],
+        };
+        let crossed = s.under(&over, &palette(), Rgb(9, 9, 9), 1.0);
+        let kept = s.kept_bytes(&Kept::new([(0, 0, 7), (1, 0, 7)], []), &palette());
+        for (name, bytes) in [
+            ("paint", s.paint()),
+            ("fade", fade),
+            ("under", under),
+            ("crossed", crossed),
+            ("kept", kept),
+        ] {
+            assert_eq!(
+                rows_on_vt100(&bytes, 2, 8),
+                [format!("a{heart} bcdef"), "ABCDEFGH".into()],
+                "{name}, one column wide"
+            );
+            let mut two = Graphemes::new(2, 8);
+            two.process(&bytes);
+            assert_eq!(
+                two.rows(),
+                [format!("a{heart}bcdef"), "ABCDEFGH".into()],
+                "{name}, two columns wide"
+            );
+        }
+    }
+
+    /// Drawn two wide, ❤️ runs over the floating screen's first cell, which a
+    /// frame that changes only the emoji would leave unwritten.
+    #[test]
+    fn a_floating_screen_beside_an_emoji_keeps_its_first_cell() {
+        let over = [laid(2, 0, 4, 2, "WXYZ")];
+        let first = |_, _| Shade::Toward(0.2);
+        let second = |_, col| Shade::Toward(if col == 1 { 0.5 } else { 0.2 });
+        let mut s = Shadow::new(2, 8);
+        s.feed(HEART.as_bytes());
+        let mut bytes = s.frame_under(&first, Some(&palette()), &over, Cursor::Hidden);
+        let diff = s.frame_under(&second, Some(&palette()), &over, Cursor::Hidden);
+        assert!(text(&diff).contains('\u{2764}'), "{:?}", text(&diff));
+        bytes.extend(diff);
+        let mut fresh = Shadow::new(2, 8);
+        fresh.feed(HEART.as_bytes());
+        let whole = fresh.frame_under(&second, Some(&palette()), &over, Cursor::Hidden);
+
+        let (mut two, mut want) = (Graphemes::new(2, 8), Graphemes::new(2, 8));
+        two.process(&bytes);
+        want.process(&whole);
+        assert_eq!(two.rows(), want.rows(), "two columns wide");
+        assert_eq!(two.rows()[0], "a WXYZef");
+        assert_eq!(
+            rows_on_vt100(&bytes, 2, 8),
+            rows_on_vt100(&whole, 2, 8),
+            "one column wide"
+        );
+    }
+
+    /// A terminal drawing East Asian Ambiguous characters wide would push
+    /// the rest of the row along.
+    #[test]
+    fn the_cell_after_an_ambiguous_character_is_placed_again() {
+        let mut s = Shadow::new(2, 8);
+        s.feed("a\u{2500}b".as_bytes());
+        let over = Over {
+            top: 0,
+            left: 0,
+            width: 8,
+            rows: vec![" ".repeat(8)],
+        };
+        for bytes in [
+            s.paint(),
+            s.frame(0.0, &palette(), Cursor::Hidden),
+            s.frame_under(&|_, _| Shade::Faint, None, &[], Cursor::Hidden),
+            s.under(&over, &palette(), Rgb(9, 9, 9), 1.0),
+        ] {
+            let text = text(&bytes);
+            assert!(text.contains("a\u{2500}\x1b[3Gb"), "{text:?}");
+        }
+    }
+
+    /// The client's bytes for a screen given cell by cell, "" for the right
+    /// half of the wide cell before it.
+    fn client_bytes(rows: &[&[&str]]) -> Vec<u8> {
+        use crate::client::compose::Frame;
+        use crate::client::grid::Text;
+        use crate::client::screen::{Cursor as Shown, Screen};
+        use crate::client::style::Style;
+
+        let cols = rows[0].len();
+        let mut f = Frame::new(cols, rows.len(), Style::default());
+        for (r, row) in rows.iter().enumerate() {
+            for (c, text) in row.iter().enumerate() {
+                f.cells[r * cols + c].text = Text::new(text);
+                if text.is_empty() {
+                    f.cells[r * cols + c - 1].wide = true;
+                }
+            }
+        }
+        let hidden = Shown {
+            visible: false,
+            row: 0,
+            col: 0,
+            shape: 2,
+            color: None,
+        };
+        Screen::new().draw(f, &hidden, false, &[])
+    }
+
+    /// vt100 holds a flag in two cells. WezTerm draws each half alone, two
+    /// wide, if anything comes between them.
+    #[test]
+    fn a_flag_is_written_whole_by_every_painter() {
+        let (jp, us, lone) = ("\u{1f1ef}\u{1f1f5}", "\u{1f1fa}\u{1f1f8}", "\u{1f1fa}");
+        let drawn = client_bytes(&[
+            &["a", jp, "", "b", lone, "", "c", "d"],
+            &[jp, "", us, "", lone, "", "x", "y"],
+        ]);
+        let mut two = Graphemes::new(2, 8);
+        two.process(&drawn);
+        assert_eq!(
+            two.rows(),
+            [format!("a{jp}b{lone}cd"), format!("{jp}{us}{lone}xy")]
+        );
+        let want = (rows_on_vt100(&drawn, 2, 8), two.rows());
+        let mut s = Shadow::new(2, 8);
+        s.feed(&drawn);
+        let mut fade = s.frame(0.0, &palette(), Cursor::Hidden);
+        fade.extend(s.frame(0.5, &palette(), Cursor::Hidden));
+        let mut under = s.frame_under(&|_, _| Shade::Faint, None, &[], Cursor::Hidden);
+        let falloff = |_, col| Shade::Toward(f32::from(col) / 10.0);
+        under.extend(s.frame_under(&falloff, Some(&palette()), &[], Cursor::Hidden));
+        let over = Over {
+            top: 0,
+            left: 0,
+            width: 8,
+            rows: vec![" ".repeat(8); 2],
+        };
+        let crossed = s.under(&over, &palette(), Rgb(9, 9, 9), 1.0);
+        let kept = s.kept_bytes(&Kept::new([(0, 0, 7), (1, 0, 7)], []), &palette());
+        for (name, bytes) in [
+            ("paint", s.paint()),
+            ("fade", fade),
+            ("under", under),
+            ("crossed", crossed),
+            ("kept", kept),
+        ] {
+            let text = text(&bytes);
+            assert!(text.contains(jp) && text.contains(us), "{name}: {text:?}");
+            let mut two = Graphemes::new(2, 8);
+            two.process(&bytes);
+            let got = (rows_on_vt100(&bytes, 2, 8), two.rows());
+            assert_eq!(got, want, "{name}: {text:?}");
+        }
+    }
+
+    /// Half a flag would show a lone indicator, as half a wide character
+    /// shows a broken glyph.
+    #[test]
+    fn a_flag_a_rectangle_cuts_is_blanked() {
+        let (first, second) = ("\u{1f1ef}", "\u{1f1f5}");
+        let mut s = Shadow::new(2, 8);
+        s.feed(&client_bytes(&[
+            &["a", "\u{1f1ef}\u{1f1f5}", "", "b", "c", "d", "e", "f"],
+            &["g"; 8],
+        ]));
+        let notice = |left: u16, row: &str, t| {
+            let over = Over {
+                top: 0,
+                left,
+                width: row.chars().count() as u16,
+                rows: vec![row.into()],
+            };
+            s.under(&over, &palette(), Rgb(9, 9, 9), t)
+        };
+        // The notice from the second half, up to the first, or with a glyph
+        // on either; what stands from the second half.
+        let mut cut = vec![
+            (notice(2, "   ", 1.0), second),
+            (notice(0, "  ", 1.0), first),
+            (notice(0, "  x ", 0.0), first),
+            (notice(0, " x  ", 0.0), second),
+            (
+                s.kept_bytes(&Kept::new([(0, 2, 5)], []), &palette()),
+                second,
+            ),
+        ];
+        // A floating screen over either half.
+        for (over, half) in [
+            (laid(2, 0, 3, 1, "xyz"), first),
+            (laid(0, 0, 2, 1, "xy"), second),
+        ] {
+            let faint = |_, _| Shade::Faint;
+            cut.push((s.frame_under(&faint, None, &[over], Cursor::Hidden), half));
+        }
+        for (bytes, half) in cut {
+            let text = text(&bytes);
+            assert!(!text.contains(half), "{text:?}");
+        }
+    }
+
+    /// Where ❤️ is drawn one column wide, its pad shows in its own pen.
+    #[test]
+    fn a_pad_is_written_again_in_its_own_pen_when_only_it_changes() {
+        let heart = "\u{2764}\u{fe0f}";
+        // Underlined, so the pad's fade shows; only the emoji stands.
+        let mut s = Shadow::new(2, 8);
+        s.feed(format!("\x1b[1;1H\x1b[0ma\x1b[4m  \x08\x08{heart}\x1b[0m\x1b[4Gbcdef").as_bytes());
+        let kept = Kept::new([(0, 0, 1)], []);
+        s.frame_with(|_| 0.0, &palette(), Cursor::Hidden, None, &kept);
+        let later = text(&s.frame_with(|_| 0.5, &palette(), Cursor::Hidden, None, &kept));
+        let pads = format!("\x1b[0;4;38;2;100;100;100m  \x08\x08\x1b[0;4;38;2;200;200;200m{heart}");
+        assert!(later.contains(&pads), "{later:?}");
+
+        // In a background, so the pad's shade shows; only its shade changes.
+        let mut s = Shadow::new(2, 8);
+        s.feed(format!("\x1b[1;1H\x1b[0;44ma  \x08\x08{heart}\x1b[4Gbcdef").as_bytes());
+        let pad_at = |t| move |_, col| Shade::Toward(if col == 2 { t } else { 0.0 });
+        s.frame_under(&pad_at(0.2), Some(&palette()), &[], Cursor::Hidden);
+        let later = text(&s.frame_under(&pad_at(0.4), Some(&palette()), &[], Cursor::Hidden));
+        let pads = format!(
+            "\x1b[0;38;2;120;120;120;48;2;0;0;120m  \x08\x08\x1b[0;38;2;200;200;200;48;2;0;0;200m{heart}"
+        );
+        assert!(later.contains(&pads), "{later:?}");
+
+        // A pad that shows nothing takes no pen of its own.
+        let mut s = Shadow::new(2, 8);
+        s.feed(HEART.as_bytes());
+        let fade = text(&s.frame(0.0, &palette(), Cursor::Hidden));
+        assert!(fade.contains(&format!("a  \x08\x08{heart}")), "{fade:?}");
+        let shaded = |_, col| Shade::Toward(f32::from(col) / 10.0);
+        let under = text(&s.frame_under(&shaded, Some(&palette()), &[], Cursor::Hidden));
+        assert!(
+            under.contains(&format!("\x1b[0;38;2;180;180;180m  \x08\x08{heart}")),
+            "{under:?}"
+        );
+    }
+
+    /// A terminal drawing the halves in a cell each keeps the second under a
+    /// space over the first.
+    #[test]
+    fn a_flag_its_shade_blanks_is_blanked_whole() {
+        let mut s = Shadow::new(2, 8);
+        s.feed(&client_bytes(&[
+            &["a", "\u{1f1ef}\u{1f1f5}", "", "b", "c", "d", "e", "f"],
+            &["g"; 8],
+        ]));
+        let lit = |_, _| Shade::Toward(0.0);
+        let mut bytes = s.frame_under(&lit, Some(&palette()), &[], Cursor::Hidden);
+        let first_blank = |_, col| {
+            if col == 1 {
+                Shade::Blank
+            } else {
+                Shade::Toward(0.0)
+            }
+        };
+        bytes.extend(s.frame_under(&first_blank, Some(&palette()), &[], Cursor::Hidden));
+        assert_eq!(
+            rows_on_vt100(&bytes, 2, 8)[0],
+            "a  bcdef",
+            "{:?}",
+            text(&bytes)
+        );
+    }
+
+    /// vt100 holds 😀 wide; a terminal may draw it in one column.
+    #[test]
+    fn a_wide_emoji_is_painted_over_two_spaces() {
+        let grin = "\u{1f600}";
+        let mut s = Shadow::new(2, 8);
+        s.feed(&client_bytes(&[
+            &["a", grin, "", "b", "c", "d", "e", "f"],
+            &["g"; 8],
+        ]));
+        let over = Over {
+            top: 0,
+            left: 0,
+            width: 8,
+            rows: vec![" ".repeat(8)],
+        };
+        for bytes in [
+            s.paint(),
+            s.frame(0.0, &palette(), Cursor::Hidden),
+            s.frame_under(&|_, _| Shade::Faint, None, &[], Cursor::Hidden),
+            s.under(&over, &palette(), Rgb(9, 9, 9), 1.0),
+            s.kept_bytes(&Kept::new([(0, 0, 7)], []), &palette()),
+        ] {
+            let text = text(&bytes);
+            assert!(text.contains(&format!("  \x08\x08{grin}")), "{text:?}");
+        }
+    }
+
+    /// Random screens as the client draws them, one over another, through
+    /// every painter (a fade and a frame under a floating screen twice, the
+    /// second a diff): each shows what the client's bytes do, on vt100 and
+    /// on a terminal drawing ❤️ and flags two wide. Keycaps are left out:
+    /// one cell to Neovim, such a terminal shows one broken by a blank the
+    /// client writes after it, which painters write under it instead.
+    #[test]
+    fn every_painter_shows_what_the_client_drew() {
+        use crate::client::compose::Frame;
+        use crate::client::grid::Text;
+        use crate::client::screen::{Cursor as Shown, Screen};
+        use crate::client::style::{Color, Style};
+
+        let styles = [
+            Style::default(),
+            Style {
+                fg: Color::Index(1),
+                ..Style::default()
+            },
+            Style {
+                bg: Color::Index(4),
+                ..Style::default()
+            },
+        ];
+        let letters = [
+            " ",
+            " ",
+            " ",
+            "a",
+            "é",
+            "─",
+            "\u{a9}",
+            "中",
+            "\u{2764}\u{fe0f}",
+            "\u{1f1ef}\u{1f1f5}",
+            "\u{1f1fa}",
+        ];
+        let wide = ["中", "\u{2764}\u{fe0f}", "\u{1f1ef}\u{1f1f5}", "\u{1f1fa}"];
+        // Fixed-seed xorshift: the same screens every run.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let (w, h) = (11, 4);
+        let hidden = Shown {
+            visible: false,
+            row: 0,
+            col: 0,
+            shape: 2,
+            color: None,
+        };
+        let over = Over {
+            top: 0,
+            left: 0,
+            width: w as u16,
+            rows: vec![" ".repeat(w); h],
+        };
+        let falloff = |_, col| Shade::Toward(f32::from(col % 5) / 10.0);
+        let mut random = || {
+            let mut f = Frame::new(w, h, Style::default());
+            for r in 0..h {
+                let mut c = 0;
+                while c < w {
+                    let at = r * w + c;
+                    let text = letters[next(letters.len())];
+                    f.cells[at].text = Text::new(text);
+                    f.cells[at].style = styles[next(styles.len())];
+                    if wide.contains(&text) {
+                        if c + 1 == w {
+                            f.cells[at].text = Text::Char('x');
+                        } else {
+                            f.cells[at].wide = true;
+                            f.cells[at + 1].text = Text::Half;
+                            f.cells[at + 1].style = f.cells[at].style;
+                            c += 1;
+                        }
+                    }
+                    c += 1;
+                }
+            }
+            f
+        };
+        for round in 0..200 {
+            let mut client = Screen::new();
+            let mut drawn = Vec::new();
+            for step in ["fresh", "over it"] {
+                drawn.extend(client.draw(random(), &hidden, false, &[]));
+                let mut s = Shadow::new(h as u16, w as u16);
+                s.feed(&drawn);
+                let mut two = Graphemes::new(h, w);
+                two.process(&drawn);
+                let want = (rows_on_vt100(&drawn, h as u16, w as u16), two.rows());
+
+                let mut fade = s.frame_with(
+                    |r| f32::from(r % 2) / 4.0,
+                    &palette(),
+                    Cursor::Hidden,
+                    None,
+                    &Kept::default(),
+                );
+                fade.extend(s.frame_with(
+                    |r| f32::from(r % 3) / 4.0,
+                    &palette(),
+                    Cursor::Hidden,
+                    None,
+                    &Kept::default(),
+                ));
+                let mut under = s.frame_under(&|_, _| Shade::Faint, None, &[], Cursor::Hidden);
+                under.extend(s.frame_under(&falloff, Some(&palette()), &[], Cursor::Hidden));
+                let kept = Kept::new((0..h).map(|r| (r, 0, w - 1)), []);
+                for (name, bytes) in [
+                    ("paint", s.paint()),
+                    ("fade", fade),
+                    ("under", under),
+                    ("crossed", s.under(&over, &palette(), Rgb(9, 9, 9), 1.0)),
+                    ("kept", s.kept_bytes(&kept, &palette())),
+                ] {
+                    let mut two = Graphemes::new(h, w);
+                    two.process(&bytes);
+                    let got = (rows_on_vt100(&bytes, h as u16, w as u16), two.rows());
+                    assert_eq!(
+                        got,
+                        want,
+                        "round {round} {step}, {name}: {:?}",
+                        text(&drawn)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
