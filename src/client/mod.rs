@@ -166,6 +166,11 @@ const RECHECK: Duration = Duration::from_millis(30);
 /// `flush` before being taken anyway: a redraw that changed nothing sends none.
 const TAILS_WAIT: Duration = Duration::from_millis(25);
 
+/// How long widths measured ahead of a redraw ([`wide::MEASURE_LUA`]) wait
+/// for its `flush` before windows are narrowed anyway. Plugins' autocommands
+/// can hold that redraw back well past a frame.
+const AHEAD_WAIT: Duration = Duration::from_millis(500);
+
 /// Timeout for a refresh, and delay before retrying one that came to nothing.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1740,6 +1745,11 @@ pub struct App {
     unanswered: HashMap<u64, Vec<usize>>,
     /// The measure's last wants for windows of the current tab page.
     wants: BTreeMap<i64, wide::Want>,
+    /// `wants` changed since [`App::narrow_windows`] last applied them.
+    unapplied: bool,
+    /// Since when `wants` measured ahead of a redraw wait for its `flush`
+    /// ([`AHEAD_WAIT`]).
+    ahead_since: Option<Instant>,
     /// Text past each window grid's edge reported since the last `flush`,
     /// and since when; taken with that `flush` ([`wide::TAILS_LUA`]).
     tails: Vec<(i64, BTreeMap<usize, wide::Tail>)>,
@@ -1831,6 +1841,8 @@ impl App {
             cut: HashMap::new(),
             unanswered: HashMap::new(),
             wants: BTreeMap::new(),
+            unapplied: false,
+            ahead_since: None,
             tails: Vec::new(),
             tails_since: None,
             looked: HashSet::new(),
@@ -1937,20 +1949,27 @@ impl App {
         }
     }
 
+    /// `ahead`: measured ahead of the redraw that shows a window coming in.
+    /// That redraw's flush narrows, so the window has its width from its
+    /// first frame; as does a switch's, measured before Neovim draws it when
+    /// made over RPC, so its fade starts from the window as drawn.
     fn measured(
         &mut self,
         laststatus: Option<i64>,
         wants: Option<BTreeMap<i64, wide::Want>>,
+        ahead: bool,
         now: Instant,
     ) {
         if let Some(w) = wants.filter(|w| *w != self.wants) {
             self.wants = w;
-            // Over RPC a switch is measured before Neovim draws it: narrowing
-            // waits for its flush, so its fade starts from the window as drawn.
-            if !self.switching() {
-                self.narrow_windows(now);
-            }
+            self.unapplied = true;
             self.dirty = true;
+        }
+        if ahead {
+            self.ahead_since.get_or_insert(now);
+        }
+        if self.unapplied && self.ahead_since.is_none() && !self.switching() {
+            self.narrow_windows(now);
         }
         if let Some(l) = laststatus {
             if self.model.laststatus != Some(l) {
@@ -1978,6 +1997,8 @@ impl App {
     /// whole. Narrowed grids are cut locally at once, as Neovim will.
     /// Returns whether anything was asked.
     fn narrow_windows(&mut self, now: Instant) -> bool {
+        self.unapplied = false;
+        self.ahead_since = None;
         let on = self.centring() && self.multigrid();
         let mut want: HashMap<u64, usize> = HashMap::new();
         let mut texts: HashMap<u64, usize> = HashMap::new();
@@ -2330,7 +2351,10 @@ impl App {
                 }
             }
             Some("options") => self.anim.set_options(options(&params[1..])),
-            Some("measure") => self.measured(int(1), wants(params.get(2)), now),
+            Some("measure") => {
+                let ahead = matches!(params.get(3), Some(ValueRef::Boolean(true)));
+                self.measured(int(1), wants(params.get(2)), ahead, now);
+            }
             // Sent ahead of the `flush` it belongs to; taken with that frame.
             Some("tails") => {
                 if let Some(win) = int(1) {
@@ -2634,7 +2658,8 @@ impl App {
                     Some(Ask::Measure) => {
                         let answer = result.and_then(ValueRef::as_array);
                         let laststatus = answer.and_then(|a| a.first()).and_then(redraw::int);
-                        self.measured(laststatus, wants(answer.and_then(|a| a.get(1))), now);
+                        let wants = wants(answer.and_then(|a| a.get(1)));
+                        self.measured(laststatus, wants, false, now);
                     }
                     Some(Ask::Uis) => {
                         self.checking = false;
@@ -5706,6 +5731,12 @@ impl App {
         {
             self.take_tails();
         }
+        if self
+            .ahead_since
+            .is_some_and(|since| since + AHEAD_WAIT <= now)
+        {
+            self.narrow_windows(now);
+        }
     }
 
     /// Whether to start a refresh now ([`refresh`]); clears the request.
@@ -5748,6 +5779,7 @@ impl App {
             frame,
             self.recheck_at,
             self.tails_since.map(|since| since + TAILS_WAIT),
+            self.ahead_since.map(|since| since + AHEAD_WAIT),
             ask,
         ]
         .into_iter()
@@ -12811,7 +12843,7 @@ mod tests {
     /// Cut then, the old text slid in to the middle and the switch faded from
     /// it cut short; the switch's flush narrows instead.
     #[test]
-    fn a_measure_ahead_of_a_switch_narrows_once_the_switch_is_drawn() {
+    fn a_switch_measured_before_it_is_drawn_narrows_with_its_flush() {
         let t0 = Instant::now();
         let (mut a, _) = wide_app(t0);
         let n = Value::from;
@@ -12847,6 +12879,48 @@ mod tests {
         assert_eq!(shown(&mut a, t1)[0], "old", "fading where it was");
         let t2 = t1 + Duration::from_secs(1);
         assert_eq!(shown(&mut a, t2)[0], "      new");
+    }
+
+    /// Over RPC the measure after the command also comes before the redraw.
+    #[test]
+    fn widths_measured_ahead_of_a_redraw_wait_for_its_flush() {
+        let t0 = Instant::now();
+        let (mut a, _) = wide_app(t0);
+        let n = Value::from;
+        let measure = |width: i64, ahead: bool| {
+            let each = Value::Array(vec![Value::Array(vec![1000.into(), width.into()])]);
+            vec!["measure".into(), 2.into(), each, ahead.into()]
+        };
+        notify(&mut a, "nvmux_client", measure(1 << 30, false), t0);
+        redraw(
+            &mut a,
+            vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+                line(2, 0, "text"),
+            ],
+            t0,
+        );
+        calls(&mut a);
+
+        notify(&mut a, "nvmux_client", measure(8, true), t0);
+        notify(&mut a, "nvmux_client", measure(8, false), t0);
+        assert!(grids_asked(&calls(&mut a)).is_empty(), "not ahead of it");
+        redraw(&mut a, vec![line(2, 0, "text")], t0);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(8), n(0)]]);
+        redraw(&mut a, vec![resize(2, 8, 5)], t0);
+
+        // A change Neovim draws nothing for sends no flush.
+        let t1 = t0 + Duration::from_secs(1);
+        notify(&mut a, "nvmux_client", measure(1 << 30, true), t1);
+        shown(&mut a, t1);
+        assert_eq!(a.wake_at(t1), Some(t1 + AHEAD_WAIT));
+        a.tick(t1 + AHEAD_WAIT / 2);
+        assert!(grids_asked(&calls(&mut a)).is_empty(), "still waiting");
+        a.tick(t1 + AHEAD_WAIT);
+        assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
     }
 
     /// Re-attaching without multigrid for a foreign UI releases narrowed

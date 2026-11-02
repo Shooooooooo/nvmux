@@ -6049,6 +6049,76 @@ fn a_buffer_switch_over_a_slow_link_waits_for_the_window_drawn_wider() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// Each column at which row `row` first shows `pat`, in the order seen over
+/// `within`.
+fn columns_seen(term: &mut Terminal, within: Duration, row: u16, pat: &str) -> Vec<usize> {
+    let mut seen: Vec<usize> = Vec::new();
+    term.frames(within, |screen| {
+        let text: String = (0..160)
+            .map(|c| match screen.cell(row, c) {
+                Some(cell) if cell.has_contents() => cell.contents(),
+                _ => " ",
+            })
+            .collect();
+        let at = text.find(pat).map(|at| text[..at].chars().count());
+        if let Some(at) = at.filter(|at| seen.last() != Some(at)) {
+            seen.push(at);
+        }
+        false
+    });
+    seen
+}
+
+/// Regression: a window coming in with text that wants it whole (long
+/// unwrapped lines, a terminal), opened or brought back with its tab page,
+/// came in centred at `window_width` and slid out to its edge. Neovim draws a
+/// typed command before measuring what the window shows.
+#[test]
+fn a_window_coming_in_has_its_width_from_its_first_frame() {
+    require_nvim!();
+    let scratch = Scratch::new("client-coming-in");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-coming-in");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    let long = long_lines(&mut term, &mut rpc);
+    let centred = format!("{}the left window", " ".repeat(50));
+    // Each new window opens on the left, 'splitright' being off, from one
+    // window the whole width.
+    for (command, pat) in [
+        (format!("vertical sbuffer {long}"), "x"),
+        (
+            "vsplit | terminal printf 'the terminal'; exec sleep 1000".into(),
+            "the terminal",
+        ),
+    ] {
+        term.pump_until(Duration::from_millis(500), |_| false);
+        term.type_bytes(format!(":{command}\r").as_bytes());
+        let seen = columns_seen(&mut term, Duration::from_millis(800), 0, pat);
+        assert_eq!(seen, [0], "after {command}");
+        rpc.command("only | buffer 1").expect("one window again");
+        assert!(
+            term.pump_until(Duration::from_secs(5), |s| s.starts_with(&centred)),
+            "not one window again:\n{}",
+            term.text()
+        );
+    }
+    // Row 0 is the tab line.
+    for (keys, pat, at) in [
+        (format!(":tab sbuffer {long}\r"), "x", 0),
+        ("gt".into(), "the left window", 50),
+        ("gt".into(), "x", 0),
+    ] {
+        term.pump_until(Duration::from_millis(500), |_| false);
+        term.type_bytes(keys.as_bytes());
+        let seen = columns_seen(&mut term, Duration::from_millis(800), 1, pat);
+        assert_eq!(seen, [at], "after {keys:?}");
+    }
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// While a UI without `ext_multigrid` is attached, the client re-attaches
 /// without it and releases its narrowed windows; once that UI goes, it
 /// narrows them again.
