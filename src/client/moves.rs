@@ -285,9 +285,10 @@ impl Ctx<'_> {
     }
 
     /// Whether `'whichwrap'` has the key's letter `ww`, letting a sideways
-    /// move cross the line's end; `None` if unknown.
+    /// move cross the line's end; `None` if unknown. Its flags are single
+    /// characters, commas between them optional (`<>[]hl,b,s`).
     fn wraps(&self, ww: char) -> Option<bool> {
-        Some(self.whichwrap?.split(',').any(|f| f.starts_with(ww)))
+        Some(self.whichwrap?.contains(ww))
     }
 }
 
@@ -1477,6 +1478,43 @@ mod tests {
                 run(keys, from, &s, Some("h,l,<,>")),
                 Some(pos(to)),
                 "{keys:?} from {from:?}"
+            );
+        }
+    }
+
+    /// Neovim finds a key's letter anywhere in `'whichwrap'`, not just at the
+    /// start of a comma-separated part: NvChad's `<>[]hl,b,s` lets every key
+    /// wrap.
+    #[test]
+    fn whichwrap_flags_count_without_commas() {
+        #[rustfmt::skip]
+        let cases: &[(&str, State, &str, State)] = &[
+            ("<>[]hl,b,s", (0, 10, -1, 0, 0), "l", (1, 0, 0, 0, 0)),
+            ("<>[]hl,b,s", (0, 10, -1, 0, 0), "2l", (1, 1, 1, 0, 0)),
+            ("<>[]hl,b,s", (0, 10, -1, 0, 0), "<Right>", (1, 0, 0, 0, 0)),
+            ("<>[]hl,b,s", (0, 10, -1, 0, 0), " ", (1, 0, 0, 0, 0)),
+            ("<>[]hl,b,s", (1, 0, 0, 0, 0), "h", (0, 10, 10, 0, 0)),
+            ("<>[]hl,b,s", (1, 0, 0, 0, 0), "3h", (0, 8, 8, 0, 0)),
+            ("<>[]hl,b,s", (1, 0, 0, 0, 0), "<Left>", (0, 10, 10, 0, 0)),
+            ("<>[]hl,b,s", (1, 0, 0, 0, 0), "<BS>", (0, 10, 10, 0, 0)),
+            ("hl", (0, 10, -1, 0, 0), "l", (1, 0, 0, 0, 0)),
+            ("hl", (2, 0, 0, 0, 0), "l", (3, 0, 7, 0, 0)),
+            ("hl", (1, 0, 0, 0, 0), "h", (0, 10, 10, 0, 0)),
+            ("hl", (0, 10, -1, 0, 0), "<Right>", (0, 10, -1, 0, 0)),
+            ("hl", (0, 10, -1, 0, 0), " ", (0, 10, -1, 0, 0)),
+            ("hl", (1, 0, 0, 0, 0), "<Left>", (1, 0, 0, 0, 0)),
+            ("hl", (1, 0, 0, 0, 0), "<C-h>", (1, 0, 0, 0, 0)),
+            ("b,s", (0, 10, -1, 0, 0), "l", (0, 10, -1, 0, 0)),
+            ("b,s", (0, 10, -1, 0, 0), "<Right>", (0, 10, -1, 0, 0)),
+            ("b,s", (1, 0, 0, 0, 0), "h", (1, 0, 0, 0, 0)),
+            ("b,s", (1, 0, 0, 0, 0), "<Left>", (1, 0, 0, 0, 0)),
+        ];
+        let s = shape();
+        for &(ww, from, keys, to) in cases {
+            assert_eq!(
+                run(keys, from, &s, Some(ww)),
+                Some(pos(to)),
+                "{keys:?} from {from:?} with {ww:?}"
             );
         }
     }
