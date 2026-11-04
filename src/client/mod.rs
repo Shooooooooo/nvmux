@@ -144,7 +144,8 @@ const MIN_FRAME_GAP: Duration = Duration::from_millis(4);
 const AWAY_FRAME_GAP: Duration = Duration::from_secs(1);
 
 /// How long drawing waits for what a multigrid attach lacks (window places,
-/// contents, other UIs settling) before drawing what it has.
+/// contents, other UIs settling, the widths windows want) before drawing
+/// what it has.
 const HOLD_LIMIT: Duration = Duration::from_millis(500);
 
 /// How long after its last byte a partial terminal reply is kept.
@@ -1735,6 +1736,9 @@ pub struct App {
     window_width: usize,
     /// The measure was installed this attach.
     measuring: bool,
+    /// The request installing it, until answered: narrowing and drawing wait
+    /// for that answer (see [`App::leave_measure`]).
+    measure_due: Option<u32>,
     /// Window grids asked to be narrower than their windows, and the width.
     narrowed: HashMap<u64, usize>,
     /// Grids the client cut to the asked width that Neovim has not resized
@@ -1837,6 +1841,7 @@ impl App {
             centre: Centre::Off,
             window_width: 0,
             measuring: false,
+            measure_due: None,
             narrowed: HashMap::new(),
             cut: HashMap::new(),
             unanswered: HashMap::new(),
@@ -1916,8 +1921,8 @@ impl App {
     }
 
     /// Runs [`wide::MEASURE_LUA`]; given the channel, it stays installed and
-    /// reports changes.
-    fn measure(&mut self, chan: Option<u64>) {
+    /// reports changes. Returns the request's id.
+    fn measure(&mut self, chan: Option<u64>) -> u32 {
         let smart = self.centre == Centre::Smart;
         let mut args = vec![Arg::Int(self.window_width as i64), Arg::Bool(smart)];
         if let Some(chan) = chan {
@@ -1928,17 +1933,20 @@ impl App {
             &[Arg::str(wide::MEASURE_LUA), Arg::Array(args)],
         );
         self.asked.insert(id, Ask::Measure);
+        id
     }
 
     /// Installs the measure and [`wide::TAILS_LUA`] for this attach, once the
-    /// channel is known.
+    /// channel is known. Neovim runs `UIEnter`, which splash screens open on,
+    /// after the attach's first redraw, and answers this request after it:
+    /// windows are narrowed, and drawn, only once the answer has come.
     fn leave_measure(&mut self) {
         if !self.centring() || self.measuring || self.attach == Attach::Asking {
             return;
         }
         if let Some(chan) = self.chan {
             self.measuring = true;
-            self.measure(Some(chan));
+            self.measure_due = Some(self.measure(Some(chan)));
             self.outbox.notify(
                 "nvim_exec_lua",
                 &[
@@ -2000,6 +2008,10 @@ impl App {
         self.unapplied = false;
         self.ahead_since = None;
         let on = self.centring() && self.multigrid();
+        if on && self.measure_due.is_some() {
+            self.unapplied = true;
+            return false;
+        }
         let mut want: HashMap<u64, usize> = HashMap::new();
         let mut texts: HashMap<u64, usize> = HashMap::new();
         if on {
@@ -2266,6 +2278,7 @@ impl App {
         self.agent = false;
         self.leave_agent();
         self.measuring = false;
+        self.measure_due = None;
         self.leave_measure();
     }
 
@@ -2659,7 +2672,14 @@ impl App {
                         let answer = result.and_then(ValueRef::as_array);
                         let laststatus = answer.and_then(|a| a.first()).and_then(redraw::int);
                         let wants = wants(answer.and_then(|a| a.get(1)));
+                        let installed = self.measure_due == Some(id);
+                        if installed {
+                            self.measure_due = None;
+                        }
                         self.measured(laststatus, wants, false, now);
+                        if installed {
+                            self.settle(now);
+                        }
                     }
                     Some(Ask::Uis) => {
                         self.checking = false;
@@ -3041,7 +3061,8 @@ impl App {
                 .get(grid)
                 .is_some_and(|r| now < r.at + HOLD_LIMIT)
         });
-        if self.multigrid() && (self.unsettled || self.placing > 0 || refreshing) {
+        let unmeasured = self.measure_due.is_some();
+        if self.multigrid() && (self.unsettled || self.placing > 0 || refreshing || unmeasured) {
             self.hold_since.get_or_insert(now);
         } else if self.hold_since.take().is_some() {
             self.dirty = true;
@@ -12563,7 +12584,8 @@ mod tests {
             .collect()
     }
 
-    /// Attached with fixed centring at 8 columns, the sent calls returned.
+    /// Attached with fixed centring at 8 columns, the measure installed with
+    /// the attach answered; the calls the attach sent returned.
     fn wide_app(t0: Instant) -> (App, Vec<Call>) {
         let mut a = app(true).with_centre(Centre::Fixed, 8);
         a.start();
@@ -12578,6 +12600,8 @@ mod tests {
         answer(&mut a, measure, Value::Array(vec![2.into()]), t0);
         answer(&mut a, asks_uis(&sent), uis(false, false), t0);
         let sent = calls(&mut a);
+        let installed = request(&sent, "nvim_exec_lua", "local most");
+        answer(&mut a, installed, Value::Array(vec![2.into()]), t0);
         (a, sent)
     }
 
@@ -12928,6 +12952,50 @@ mod tests {
         assert!(grids_asked(&calls(&mut a)).is_empty(), "still waiting");
         a.tick(t1 + AHEAD_WAIT);
         assert_eq!(grids_asked(&calls(&mut a)), [vec![n(2), n(0), n(0)]]);
+    }
+
+    /// Neovim answers the measure installed with the attach after `UIEnter`,
+    /// which a splash screen opens on after the attach's first redraw. Until
+    /// then that redraw is neither narrowed nor drawn; the answer says how
+    /// wide the window's text is: centred, or a splash's own.
+    #[test]
+    fn windows_wait_for_the_measure_installed_with_the_attach() {
+        let t0 = Instant::now();
+        let n = Value::from;
+        for (wanted, asked, row) in [
+            (8, vec![vec![n(2), n(8), n(0)]], "      text"),
+            (1 << 30, vec![], "text"),
+        ] {
+            let mut a = app(true).with_centre(Centre::Fixed, 8);
+            a.start();
+            let sent = calls(&mut a);
+            let measure = request(&sent, "nvim_exec_lua", "local most");
+            answer(
+                &mut a,
+                request(&sent, "nvim_get_api_info", ""),
+                Value::Array(vec![7.into()]),
+                t0,
+            );
+            answer(&mut a, measure, Value::Array(vec![2.into()]), t0);
+            answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+            let installed = request(&calls(&mut a), "nvim_exec_lua", "local most");
+            let mut drawn = vec![
+                resize(1, 20, 6),
+                resize(2, 20, 5),
+                place(2, 1000, 0, 0, 20, 5),
+                viewport(2, 1000),
+                line(2, 0, &format!("{:20}", "text")),
+            ];
+            drawn.extend((1..5).map(|r| line(2, r, &" ".repeat(20))));
+            redraw(&mut a, drawn, t0);
+            assert!(grids_asked(&calls(&mut a)).is_empty(), "not narrowed yet");
+            assert!(!a.due(t0), "nor drawn");
+            let each = Value::Array(vec![Value::Array(vec![1000.into(), wanted.into()])]);
+            answer(&mut a, installed, Value::Array(vec![2.into(), each]), t0);
+            assert_eq!(grids_asked(&calls(&mut a)), asked, "wanting {wanted}");
+            assert!(a.due(t0), "drawn, wanting {wanted}");
+            assert_eq!(shown(&mut a, t0)[0], row);
+        }
     }
 
     /// Neovim takes an ask only for a window on the current tab page; one

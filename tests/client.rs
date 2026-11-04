@@ -6153,6 +6153,78 @@ fn a_window_whose_ask_its_tab_page_lost_comes_back_centred() {
     assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
+/// A splash screen drawn as snacks.nvim's dashboard draws one: opened on the
+/// first `UIEnter`, into the first buffer and window, with its options set
+/// while events are ignored and its lines centred for the window's width.
+const SPLASH_LUA: &str = r"
+local text = { 'S P L A S H', '', '[f]  Find File', '[q]  Quit' }
+vim.api.nvim_create_autocmd('UIEnter', {
+  once = true,
+  callback = function()
+    local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+    vim.o.laststatus = 0
+    vim.o.eventignore = 'all'
+    vim.bo[buf].buftype = 'nofile'
+    vim.o.eventignore = ''
+    local pad = string.rep(' ', math.floor((vim.api.nvim_win_get_width(win) - 14) / 2))
+    local lines = {}
+    for _ = 1, math.floor((vim.api.nvim_win_get_height(win) - #text) / 2) do
+      lines[#lines + 1] = ''
+    end
+    for _, line in ipairs(text) do
+      lines[#lines + 1] = line == '' and '' or pad .. line
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+  end,
+})";
+
+/// Regression: a splash screen opened on `UIEnter` came up cut in the
+/// middle of the window and slid out to where it centres itself. Neovim
+/// draws the attach's first frame, an empty buffer, before `UIEnter`, and
+/// the client narrowed it as measured before attaching.
+#[test]
+fn a_splash_screen_shows_only_where_it_centres_itself() {
+    require_nvim!();
+    let scratch = Scratch::new("client-splash");
+    let t = scratch.transport();
+    let splash = scratch.0.join("splash.lua");
+    std::fs::write(&splash, SPLASH_LUA).expect("write the splash");
+    let launch = common::launch_with(&format!("-u {}", splash.display()));
+    let session = t
+        .create_session(
+            &common::unique("client-splash"),
+            &launch,
+            common::anywhere(),
+        )
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let config = scratch.0.join("config.toml");
+    std::fs::write(&config, "[client]\ncentre = \"smart\"\nwindow_width = 60\n")
+        .expect("write the config");
+    let mut term = Terminal::spawn_sized(&sock, &config, DA1_REPLY, (160, 12));
+    // The column the title starts at, on whichever row, each frame it shows.
+    let mut seen: Vec<usize> = Vec::new();
+    term.frames(Duration::from_secs(3), |screen| {
+        let at = (0..12).find_map(|r| {
+            let row: String = (0..160)
+                .map(|c| match screen.cell(r, c) {
+                    Some(cell) if cell.has_contents() => cell.contents(),
+                    _ => " ",
+                })
+                .collect();
+            row.find("S P L A S H").map(|at| row[..at].chars().count())
+        });
+        if let Some(at) = at.filter(|at| seen.last() != Some(at)) {
+            seen.push(at);
+        }
+        false
+    });
+    // Centred by its 14-column longest line.
+    assert_eq!(seen, [(160 - 14) / 2]);
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// While a UI without `ext_multigrid` is attached, the client re-attaches
 /// without it and releases its narrowed windows; once that UI goes, it
 /// narrows them again.
