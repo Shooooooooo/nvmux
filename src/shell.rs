@@ -669,6 +669,8 @@ mod tests {
         );
     }
 
+    const SERVING_PID: &str = with_prelude!("serving_pid \"$1\"\n");
+
     /// A user command may put arguments after the socket, which the `serving`
     /// snapshot cannot match (`listen_args` takes the rest of the line, as a
     /// runtime directory may contain a space). `serving_pid`, the fallback for
@@ -679,11 +681,11 @@ mod tests {
         let sock = scratch_sock("shell-trailing");
         let sock = sock.to_string_lossy().into_owned();
 
-        let ask = with_prelude!("serving_pid \"$1\"\n");
-
         for trailing in [&[][..], &["--clean"][..], &["--clean", "-u", "NONE"][..]] {
             let mut held = spawn_standin(&sock, trailing);
-            let found = crate::proc::run_local(ask, &[&sock]).expect("ask").stdout;
+            let found = crate::proc::run_local(SERVING_PID, &[&sock])
+                .expect("ask")
+                .stdout;
             let _ = held.kill();
             let _ = held.wait();
             assert_eq!(
@@ -691,6 +693,177 @@ mod tests {
                 held.id().to_string(),
                 "not found with {trailing:?} after the socket"
             );
+        }
+    }
+
+    /// `serving_pid`'s answer for `sock` from `ps` and, where there is a
+    /// `/proc`, from the fallback that hosts without `ps` take.
+    fn serving_pid_answers(sock: &str, tag: &str) -> Vec<(&'static str, String)> {
+        let mut answers = vec![("ps", run_script(SERVING_PID, &[sock]).stdout)];
+        if std::path::Path::new("/proc/self/cmdline").exists() {
+            // A host without `ps` but with the usual tools.
+            let bin = scratch_dir(tag);
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            for tool in [
+                "awk", "cat", "cut", "grep", "head", "id", "sed", "sort", "tr",
+            ] {
+                let found = std::env::split_paths(&path)
+                    .map(|dir| dir.join(tool))
+                    .find(|found| found.is_file());
+                if let Some(found) = found {
+                    std::os::unix::fs::symlink(found, bin.join(tool)).expect("link a tool");
+                }
+            }
+            let mut sh = Command::new("/bin/sh");
+            sh.arg("-s").arg(sock).env("PATH", &bin);
+            let out = crate::proc::run_feeding_stdin(&mut sh, SERVING_PID).expect("ask");
+            let _ = std::fs::remove_dir_all(&bin);
+            answers.push(("/proc", out.stdout));
+        }
+        answers
+    }
+
+    /// Start a stand-in serving `sock`, with `trailing` after the socket, and
+    /// panic unless every lookup finds it.
+    fn assert_found(sock: &str, trailing: &[&str], tag: &str) {
+        let mut held = spawn_standin(sock, trailing);
+        let answers = serving_pid_answers(sock, tag);
+        let _ = held.kill();
+        let _ = held.wait();
+        for (how, found) in answers {
+            assert_eq!(found.trim(), held.id().to_string(), "not found by {how}");
+        }
+    }
+
+    /// A lookup that drops lines saying "grep", to skip its own `grep`, drops
+    /// this session too: the listing sweeps its files and `kill.sh` calls it
+    /// absent, leaving it running.
+    #[test]
+    fn a_session_whose_command_line_says_grep_is_found() {
+        let sock = scratch_sock("shell-says");
+        assert_found(
+            &sock.to_string_lossy(),
+            &["--cmd", "set grepprg=rg"],
+            "shell-says-bin",
+        );
+    }
+
+    /// `awk -v` would read its `\t` as a tab.
+    #[test]
+    fn a_socket_path_with_a_backslash_is_matched_as_written() {
+        let sock = scratch_sock(r"shell-back\tslash");
+        assert_found(&sock.to_string_lossy(), &[], "shell-backslash-bin");
+    }
+
+    /// Asked for `a.sock`, `kill.sh` would end the session at `a.sock2`.
+    #[test]
+    fn a_longer_path_is_another_socket() {
+        let sock = scratch_sock("shell-longer");
+        let sock = sock.to_string_lossy().into_owned();
+        let longer = format!("{sock}2");
+        let mut held = spawn_standin(&longer, &[]);
+        let asked = serving_pid_answers(&sock, "shell-longer-bin");
+        let own = serving_pid_answers(&longer, "shell-longer-bin");
+        let _ = held.kill();
+        let _ = held.wait();
+        for (how, found) in asked {
+            assert_eq!(found, "", "{how} matched {longer} when asked for {sock}");
+        }
+        for (how, found) in own {
+            assert_eq!(
+                found.trim(),
+                held.id().to_string(),
+                "{longer} not found by {how}"
+            );
+        }
+    }
+
+    /// A grep for the socket names it too, and started first it has the lower
+    /// pid: taken for the session, it is what `kill.sh` would end, leaving
+    /// nvim running with its files gone.
+    #[test]
+    fn a_grep_for_the_socket_is_not_the_session() {
+        use std::process::Stdio;
+
+        let sock = scratch_sock("shell-sought");
+        let sock = sock.to_string_lossy().into_owned();
+        // Blocks reading its stdin, which closes if this test panics.
+        let mut grep = Command::new("grep")
+            .args(["-q", "-F", "--", &format!("--listen {sock}")])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn grep");
+        let alone = serving_pid_answers(&sock, "shell-sought-bin");
+        assert_found(&sock, &[], "shell-sought-bin");
+        let _ = grep.kill();
+        let _ = grep.wait();
+        for (how, found) in alone {
+            assert_eq!(found, "", "{how} took the grep for a session");
+        }
+    }
+
+    /// macOS's `ps` prints such a byte raw, and its awk exits when a regex
+    /// meets one: a lookup that tested every line's argv[0] found nothing past
+    /// this process. Linux's `ps` prints a `?`, so only macOS can fail this.
+    #[test]
+    fn a_session_is_found_past_a_command_line_the_locale_cannot_decode() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+
+        // Started first, so `ps` lists it before the session.
+        let mut decoy = Command::new("sleep")
+            .arg0(OsStr::from_bytes(b"caf\xe9"))
+            .arg("30")
+            .spawn()
+            .expect("spawn the decoy");
+        let sock = scratch_sock("shell-undecodable");
+        let sock = sock.to_string_lossy().into_owned();
+        let mut held = spawn_standin(&sock, &[]);
+        let utf8 = if cfg!(target_os = "macos") {
+            "en_US.UTF-8"
+        } else {
+            "C.UTF-8"
+        };
+        let mut sh = Command::new("/bin/sh");
+        sh.arg("-s").arg(&sock).env("LC_ALL", utf8);
+        let out = crate::proc::run_feeding_stdin(&mut sh, SERVING_PID).expect("ask");
+        for child in [&mut held, &mut decoy] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(out.stdout.trim(), held.id().to_string(), "{}", out.stderr);
+    }
+
+    const OWNS_SOCKET: &str =
+        with_prelude!("if owns_socket \"$1\" \"$2\"; then echo yes; else echo no; fi\n");
+
+    /// A recorded pid is trusted only if it owns the socket: reused by the
+    /// session at `a.sock2`, it must not pass for `a.sock`'s, or `kill.sh`
+    /// ends the wrong session.
+    #[test]
+    fn a_session_owns_its_socket_and_not_a_prefix_of_it() {
+        let sock = scratch_sock("shell-owns");
+        let sock = sock.to_string_lossy().into_owned();
+        let longer = format!("{sock}2");
+        let mut held = spawn_standin(&longer, &["--cmd", "set grepprg=rg"]);
+        let pid = held.id().to_string();
+        let own = run_script(OWNS_SOCKET, &[&pid, &longer]).stdout;
+        let prefix = run_script(OWNS_SOCKET, &[&pid, &sock]).stdout;
+        let _ = held.kill();
+        let _ = held.wait();
+        assert_eq!(own, "yes\n", "{pid} serves {longer}");
+        assert_eq!(prefix, "no\n", "{pid} serves {longer}, not {sock}");
+    }
+
+    /// Its own processes are in the table it reads, and a matcher carrying the
+    /// flag and path, as `grep -F -- "--listen $1"` does, finds itself.
+    #[test]
+    fn the_lookup_does_not_find_its_own_processes() {
+        let sock = scratch_sock("shell-unserved");
+        let sock = sock.to_string_lossy().into_owned();
+        for (how, found) in serving_pid_answers(&sock, "shell-unserved-bin") {
+            assert_eq!(found, "", "{how}: nothing serves {sock}");
         }
     }
 

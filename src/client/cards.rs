@@ -33,7 +33,7 @@
 
 use std::time::{Duration, Instant};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use super::compose::{Frame, Out};
 use super::grid::Text;
@@ -585,7 +585,7 @@ impl Head {
     }
 
     fn age_at(&self) -> usize {
-        self.title_at() + self.title.width() + 2
+        self.title_at() + cells(&self.title) + 2
     }
 }
 
@@ -593,9 +593,9 @@ fn head(card: &Card, age: Option<u64>, at: Margin) -> Head {
     let age = age
         .map(|a| crate::ui::note::age(Duration::from_secs(a)))
         .unwrap_or_default();
-    let for_age = if age.is_empty() { 0 } else { 2 + age.width() };
+    let for_age = if age.is_empty() { 0 } else { 2 + cells(&age) };
     let title = fit(&card.title, at.widest.saturating_sub(2 + for_age).max(1));
-    let width = 2 + title.width() + for_age;
+    let width = 2 + cells(&title) + for_age;
     Head {
         sign: (at.end + 1).saturating_sub(width),
         title,
@@ -614,7 +614,7 @@ fn news(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens: &P
     sheet.part(row, h.sign, at.end, p.mask, PEAK, REACH);
     if let Some(body) = &card.body {
         let body = fit(body, at.widest);
-        let from = at.end + 1 - body.width();
+        let from = at.end + 1 - cells(&body);
         sheet.text(row + 1, from, &body, pens.soft, p.body);
         sheet.part(row + 1, from, at.end, p.mask, PEAK, REACH);
     }
@@ -627,7 +627,7 @@ fn key(sheet: &mut Sheet, card: &Card, row: usize, at: Margin, pens: &Pens) {
     };
     let below = row + 2 + usize::from(card.body.is_some());
     let key = fit(key, at.widest);
-    let from = at.end + 1 - key.width();
+    let from = at.end + 1 - cells(&key);
     sheet.text(below, from, &key, pens.dim, 1.0);
     sheet.part(below, from, at.end, 1.0, PEAK, REACH);
 }
@@ -708,7 +708,7 @@ struct Landing<'a> {
 fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
     // Columns for `names` flush right, or `None` if too wide.
     let lay = |names: &[&str]| -> Option<Vec<isize>> {
-        let width = names.iter().map(|n| n.width()).sum::<usize>() + GAP * (names.len() - 1);
+        let width = names.iter().map(|n| cells(n)).sum::<usize>() + GAP * (names.len() - 1);
         let mut col = (at.end + 1)
             .checked_sub(width)
             .filter(|_| width <= at.widest)? as isize;
@@ -717,7 +717,7 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
                 .iter()
                 .map(|n| {
                     let here = col;
-                    col += (n.width() + GAP) as isize;
+                    col += (cells(n) + GAP) as isize;
                     here
                 })
                 .collect(),
@@ -736,7 +736,7 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
         None => {
             after_names = vec![title];
             landed_at = 0;
-            vec![(at.end + 1 - title.width()) as isize]
+            vec![(at.end + 1 - cells(title)) as isize]
         }
     };
     let (mut covers, mut right) = (after[0], at.end);
@@ -795,11 +795,13 @@ fn landing<'a>(card: &'a Card, title: &'a str, at: Margin) -> Landing<'a> {
             .unwrap_or(covers);
         right = at.end + MARGIN;
     }
-    let waiting = card.body.as_ref().map(|waiting| {
-        let end = after[landed_at] as usize + after_names[landed_at].width() - 1;
+    // The waiting line ends under the landed name's last column. A name of
+    // no width at column 0 has none, so the line is left out.
+    let waiting = card.body.as_ref().and_then(|waiting| {
+        let end = (after[landed_at] as usize + cells(after_names[landed_at])).checked_sub(1)?;
         let waiting = fit(waiting, end + 1);
-        let from = end + 1 - waiting.width();
-        (waiting, from, end)
+        let from = end + 1 - cells(&waiting);
+        Some((waiting, from, end))
     });
     Landing {
         names,
@@ -912,10 +914,20 @@ fn arrival(sheet: &mut Sheet, l: &Live, p: Pieces, row: usize, at: Margin, pens:
     }
 }
 
-/// Cut `s` to `width` columns, ending in `…` if cut.
+/// Columns `s` takes as [`Sheet::text_at`] draws it, a character at a time.
+/// `UnicodeWidthStr::width` would count `⚠️` or a ZWJ family as one emoji.
+fn cells(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Cut `s` to at most `width` [`cells`], ending in `…` if cut.
 fn fit(s: &str, width: usize) -> String {
-    if s.width() <= width {
+    if cells(s) <= width {
         return s.to_string();
+    }
+    // No room for the `…`.
+    if width == 0 {
+        return String::new();
     }
     let mut out = String::new();
     let mut used = 0;
@@ -1173,9 +1185,9 @@ fn hush(cell: &mut Out, amount: f32, pens: &Pens, colors: &Colors) {
 /// Draw `g`: its cell fades to the background over the first half of its
 /// fade-in, and the glyph rises out of it over the second.
 fn put(frame: &mut Frame, g: &Glyph, pens: &Pens, colors: &Colors) {
-    let cells = if g.wide { 2 } else { 1 };
+    let span = if g.wide { 2 } else { 1 };
     if g.there < 0.5 {
-        for c in g.col..g.col + cells {
+        for c in g.col..g.col + span {
             if let Some(cell) = frame.get_mut(g.row, c) {
                 hush(cell, g.there * 2.0, pens, colors);
             }
@@ -1302,7 +1314,7 @@ mod tests {
 
     /// `s` flush right on a row of `w` x's, before the two-column margin.
     fn right(w: usize, s: &str) -> String {
-        format!("{}{s}xx", "x".repeat(w - 2 - s.width()))
+        format!("{}{s}xx", "x".repeat(w - 2 - cells(s)))
     }
 
     fn ms(n: u64) -> Duration {
@@ -1320,7 +1332,7 @@ mod tests {
         assert_eq!(screen[2], right(100, "cargo test: exited with code 0"));
         assert_eq!(screen[3], "x".repeat(100), "the key only with the prefix");
         for row in &screen {
-            assert_eq!(row.width(), 100, "{row:?}");
+            assert_eq!(cells(row), 100, "{row:?}");
         }
     }
 
@@ -1676,7 +1688,7 @@ mod tests {
             format!(
                 "{}{}{row}  ",
                 "x".repeat(from),
-                " ".repeat(98 - from - row.width())
+                " ".repeat(98 - from - cells(row))
             )
         };
         let mut cards = Cards::default();
@@ -1833,8 +1845,8 @@ mod tests {
             "{screen:#?}"
         );
         assert!(screen[2].contains('…'), "{screen:#?}");
-        assert_eq!(screen[1].width(), 60);
-        assert_eq!(screen[2].width(), 60);
+        assert_eq!(cells(&screen[1]), 60);
+        assert_eq!(cells(&screen[2]), 60);
 
         let mut cards = Cards::default();
         let long = "a-session-with-a-long-name";
@@ -1854,7 +1866,144 @@ mod tests {
         cards.apply(Command::Show(landed("日本語", None, None, None)), now);
         let screen = painted(&mut cards, 30, 8, now);
         assert!(screen[1].ends_with("日本語xx"), "{screen:#?}");
-        assert_eq!(screen[1].width(), 30);
+        assert_eq!(cells(&screen[1]), 30);
+    }
+
+    /// `⚠️` is drawn as `⚠` alone, a column; a ZWJ family as its four
+    /// people, two columns each.
+    #[test]
+    fn a_cut_counts_the_columns_it_is_drawn_in() {
+        let span = |s: &str| {
+            let mut sheet = Sheet::new(200);
+            sheet.text(0, 0, s, Pen::plain(WHITE), 1.0);
+            let ends = sheet.glyphs.iter().map(|g| g.col + 1 + usize::from(g.wide));
+            ends.max().unwrap_or(0)
+        };
+        let cut = fit(&"⚠\u{fe0f}".repeat(60), 46);
+        assert_eq!((span(&cut), cells(&cut)), (46, 46), "{cut:?}");
+        assert!(cut.ends_with('…'));
+        let fits = "⚠\u{fe0f}".repeat(30);
+        assert_eq!(fit(&fits, 46), fits, "nothing cut, nothing marked");
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        assert_eq!((span(family), fit(family, 8).as_str()), (8, family));
+        let cut = fit(family, 7);
+        assert_eq!((span(&cut), cells(&cut)), (7, 7), "{cut:?}");
+        assert!(cut.ends_with('…'));
+        assert_eq!(fit(family, 0), "", "no room for the …");
+    }
+
+    /// Laid out by `str` width, the `⚠️` lines would start before column 0
+    /// and the family run into the margin.
+    #[test]
+    fn a_note_with_emoji_still_ends_at_the_margin() {
+        let now = Instant::now();
+        let screen = |cols, title: &str, text: &str| {
+            let mut card = news(1);
+            card.title = title.into();
+            card.body = Some(text.into());
+            card.footer = Some(text.into());
+            let mut cards = Cards::default();
+            cards.apply(Command::Show(card), now);
+            cards.apply(Command::Keys { held: true }, now);
+            painted(&mut cards, cols, 10, now)
+        };
+        for cols in [80, 40] {
+            let rows = screen(cols, "api-server", &"⚠\u{fe0f}".repeat(60));
+            let cut = format!("{}…", "⚠".repeat(Margin::of(cols).widest - 1));
+            assert_eq!(rows[2], right(cols, &cut), "the body, {cols} columns");
+            assert_eq!(rows[4], right(cols, &cut), "the key, {cols} columns");
+        }
+        let rows = screen(80, "⚠\u{fe0f} prod", "👨\u{200d}👩\u{200d}👧\u{200d}👦");
+        assert_eq!(rows[1], right(80, "✓ ⚠ prod  3s"));
+        assert_eq!(rows[2], right(80, "👨👩👧👦"));
+        assert_eq!(rows[4], right(80, "👨👩👧👦"));
+    }
+
+    /// The relay's footprint of it agrees, still or sliding.
+    #[test]
+    fn an_arrival_with_emoji_is_laid_out_as_drawn() {
+        let now = Instant::now();
+        // Each glyph of `footprint` on `f`, the moving names `k` along.
+        let stands = |footprint: &Footprint, f: &Frame, k: isize| {
+            let moved = footprint.moving.iter().map(|&(row, col, ch)| {
+                let col = col.checked_add_signed(k).expect("a column");
+                (row, col, ch)
+            });
+            for (row, col, ch) in footprint.glyphs.iter().copied().chain(moved) {
+                let text = &f.get(row, col).expect("a cell").text;
+                assert_eq!(text, &Text::Char(ch), "{row},{col} {k} along");
+            }
+        };
+        let still = |cols, mut card: Card| {
+            card.body = Some(crate::card::WAITING.into());
+            let footprint = arrival_footprint(&card, cols, 10);
+            let mut cards = Cards::default();
+            cards.apply(Command::Show(card), now);
+            let f = drawn(&mut cards, cols, 10, now);
+            stands(&footprint, &f, 0);
+            rows(&f)
+        };
+        let screen = still(
+            100,
+            landed("⚠\u{fe0f} prod", Some("nvmux"), Some("⚠\u{fe0f} ops"), None),
+        );
+        assert_eq!(screen[1], right(100, "nvmux   ⚠ prod   ⚠ ops"));
+        assert_eq!(
+            screen[2],
+            format!("{}waiting for a key{}", "x".repeat(73), "x".repeat(10)),
+            "ending under the name"
+        );
+
+        // Neighbours too wide: the landed name alone.
+        let screen = still(
+            40,
+            landed("⚠\u{fe0f} prod", Some(&"n".repeat(30)), Some("ops"), None),
+        );
+        assert_eq!(screen[1], right(40, "⚠ prod"));
+        assert_eq!(screen[2], right(40, "waiting for a key"));
+
+        let mut card = landed(
+            "⚠\u{fe0f} prod",
+            Some("nvmux"),
+            Some("⚠\u{fe0f} ops"),
+            Some(Step {
+                forward: true,
+                gone: "⚠\u{fe0f} old".into(),
+            }),
+        );
+        card.fade_ms = 100;
+        card.body = Some(crate::card::WAITING.into());
+        let footprint = arrival_footprint(&card, 100, 10);
+        assert_eq!(footprint.spans, [(1, 68, 99), (2, 73, 89)]);
+        assert_eq!(footprint.shift, -8);
+        let mut cards = Cards::default();
+        cards.apply(Command::Show(card), now);
+        let ends = [
+            (0, 0, "⚠ old   nvmux   ⚠ prod"),
+            (380, -8, "nvmux   ⚠ prod   ⚠ ops"),
+        ];
+        for (t, k, names) in ends {
+            let f = drawn(&mut cards, 100, 10, now + ms(t));
+            stands(&footprint, &f, k);
+            // Cleared from where the slide path starts.
+            let cleared = " ".repeat(30 - cells(names));
+            let row = format!("{}{cleared}{names}  ", "x".repeat(68));
+            assert_eq!(rows(&f)[1], row, "at {t} ms");
+        }
+    }
+
+    /// The waiting line ends under the landed name's last column, here -1.
+    #[test]
+    fn a_name_of_no_width_at_column_0_has_no_waiting_line() {
+        let now = Instant::now();
+        let mut card = landed("\u{301}", None, Some(&"n".repeat(25)), None);
+        card.body = Some(crate::card::WAITING.into());
+        assert_eq!(arrival_footprint(&card, 30, 10).spans, [(1, 0, 27)]);
+        let mut cards = Cards::default();
+        cards.apply(Command::Show(card), now);
+        let screen = painted(&mut cards, 30, 10, now);
+        assert_eq!(screen[1], right(30, &format!("   {}", "n".repeat(25))));
+        assert_eq!(screen[2], "x".repeat(30));
     }
 
     /// It counts from the relay's age, with a frame asked for at each tick.

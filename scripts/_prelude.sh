@@ -58,9 +58,14 @@ require_private_dir() {
   esac
 }
 
-# Is pid $1 the nvim serving socket $2? `grep -F`: the path is data.
+# Is pid $1 the nvim serving socket $2? By `serving_pid`'s rule, in the shell:
+# a `grep` would put the flag and path on a command line `serving_pid` reads.
+# Quoted: the path is data, not a pattern.
 owns_socket() {
-  cmdline "$1" | grep -q -F -- "--listen $2"
+  case " $(cmdline "$1") " in
+    *" --listen $2 "*) return 0 ;;
+  esac
+  return 1
 }
 
 # Replace $1/$2.json with $3 atomically (temp file plus rename), so a
@@ -90,30 +95,50 @@ cmdline() {
   fi
 }
 
-# The pid serving this socket, or nothing. The socket is a session's identity:
+# The pid serving this socket, or nothing.
+#
+# The first process whose command line has `--listen`, this path, then a space
+# or its end: `a.sock` is not `a.sock2`. The socket is a session's identity:
 # pids are reused, paths are not.
 #
 # `ps` first: one call reads every command line, where a `/proc` loop forks
-# twice per process (seconds on a host with a thousand). `/proc` is the
-# fallback for minimal containers without `ps`. `-A`, not `-e`, which on macOS
-# shows the environment. Callers test for empty output: the `awk` succeeds
-# whether or not it matched.
+# per process (seconds on a host with a thousand). `/proc` is the fallback for
+# minimal containers without `ps`. `-A`, not `-e`, which on macOS shows the
+# environment. Callers test for empty output: the `awk` succeeds whether or
+# not it matched.
+#
+# The flag is split, so the `awk`'s own command line, which `ps` may catch,
+# cannot match. Nor can the shell's: nvmux runs `sh -s`, arguments on stdin.
+# `owns_socket` starts no process that could: it matches in the shell. The
+# path comes from the environment because `-v` would process its backslashes.
+# Greps are skipped: one for the socket (a user's `pgrep -f`, say) names it
+# too, and no session's argv[0] is a grep.
+#
+# Only lines naming the socket are split or matched: macOS's awk exits when a
+# regex meets a byte its locale cannot decode, which its `ps` prints raw, and
+# mawk 1.3.3 when a line splits into more than 32767 fields.
 serving_pid() {
   if command -v ps >/dev/null 2>&1; then
     ps -ww -A -u "$(id -u)" -o pid=,args= 2>/dev/null \
-      | grep -F -- "--listen $1" \
-      | grep -v grep \
-      | awk 'NR==1{print $1}'
+      | nvmux_sock=$1 awk '
+          BEGIN { want = " --lis" "ten " ENVIRON["nvmux_sock"] " " }
+          index($0 " ", want) && $2 !~ /(^|\/)[efp]?grep$/ { print $1; exit }'
     return
   fi
 
   if [ -r /proc/self/cmdline ]; then
     for c in /proc/[0-9]*/cmdline; do
-      if tr '\0' ' ' < "$c" 2>/dev/null | grep -q -F -- "--listen $1"; then
-        c=${c#/proc/}
-        printf '%s\n' "${c%/cmdline}"
-        return 0
-      fi
+      nvmux_args=$(tr '\0' ' ' 2>/dev/null < "$c")
+      case "/${nvmux_args%% *}" in
+        */grep | */egrep | */fgrep | */pgrep) continue ;;
+      esac
+      case " $nvmux_args " in
+        *" --listen $1 "*)
+          c=${c#/proc/}
+          printf '%s\n' "${c%/cmdline}"
+          return 0
+          ;;
+      esac
     done
     return 1
   fi
@@ -151,8 +176,7 @@ $NVMUX_LISTENING
 # Taken to end of line, not the next space: `spawn.sh` puts the socket last
 # and a runtime directory may contain a space. The trailing trim is for
 # `/proc`, whose command lines end in a separator. The flag is split in two
-# so this `awk`'s own command line, which `ps` may catch, cannot match itself
-# (what `grep -v grep` does above).
+# so this `awk`'s own command line, which `ps` may catch, cannot match itself.
 listen_args() {
   awk '
     BEGIN { flag = " --lis" "ten " }

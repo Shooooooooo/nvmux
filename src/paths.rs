@@ -215,6 +215,13 @@ pub fn master_socket(control_path: &Path, nonce: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Where the `ssh` that starts the master bound at `own` writes its stderr.
+pub fn master_stderr(own: &Path) -> PathBuf {
+    let mut name = own.as_os_str().to_owned();
+    name.push(".err");
+    PathBuf::from(name)
+}
+
 /// nvmux's own log file, one per user.
 pub fn client_log(dir: &Path) -> PathBuf {
     dir.join("nvmux.log")

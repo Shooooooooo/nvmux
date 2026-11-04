@@ -14,6 +14,12 @@
 //!   [`recolour`]), as Neovim's TUI does. After a non-ASCII character or a
 //!   last-column write, the next move is absolute, since terminals disagree
 //!   there. `Screen::set_lean` turns this off for tests.
+//! - A cell a terminal may draw at another width than Neovim's grid
+//!   ([`ambiwidth`]) is drawn as Neovim's TUI draws it: over two spaces if
+//!   wide, and the cell after it placed absolutely even if adjacent, as the
+//!   shadow's painters also do (`crate::shadow`). Cells that a cluster drawn
+//!   code point by code point (as xterm draws a ZWJ sequence) runs over are
+//!   written again.
 //! - [`Screen::moving_rows`] has the terminal scroll moved rows first and diffs
 //!   against the result ([`super::region`]); [`Screen::new`] rewrites them.
 //! - Frames go inside a synchronized update (`?2026`) unless `'termsync'` is
@@ -24,10 +30,13 @@
 
 use std::io::Write as _;
 
+use unicode_width::UnicodeWidthChar;
+
 use super::compose::{Frame, Out};
 use super::grid::Text;
 use super::region::Bands;
 use super::style::{Color, Style, Underline};
+use super::words;
 use crate::fade::{SYNC_BEGIN, SYNC_END};
 use crate::palette::Rgb;
 
@@ -249,10 +258,13 @@ impl Screen {
         let mut pen: Option<Style> = None;
         let mut at: Option<(usize, usize)> = None;
         // Whether the cursor is surely at `at`, so a relative move is safe:
-        // lean, and only plain ASCII written since the last CUP, none in the
-        // last column. Neovim's TUI also re-places the cursor after an
-        // ambiguous-width character.
+        // lean, and only plain ASCII written since the last absolute move,
+        // none in the last column.
         let mut sure = false;
+        // Whether the last cell written may have left the cursor elsewhere
+        // ([`ambiwidth`]): the next is then placed absolutely even if
+        // adjacent, as Neovim's TUI does; by CHA if `at` still has the row.
+        let mut astray = false;
         let mut fed = false;
         // The open hyperlink, closed before every jump (as Neovim's TUI does)
         // so it never spans skipped cells.
@@ -282,25 +294,33 @@ impl Screen {
                 continue;
             }
             let mut c = 0;
+            // Cells before this column are written even if unchanged: a
+            // cluster drawn code point by code point may have run over them.
+            let mut owed = 0;
             while c < frame.width {
                 let cell = &frame.cells[r * frame.width + c];
                 let span = if cell.wide { 2 } else { 1 };
-                let same = was.is_some_and(|was| {
-                    (c..(c + span).min(frame.width))
-                        .all(|k| was[k] == frame.cells[r * frame.width + k])
-                });
+                let same = c >= owed
+                    && was.is_some_and(|was| {
+                        (c..(c + span).min(frame.width))
+                            .all(|k| was[k] == frame.cells[r * frame.width + k])
+                    });
                 // A right half is drawn with its left.
                 if same || cell.text == Text::Half {
                     c += 1;
                     continue;
                 }
-                if at != Some((r, c)) {
+                if astray || at != Some((r, c)) {
                     if link != 0 {
                         out.extend_from_slice(LINK_END);
                         link = 0;
                     }
-                    let from = at.filter(|_| sure);
-                    fed |= move_to(out, &frame, from, (r, c), pen.as_ref(), fed || moved);
+                    if astray && at.is_some_and(|at| at.0 == r) {
+                        column(out, c);
+                    } else {
+                        let from = at.filter(|_| sure);
+                        fed |= move_to(out, &frame, from, (r, c), pen.as_ref(), fed || moved);
+                    }
                     sure = self.lean;
                 }
                 // The link is handled by OSC 8 below, not the pen.
@@ -316,6 +336,23 @@ impl Screen {
                         _ => sgr(out, &style),
                     }
                     pen = Some(style);
+                }
+                let drifting = drifts(cell);
+                if drifting && cell.wide && c + 2 <= frame.width {
+                    // Blanked first, so a terminal drawing it narrower leaves
+                    // no stale right half.
+                    if link != 0 {
+                        out.extend_from_slice(LINK_END);
+                        link = 0;
+                    }
+                    out.extend_from_slice(b"  ");
+                    // Up to the last column leaves a wrap pending, where
+                    // terminals disagree on BS.
+                    if self.lean && c + 2 < frame.width {
+                        out.extend_from_slice(b"\x08\x08");
+                    } else {
+                        column(out, c);
+                    }
                 }
                 if cell.style.link != link {
                     let target = (cell.style.link as usize)
@@ -333,8 +370,16 @@ impl Screen {
                 }
                 cell.text.push_to(out);
                 drew = true;
+                if drifting {
+                    owed = owed.max(c + reach(&cell.text, false));
+                }
+                // Drawn code point by code point it may wrap, and on the last
+                // row scroll. That is not prevented; the next cell is then
+                // placed by CUP, as not even the row is known.
+                let wrapped = drifting && c + reach(&cell.text, true) > frame.width;
                 c += span;
-                at = Some((r, c));
+                at = (!wrapped).then_some((r, c));
+                astray = drifting;
                 sure &= c < frame.width && plain(cell);
             }
         }
@@ -433,6 +478,13 @@ fn move_to(
     false
 }
 
+/// CHA: column `c` of the cursor's row, also ending a pending wrap.
+fn column(out: &mut Vec<u8>, c: usize) {
+    out.extend_from_slice(b"\x1b[");
+    push_dec(out, c + 1);
+    out.push(b'G');
+}
+
 /// Move along row `r` from `from` to `to` in fewer than `limit` bytes, by
 /// rewriting the cells between (few, plain ASCII, in `pen`) or by CUF.
 /// Returns whether it moved.
@@ -473,6 +525,52 @@ fn cross(
 /// Printable ASCII: one column wide on every terminal.
 fn plain(cell: &Out) -> bool {
     !cell.wide && matches!(cell.text, Text::Char(' '..='~'))
+}
+
+/// Whether a terminal may draw `text` at another width than its cell, which
+/// is two columns if `wide`.
+///
+/// As Neovim's TUI tests it (`utf_ambiguous_width`, `print_cell_at_pos`):
+/// the first character is East Asian Ambiguous or an emoji, or is followed
+/// by VS16, or its own width is not the cell's (`setcellwidths()`,
+/// `'ambiwidth'`; the TUI tests this for wide cells only). Ambiguous letters
+/// and modifier symbols are left out, as `width_cjk` leaves them: a move
+/// after each would multiply the bytes of Cyrillic or Greek text.
+pub(crate) fn ambiwidth(text: &str, wide: bool) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let own = first.width();
+    own != Some(if wide { 2 } else { 1 })
+        || first.width_cjk() != own
+        || chars.next() == Some('\u{fe0f}')
+        // Neovim's emoji class (`prop_is_emojilike`) below 256, where `class`
+        // goes by 'iskeyword': ©, as ® is ambiguous.
+        || first == '\u{a9}'
+        || words::class(first, &[], false) == 3
+}
+
+/// [`ambiwidth`] for a frame's cell.
+fn drifts(cell: &Out) -> bool {
+    match &cell.text {
+        _ if plain(cell) => false,
+        Text::Char(ch) => ambiwidth(ch.encode_utf8(&mut [0; 4]), cell.wide),
+        Text::Cluster(s) => ambiwidth(s, cell.wide),
+        Text::Half => false,
+    }
+}
+
+/// Columns `text` takes on a terminal drawing it code point by code point,
+/// as xterm and the shadow's vt100 draw an emoji sequence; ambiguous ones
+/// wide if `cjk`.
+fn reach(text: &Text, cjk: bool) -> usize {
+    let width = |ch: char| if cjk { ch.width_cjk() } else { ch.width() };
+    match text {
+        Text::Char(ch) => width(*ch).unwrap_or(0),
+        Text::Cluster(s) => s.chars().filter_map(width).sum(),
+        Text::Half => 0,
+    }
 }
 
 /// Whether `was` and `now` differ only in fg/bg.
@@ -913,7 +1011,7 @@ mod tests {
     }
 
     /// After non-ASCII (width may differ from Neovim's) or a last-column write
-    /// (terminals disagree on the cursor), the next move is a CUP.
+    /// (terminals disagree on the cursor), the next move is absolute.
     #[test]
     fn a_move_is_absolute_where_the_cursor_may_be_elsewhere() {
         let mut after = frame(&["XécdefYh"]);
@@ -934,6 +1032,156 @@ mod tests {
 
         let text = over(frame(&["ab", "cd"]), frame(&["aX", "Yd"]));
         assert_eq!(text, "\x1b[?25l\x1b[1;2H\x1b[0mX\x1b[2;1HY\x1b[0m");
+    }
+
+    /// `f` with `text` in cells `at` and `at + 1`, as Neovim sends a
+    /// double-width cell.
+    fn widened(mut f: Frame, at: usize, text: &str) -> Frame {
+        f.cells[at] = Out {
+            text: Text::new(text),
+            style: Style::default(),
+            wide: true,
+        };
+        f.cells[at + 1].text = Text::Half;
+        f
+    }
+
+    /// What a fresh screen writes for `f`, as text.
+    fn drawn(f: Frame) -> String {
+        String::from_utf8_lossy(&Screen::new().draw(f, &hidden(), false, &[])).into_owned()
+    }
+
+    /// Neovim gives a VS16 emoji such as ❤️ two cells; xterm, VTE and
+    /// Alacritty draw it in one.
+    #[test]
+    fn a_wide_cell_drawn_narrower_is_cleared_and_the_next_placed_again() {
+        let heart = "\u{2764}\u{fe0f}";
+        let text = drawn(widened(frame(&["a..bcdef"]), 1, heart));
+        assert!(
+            text.contains(&format!("a  \x08\x08{heart}\x1b[4Gb")),
+            "{text:?}"
+        );
+        let text = drawn(widened(frame(&["abc.."]), 3, heart));
+        assert!(
+            text.contains(&format!("c  \x1b[4G{heart}\x1b[0m")),
+            "back from the last column without BS: {text:?}"
+        );
+        let thumb = "\u{1f44d}\u{1f3fd}";
+        let text = drawn(widened(frame(&["abcde..f"]), 5, thumb));
+        assert!(
+            text.contains(&format!("e  \x08\x08{thumb}\x1b[1;8Hf")),
+            "a CUP where a terminal drawing each code point would wrap: {text:?}"
+        );
+    }
+
+    /// `setcellwidths()` can make a narrow character wide, such as ✓ or a Nerd
+    /// Font icon.
+    #[test]
+    fn a_narrow_character_neovim_makes_wide_is_cleared_first() {
+        for icon in ["\u{2713}", "\u{f07b}"] {
+            let text = drawn(widened(frame(&["a..b"]), 1, icon));
+            assert!(
+                text.contains(&format!("a  \x08\x08{icon}\x1b[4Gb")),
+                "{icon:?}: {text:?}"
+            );
+        }
+    }
+
+    /// A terminal drawing East Asian Ambiguous characters wide would shift
+    /// the rest of the row. A keycap is one cell to Neovim but two columns
+    /// to kitty; © is an emoji to Neovim's TUI.
+    #[test]
+    fn the_cell_after_an_ambiguous_width_character_is_placed_again() {
+        for text in ["─", "…", "#\u{fe0f}\u{20e3}", "\u{a9}"] {
+            let mut f = frame(&["a?b"]);
+            f.cells[1].text = Text::new(text);
+            assert_eq!(
+                drawn(f),
+                format!("\x1b[?25l\x1b[1;1H\x1b[0ma{text}\x1b[3Gb\x1b[0m"),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_cjk_character_or_a_letter_needs_no_move_after_it() {
+        assert_eq!(
+            drawn(widened(frame(&["a..b"]), 1, "中")),
+            "\x1b[?25l\x1b[1;1H\x1b[0ma中b\x1b[0m"
+        );
+        assert_eq!(
+            drawn(frame(&["aéb"])),
+            "\x1b[?25l\x1b[1;1H\x1b[0maéb\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn a_hyperlink_is_closed_before_each_jump_around_an_emoji() {
+        let mut f = widened(frame(&["a..b"]), 1, "\u{2764}\u{fe0f}");
+        for cell in &mut f.cells {
+            cell.style.link = 1;
+        }
+        let links: Vec<Box<str>> = vec!["https://neovim.io".into()];
+        let bytes = Screen::new().draw(f, &hidden(), false, &links);
+        let text = String::from_utf8_lossy(&bytes);
+        let open = "\x1b]8;id=nvmux-1;https://neovim.io\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        assert!(
+            text.contains(&format!(
+                "{open}a{close}  \x08\x08{open}\u{2764}\u{fe0f}{close}\x1b[4G{open}b{close}"
+            )),
+            "{text:?}"
+        );
+    }
+
+    /// The shadow's vt100 counts ❤️ and ⚠️ as one column, as xterm does.
+    #[test]
+    fn the_cell_after_an_emoji_lands_at_its_grid_column() {
+        let heart = "\u{2764}\u{fe0f}";
+        for emoji in [heart, "\u{26a0}\u{fe0f}"] {
+            let f = widened(frame(&["a..b"]), 1, emoji);
+            let bytes = Screen::new().draw(f, &hidden(), false, &[]);
+            assert_eq!(shown(&bytes, 4, 1), format!("a{emoji} b"));
+        }
+        let mut s = Screen::new();
+        let mut bytes = s.draw(frame(&["abcd"]), &hidden(), false, &[]);
+        bytes.extend(s.draw(widened(frame(&["abcd"]), 1, heart), &hidden(), false, &[]));
+        assert_eq!(shown(&bytes, 4, 1), format!("a{heart} d"), "c left showing");
+    }
+
+    /// Drawn code point by code point, 👍🏽 takes four columns: the rest of
+    /// the row, left there, would wrap and scroll vt100 from the last row.
+    #[test]
+    fn a_cluster_pushes_nothing_off_the_last_row() {
+        let f = widened(
+            frame(&["top.......", "ab..cdefgh"]),
+            12,
+            "\u{1f44d}\u{1f3fd}",
+        );
+        let bytes = Screen::new().draw(f, &hidden(), false, &[]);
+        assert_eq!(shown(&bytes, 10, 2), "top.......\nab\u{1f44d}cdefgh");
+    }
+
+    /// xterm and vt100 draw 👨‍👩‍👧 code point by code point, over the four
+    /// cells after its own.
+    #[test]
+    fn the_cells_a_cluster_runs_over_are_written_again() {
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let mut s = Screen::new();
+        let mut bytes = s.draw(frame(&["abcdefgh"]), &hidden(), false, &[]);
+        let next = s.draw(
+            widened(frame(&["a..defgh"]), 1, family),
+            &hidden(),
+            false,
+            &[],
+        );
+        let text = String::from_utf8_lossy(&next);
+        assert!(
+            text.contains(&format!("\x08\x08{family}\x1b[4Gdefg\x1b[0m")),
+            "{text:?}"
+        );
+        bytes.extend(next);
+        assert_eq!(shown(&bytes, 8, 1), "a\u{1f468}\u{200d}defgh");
     }
 
     #[test]
@@ -991,7 +1239,8 @@ mod tests {
         );
     }
 
-    /// Random frames drawn over another, lean or not, match a fresh draw.
+    /// Random frames drawn over another, lean or not, match a fresh draw,
+    /// and one placing every cell where the grid has it.
     #[test]
     fn a_frame_drawn_over_another_shows_what_a_fresh_one_does() {
         let styles = [
@@ -1021,7 +1270,20 @@ mod tests {
                 ..Style::default()
             },
         ];
-        let letters = [' ', ' ', ' ', 'a', 'b', 'é', '─', '中'];
+        // ❤️ is wide in the grid but one column to vt100.
+        let letters = [
+            " ",
+            " ",
+            " ",
+            "a",
+            "b",
+            "é",
+            "─",
+            "\u{a9}",
+            "#\u{fe0f}\u{20e3}",
+            "中",
+            "\u{2764}\u{fe0f}",
+        ];
         // Fixed-seed xorshift: the same frames every run.
         let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
         let mut next = move |n: usize| {
@@ -1045,16 +1307,17 @@ mod tests {
                             continue;
                         }
                     }
-                    let ch = letters[next(letters.len())];
-                    f.cells[at].text = Text::Char(ch);
+                    let s = letters[next(letters.len())];
+                    let wide = matches!(s, "中" | "\u{2764}\u{fe0f}");
+                    f.cells[at].text = Text::new(s);
                     f.cells[at].style = styles[next(styles.len())];
-                    if ch == '中' && c + 1 < w {
+                    if wide && c + 1 < w {
                         f.cells[at].wide = true;
                         f.cells[at + 1].text = Text::Half;
                         f.cells[at + 1].style = f.cells[at].style;
                         c += 2;
                     } else {
-                        if ch == '中' {
+                        if wide {
                             f.cells[at].text = Text::Char('x');
                         }
                         c += 1;
@@ -1070,12 +1333,35 @@ mod tests {
             p.process(bytes);
             p.screen().rows_formatted(0, w as u16).collect::<Vec<_>>()
         };
+        // Each cell by CUP, a wide one over two spaces in its pen.
+        let placed = |f: &Frame| {
+            let mut out = Vec::new();
+            for (at, cell) in f.cells.iter().enumerate() {
+                if cell.text == Text::Half {
+                    continue;
+                }
+                let cup = format!("\x1b[{};{}H", at / w + 1, at % w + 1);
+                sgr(&mut out, &cell.style);
+                out.extend(cup.bytes());
+                if cell.wide {
+                    out.extend(b"  ");
+                    out.extend(cup.bytes());
+                }
+                cell.text.push_to(&mut out);
+            }
+            out
+        };
         for round in 0..300 {
             let first = random(None);
             let second = random(Some(&first));
             let mut whole = Screen::new();
             whole.set_lean(false);
             let fresh = screen_of(&whole.draw(second.clone(), &hidden(), false, &[]));
+            assert_eq!(
+                fresh,
+                screen_of(&placed(&second)),
+                "round {round}: misplaced"
+            );
             for lean in [false, true] {
                 let mut s = Screen::new();
                 s.set_lean(lean);

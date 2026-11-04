@@ -86,10 +86,11 @@ nvmux myhost     # sessions on myhost
 The host string is handed to `ssh` verbatim, so a hostname, `user@host`, or any
 `~/.ssh/config` alias works — including `ProxyJump`, agent forwarding and
 hardware keys, because nvmux drives your own ssh client rather than
-reimplementing it. Its connection leaves out the config's `LocalForward`,
-`RemoteForward` and `DynamicForward`, so they never fight your own ssh for a
-port; a `RemoteForward` your sessions need, such as a gpg-agent socket, needs
-an ssh of your own to that host.
+reimplementing it. Its connection leaves out the config's `RemoteCommand`,
+such as `tmux new -A`, and its `LocalForward`, `RemoteForward` and
+`DynamicForward`, which would fight your own ssh for a port; a `RemoteForward`
+your sessions need, such as a gpg-agent socket, needs an ssh of your own to
+that host.
 
 ### While attached
 

@@ -62,24 +62,21 @@ impl SshTransport {
         let host_token = ids::host_token(&host);
         let control_path = paths::control_path(&local_dir, &host_token)?;
 
-        // Runs alongside the connection and is judged before its result: an
-        // `ssh` too old for nvmux also fails on the master's options, which
-        // would hide the real cause.
-        let version = crate::ssh::check_local();
-
+        // Runs alongside the master's connect and is judged before its result:
+        // an `ssh` too old for nvmux also fails on the master's options, which
+        // would hide the real cause. The shells need the version it finds.
+        let check = crate::ssh::check_local();
         let ssh = Ssh::new(host.clone(), control_path);
+        let mastered = ssh.ensure_master();
+        let ssh = ssh.with_version(check.verdict()?);
+        mastered?;
+
         // One round trip for the runtime directory, the Neovim version and the
         // sessions; as the shell's first script it also absorbs whatever the
         // login shell prints. It sweeps dead sessions even on a host the
         // version gate then refuses, which is harmless.
-        let greeted = (|| {
-            ssh.ensure_master()?;
-            let mut shell = ssh.start_shell()?;
-            let out = checked_script(&host, &mut shell, shell::HELLO_SCRIPT, &[])?;
-            Ok::<_, SshError>((shell, out))
-        })();
-        version.verdict()?;
-        let (shell, out) = greeted?;
+        let mut shell = ssh.start_shell()?;
+        let out = checked_script(&host, &mut shell, shell::HELLO_SCRIPT, &[])?;
         let probe = protocol::parse_probe(&out.stdout)?;
 
         // An empty banner means nvim is not on the host's PATH.
@@ -374,6 +371,7 @@ impl Transport for SshTransport {
         crate::dirs::DirSource::Ssh {
             host: self.ssh.host().to_string(),
             control_path: self.ssh.control_path().to_path_buf(),
+            version: self.ssh.version(),
         }
     }
 
