@@ -96,6 +96,10 @@ pub enum Action {
 pub enum Step {
     /// Write these bytes to the PTY master, verbatim.
     Forward(Vec<u8>),
+    /// A terminal's reply or report, written as [`Step::Forward`] is, but for
+    /// the client relayed when it came: it never follows the keys read with
+    /// it to another.
+    Reply(Vec<u8>),
     Act(Action),
 }
 
@@ -406,6 +410,16 @@ pub enum Pending {
     Number(u32),
 }
 
+/// What a machine has half-typed (a `<prefix>`, digits, a sequence cut off),
+/// for another machine to go on from: the next relay's, after a switch (see
+/// [`Prefix::take_held`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Held {
+    state: State,
+    armed: Vec<u8>,
+    seq: Vec<u8>,
+}
+
 /// The prefix state machine. The prefix byte and keymap come in through the
 /// constructor rather than a global read, keeping it pure.
 #[derive(Debug)]
@@ -483,6 +497,31 @@ impl Prefix {
         }
     }
 
+    /// What is half-typed, taken out for another machine to
+    /// [`resume`](Self::resume), leaving this one idle.
+    pub fn take_held(&mut self) -> Held {
+        Held {
+            state: std::mem::take(&mut self.state),
+            armed: std::mem::take(&mut self.armed),
+            seq: std::mem::take(&mut self.seq),
+        }
+    }
+
+    /// Go on, on a new machine, from what another held; the wait is still the
+    /// caller's to time. Digits are read against this machine's highest
+    /// session: a number no digit can extend now is whole, and its switch is
+    /// returned.
+    pub fn resume(&mut self, held: Held) -> Vec<Step> {
+        let mut steps = Vec::new();
+        self.armed = held.armed;
+        self.seq = held.seq;
+        match held.state {
+            State::Number(n) => self.start_number(n, &mut steps, &mut Vec::new()),
+            state => self.state = state,
+        }
+        steps
+    }
+
     /// Whether another digit could extend `n` into a live session number.
     /// `checked_mul`: a held-down digit key would overflow.
     fn can_extend(&self, n: u32) -> bool {
@@ -524,7 +563,8 @@ impl Prefix {
                 Sequence::Reply => {
                     // A terminal reply, not typing: forwarded unchanged, even
                     // between a prefix and its command.
-                    pending.append(&mut self.seq);
+                    flush(steps, pending);
+                    steps.push(Step::Reply(std::mem::take(&mut self.seq)));
                 }
                 Sequence::Other(n) => {
                     let mut key = std::mem::take(&mut self.seq);
@@ -678,12 +718,13 @@ fn flush(steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
-    /// Concatenate everything the machine would forward, dropping actions.
+    /// Concatenate everything the machine would write, replies too, dropping
+    /// actions.
     fn forwarded(steps: &[Step]) -> Vec<u8> {
         steps
             .iter()
             .filter_map(|s| match s {
-                Step::Forward(b) => Some(b.clone()),
+                Step::Forward(b) | Step::Reply(b) => Some(b.clone()),
                 Step::Act(_) => None,
             })
             .flatten()
@@ -695,7 +736,7 @@ mod tests {
             .iter()
             .filter_map(|s| match s {
                 Step::Act(a) => Some(*a),
-                Step::Forward(_) => None,
+                Step::Forward(_) | Step::Reply(_) => None,
             })
             .collect()
     }
@@ -1035,22 +1076,67 @@ mod tests {
 
     /// The editor queries the terminal at every start and resume, so a reply
     /// can land between a prefix typed at startup and its command. So can a
-    /// size report, sent as a held paint turns in-band sizes on.
+    /// size or focus report, which a terminal may send as a client turns its
+    /// mode on.
     #[test]
     fn a_terminal_reply_between_the_prefix_and_its_command_is_not_a_key() {
-        for reply in [&b"\x1b[?62;22c"[..], b"\x1b[48;30;120;0;0t"] {
+        for reply in [
+            &b"\x1b[?62;22c"[..],
+            b"\x1b[48;30;120;0;0t",
+            b"\x1b]11;rgb:0000/0000/0000\x07",
+            b"\x1bP1$r0m\x1b\\",
+            b"\x1bP1+r4D73=1B5D35323B25703125733B257032257307\x1b\\",
+            b"\x1b[0n",
+            b"\x1b[I",
+            b"\x1b[O",
+        ] {
             let mut p = Prefix::new(12);
             p.feed(KITTY);
             assert_eq!(forwarded(&p.feed(reply)), reply, "the answer goes through");
             assert_eq!(p.wait(), Some(Wait::Command), "still armed");
+            assert_eq!(p.pending(), Some(Pending::Command));
             assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach]);
+
+            let mut p = Prefix::new(12);
+            p.feed(&[PREFIX, b'1']);
+            assert_eq!(forwarded(&p.feed(reply)), reply);
+            assert_eq!(p.wait(), Some(Wait::Command), "still a number");
+            assert_eq!(actions(&p.feed(b"2")), vec![Action::Switch(12)]);
         }
+    }
+
+    /// The relay hands the keys after a switch on to the session it lands on,
+    /// and a reply read with them to the client it leaves.
+    #[test]
+    fn a_reply_is_a_step_of_its_own() {
+        let mut p = Prefix::new(12);
+        let typed = [&[PREFIX, b'1', b'j'][..], b"\x1b[?62;22c", b"k"].concat();
+        assert_eq!(
+            p.feed(&typed),
+            vec![
+                Step::Act(Action::Switch(1)),
+                Step::Forward(b"j".to_vec()),
+                Step::Reply(b"\x1b[?62;22c".to_vec()),
+                Step::Forward(b"k".to_vec()),
+            ]
+        );
+    }
+
+    /// No reply opens so: they are keys, at the next byte or the sequence's
+    /// timeout.
+    #[test]
+    fn alt_and_a_bracket_or_p_after_the_prefix_is_not_a_command() {
+        let mut p = Prefix::new(12);
+        p.feed(KITTY);
+        assert_eq!(forwarded(&p.feed(b"\x1b]x")), [KITTY, b"\x1b]x"].concat());
+        assert!(!p.is_armed());
 
         let mut p = Prefix::new(12);
-        p.feed(&[PREFIX, b'1']);
-        assert_eq!(forwarded(&p.feed(b"\x1b[?0u")), b"\x1b[?0u");
-        assert_eq!(p.wait(), Some(Wait::Command), "still a number");
-        assert_eq!(actions(&p.feed(b"2")), vec![Action::Switch(12)]);
+        p.feed(KITTY);
+        assert!(p.feed(b"\x1bP").is_empty());
+        assert_eq!(p.wait(), Some(Wait::Sequence));
+        assert_eq!(forwarded(&p.timeout()), [KITTY, b"\x1bP"].concat());
+        assert!(!p.is_armed());
     }
 
     /// Whether the literal comes from a doubled prefix or the timeout.
@@ -1862,6 +1948,80 @@ mod tests {
         assert!(p.feed(b"1").is_empty(), "1 could still become 12");
         let steps = p.feed(b"2");
         assert_eq!(actions(&steps), vec![Action::Switch(12)]);
+    }
+
+    /// What `<prefix> 1 <prefix>` leaves as it switches, and what is cut off
+    /// mid-sequence, are the next machine's to finish.
+    #[test]
+    fn what_is_half_typed_goes_on_in_another_machine() {
+        let release = b"\x1b[32;5:3u";
+        let mut p = Prefix::new(12);
+        p.feed(&[PREFIX, b'1']);
+        let mut spelled = KITTY.to_vec();
+        spelled.extend_from_slice(release);
+        assert_eq!(actions(&p.feed(&spelled)), vec![Action::Switch(1)]);
+        let held = p.take_held();
+        assert_eq!(p.wait(), None, "the old machine keeps nothing");
+        assert_eq!(p.take_held(), Held::default());
+
+        let mut next = Prefix::new(12);
+        assert!(next.resume(held.clone()).is_empty());
+        assert_eq!(next.pending(), Some(Pending::Command));
+        assert_eq!(next.wait(), Some(Wait::Command));
+        let steps = next.feed(b"2");
+        assert_eq!(actions(&steps), vec![Action::Switch(2)]);
+        assert!(forwarded(&steps).is_empty());
+        let mut next = Prefix::new(12);
+        next.resume(held);
+        assert_eq!(
+            forwarded(&next.timeout()),
+            spelled,
+            "meant literally, as typed"
+        );
+
+        let mut p = Prefix::new(12);
+        p.feed(&[PREFIX, b'1']);
+        let mut next = Prefix::new(12);
+        assert!(next.resume(p.take_held()).is_empty());
+        assert_eq!(next.pending(), Some(Pending::Number(1)));
+        assert_eq!(actions(&next.feed(b"2")), vec![Action::Switch(12)]);
+
+        let mut p = Prefix::new(12);
+        p.feed(b"\x1b[1");
+        let mut next = Prefix::new(12);
+        next.resume(p.take_held());
+        assert_eq!(next.wait(), Some(Wait::Sequence));
+        assert_eq!(forwarded(&next.feed(b";5A")), b"\x1b[1;5A");
+    }
+
+    /// Sessions come and go between relays.
+    #[test]
+    fn a_number_carried_on_is_read_against_the_sessions_now() {
+        let mut p = Prefix::new(12);
+        p.feed(&[PREFIX, b'1']);
+        let held = p.take_held();
+
+        let mut fewer = Prefix::new(9);
+        assert_eq!(
+            fewer.resume(held.clone()),
+            vec![Step::Act(Action::Switch(1))]
+        );
+        assert_eq!(fewer.wait(), None);
+
+        let mut more = Prefix::new(30);
+        assert!(more.resume(held).is_empty());
+        assert_eq!(actions(&more.feed(b"9")), vec![Action::Switch(19)]);
+
+        // The sequence after the digits stays held, to follow the switch.
+        let mut p = Prefix::new(12);
+        p.feed(&[PREFIX, b'1', ESC]);
+        let mut fewer = Prefix::new(9);
+        assert_eq!(
+            fewer.resume(p.take_held()),
+            vec![Step::Act(Action::Switch(1))]
+        );
+        assert_eq!(fewer.wait(), Some(Wait::Sequence));
+        assert_eq!(fewer.timeout(), vec![Step::Forward(vec![ESC])]);
     }
 
     /// The documented way to send a digit to Neovim.

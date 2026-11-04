@@ -73,6 +73,15 @@ impl Verdict {
     }
 }
 
+/// How a wait ended, and whether it read the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Waited {
+    pub verdict: Verdict,
+    /// Past [`GRACE`]: what was typed before is gone, and what came after
+    /// went to the session.
+    pub listened: bool,
+}
+
 /// Given the time rather than reading a clock, like [`crate::announce::Popup`],
 /// so every frame is reachable from a test.
 struct State {
@@ -94,18 +103,23 @@ pub fn run(
     name: &str,
     sock: &Path,
     hand_off: &mut Option<HandOff>,
-) -> Result<Verdict> {
+) -> Result<Waited> {
     let started = Instant::now();
     if let Some(verdict) = wait_out_grace(&mut probe, started)? {
-        return Ok(verdict);
+        return Ok(Waited {
+            verdict,
+            listened: false,
+        });
     }
     if let Some(h) = hand_off.take() {
         h.take_down();
     }
     // No mouse: see the module docs.
-    super::owning_for_attach(Verdict::attaches, false, |terminal| {
-        run_on(terminal, probe, name, sock, started)
-    })
+    super::owning_for_attach(
+        |waited: &Waited| waited.verdict.attaches(),
+        false,
+        |terminal| run_on(terminal, probe, name, sock, started),
+    )
 }
 
 /// Wait for the probe until [`GRACE`], in raw mode so keys typed meanwhile
@@ -135,44 +149,109 @@ fn verdict(answer: Answer) -> Verdict {
 
 fn run_on(
     terminal: &mut ratatui::DefaultTerminal,
-    mut probe: Probe,
+    probe: Probe,
     name: &str,
     sock: &Path,
     started: Instant,
-) -> Result<Verdict> {
+) -> Result<Waited> {
+    let mut world = Live {
+        terminal,
+        probe,
+        started,
+        forward: Forward::to(sock),
+    };
+    wait(&mut world, name)
+}
+
+/// What [`wait`] reads and writes, so a test can stand in for the probe, the
+/// clock, the keyboard and the session.
+trait World {
+    /// The probe's answer, if it comes within a [`FRAME`].
+    fn answer(&mut self) -> Option<Result<Answer>>;
+    /// Since the attach began.
+    fn elapsed(&self) -> Duration;
+    /// Drop what was typed so far ([`drain`]).
+    fn drain(&mut self) -> Result<()>;
+    /// The next key pressed, without blocking ([`next_key`]).
+    fn next_key(&mut self) -> Result<Option<Key>>;
+    /// To the session ([`Forward`]).
+    fn send(&mut self, key: Key);
+    fn draw(&mut self, state: &State) -> Result<()>;
+}
+
+struct Live<'a> {
+    terminal: &'a mut ratatui::DefaultTerminal,
+    probe: Probe,
+    started: Instant,
+    forward: Forward<'a>,
+}
+
+impl World for Live<'_> {
+    fn answer(&mut self) -> Option<Result<Answer>> {
+        self.probe.wait(FRAME)
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        drain()
+    }
+
+    fn next_key(&mut self) -> Result<Option<Key>> {
+        next_key()
+    }
+
+    fn send(&mut self, key: Key) {
+        self.forward.send(key);
+    }
+
+    fn draw(&mut self, state: &State) -> Result<()> {
+        self.terminal.draw(|f| {
+            draw(f, state);
+            crate::theme::paint(f.buffer_mut());
+        })?;
+        Ok(())
+    }
+}
+
+fn wait(world: &mut impl World, name: &str) -> Result<Waited> {
     let mut state = State {
         name: name.to_string(),
         elapsed: Duration::ZERO,
     };
     // Set once the input queue is drained, at `GRACE`.
     let mut listening = false;
-    let mut forward = Forward::to(sock);
 
     loop {
-        if let Some(answer) = probe.wait(FRAME) {
-            return Ok(verdict(answer?));
+        if let Some(answer) = world.answer() {
+            return Ok(Waited {
+                verdict: verdict(answer?),
+                listened: listening,
+            });
         }
-        state.elapsed = started.elapsed();
+        state.elapsed = world.elapsed();
 
         // No reads before `GRACE`, not even a poll: the bytes are the
         // editor's.
         if state.elapsed >= GRACE {
             if !listening {
                 listening = true;
-                drain()?;
+                world.drain()?;
             }
-            while let Some(key) = next_key()? {
+            while let Some(key) = world.next_key()? {
                 if matches!(key, Key::Esc | Key::CtrlC) {
-                    return Ok(Verdict::Cancelled);
+                    return Ok(Waited {
+                        verdict: Verdict::Cancelled,
+                        listened: listening,
+                    });
                 }
-                forward.send(key);
+                world.send(key);
             }
         }
 
-        terminal.draw(|f| {
-            draw(f, &state);
-            crate::theme::paint(f.buffer_mut());
-        })?;
+        world.draw(&state)?;
     }
 }
 
@@ -337,7 +416,6 @@ mod tests {
             .is_some_and(|c| GLYPHS.contains(&c))
     }
 
-    /// That no keys are read before `GRACE` is not covered here.
     #[test]
     fn nothing_is_drawn_before_the_grace_period() {
         let lines = render(40, 8, &at(GRACE - Duration::from_millis(1), "dotfiles"));
@@ -453,6 +531,131 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A probe that answers at `answers`, a clock that moves a [`FRAME`] per
+    /// look at it, and keys pressed at given times, in order.
+    struct Fake {
+        now: Duration,
+        answers: Option<Duration>,
+        typed: Vec<(Duration, Key)>,
+        drained: Vec<Key>,
+        sent: Vec<Key>,
+        first_read: Option<Duration>,
+    }
+
+    impl Fake {
+        fn new(now: Duration, answers: Option<Duration>, typed: &[(Duration, Key)]) -> Self {
+            Self {
+                now,
+                answers,
+                typed: typed.to_vec(),
+                drained: Vec::new(),
+                sent: Vec::new(),
+                first_read: None,
+            }
+        }
+    }
+
+    impl World for Fake {
+        fn answer(&mut self) -> Option<Result<Answer>> {
+            self.now += FRAME;
+            assert!(self.now < Duration::from_secs(60), "the wait never ended");
+            self.answers
+                .filter(|at| self.now >= *at)
+                .map(|_| Ok(Answer::Ready))
+        }
+
+        fn elapsed(&self) -> Duration {
+            self.now
+        }
+
+        fn drain(&mut self) -> Result<()> {
+            while let Some(key) = self.next_key()? {
+                self.drained.push(key);
+            }
+            Ok(())
+        }
+
+        fn next_key(&mut self) -> Result<Option<Key>> {
+            self.first_read.get_or_insert(self.now);
+            match self.typed.first() {
+                Some(&(at, key)) if at <= self.now => {
+                    self.typed.remove(0);
+                    Ok(Some(key))
+                }
+                _ => Ok(None),
+            }
+        }
+
+        fn send(&mut self, key: Key) {
+            self.sent.push(key);
+        }
+
+        fn draw(&mut self, _: &State) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What was typed before the screen came up is dropped, an `Esc` too,
+    /// and later keys go to the session. Saying so tells the session loop
+    /// that what a switch carried can no longer be finished
+    /// (`pty::Carry::forget_held`).
+    #[test]
+    fn a_wait_that_read_the_keyboard_says_so() {
+        let typed = [
+            (GRACE / 2, Key::Char('2')),
+            (GRACE / 2, Key::Esc),
+            (GRACE + FRAME, Key::Char('x')),
+        ];
+        let mut world = Fake::new(Duration::ZERO, Some(GRACE + 3 * FRAME), &typed);
+        let waited = wait(&mut world, "dotfiles").expect("waited");
+        assert_eq!(
+            waited,
+            Waited {
+                verdict: Verdict::Ready,
+                listened: true
+            }
+        );
+        assert_eq!(world.drained, [Key::Char('2'), Key::Esc]);
+        assert_eq!(world.sent, [Key::Char('x')]);
+        assert!(
+            world.first_read.is_some_and(|at| at >= GRACE),
+            "read at {:?}",
+            world.first_read
+        );
+    }
+
+    /// Answered within the first frame: what was typed is still queued, for
+    /// the relay to read.
+    #[test]
+    fn a_wait_answered_before_it_read_the_keyboard_says_so() {
+        let typed = [(GRACE / 2, Key::Char('2'))];
+        let mut world = Fake::new(GRACE, Some(GRACE), &typed);
+        let waited = wait(&mut world, "dotfiles").expect("waited");
+        assert_eq!(
+            waited,
+            Waited {
+                verdict: Verdict::Ready,
+                listened: false
+            }
+        );
+        assert_eq!(world.first_read, None);
+        assert_eq!(world.typed, typed);
+    }
+
+    #[test]
+    fn a_cancel_is_a_wait_that_read_the_keyboard() {
+        let typed = [(GRACE + 2 * FRAME, Key::Esc)];
+        let mut world = Fake::new(GRACE, None, &typed);
+        let waited = wait(&mut world, "dotfiles").expect("waited");
+        assert_eq!(
+            waited,
+            Waited {
+                verdict: Verdict::Cancelled,
+                listened: true
+            }
+        );
     }
 
     /// A blocked session is attached to like any other: the key that ends its

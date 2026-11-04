@@ -197,6 +197,9 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
         // The row to reopen the floating picker on, after a prompt that went
         // nowhere (`r`, or `c` cancelled).
         let mut float_picker: Option<String> = None;
+        // Keys typed after a switch or a resettle, for the relay it leads
+        // to; they never outlive the trip.
+        let mut carry = pty::Carry::default();
 
         loop {
             // `early`: the fork and probe ran under the outgoing dissolve.
@@ -205,6 +208,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
             let started = begun.take().filter(|b| b.session.id == current.id);
             let early = started.is_some();
             let mut warm = false;
+            let mut listened = false;
             if revival
                 .as_ref()
                 .is_some_and(|r| !r.collect(&mut pool, None))
@@ -249,6 +253,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                         &mut warm,
                         &mut hand_off,
                         &mut after_a_drop,
+                        &mut listened,
                     )?;
                     // The reap the hangup deferred: explicit, so it stays
                     // after the spawn, a failed attach included.
@@ -263,8 +268,14 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     &mut warm,
                     &mut hand_off,
                     &mut after_a_drop,
+                    &mut listened,
                 )?,
             };
+            // The attaching screen took the keys that would have finished
+            // what the last relay left waiting.
+            if listened {
+                carry.forget_held();
+            }
 
             tracing::debug!(
                 ms = t_open.elapsed().as_secs_f64() * 1000.0,
@@ -358,7 +369,7 @@ fn session_loop(shared: &transport::Shared) -> Result<()> {
                     begun: &mut begun,
                     chosen: &mut chosen,
                 };
-                pty::relay(attachment, highest, &mut neighbours)?
+                pty::relay(attachment, highest, &mut carry, &mut neighbours)?
             };
             // The rows as a floating picker or prompt left them.
             if let Some(rows) = ui::picker::take_changed() {
@@ -591,7 +602,8 @@ fn settle(
 /// failure for the picker. `warm` is set for a resumed kept client (not one
 /// started ahead, which is new to the terminal). `after_a_drop` is set when
 /// the kept client had exited but the session remains, so it went with the
-/// link (see [`Revival`]).
+/// link (see [`Revival`]). `listened` is set if the attaching screen read the
+/// keyboard.
 #[allow(clippy::too_many_arguments)]
 fn resume_or_attach(
     transport: &dyn transport::Transport,
@@ -601,6 +613,7 @@ fn resume_or_attach(
     warm: &mut bool,
     hand_off: &mut Option<HandOff>,
     after_a_drop: &mut bool,
+    listened: &mut bool,
 ) -> Result<nvmux::Result<Option<pty::Attachment>>> {
     Ok(match pool.take(&session.id) {
         // An unanswered probe is waited out on the attaching screen.
@@ -616,6 +629,7 @@ fn resume_or_attach(
                         probe,
                     },
                     hand_off,
+                    listened,
                 ),
                 None => Ok(Some(ahead)),
             }
@@ -632,11 +646,11 @@ fn resume_or_attach(
                 h.take_down();
             }
             recover_the_link(transport)?;
-            let attached = attach(transport, session, begun, hand_off);
+            let attached = attach(transport, session, begun, hand_off, listened);
             *after_a_drop |= matches!(attached, Ok(Some(_)));
             attached
         }
-        pool::Taken::Absent => attach(transport, session, begun, hand_off),
+        pool::Taken::Absent => attach(transport, session, begun, hand_off, listened),
     })
 }
 
@@ -1145,10 +1159,11 @@ fn let_go(held: pty::Parked) {
 
 /// Wait on the attaching screen for the probe. `None` means the user gave up.
 /// Failures drop the attachment explicitly, so the client is gone before the
-/// picker reports it.
+/// picker reports it. `listened` is set if the screen read the keyboard.
 fn finish_attachment(
     begun: Begun,
     hand_off: &mut Option<HandOff>,
+    listened: &mut bool,
 ) -> nvmux::Result<Option<pty::Attachment>> {
     let Begun {
         session,
@@ -1156,7 +1171,9 @@ fn finish_attachment(
         mut attachment,
         probe,
     } = begun;
-    match ui::attaching::run(probe, &session.name, &sock, hand_off) {
+    let waited = ui::attaching::run(probe, &session.name, &sock, hand_off);
+    *listened |= waited.as_ref().is_ok_and(|w| w.listened);
+    match waited.map(|w| w.verdict) {
         Ok(ui::attaching::Verdict::Ready) => Ok(Some(attachment)),
         // The client draws nothing until a key reaches the server, so the
         // notice says why the screen is blank.
@@ -1180,10 +1197,11 @@ fn attach(
     session: &nvmux::session::Session,
     begun: Option<Begun>,
     hand_off: &mut Option<HandOff>,
+    listened: &mut bool,
 ) -> nvmux::Result<Option<pty::Attachment>> {
     match begun {
-        Some(begun) => finish_attachment(begun, hand_off),
-        None => finish_attachment(begin_attachment(transport, session)?, hand_off),
+        Some(begun) => finish_attachment(begun, hand_off, listened),
+        None => finish_attachment(begin_attachment(transport, session)?, hand_off, listened),
     }
 }
 

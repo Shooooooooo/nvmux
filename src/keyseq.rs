@@ -27,10 +27,14 @@
 //!
 //! Replies are `CSI` sequences starting with a private marker (`?`, `>`,
 //! `=`), which no key has: kitty and `modifyOtherKeys` answers, DA1, DA2,
-//! DECRPM. Also DEC mode 2048's size report, `CSI 48 ; … t`, which a
-//! terminal sends as a client's output turns the mode on, so as a held
-//! first paint is shown. String replies (DCS, OSC) pass through as ordinary
-//! input.
+//! DECRPM. Also device status, `CSI 0 n`, and OSC and DCS strings through
+//! their `BEL` (OSC only) or `ST`, told from Alt and a key by the byte after
+//! the introducer, as [`crate::client::input`] tells them. And two reports a
+//! terminal may send as a client's output turns their mode on: DEC mode
+//! 2048's size report, `CSI 48 ; … t`, so as a held first paint is shown,
+//! and focus, `CSI I` or `CSI O`, which Ghostty sends whenever mode 1004 is
+//! set. A new client asks its questions and sets both modes as it starts,
+//! so all of these arrive while a prefix carried over a switch waits.
 //!
 //! # The kitty form
 //!
@@ -46,11 +50,18 @@
 //! `CSI 27 ; modifiers ; key ~`, same modifier arithmetic (shift 1, alt 2,
 //! ctrl 4, meta 8), no event types.
 
+use crate::client::input::{DCS_OPENS, OSC_OPENS};
+
 pub const ESC: u8 = 0x1b;
 
 /// Longest sequence still considered a key report or reply. A chord with
 /// every field is ~20 bytes; a long DA1 reply ~40.
 const MAX_LEN: usize = 64;
+
+/// Longest OSC or DCS reply waited for whole. XTGETTCAP answers for several
+/// capabilities run to a few hundred bytes; an OSC 52 paste can be any size,
+/// and is passed on as it comes past this.
+const MAX_STRING: usize = 1024;
 
 const CTRL: u32 = 4;
 const CAPS_LOCK: u32 = 64;
@@ -65,7 +76,8 @@ pub enum Sequence {
     Prefix,
     /// Release of the key with this code; not a keystroke.
     Release(u32),
-    /// A terminal reply to an editor query; not a keystroke.
+    /// A terminal's reply to a query, or a report it sends unasked; not a
+    /// keystroke.
     Reply,
     /// The first `n` bytes (at least 1) are a non-prefix key or non-key
     /// sequence; later bytes are ordinary input. A lone `ESC` followed by a
@@ -83,6 +95,7 @@ pub fn classify(seq: &[u8], code: u8) -> Sequence {
     match seq.get(1) {
         None => return Sequence::Partial,
         Some(b'[') => {}
+        Some(&kind @ (b']' | b'P')) => return string(seq, kind),
         // Escape, legacy Alt, or an SS3 key. Only CSI can spell the prefix,
         // so the following bytes are handled on their own.
         Some(_) => return Sequence::Other(1),
@@ -119,6 +132,36 @@ pub fn classify(seq: &[u8], code: u8) -> Sequence {
     }
 }
 
+/// An OSC (`kind` `]`) or DCS (`P`) reply, whole once it ends; Alt and a key
+/// if the byte after the introducer is not one a reply opens with.
+fn string(seq: &[u8], kind: u8) -> Sequence {
+    let opens = if kind == b']' { OSC_OPENS } else { DCS_OPENS };
+    match seq.get(2) {
+        None => return Sequence::Partial,
+        Some(b) if !opens.contains(b) => return Sequence::Other(1),
+        Some(_) => {}
+    }
+    for (i, &b) in seq.iter().enumerate().skip(3) {
+        match b {
+            0x07 if kind == b']' => return Sequence::Reply,
+            ESC => match seq.get(i + 1) {
+                Some(b'\\') => return Sequence::Reply,
+                Some(_) => return Sequence::Other(i),
+                None => {}
+            },
+            // A control byte cut it short, as the prefix byte typed after a
+            // reply that never ended would.
+            0x00..=0x1f | 0x7f => return Sequence::Other(i),
+            _ => {}
+        }
+    }
+    if seq.len() >= MAX_STRING {
+        Sequence::Other(seq.len())
+    } else {
+        Sequence::Partial
+    }
+}
+
 /// Decide a complete sequence; `params` is everything between `ESC [` and
 /// the final byte. `None` means some other key or none.
 fn complete(params: &[u8], fin: u8, code: u8) -> Option<Sequence> {
@@ -126,6 +169,10 @@ fn complete(params: &[u8], fin: u8, code: u8) -> Option<Sequence> {
         b'u' => kitty(params, code),
         b'~' => xterm(params, code),
         b't' if params.starts_with(b"48;") && !params.contains(&b':') => Some(Sequence::Reply),
+        b'n' if !params.is_empty() && params.iter().all(u8::is_ascii_digit) => {
+            Some(Sequence::Reply)
+        }
+        b'I' | b'O' if params.is_empty() => Some(Sequence::Reply),
         _ => None,
     }
 }
@@ -286,11 +333,66 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_followed_by_anything_but_a_bracket_stands_alone() {
+    fn an_escape_followed_by_anything_but_an_introducer_stands_alone() {
         assert_eq!(classify(b"\x1b", SPACE), Sequence::Partial);
         for b in [b'x', b':', 0x00, ESC, b'O', 0x7f, 0xc3] {
             assert_eq!(classify(&[ESC, b], SPACE), Sequence::Other(1), "{b:#04x}");
         }
+    }
+
+    /// OSC 11, DECRQSS, XTGETTCAP and XTVERSION answers, ended by BEL or ST.
+    #[test]
+    fn a_string_reply_is_recognised_whole() {
+        for reply in [
+            &b"\x1b]11;rgb:1414/1616/1b1b\x07"[..],
+            b"\x1b]11;rgb:1414/1616/1b1b\x1b\\",
+            b"\x1bP1$r0m\x1b\\",
+            b"\x1bP1+r4D73=1B5D35323B25703125733B257032257307\x1b\\",
+            b"\x1bP0+r4D73\x1b\\",
+            b"\x1bP>|kitty(0.35.2)\x1b\\",
+        ] {
+            for n in 1..reply.len() {
+                assert_eq!(
+                    classify(&reply[..n], SPACE),
+                    Sequence::Partial,
+                    "{:?} cut after {n} bytes",
+                    String::from_utf8_lossy(reply)
+                );
+            }
+            assert_eq!(
+                classify(reply, SPACE),
+                Sequence::Reply,
+                "{:?}",
+                String::from_utf8_lossy(reply)
+            );
+        }
+    }
+
+    /// Alt-] and Alt-P, then a key, which no reply opens with.
+    #[test]
+    fn alt_and_a_bracket_or_p_is_still_a_key() {
+        for seq in [
+            &b"\x1b]x"[..],
+            b"\x1b];",
+            b"\x1bPp",
+            b"\x1bP\x00",
+            b"\x1b]\x1b",
+        ] {
+            assert_eq!(classify(seq, SPACE), Sequence::Other(1), "{seq:?}");
+        }
+    }
+
+    /// A prefix byte typed after a reply that never ended must still be the
+    /// prefix; BEL ends only an OSC.
+    #[test]
+    fn a_string_cut_short_ends_before_what_cut_it() {
+        assert_eq!(classify(b"\x1b]11;rgb\x00", SPACE), Sequence::Other(8));
+        assert_eq!(classify(b"\x1b]11;rgb\x1b[A", SPACE), Sequence::Other(8));
+        assert_eq!(classify(b"\x1bP1$r\x07", SPACE), Sequence::Other(5));
+        let mut seq = b"\x1b]52;c;".to_vec();
+        seq.resize(MAX_STRING, b'A');
+        assert_eq!(classify(&seq, SPACE), Sequence::Other(MAX_STRING));
+        assert_eq!(classify(&seq[..MAX_STRING - 1], SPACE), Sequence::Partial);
     }
 
     /// A non-prefix key is decided at its final byte; a non-key sequence at
@@ -302,7 +404,6 @@ mod tests {
             (b"\x1b[1;5A", 6),        // ctrl-up
             (b"\x1b[200~", 6),        // bracketed paste begins
             (b"\x1b[15~", 5),         // F5
-            (b"\x1b[I", 3),           // focus in
             (b"\x1b[27;5;32;9u", 12), // nonsense
             (b"\x1b[<35;10;20M", 3),  // a mouse report
             (b"\x1b[;", 3),           // a separator first
@@ -318,7 +419,7 @@ mod tests {
     }
 
     /// Kitty query reply, DA1 (short and long), DA2, DECRPM, an in-band size
-    /// report.
+    /// report, device status, focus in and out.
     #[test]
     fn a_terminal_reply_is_recognised_whole() {
         for reply in [
@@ -329,6 +430,9 @@ mod tests {
             b"\x1b[?2026;2$y",
             b"\x1b[=0c",
             b"\x1b[48;30;120;600;1200t",
+            b"\x1b[0n",
+            b"\x1b[I",
+            b"\x1b[O",
         ] {
             for n in 1..reply.len() {
                 assert_eq!(

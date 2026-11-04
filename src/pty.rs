@@ -47,7 +47,7 @@ use pty_process::blocking::{Command, Pty};
 
 use crate::error::{NvmuxError, Result};
 use crate::handoff::HandOff;
-use crate::keys::{self, Action, Pending, Prefix, Step, Wait};
+use crate::keys::{self, Action, Held, Pending, Prefix, Step, Wait};
 use crate::ledger::Ledger;
 use crate::term::write_stdout;
 use crate::{announce, boundary, card, config, fade, hint, keyseq, rpc, shadow, term, winch};
@@ -140,6 +140,46 @@ impl Outcome {
         matches!(self, Outcome::Switch(_))
     }
 
+    /// Whether keys typed after the one that ended the relay go on into the
+    /// next relay ([`Carry`]). A switch's go to the session it lands on;
+    /// settings that attach the session again send them back to it, as a
+    /// panel that closes does. Every other outcome leads to a screen of
+    /// nvmux's, out of it, or (a client gone) to a reconnect first, and drops
+    /// them: past a screen they could reach a session picked there.
+    fn carries_keys(self) -> bool {
+        match self {
+            Outcome::Switch(_) | Outcome::Resettle => true,
+            Outcome::ToPicker
+            | Outcome::Detached
+            | Outcome::CreateNew
+            | Outcome::CreateAfter(_)
+            | Outcome::Rename(_)
+            | Outcome::ShowHelp
+            | Outcome::ShowSettings
+            | Outcome::ChildExited
+            | Outcome::StdinClosed => false,
+        }
+    }
+
+    /// What a relay ending in this leaves the next ([`carries_keys`]), its key
+    /// having made `keyed`, a panel having come and gone earlier in the read
+    /// if `floated`. Only a panel makes `keyed` another outcome. What the
+    /// machine holds predates a panel, as when one closes. Keys read with a
+    /// panel's key never reached it: on into a session it switched to, they
+    /// would land after whatever was done there, as past the full-screen
+    /// picker.
+    ///
+    /// [`carries_keys`]: Outcome::carries_keys
+    fn leaves(self, keyed: Outcome, floated: bool) -> Leaves {
+        let by_a_panel = self != keyed;
+        match self {
+            _ if !self.carries_keys() => Leaves::Nothing,
+            Outcome::Switch(_) if by_a_panel => Leaves::Nothing,
+            _ if by_a_panel || floated => Leaves::Keys,
+            _ => Leaves::KeysAndHeld,
+        }
+    }
+
     /// The session to start attaching while the outgoing one fades (see
     /// [`relay`]). A method so a test pins that only `Switch` gives one: an
     /// outcome leading into another relay must not silently start nothing.
@@ -167,6 +207,37 @@ pub enum Target {
     Number(u32),
     Step(crate::keys::Direction),
     Session(crate::ids::Id),
+}
+
+/// What of the keys after the one that ended a relay goes on into the next
+/// (see [`Outcome::leaves`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leaves {
+    Nothing,
+    /// The steps after it, not what the machine held.
+    Keys,
+    KeysAndHeld,
+}
+
+/// The keys typed after the one that ended a relay, for the next relay to
+/// take as if typed there: the prefix machine's steps after the one that
+/// ended it, less replies, which go to the client they answer, then what it
+/// held, still due when it was. Only outcomes that relay again at once leave
+/// any (see [`Outcome::leaves`]).
+#[derive(Debug, Default)]
+pub struct Carry {
+    steps: Vec<Step>,
+    held: Held,
+    due: Option<Instant>,
+}
+
+impl Carry {
+    /// Drop what the machine held, keeping the steps: for when the keys that
+    /// would end its wait were read elsewhere (the attaching screen).
+    pub fn forget_held(&mut self) {
+        self.held = Held::default();
+        self.due = None;
+    }
 }
 
 /// A running client, and the PTY it is talking through.
@@ -636,7 +707,7 @@ impl Attachment {
     /// parked was sent by [`Attachment::tell_its_size`]. Other sizes (a
     /// resize since) go through.
     fn saw_input(&mut self, step: &mut Step) {
-        let Step::Forward(bytes) = step else {
+        let (Step::Forward(bytes) | Step::Reply(bytes)) = step else {
             return;
         };
         if self.flush_after_answers && answers_device_attributes(bytes) {
@@ -2523,9 +2594,13 @@ impl<F: FnMut(Target) -> Option<card::Card>> Others for F {
 /// One thread and one `poll` over stdin, the master and the SIGWINCH pipe:
 /// two readers on one file description would split the stream, and a thread
 /// blocked in `read(0)` cannot be cancelled.
+///
+/// `carry` starts with what the last relay left for this one, and ends with
+/// what this one leaves for the next.
 pub fn relay(
     mut attachment: Attachment,
     highest_session_num: u32,
+    carry: &mut Carry,
     others: &mut dyn Others,
 ) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment.master.as_raw_fd();
@@ -2699,6 +2774,7 @@ pub fn relay(
         popup,
         dissolved,
         erasing,
+        carry,
         others,
     );
     // Cleared whether or not shown: this client may come straight back.
@@ -2832,16 +2908,21 @@ fn pump(
     mut popup: Option<announce::Popup>,
     dissolved: bool,
     mut erasing: Option<Erasing>,
+    carry: &mut Carry,
     others: &mut dyn Others,
 ) -> Result<Outcome> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let mut keys = crate::config::get().keys;
     let mut prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
     let mut prefix_timeout = Duration::from_millis(keys.timeout_ms);
-    // When a pending prefix, half-typed number or cut-off sequence must be
-    // settled. An instant, not a per-poll timeout: a chatty child keeps
-    // `poll` returning early, so a restarting timeout would never fire.
-    let mut deadline: Option<Instant> = None;
+    // The steps to take on this pass; on the first, the last relay's go
+    // ahead of anything read here. `deadline`: when a pending prefix,
+    // half-typed number or cut-off sequence must be settled. An instant, not
+    // a per-poll timeout: a chatty child keeps `poll` returning early, so a
+    // restarting timeout would never fire.
+    let (mut steps, mut deadline) = take_carry(carry, &mut prefix);
+    // Until stdin is first polled.
+    let mut first_look = true;
     // Re-read only on a `SIGWINCH` or after a floating panel: each read
     // costs 3x the syscalls of the rest of a pass.
     let mut size = term::terminal_size();
@@ -2900,6 +2981,7 @@ fn pump(
             attachment.kept_due(),
             erasing.as_ref().map(|_| now + ERASE_POLL),
             attachment.cards_due(),
+            steps.first().map(|_| now),
         ]
         .into_iter()
         .flatten()
@@ -3063,22 +3145,22 @@ fn pump(
         // Settle a pending prefix before reading new input, so a key just
         // after the deadline is not taken as a command. A cut-off escape
         // sequence is the opposite: waiting input may complete it, so it is
-        // read first.
+        // read first. So is input waiting as the relay starts: typed during
+        // the switch into it, it may be in time for what the last relay left.
         let stdin_ready = n > 0 && ready(&fds[0]);
         // Keys left unread behind the backlog are not late.
         if backlogged {
             deadline = settles_at(&prefix, prefix_timeout);
         }
         let overdue = deadline.is_some_and(|d| Instant::now() >= d);
-        if overdue && !(stdin_ready && prefix.wait() == Some(Wait::Sequence)) {
+        let read_first = first_look || prefix.wait() == Some(Wait::Sequence);
+        if overdue && !(stdin_ready && read_first) {
             deadline = None;
-            // `timeout` may also turn a half-typed number into a switch, so
-            // act on its steps.
-            for step in prefix.timeout() {
-                if let Some(outcome) = take_step(attachment, step)? {
-                    return Ok(outcome);
-                }
-            }
+            // `timeout` may also turn a half-typed number into a switch.
+            steps.extend(prefix.timeout());
+        }
+        if !backlogged {
+            first_look = false;
         }
 
         if stdin_ready {
@@ -3112,54 +3194,74 @@ fn pump(
                     }
                 }
                 Ok(len) => {
-                    // Whether a floating panel came and went (keys may change).
-                    let mut floated = false;
                     // Deliberately NOT logged: every keystroke, into a /tmp
                     // file that outlives the session.
-                    for step in prefix.feed(&buf[..len]) {
-                        if let Some(outcome) = take_step(attachment, step)? {
-                            // `<prefix> ,`, `?`, `Space` or `c`: float the
-                            // panel and return here, unless it cannot float or
-                            // leads to the session loop.
-                            let outcome =
-                                match float_over(attachment, master_fd, winch, outcome, others)? {
-                                    Some(outcome) => outcome,
-                                    None => {
-                                        floated = true;
-                                        continue;
-                                    }
-                                };
-                            // With unsaved settings, a detach asks first.
-                            if outcome == Outcome::Detached {
-                                let unsaved =
-                                    crate::settings::changed(&config::get(), &config::saved())
-                                        .len();
-                                if unsaved > 0 {
-                                    let leave = Leaving {
-                                        detach: keys.bind.key(Action::Detach).unwrap_or(b'd'),
-                                        overwrite: false,
-                                    };
-                                    bar.ask(Some(leave.question(unsaved)));
-                                    leaving = Some(leave);
-                                    break;
-                                }
-                            }
-                            return Ok(outcome);
-                        }
-                    }
-                    if floated {
-                        keys = crate::config::get().keys;
-                        prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
-                        prefix_timeout = Duration::from_millis(keys.timeout_ms);
-                        // A resize while they floated was theirs.
-                        size = term::terminal_size();
-                        bar = hint::Bar::new(Instant::now(), size, keys.bind);
-                    }
+                    steps.extend(prefix.feed(&buf[..len]));
                     // Every keystroke restarts the clock, so a number typed at
                     // a human pace is one number.
                     deadline = settles_at(&prefix, prefix_timeout);
                 }
             }
+        }
+
+        // Whether a floating panel came and went (keys may change).
+        let mut floated = false;
+        let mut taking = std::mem::take(&mut steps).into_iter();
+        while let Some(step) = taking.next() {
+            let Some(keyed) = take_step(attachment, step)? else {
+                continue;
+            };
+            // `<prefix> ,`, `?`, `Space` or `c`: float the panel and return
+            // here, unless it cannot float or leads to the session loop.
+            let Some(outcome) = float_over(attachment, master_fd, winch, keyed, others)? else {
+                floated = true;
+                continue;
+            };
+            // With unsaved settings, a detach asks first.
+            if outcome == Outcome::Detached {
+                let unsaved = crate::settings::changed(&config::get(), &config::saved()).len();
+                if unsaved > 0 {
+                    let leave = Leaving {
+                        detach: keys.bind.key(Action::Detach).unwrap_or(b'd'),
+                        overwrite: false,
+                    };
+                    bar.ask(Some(leave.question(unsaved)));
+                    leaving = Some(leave);
+                    break;
+                }
+            }
+            // Replies read with that key are this client's, whatever becomes
+            // of the keys.
+            let mut after = Vec::new();
+            for step in taking {
+                if matches!(step, Step::Reply(_)) {
+                    take_step(attachment, step)?;
+                } else {
+                    after.push(step);
+                }
+            }
+            *carry = match outcome.leaves(keyed, floated) {
+                Leaves::Nothing => Carry::default(),
+                Leaves::Keys => Carry {
+                    steps: after,
+                    ..Carry::default()
+                },
+                Leaves::KeysAndHeld => Carry {
+                    steps: after,
+                    held: prefix.take_held(),
+                    due: deadline,
+                },
+            };
+            return Ok(outcome);
+        }
+        if floated {
+            keys = crate::config::get().keys;
+            prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
+            prefix_timeout = Duration::from_millis(keys.timeout_ms);
+            deadline = None;
+            // A resize while they floated was theirs.
+            size = term::terminal_size();
+            bar = hint::Bar::new(Instant::now(), size, keys.bind);
         }
 
         // The hint bar goes after the keys (earlier, it would appear a wake-up
@@ -3375,7 +3477,7 @@ fn kitty_press(seq: &[u8]) -> Option<u32> {
 /// [`Outcome`]. No `_` arm, so a new [`Action`] cannot be silently dropped.
 fn act(writer: &mut dyn Write, step: Step) -> Result<Option<Outcome>> {
     Ok(match step {
-        Step::Forward(bytes) => {
+        Step::Forward(bytes) | Step::Reply(bytes) => {
             writer.write_all(&bytes)?;
             writer.flush()?;
             None
@@ -3399,10 +3501,26 @@ fn take_step(attachment: &mut Attachment, mut step: Step) -> Result<Option<Outco
     if step == Step::Act(Action::Go) {
         return Ok(attachment.go(Instant::now()));
     }
-    if let (Step::Forward(bytes), Some(desk)) = (&step, attachment.desk.as_mut()) {
+    if let (Step::Forward(bytes) | Step::Reply(bytes), Some(desk)) =
+        (&step, attachment.desk.as_mut())
+    {
         desk.forwarded.saw(bytes, Instant::now());
     }
     act(&mut attachment.input, step)
+}
+
+/// What `carry` leaves a relay whose machine is `prefix`: the steps the last
+/// relay left, then any that what it held makes here (a number the sessions
+/// now listed cannot extend is switched to), and when what is still held is
+/// due.
+fn take_carry(carry: &mut Carry, prefix: &mut Prefix) -> (Vec<Step>, Option<Instant>) {
+    let Carry {
+        mut steps,
+        held,
+        due,
+    } = std::mem::take(carry);
+    steps.extend(prefix.resume(held));
+    (steps, due.filter(|_| prefix.wait().is_some()))
 }
 
 /// Float `outcome`'s panel over the session if it floats and `[style] float`
@@ -4608,6 +4726,126 @@ mod tests {
         }
     }
 
+    /// Too narrow drops keys typed after a switch; too wide hands them past a
+    /// screen of nvmux's, to whichever session comes after it.
+    #[test]
+    fn only_outcomes_that_relay_again_at_once_carry_keys_on() {
+        for carrying in [
+            Outcome::Switch(Target::Number(3)),
+            Outcome::Switch(Target::Step(Direction::Next)),
+            Outcome::Resettle,
+        ] {
+            assert!(carrying.carries_keys(), "{carrying:?}");
+        }
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
+        for other in [
+            Outcome::ToPicker,
+            Outcome::CreateNew,
+            Outcome::CreateAfter(Some(id)),
+            Outcome::CreateAfter(None),
+            Outcome::Rename(id),
+            Outcome::ShowHelp,
+            Outcome::ShowSettings,
+            Outcome::Detached,
+            Outcome::ChildExited,
+            Outcome::StdinClosed,
+        ] {
+            assert!(!other.carries_keys(), "{other:?}");
+        }
+    }
+
+    /// Past a panel: the floating picker or prompt switching (`Enter`, or a
+    /// session created), the settings resettling, and one closed back before
+    /// a switch later in the same read.
+    #[test]
+    fn a_panel_that_switches_takes_no_keys_with_it() {
+        use Leaves::{Keys, KeysAndHeld, Nothing};
+        use Outcome::{
+            ChildExited, CreateNew, Detached, Resettle, ShowHelp, ShowSettings, ToPicker,
+        };
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
+        let number = Outcome::Switch(Target::Number(3));
+        let picked = Outcome::Switch(Target::Session(id));
+        for (ended, keyed, floated, leaves) in [
+            (number, number, false, KeysAndHeld),
+            (number, number, true, Keys),
+            (picked, picked, false, KeysAndHeld),
+            (picked, ToPicker, false, Nothing),
+            (picked, ToPicker, true, Nothing),
+            (picked, CreateNew, false, Nothing),
+            (Resettle, ShowSettings, false, Keys),
+            (Resettle, ShowSettings, true, Keys),
+            (Detached, ToPicker, false, Nothing),
+            (ToPicker, ToPicker, false, Nothing),
+            (ChildExited, ShowHelp, false, Nothing),
+        ] {
+            assert_eq!(
+                ended.leaves(keyed, floated),
+                leaves,
+                "{ended:?} by {keyed:?}, floated {floated}"
+            );
+        }
+    }
+
+    /// Carried steps go first, then the switch a number held over makes
+    /// against fewer sessions: the `x` is for the session `n` stepped to.
+    #[test]
+    fn a_carried_key_goes_ahead_of_the_switch_its_held_number_makes() {
+        let mut p = Prefix::new(12);
+        let steps = p.feed(&[keys::PREFIX, b'n', b'x', keys::PREFIX, b'1']);
+        assert_eq!(steps[0], Step::Act(Action::Cycle(Direction::Next)));
+        let due = Instant::now() + Duration::from_secs(1);
+        let mut carry = Carry {
+            steps: steps[1..].to_vec(),
+            held: p.take_held(),
+            due: Some(due),
+        };
+        let mut fewer = Prefix::new(9);
+        assert_eq!(
+            take_carry(&mut carry, &mut fewer),
+            (
+                vec![Step::Forward(b"x".to_vec()), Step::Act(Action::Switch(1))],
+                None
+            ),
+            "settled, so nothing is due"
+        );
+        assert!(carry.steps.is_empty(), "taken");
+
+        let mut p = Prefix::new(12);
+        p.feed(&[keys::PREFIX, b'1']);
+        let mut carry = Carry {
+            steps: vec![Step::Forward(b"x".to_vec())],
+            held: p.take_held(),
+            due: Some(due),
+        };
+        let mut more = Prefix::new(12);
+        assert_eq!(
+            take_carry(&mut carry, &mut more),
+            (vec![Step::Forward(b"x".to_vec())], Some(due))
+        );
+        assert_eq!(more.pending(), Some(Pending::Number(1)));
+    }
+
+    /// The attaching screen read the keys that would end the wait; the key
+    /// carried whole still goes.
+    #[test]
+    fn a_forgotten_wait_leaves_the_carried_keys() {
+        let mut p = Prefix::new(12);
+        let steps = p.feed(&[keys::PREFIX, b'n', b'x', keys::PREFIX]);
+        let mut carry = Carry {
+            steps: steps[1..].to_vec(),
+            held: p.take_held(),
+            due: Some(Instant::now()),
+        };
+        carry.forget_held();
+        let mut next = Prefix::new(12);
+        assert_eq!(
+            take_carry(&mut carry, &mut next),
+            (vec![Step::Forward(b"x".to_vec())], None)
+        );
+        assert_eq!(next.wait(), None, "nothing held");
+    }
+
     /// Too narrow leaves the old session on screen through the spawn; too wide
     /// clears a screen about to draw anyway.
     #[test]
@@ -5396,7 +5634,18 @@ mod tests {
         let winch = winch::Winch::install().expect("the SIGWINCH pipe");
         let master = a.master.as_raw_fd();
         let mut others = |_: Target| None::<card::Card>;
-        let ended = pump(&mut a, master, &winch, 0, None, false, None, &mut others);
+        let mut carry = Carry::default();
+        let ended = pump(
+            &mut a,
+            master,
+            &winch,
+            0,
+            None,
+            false,
+            None,
+            &mut carry,
+            &mut others,
+        );
         eprintln!("relay ended: {ended:?}; unsent: {}", a.input.unsent.len());
     }
 
@@ -5466,8 +5715,346 @@ mod tests {
         let winch = winch::Winch::install().expect("the SIGWINCH pipe");
         let master = a.master.as_raw_fd();
         let mut others = |_: Target| None::<card::Card>;
-        let ended = pump(&mut a, master, &winch, 0, None, false, None, &mut others);
+        let mut carry = Carry::default();
+        let ended = pump(
+            &mut a,
+            master,
+            &winch,
+            0,
+            None,
+            false,
+            None,
+            &mut carry,
+            &mut others,
+        );
         eprintln!("relay ended: {ended:?}");
+    }
+
+    /// Set, to a scratch directory, on the binary rerun by [`switching`].
+    const SWITCH_CHILD: &str = "NVMUX_TEST_SWITCH_CHILD";
+
+    /// How long that child waits between relays, in ms, as a slow switch
+    /// would.
+    const SWITCH_SLOW_MS: &str = "NVMUX_TEST_SWITCH_SLOW_MS";
+
+    /// Set for that child to read stdin at the end of each wait and forget
+    /// what the carry holds, as `main` does after an attaching screen that
+    /// listened.
+    const SWITCH_LISTENS: &str = "NVMUX_TEST_SWITCH_LISTENS";
+
+    /// The session a run of [`switching`] detached from, and what sessions 1,
+    /// 2 and 3 were sent, escaped.
+    type Landed = (Option<u32>, [String; 3]);
+
+    fn landed(on: Option<u32>, sent: [&str; 3]) -> Landed {
+        (on, sent.map(str::to_string))
+    }
+
+    /// How a run of [`switching`] went.
+    struct Run {
+        landed: Landed,
+        /// What the child said, for a failure's message.
+        said: String,
+        /// How long after the landing relay began every session had been
+        /// sent what was wanted; `None` if it never was.
+        settled: Option<Duration>,
+    }
+
+    /// Well under the idle poll, which a carried step must not wait out.
+    fn at_once(run: &Run) -> bool {
+        run.settled
+            .is_some_and(|after| after < Duration::from_millis(IDLE_POLL_MS as u64 / 2))
+    }
+
+    /// Run [`relaying_across_switches`] in a rerun of this binary and type
+    /// `chunks` into it, one read each. Once it has landed as `want` says, or
+    /// failed to, detach.
+    fn switching(tag: &str, chunks: &[&[u8]], slow: Duration, want: &Landed) -> Run {
+        switching_with(tag, chunks, slow, false, want)
+    }
+
+    /// [`switching`], with [`SWITCH_LISTENS`] if `listens`.
+    fn switching_with(
+        tag: &str,
+        chunks: &[&[u8]],
+        slow: Duration,
+        listens: bool,
+        want: &Landed,
+    ) -> Run {
+        let dir = crate::test_support::scratch_dir(tag);
+        let mut command = std::process::Command::new(std::env::current_exe().expect("the tests"));
+        if listens {
+            command.env(SWITCH_LISTENS, "1");
+        }
+        let mut child = command
+            .args([
+                "--exact",
+                "pty::tests::relaying_across_switches",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SWITCH_CHILD, &dir)
+            .env(SWITCH_SLOW_MS, slow.as_millis().to_string())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the child");
+        let (lines, said) = mpsc::channel::<String>();
+        let stderr = child.stderr.take().expect("its stderr");
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(|l| l.ok())
+            {
+                if lines.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut heard = String::new();
+        // Until the child says `want`, or all it says if `None`.
+        let mut hear = |want: Option<&str>, within: Duration| {
+            let deadline = Instant::now() + within;
+            while want.is_none_or(|want| !heard.lines().any(|l| l == want)) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match said.recv_timeout(left) {
+                    Ok(line) => {
+                        heard.push_str(&line);
+                        heard.push('\n');
+                    }
+                    Err(_) => return,
+                }
+            }
+        };
+        let sent = || {
+            [1, 2, 3].map(|n| {
+                let bytes = std::fs::read(dir.join(n.to_string())).unwrap_or_default();
+                String::from_utf8_lossy(&bytes).escape_debug().to_string()
+            })
+        };
+        let mut stdin = child.stdin.take().expect("its stdin");
+        let mut typing = |bytes: &[u8]| {
+            stdin.write_all(bytes).expect("type");
+            stdin.flush().expect("type");
+            // Long enough for the relay to read each chunk on its own.
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        hear(Some("relaying 3"), Duration::from_secs(10));
+        for chunk in chunks {
+            typing(chunk);
+        }
+        let to = want.0.expect("a session to land on");
+        hear(
+            Some(&format!("relaying {to}")),
+            Duration::from_secs(3) + 2 * slow,
+        );
+        let relayed = Instant::now();
+        let settled = crate::test_support::wait_until(Duration::from_secs(3), || sent() == want.1)
+            .then(|| relayed.elapsed());
+        typing(&[keys::PREFIX]);
+        typing(b"d");
+        let ended = crate::test_support::wait_until(Duration::from_secs(10), || {
+            child.try_wait().is_ok_and(|status| status.is_some())
+        });
+        if !ended {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        drop(stdin);
+        hear(None, Duration::from_secs(2));
+        let on = heard
+            .lines()
+            .find_map(|l| l.strip_prefix("ended Ok(Detached) on "))
+            .and_then(|n| n.parse().ok());
+        let landed = (on, sent());
+        let _ = std::fs::remove_dir_all(&dir);
+        Run {
+            landed,
+            said: heard,
+            settled,
+        }
+    }
+
+    /// The child half of [`switching`]; does nothing without
+    /// [`SWITCH_CHILD`]. Three stand-in sessions, starting on the third, each
+    /// writing what it is sent to its own file there; switches go between
+    /// them, and `<prefix> Space` goes to the second, as if picked. Twelve
+    /// sessions as far as the machine knows, so a `1` waits for a digit.
+    #[test]
+    #[ignore = "the child half of a test; run by it, not by hand"]
+    fn relaying_across_switches() {
+        let Some(dir) = std::env::var_os(SWITCH_CHILD).map(PathBuf::from) else {
+            return;
+        };
+        let slow = std::env::var(SWITCH_SLOW_MS)
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map_or(Duration::ZERO, Duration::from_millis);
+        let listens = std::env::var_os(SWITCH_LISTENS).is_some();
+        // The picker full screen, so it ends the relay without a panel.
+        let mut settings = config::Settings::default();
+        settings.style.float = false;
+        config::init(settings);
+        let winch = winch::Winch::install().expect("the SIGWINCH pipe");
+        let mut others = |_: Target| None::<card::Card>;
+        let client = |n: u32| attached_to(&format!("exec cat > '{}/{n}'", dir.display()));
+        let mut clients = vec![(3, client(3))];
+        let mut on = 3;
+        let mut carry = Carry::default();
+        loop {
+            let a = &mut clients
+                .iter_mut()
+                .find(|(n, _)| *n == on)
+                .expect("a client")
+                .1;
+            let master = a.master.as_raw_fd();
+            eprintln!("relaying {on}");
+            let ended = pump(
+                a,
+                master,
+                &winch,
+                12,
+                None,
+                false,
+                None,
+                &mut carry,
+                &mut others,
+            );
+            on = match ended {
+                Ok(Outcome::Switch(Target::Number(n))) if (1..=3).contains(&n) => n,
+                Ok(Outcome::Switch(Target::Step(Direction::Next))) => on % 3 + 1,
+                Ok(Outcome::Switch(Target::Step(Direction::Prev))) => (on + 1) % 3 + 1,
+                Ok(Outcome::Switch(_)) => on,
+                Ok(Outcome::ToPicker) => 2,
+                other => {
+                    eprintln!("ended {other:?} on {on}");
+                    break;
+                }
+            };
+            if !clients.iter().any(|(n, _)| *n == on) {
+                clients.push((on, client(on)));
+            }
+            std::thread::sleep(slow);
+            if listens {
+                discard_pending(std::io::stdin().as_raw_fd());
+                carry.forget_held();
+            }
+        }
+        // For each client to read what it was sent before it is hung up.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn the_key_after_a_number_reaches_the_session_switched_to() {
+        let want = landed(Some(1), ["j", "", ""]);
+        for (tag, chunks) in [
+            ("pty-switch-j-apart", &[&[keys::PREFIX][..], b"1", b"j"][..]),
+            (
+                "pty-switch-j-at-once",
+                &[&[keys::PREFIX, b'1', b'j'][..]][..],
+            ),
+        ] {
+            let run = switching(tag, chunks, Duration::ZERO, &want);
+            assert_eq!(run.landed, want, "{tag}: {}", run.said);
+            assert!(at_once(&run), "{tag}: the j came {:?} in", run.settled);
+        }
+    }
+
+    /// The `2` must not reach session 1's editor, where it would be a count.
+    #[test]
+    fn a_prefix_that_ends_a_number_goes_on_into_the_next_relay() {
+        let want = landed(Some(2), ["", "", ""]);
+        let chunks: &[&[u8]] = &[&[keys::PREFIX], b"1", &[keys::PREFIX], b"2"];
+        let run = switching("pty-switch-twice", chunks, Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    #[test]
+    fn the_key_after_a_command_in_its_read_reaches_the_session_switched_to() {
+        let want = landed(Some(1), ["x", "", ""]);
+        let chunks: &[&[u8]] = &[&[keys::PREFIX, b'n', b'x']];
+        let run = switching("pty-switch-next-x", chunks, Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+        assert!(at_once(&run), "the x came {:?} in", run.settled);
+    }
+
+    /// The terminal's answer to the client left, read with the key after the
+    /// number: sent on with the `j`, a DA1 would pass for the startup answer
+    /// of the client switched to.
+    #[test]
+    fn a_reply_read_with_the_keys_after_a_switch_goes_to_the_session_left() {
+        let want = landed(Some(1), ["j", "", "\\u{1b}[?62;22c"]);
+        let typed = [&[keys::PREFIX, b'1', b'j'][..], b"\x1b[?62;22c"].concat();
+        let run = switching("pty-switch-reply", &[&typed], Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The number settles on the sequence's timeout, which forwards it.
+    #[test]
+    fn an_escape_after_a_number_reaches_the_session_switched_to() {
+        let want = landed(Some(1), ["\\u{1b}", "", ""]);
+        let chunks: &[&[u8]] = &[&[keys::PREFIX, b'1', 0x1b]];
+        let run = switching("pty-switch-esc", chunks, Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+        assert!(at_once(&run), "the Esc came {:?} in", run.settled);
+    }
+
+    /// A switch slower than the prefix's timeout: the prefix carried on is
+    /// settled as the next relay starts, not a timeout after.
+    #[test]
+    fn a_prefix_carried_on_times_out_from_when_it_was_typed() {
+        let want = landed(Some(1), ["\\0", "", ""]);
+        let chunks: &[&[u8]] = &[&[keys::PREFIX], b"1", &[keys::PREFIX]];
+        let slow = Duration::from_millis(1500);
+        let run = switching("pty-switch-timeout", chunks, slow, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+        let timeout = Duration::from_millis(config::get().keys.timeout_ms);
+        assert!(
+            run.settled.is_some_and(|after| after < timeout / 2),
+            "the literal came {:?} into the relay, as if its timeout began there",
+            run.settled
+        );
+    }
+
+    /// The `2` comes in time but is read only after the prefix's timeout,
+    /// the switch having left it unread.
+    #[test]
+    fn a_key_typed_during_a_slow_switch_is_not_late() {
+        let want = landed(Some(2), ["", "", ""]);
+        let chunks: &[&[u8]] = &[&[keys::PREFIX], b"1", &[keys::PREFIX], b"2"];
+        let slow = Duration::from_millis(1500);
+        let run = switching("pty-switch-slow", chunks, slow, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The same `2`, but read by the attaching screen: the prefix it would
+    /// have ended is not sent on as a literal, while a key carried whole
+    /// still arrives.
+    #[test]
+    fn what_an_attaching_screen_read_cannot_end_is_dropped() {
+        let slow = Duration::from_millis(1500);
+        let want = landed(Some(1), ["", "", ""]);
+        let chunks: &[&[u8]] = &[&[keys::PREFIX], b"1", &[keys::PREFIX], b"2"];
+        let run = switching_with("pty-switch-listened", chunks, slow, true, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let want = landed(Some(1), ["j", "", ""]);
+        let chunks: &[&[u8]] = &[&[keys::PREFIX, b'1', b'j']];
+        let run = switching_with("pty-switch-listened-j", chunks, slow, true, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// `<prefix> Space` leaves for the full-screen picker here, and the `j`
+    /// must not follow to the session picked there.
+    #[test]
+    fn keys_after_leaving_for_a_screen_are_dropped() {
+        let want = landed(Some(2), ["", "", ""]);
+        let chunks: &[&[u8]] = &[&[keys::PREFIX, b' ', b'j']];
+        let run = switching("pty-switch-picker", chunks, Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
     }
 
     /// Once per client, and never for nvmux's own, which writes its replies
@@ -6025,7 +6612,7 @@ mod tests {
         let mut step = Step::Forward(bytes.to_vec());
         a.saw_input(&mut step);
         match step {
-            Step::Forward(bytes) => bytes,
+            Step::Forward(bytes) | Step::Reply(bytes) => bytes,
             Step::Act(action) => panic!("{action:?} out of forwarded bytes"),
         }
     }
