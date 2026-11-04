@@ -843,7 +843,7 @@ fn hand_off_for(app: &App, area: ratatui::layout::Rect, session: &Session) -> Op
 ///
 /// New sessions are numbered last, so this is a renumber
 /// ([`App::placement_of`]) then a listing (only a listing knows the numbers):
-/// two round trips over SSH, skipped when the highlight is already last. In
+/// two round trips over SSH, skipped when the session lands last anyway. In
 /// that case the rows plus the new one serve as the listing; order does not
 /// matter to its readers.
 ///

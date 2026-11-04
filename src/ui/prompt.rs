@@ -121,8 +121,8 @@ impl Outcome {
 pub enum Place {
     /// At the end (`<prefix> c`).
     Last,
-    /// After the picker's highlighted row (the picker's `c`); `None` (no
-    /// rows) means first.
+    /// After the picker's highlighted row (the picker's `c`) among the rows
+    /// its filter shows; `None` (none shown) means past every row.
     After(Option<Id>),
 }
 
@@ -633,17 +633,15 @@ pub fn run(transport: &dyn Transport) -> Result<Outcome> {
 
 /// Ask for a new session on a terminal of its own, for `c` on the floating
 /// picker (see [`super::picker`]). Named and placed after row `after` of
-/// `rows` as the full-screen picker would (see [`super::settle`]). Returns the
-/// session and its rows, or `None` if cancelled.
+/// `rows`, under the filter the picker left with, as the full-screen picker
+/// would (see [`super::settle`]). Returns the session and its rows, or `None`
+/// if cancelled.
 pub fn create_after(
     transport: &dyn Transport,
     rows: &[Session],
     after: Option<&str>,
 ) -> Result<Option<(Session, Vec<Session>)>> {
-    let mut picker = super::app::App::new(rows.to_vec());
-    if let Some(id) = after {
-        picker.select_session(id);
-    }
+    let picker = picker_after(rows.to_vec(), &super::picker::left_filter(), after);
     // The session just went to the background, so dissolve in.
     let outcome = super::owning_for_attach(Outcome::attaches, true, |terminal| {
         run_on(
@@ -660,6 +658,18 @@ pub fn create_after(
         Outcome::Created(session) => Some(super::settle(&picker, transport, session)),
         Outcome::Renamed(_) | Outcome::Cancelled => None,
     })
+}
+
+/// The floating picker as its `c` left it, which numbered and placed the new
+/// session in its gap: `rows` under `filter`, the cursor on `after`.
+fn picker_after(rows: Vec<Session>, filter: &str, after: Option<&str>) -> App {
+    let mut picker = App::new(rows);
+    // First: the cursor is an index into the rows the filter shows.
+    picker.set_filter(filter);
+    if let Some(id) = after {
+        picker.select_session(id);
+    }
+    picker
 }
 
 /// Ask for a new name on a terminal of its own, for `r` on the floating
@@ -719,8 +729,9 @@ pub struct Panel {
 }
 
 enum Job {
-    /// Create at `place`. The picker holds the current rows and cursor, used
-    /// for naming and placement (see [`super::settle`]).
+    /// Create at `place`. The picker holds the current rows, and the floating
+    /// picker's filter and cursor for [`Place::After`], used for naming and
+    /// placement (see [`super::settle`]).
     Create { place: Place, picker: Box<App> },
     /// Rename this session; `None` if it is no longer in the rows.
     Rename(Option<Session>),
@@ -728,7 +739,12 @@ enum Job {
 
 impl Panel {
     pub fn create(place: Place) -> Self {
-        Self::create_on(place, super::picker::rows(), super::picker::transport())
+        Self::create_on(
+            place,
+            super::picker::rows(),
+            &super::picker::left_filter(),
+            super::picker::transport(),
+        )
     }
 
     pub fn rename(id: Id) -> Self {
@@ -736,16 +752,20 @@ impl Panel {
     }
 
     /// Offers the same default name as the full-screen picker would and
-    /// starts listing the default directory right away.
-    fn create_on(place: Place, rows: Vec<Session>, transport: Option<Shared>) -> Self {
-        let mut picker = App::new(rows);
-        let number = match place {
-            Place::Last => None,
+    /// starts listing the default directory right away. `filter` is the
+    /// floating picker's, for [`Place::After`].
+    fn create_on(
+        place: Place,
+        rows: Vec<Session>,
+        filter: &str,
+        transport: Option<Shared>,
+    ) -> Self {
+        let (picker, number) = match place {
+            Place::Last => (App::new(rows), None),
             Place::After(after) => {
-                if let Some(id) = after {
-                    picker.select_session(id.as_str());
-                }
-                Some(picker.new_number())
+                let picker = picker_after(rows, filter, after.as_ref().map(Id::as_str));
+                let number = picker.new_number();
+                (picker, Some(number))
             }
         };
         let name = default_name(picker.sessions(), number);
@@ -3216,9 +3236,9 @@ mod tests {
     #[test]
     fn the_floating_create_prompt_offers_the_name_for_where_the_session_goes() {
         let rows = hosted(&["one", "two", "three"]);
-        let after = Panel::create_on(Place::After(Some(id("aaaaaaaa"))), rows.clone(), None);
+        let after = Panel::create_on(Place::After(Some(id("aaaaaaaa"))), rows.clone(), "", None);
         assert_eq!(after.prompt.fields[NAME].default, "session 2");
-        let last = Panel::create_on(Place::Last, rows, None);
+        let last = Panel::create_on(Place::Last, rows, "", None);
         assert_eq!(last.prompt.fields[NAME].default, "session 4");
     }
 
@@ -3227,7 +3247,7 @@ mod tests {
     #[test]
     fn the_floating_prompt_fits_where_it_can() {
         let rows = hosted(&["one", "two"]);
-        let mut create = Panel::create_on(Place::Last, rows.clone(), None);
+        let mut create = Panel::create_on(Place::Last, rows.clone(), "", None);
         let mut rename = Panel::rename_on(id("aaaaaaaa"), rows, None);
         let screen = Rect::new(0, 0, 80, 24);
         let c = create.area(screen).expect("room for a create");
@@ -3270,7 +3290,7 @@ mod tests {
             let command: String = LONG_COMMAND.chars().cycle().take(len).collect();
             let shows =
                 |panel: &mut Panel, at: Rect| drawn(panel, at).iter().any(|r| r.contains(&command));
-            let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+            let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), "", None);
             panel.prompt = Prompt::create(
                 "session 2".to_string(),
                 command.clone(),
@@ -3295,7 +3315,7 @@ mod tests {
 
     #[test]
     fn a_widened_panel_keeps_its_margins_and_marks_what_still_does_not_fit() {
-        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), "", None);
         panel.prompt = Prompt::create(
             "session 2".to_string(),
             LONG_COMMAND.to_string(),
@@ -3328,7 +3348,7 @@ mod tests {
 
     #[test]
     fn the_floating_create_prompt_draws_its_form_and_its_hints() {
-        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), "", None);
         let screen = Rect::new(0, 0, 80, 24);
         let area = panel.area(screen).expect("room");
         let buf = panel.draw(area);
@@ -3357,7 +3377,7 @@ mod tests {
 
     #[test]
     fn the_floating_prompt_takes_keys_and_esc_takes_it_down() {
-        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), None);
+        let mut panel = Panel::create_on(Place::Last, hosted(&["one"]), "", None);
         type_into(&mut panel, "blog");
         assert_eq!(panel.prompt.fields[NAME].input, "blog");
         assert_eq!(
@@ -3377,12 +3397,61 @@ mod tests {
         made.state.num = 4;
         let host = Host::new(rows.clone());
         host.rows.lock().expect("rows").push(made.clone());
-        let mut panel =
-            Panel::create_on(Place::After(Some(id("aaaaaaaa"))), rows, Some(host.clone()));
+        let mut panel = Panel::create_on(
+            Place::After(Some(id("aaaaaaaa"))),
+            rows,
+            "",
+            Some(host.clone()),
+        );
         assert_eq!(panel.made(host.as_ref(), made), Did::Close);
         assert_eq!(panel.leave(), Some(Leave::Switch(id("dddddddd"))));
         let left = super::super::picker::take_changed().expect("rows left");
         assert_eq!(named(&left), ["one", "blog", "two", "three"]);
+    }
+
+    /// After a drag in the floating picker's filter, `c` on "web-b" opens
+    /// the gap past hidden "docs", whose number an unfiltered prompt would
+    /// offer, placing the session above it.
+    #[test]
+    fn a_session_made_floating_under_a_filter_goes_where_the_gap_showed_it() {
+        let _turn = super::super::test_support::PANELS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rows = hosted(&["blog", "web-b", "docs", "web-a"]);
+        let mut made = Session::new("eeeeeeee".into(), "fresh".into(), 100, 5);
+        made.state.num = 5;
+        let host = Host::new(rows.clone());
+        host.rows.lock().expect("rows").push(made.clone());
+        let mut panel = Panel::create_on(
+            Place::After(Some(id("bbbbbbbb"))),
+            rows,
+            "web",
+            Some(host.clone()),
+        );
+        assert_eq!(panel.prompt.fields[NAME].default, "session 4");
+        assert_eq!(panel.made(host.as_ref(), made), Did::Close);
+        let left = super::super::picker::take_changed().expect("rows left");
+        assert_eq!(named(&left), ["blog", "web-b", "docs", "fresh", "web-a"]);
+    }
+
+    /// `/zzz` then Enter leaves the floating picker no cursor row, and its
+    /// gap past every row. Unfiltered, the prompt would put the session
+    /// after its own cursor, on the first row.
+    #[test]
+    fn a_session_made_floating_with_every_row_filtered_out_goes_last() {
+        let _turn = super::super::test_support::PANELS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rows = hosted(&["one", "two", "three"]);
+        let mut made = Session::new("dddddddd".into(), "blog".into(), 100, 4);
+        made.state.num = 4;
+        let host = Host::new(rows.clone());
+        host.rows.lock().expect("rows").push(made.clone());
+        let mut panel = Panel::create_on(Place::After(None), rows, "zzz", Some(host.clone()));
+        assert_eq!(panel.prompt.fields[NAME].default, "session 4");
+        assert_eq!(panel.made(host.as_ref(), made), Did::Close);
+        let left = super::super::picker::take_changed().expect("rows left");
+        assert_eq!(named(&left), ["one", "two", "three", "blog"]);
     }
 
     #[test]
@@ -3394,7 +3463,7 @@ mod tests {
         let mut made = Session::new("cccccccc".into(), "blog".into(), 100, 3);
         made.state.num = 3;
         let host = Host::new(rows.clone());
-        let mut panel = Panel::create_on(Place::Last, rows, Some(host.clone()));
+        let mut panel = Panel::create_on(Place::Last, rows, "", Some(host.clone()));
         assert_eq!(panel.made(host.as_ref(), made), Did::Close);
         assert_eq!(panel.leave(), Some(Leave::Switch(id("cccccccc"))));
         let left = super::super::picker::take_changed().expect("rows left");

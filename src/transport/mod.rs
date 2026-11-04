@@ -448,7 +448,7 @@ const DETACH_ALIAS: &str = "command! -bar Detach detach";
 /// [`Session::num`] is a rank, used only to sort; ranks may have gaps. Missing
 /// or duplicate ranks are resolved in memory, never written back (that would
 /// cost an SSH round trip per listing).
-fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
+pub(crate) fn finish_listing(mut sessions: Vec<Session>) -> Vec<Session> {
     // `created` then `id` give unranked sessions and ties a stable order.
     sessions.sort_by(|a, b| {
         let key = |s: &Session| if s.num == 0 { u32::MAX } else { s.num };

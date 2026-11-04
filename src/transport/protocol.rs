@@ -286,6 +286,7 @@ fn orphan(id: &str) -> Session {
     // Unnumbered; `finish_listing` numbers it so it can be selected and killed.
     let mut s = Session::new(id.to_string(), format!("<orphan {id}>"), 0, 0);
     s.created = 0;
+    s.state.orphan = true;
     s
 }
 
@@ -369,6 +370,7 @@ mod tests {
         let sessions = rows_to_sessions(rows);
         assert_eq!(sessions.len(), 1, "an orphaned socket must still be listed");
         assert!(sessions[0].name.contains("abcdefgh"));
+        assert!(sessions[0].state.orphan);
     }
 
     #[test]
@@ -380,6 +382,8 @@ mod tests {
         let sessions = rows_to_sessions(parse_listing(&out).expect("parse"));
         assert_eq!(sessions.len(), 2, "one bad row must not drop the good one");
         assert_eq!(sessions[1].name, "ok");
+        // The file is there, so only the flag keeps a reorder off it.
+        assert!(sessions[0].state.orphan && !sessions[1].state.orphan);
     }
 
     #[test]
