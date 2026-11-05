@@ -533,6 +533,15 @@ if predict then
       siso = vim.go.sidescrolloff
     end
     local nmaps, imaps, idioms = mapped(buf)
+    -- nv_down gives <CR> other meanings: it opens a quickfix entry, runs the
+    -- command-line window's line and invokes a prompt buffer's callback on
+    -- its last line (listed on every one: a shape is per window). Without
+    -- acks <CR> is never followed, and listing it would delay the next scroll.
+    local bt = vim.bo[buf].buftype
+    if acks and (bt == 'quickfix' or bt == 'prompt'
+        or vim.fn.win_gettype(info.winid) == 'command') then
+      nmaps = vim.list_extend({ '<CR>' }, nmaps)
+    end
     -- 'listchars' except tab, as predict::Listchars::read reads them; and
     -- whether Neovim's own highlighting looks at every character, blanks
     -- included (predict::Blanks).
@@ -11057,6 +11066,41 @@ mod tests {
         assert_eq!(drawn(&a), (0, 0));
         a.keys(b"$", t1);
         assert_eq!(drawn(&a), (0, 0), "and blind after it");
+    }
+
+    /// With acks, the agent counts `<CR>` so in a quickfix list, a prompt
+    /// buffer and the command-line window.
+    #[test]
+    fn enter_counted_as_mapped_is_left_to_neovim_but_j_is_not() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let rtt = Duration::from_millis(200);
+        let mut a = stepping(rtt);
+        a.keys(b"\r", t1);
+        assert_eq!(drawn(&a), (1, 0), "unmapped");
+        let mut a = stepping_with(rtt, &["<CR>"]);
+        a.keys(b"\r", t1);
+        assert_eq!(drawn(&a), (0, 0), "mapped");
+        let mut a = stepping_with(rtt, &["<CR>"]);
+        a.keys(b"j", t1);
+        assert_eq!(drawn(&a), (1, 0), "j");
+    }
+
+    /// Neovim reads both as `<CR>` when unmapped, so were they followed, the
+    /// agent would have to count them as mapped wherever it counts `<CR>`.
+    #[test]
+    fn ctrl_m_and_keypad_enter_are_never_followed() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        for (name, keys) in [("<C-m>", &b"\x1b[109;5u"[..]), ("<kEnter>", b"\x1bOM")] {
+            let mut a = stepping(Duration::from_millis(200));
+            a.keys(keys, t1);
+            assert_eq!(drawn(&a), (0, 0), "{name}");
+            assert!(
+                calls(&mut a)
+                    .iter()
+                    .any(|(_, m, args)| m == "nvim_input" && args[0] == Value::from(name)),
+                "{name} sent"
+            );
+        }
     }
 
     /// `g` prefixes Neovim's default mappings, yet `g_` is followed.

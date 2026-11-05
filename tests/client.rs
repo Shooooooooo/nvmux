@@ -1340,6 +1340,27 @@ impl Trace {
             .collect()
     }
 
+    /// The keys the agent's last shape for window `win` lists as mapped
+    /// (`nvmux::client::predict::Shape::mapped`); `None` before one.
+    fn mapped(&self, win: u64) -> Option<Vec<String>> {
+        self.messages(true)
+            .into_iter()
+            .rev()
+            .find_map(|(_, _, v)| match notification(&v) {
+                Some(("nvmux_client", [kind, w, shape]))
+                    if kind.as_str() == Some("shape") && w.as_u64() == Some(win) =>
+                {
+                    let keys = shape.as_array()?.get(18)?.as_array()?;
+                    Some(
+                        keys.iter()
+                            .filter_map(|k| k.as_str().map(String::from))
+                            .collect(),
+                    )
+                }
+                _ => None,
+            })
+    }
+
     /// Acks not followed by a frame with their top, as (count, the ack's top,
     /// the next frame's top or `None` if another ack came first). An ack for
     /// the top the last frame showed needs none: Neovim flushes nothing when
@@ -1849,6 +1870,65 @@ fn the_agent_acks_each_key_neovim_takes() {
     // As many keys taken as the client sent.
     let to = (count(&link), link.trace.inputs());
     assert_eq!(to.0 - from.0, (to.1 - from.1) as u64);
+}
+
+/// Neovim's `nv_down` gives an unmapped `<CR>` another meaning in a
+/// quickfix or location list, a prompt buffer and the command-line window;
+/// not in a file's window.
+#[test]
+fn the_agent_counts_enter_as_mapped_where_it_is_no_motion() {
+    require_nvim!();
+    let scratch = Scratch::new("client-cr-mapped");
+    let (mut rpc, mut term, link) =
+        drawn_slowly_with(&scratch, "client-cr-mapped", SCROLLING, MOTIONS);
+    let entries = "[{'bufnr': bufnr(), 'lnum': 2}, {'bufnr': bufnr(), 'lnum': 5}]";
+    // The keys the current window's last shape lists, once it has one.
+    let mapped = |term: &mut Terminal,
+                  rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+                  name: &str| {
+        let win = rpc.eval("win_getid()").expect("the window");
+        let win = win.as_u64().expect("its id");
+        term.pump(Duration::from_secs(5), |_| link.trace.mapped(win).is_some());
+        let keys = link.trace.mapped(win);
+        keys.unwrap_or_else(|| panic!("{name}: no shape"))
+    };
+    for (name, command, listed) in [
+        ("a file", String::new(), false),
+        (
+            "a quickfix list",
+            format!("call setqflist({entries}) | copen"),
+            true,
+        ),
+        (
+            "a location list",
+            format!("cclose | call setloclist(0, {entries}) | lopen"),
+            true,
+        ),
+        (
+            "a prompt buffer",
+            "lclose | new | setlocal buftype=prompt".into(),
+            true,
+        ),
+    ] {
+        if !command.is_empty() {
+            rpc.command(&command).expect(name);
+        }
+        let keys = mapped(&mut term, &mut rpc, name);
+        assert_eq!(keys.iter().any(|k| k == "<CR>"), listed, "{name}: {keys:?}");
+    }
+    term.type_bytes(b"q:");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            rpc.eval("getcmdwintype()").ok() == Some(Value::from(":"))
+        }),
+        "no command-line window"
+    );
+    let keys = mapped(&mut term, &mut rpc, "the command-line window");
+    assert!(
+        keys.iter().any(|k| k == "<CR>"),
+        "the command-line window: {keys:?}"
+    );
 }
 
 /// Starting at the end of a short line, reached from column 40 of a long
@@ -2797,6 +2877,42 @@ fn a_motion_to_a_character_mapped_is_left_to_neovim() {
     term.pump_until(Duration::from_secs(2), |_| false);
     typed(&mut term, b"0");
     left_to_neovim(&mut term, "to, o taken for e", b"to");
+}
+
+/// `<CR>` opens the entry under the cursor in a quickfix list, and runs the
+/// line in the command-line window, rather than moving a line down.
+#[test]
+fn enter_is_left_to_neovim_where_it_is_no_motion() {
+    require_nvim!();
+    let scratch = Scratch::new("client-cr-unmoved");
+    let setline = format!(
+        "{SCROLLING} | call setqflist(map(range(1, 30, 3), \
+         {{_, l -> {{'bufnr': bufnr(), 'lnum': l}}}})) | copen"
+    );
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-cr-unmoved", &setline, MOTIONS);
+    predicted(&mut term, "j in the quickfix list", b"j");
+    left_to_neovim(&mut term, "<CR> in the quickfix list", b"\r");
+    term.type_bytes(b":let g:a = 1\r:let g:b = 2\rq:");
+    term.pump_until(Duration::from_secs(2), |_| false);
+    predicted(&mut term, "k in the command-line window", b"k");
+    left_to_neovim(&mut term, "<CR> in the command-line window", b"\r");
+}
+
+/// Scrolls alone never follow `<CR>`, so the agent lists it as mapped in a
+/// quickfix list only with acks: listed, it would leave this scroll to
+/// Neovim. No ruler: the client does not draw the one in the window's status
+/// line.
+#[test]
+fn a_scroll_after_enter_in_a_quickfix_list_shows_at_once_with_scrolls_only() {
+    require_nvim!();
+    let scratch = Scratch::new("client-cr-scrolls");
+    let setline = format!(
+        "set noruler | {SCROLLING} | call setqflist(map(range(1, 30, 3), \
+         {{_, l -> {{'bufnr': bufnr(), 'lnum': l}}}})) | copen"
+    );
+    let (_rpc, mut term, _) = drawn_slowly(&scratch, "client-cr-scrolls", &setline);
+    typed(&mut term, b"\r");
+    predicted(&mut term, "<C-e> in the entry's window", b"\x05");
 }
 
 /// With `'number'` and `'relativenumber'`: the gutter must match too.

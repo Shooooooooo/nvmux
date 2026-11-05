@@ -106,7 +106,8 @@ pub struct Shape {
     pub page: i64,
     pub startofline: bool,
     /// Followed keys ([`keys`]) mapped, or starting a mapping, in Normal or
-    /// Visual mode.
+    /// Visual mode; with acks, also `<CR>` where Neovim gives it another
+    /// meaning (see `super::AGENT_LUA`).
     pub mapped: Vec<String>,
     /// The same for Insert-mode keys ([`insert_keys`]).
     pub imapped: Vec<String>,
