@@ -293,8 +293,14 @@ local function send(...)
     stop()
   end
 end
+-- nvim_get_hl leaves out the index flags before 0.12.2.
+local flagless = vim.fn.has('nvim-0.12.2') == 0
 local function attrs(gid)
   local a = api.nvim_get_hl(0, { id = gid, link = false })
+  if flagless then
+    local old = api.nvim_get_hl_by_id(gid, true)
+    a.fg_indexed, a.bg_indexed = old.fg_indexed, old.bg_indexed
+  end
   local function flags(from, into)
     for _, k in ipairs({ 'bold', 'italic', 'underline', 'undercurl', 'underdouble',
         'underdotted', 'underdashed', 'strikethrough', 'reverse', 'altfont' }) do
@@ -306,6 +312,7 @@ local function attrs(gid)
   end
   local rgb = flags(a, vim.empty_dict())
   rgb.foreground, rgb.background, rgb.special = a.fg, a.bg, a.sp
+  rgb.fg_indexed, rgb.bg_indexed = a.fg_indexed, a.bg_indexed
   local cterm = flags(a.cterm or {}, vim.empty_dict())
   cterm.foreground, cterm.background = a.ctermfg, a.ctermbg
   return { gid, rgb, cterm }

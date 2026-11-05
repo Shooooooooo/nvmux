@@ -310,10 +310,12 @@ pub fn syntax_hl(base: u32, group: u32) -> u32 {
 }
 
 /// A Neovim highlight with the `'cursorline'` bar's background added (where
-/// the cell has none) or removed (where it equals the bar's), for rows the
-/// client moves the cursor onto or off until Neovim redraws them (see
-/// `super::App::repaint`). Briefly wrong for cells whose own background is
-/// the bar's, and for `hl_mode` `replace` virtual text.
+/// the cell has none) or removed (where it equals the bar's and is not
+/// flagged indexed), for rows the client moves the cursor onto or off until
+/// Neovim redraws them (see `super::App::repaint`). Briefly wrong for
+/// unflagged cells whose own background is the bar's, for cells flagged
+/// `bg_indexed` with no `ctermbg` of their own, which keep the bar's, and for
+/// `hl_mode` `replace` virtual text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Derive {
     CursorLineOn,
@@ -329,6 +331,8 @@ fn laid(under: &Attrs, over: &Attrs) -> Attrs {
         fg: over.fg.or(under.fg),
         bg: over.bg.or(under.bg),
         sp: over.sp.or(under.sp),
+        fg_indexed: under.fg_indexed || over.fg_indexed,
+        bg_indexed: under.bg_indexed || over.bg_indexed,
         reverse: under.reverse || over.reverse,
         bold: under.bold || over.bold,
         italic: under.italic || over.italic,
@@ -478,8 +482,16 @@ impl Model {
         };
         let plain = (Attrs::default(), Attrs::default());
         let (under_rgb, under_cterm) = self.attrs(base).unwrap_or(&plain);
-        self.colors()
-            .style(&laid(under_rgb, rgb), &laid(under_cterm, cterm))
+        let mut gui = laid(under_rgb, rgb);
+        // As in Neovim's `hl_combine_attr`: a group colouring either form
+        // brings its own index flag.
+        if rgb.fg.or(cterm.fg).is_some() {
+            gui.fg_indexed = rgb.fg_indexed;
+        }
+        if rgb.bg.or(cterm.bg).is_some() {
+            gui.bg_indexed = rgb.bg_indexed;
+        }
+        self.colors().style(&gui, &laid(under_cterm, cterm))
     }
 
     /// Id of client highlight `base` derived by `d`: `SYNTAX` plus an index
@@ -530,13 +542,16 @@ impl Model {
         let (rgb, cterm) = self.attrs(base).unwrap_or(&plain);
         let bar = self.groups.get("CursorLine").and_then(|&g| self.attrs(g));
         let (bar_rgb, bar_cterm) = bar.unwrap_or(&plain);
+        // The bar is never flagged indexed (see `bar_derivable`), so a flagged
+        // background is taken for the cell's own.
+        let flagged = rgb.bg_indexed;
         let made = |own: &Attrs, bar: &Attrs| match d {
             Derive::CursorLineOn => Attrs {
                 bg: own.bg.or(bar.bg),
                 ..own.clone()
             },
             Derive::CursorLineOff => Attrs {
-                bg: own.bg.filter(|bg| bar.bg != Some(*bg)),
+                bg: own.bg.filter(|bg| flagged || bar.bg != Some(*bg)),
                 ..own.clone()
             },
         };
@@ -1825,6 +1840,185 @@ mod tests {
             ],
         );
         assert!(!m.bar_derivable());
+    }
+
+    /// Flagged highlights reach rows the client draws only from groups set
+    /// with `fg_indexed` or `bg_indexed`: terminal buffers are never predicted.
+    #[test]
+    fn palette_colours_keep_their_index_unless_laid_over() {
+        let mut m = model();
+        let indexed = |id: u32, fg: bool| Event::HlAttr {
+            id,
+            rgb: Attrs {
+                fg: fg.then_some(0xe00000),
+                bg: (!fg).then_some(0x0000e0),
+                fg_indexed: fg,
+                bg_indexed: !fg,
+                ..Attrs::default()
+            },
+            cterm: Attrs {
+                fg: fg.then_some(1),
+                bg: (!fg).then_some(4),
+                ..Attrs::default()
+            },
+        };
+        apply(
+            &mut m,
+            vec![
+                indexed(3, true),
+                indexed(4, false),
+                // Its index is the bar's.
+                Event::HlAttr {
+                    id: 5,
+                    rgb: Attrs {
+                        bg: Some(0x2c2c2c),
+                        bg_indexed: true,
+                        ..Attrs::default()
+                    },
+                    cterm: Attrs {
+                        bg: Some(236),
+                        ..Attrs::default()
+                    },
+                },
+                Event::HlAttr {
+                    id: 6,
+                    rgb: Attrs {
+                        bg: Some(0x303030),
+                        ..Attrs::default()
+                    },
+                    cterm: Attrs {
+                        bg: Some(236),
+                        ..Attrs::default()
+                    },
+                },
+                Event::HlGroup {
+                    name: "CursorLine".into(),
+                    id: 6,
+                },
+                Event::OptionSet {
+                    name: "termguicolors".into(),
+                    value: OptionValue::Bool(true),
+                },
+            ],
+        );
+        m.refresh_styles();
+        let gui = Attrs {
+            fg: Some(0x0a0b0c),
+            bg: Some(0x0d0e0f),
+            ..Attrs::default()
+        };
+        let cterm = Attrs {
+            fg: Some(9),
+            bg: Some(2),
+            ..Attrs::default()
+        };
+        let underline = Attrs {
+            underline: crate::client::style::Underline::Line,
+            ..Attrs::default()
+        };
+        m.set_group(400, gui, Attrs::default());
+        m.set_group(401, Attrs::default(), cterm);
+        m.set_group(402, underline.clone(), underline);
+        let red_on = m.derived(3, Derive::CursorLineOn).expect("made");
+        let blue_on = m.derived(4, Derive::CursorLineOn).expect("made");
+        let blue_off = m.derived(4, Derive::CursorLineOff).expect("made");
+        let grey_off = m.derived(5, Derive::CursorLineOff).expect("made");
+        let colours = |id: u32| (m.style(id).fg, m.style(id).bg);
+        let (red, blue, none) = (Color::Index(1), Color::Index(4), Color::Default);
+        let rgb = |r, g, b| Color::Rgb(Rgb(r, g, b));
+        let group = (rgb(10, 11, 12), rgb(13, 14, 15));
+        // Over red and over blue. Coloured in the cterm form alone, Neovim
+        // leaves its guess.
+        for (id, over_red, over_blue) in [
+            (400, group, group),
+            (401, (rgb(0xe0, 0, 0), none), (none, rgb(0, 0, 0xe0))),
+            (402, (red, none), (none, blue)),
+        ] {
+            assert_eq!(colours(syntax_hl(3, id)), over_red, "{id} over red");
+            assert_eq!(colours(syntax_hl(4, id)), over_blue, "{id} over blue");
+        }
+        assert_eq!(colours(red_on), (red, rgb(0x30, 0x30, 0x30)));
+        assert_eq!(colours(blue_on), (none, blue));
+        assert_eq!(colours(blue_off), (none, blue));
+        assert_eq!(colours(grey_off), (none, Color::Index(236)));
+        apply(
+            &mut m,
+            vec![Event::OptionSet {
+                name: "termguicolors".into(),
+                value: OptionValue::Bool(false),
+            }],
+        );
+        assert_eq!(m.style(grey_off).bg, Color::Index(236), "cterm");
+        // Off keeps a flagged background because no flagged bar is derived.
+        apply(
+            &mut m,
+            vec![
+                indexed(7, false),
+                Event::HlGroup {
+                    name: "CursorLine".into(),
+                    id: 7,
+                },
+            ],
+        );
+        assert!(!m.bar_derivable(), "a flagged bar");
+    }
+
+    /// As Neovim's `hl_combine_attr` lays a group set with `fg_indexed` and
+    /// `bg_indexed`: coloured, it brings its own flags; with no colour, it
+    /// adds them to the colours below.
+    #[test]
+    fn a_group_flagged_indexed_keeps_its_index_when_laid() {
+        let mut m = model();
+        apply(
+            &mut m,
+            vec![
+                Event::HlAttr {
+                    id: 5,
+                    rgb: Attrs {
+                        fg: Some(0xe00000),
+                        bg: Some(0x0000e0),
+                        ..Attrs::default()
+                    },
+                    cterm: Attrs {
+                        fg: Some(1),
+                        bg: Some(4),
+                        ..Attrs::default()
+                    },
+                },
+                Event::OptionSet {
+                    name: "termguicolors".into(),
+                    value: OptionValue::Bool(true),
+                },
+            ],
+        );
+        m.refresh_styles();
+        let gui = Attrs {
+            fg: Some(0x808080),
+            bg: Some(0x2c2c2c),
+            fg_indexed: true,
+            bg_indexed: true,
+            ..Attrs::default()
+        };
+        let cterm = Attrs {
+            fg: Some(8),
+            bg: Some(236),
+            ..Attrs::default()
+        };
+        let flags = Attrs {
+            fg_indexed: true,
+            bg_indexed: true,
+            ..Attrs::default()
+        };
+        m.set_group(400, gui, cterm);
+        m.set_group(401, flags, Attrs::default());
+        let colours = |id: u32| (m.style(id).fg, m.style(id).bg);
+        let own = (Color::Index(8), Color::Index(236));
+        assert_eq!(colours(syntax_hl(5, 400)), own);
+        assert_eq!(colours(syntax_hl(0, 400)), own, "over nothing, as a tail");
+        assert_eq!(
+            colours(syntax_hl(5, 401)),
+            (Color::Index(1), Color::Index(4))
+        );
     }
 
     #[test]

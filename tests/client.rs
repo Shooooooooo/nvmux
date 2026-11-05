@@ -722,6 +722,40 @@ fn a_client_draws_the_screen_a_fresh_one_does() {
     );
 }
 
+/// With `'termguicolors'` Neovim sends a `:terminal`'s palette colours as RGB
+/// guesses flagged indexed; the terminal must get the index, as from
+/// Neovim's own TUI, so that its theme applies.
+#[test]
+fn a_terminals_palette_colours_reach_the_terminal_as_indices() {
+    require_nvim!();
+    let scratch = Scratch::new("client-palette");
+    let (sock, mut rpc, config) = session(&scratch, "client-palette");
+    rpc.command(
+        "set termguicolors | terminal printf '\\033[31mRED\\033[0m \\033[44mBLUE\\033[0m \
+         \\033[93mYELLOW\\033[0m \\033[38;5;200mPINK\\033[0m \\033[38;2;1;2;3mTRUE\\033[0m'",
+    )
+    .expect("open a terminal");
+
+    let mut term = Terminal::spawn(&sock, &config);
+    let line = "RED BLUE YELLOW PINK TRUE";
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with(line)),
+        "the terminal's line was never drawn:\n{}",
+        term.text()
+    );
+    let screen = term.parser.screen();
+    let at = |word: &str| {
+        let col = line.find(word).expect("a word of the line");
+        screen.cell(0, col as u16).expect("on the screen")
+    };
+    use vt100::Color::{Idx, Rgb};
+    assert_eq!(at("RED").fgcolor(), Idx(1));
+    assert_eq!(at("BLUE").bgcolor(), Idx(4));
+    assert_eq!(at("YELLOW").fgcolor(), Idx(11));
+    assert_eq!(at("PINK").fgcolor(), Idx(200));
+    assert_eq!(at("TRUE").fgcolor(), Rgb(1, 2, 3), "a true colour");
+}
+
 #[test]
 fn reads_that_cut_a_character_in_two_draw_it_whole() {
     let written = "漢字 é ─ ab".as_bytes();
@@ -4790,6 +4824,36 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     step(&mut term, "<C-b> back over it", b"\x02");
 }
 
+/// Neovim draws the comments by index; the rows a scroll uncovers must too,
+/// or they change colour when Neovim's land.
+#[test]
+fn predicted_rows_draw_a_group_flagged_indexed_by_its_index() {
+    require_nvim!();
+    let scratch = Scratch::new("client-flagged");
+    let (_rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-flagged",
+        "call setline(1, map(range(1, 600), \
+         '\"local v\" . v:val . \" = \" . v:val . \" -- line \" . v:val')) | \
+         set termguicolors | lua vim.api.nvim_set_hl(0, 'Comment', \
+         { fg = '#808080', ctermfg = 8, fg_indexed = true, \
+           bg = '#2c2c2c', ctermbg = 236, bg_indexed = true }) vim.treesitter.start(0, 'lua')",
+    );
+    let drawn = ahead(&mut term, "<C-f>", b"\x06");
+    let predicted = colours_of(&drawn);
+    let indices = (vt100::Color::Idx(8), vt100::Color::Idx(236));
+    let grey = predicted
+        .iter()
+        .filter(|row| row.iter().any(|&(fg, bg, ..)| (fg, bg) == indices))
+        .count();
+    assert_eq!(grey, 22, "rows with a comment drawn by its indices");
+    let landed = last_frame(&mut term, 4 * SLOW);
+    assert_eq!(sight(&drawn), sight(&landed), "the text moved");
+    for (r, (p, l)) in predicted.iter().zip(&colours_of(&landed)).enumerate() {
+        assert_eq!(p, l, "row {r} changed colour when Neovim's landed");
+    }
+}
+
 /// With the default colorscheme's `'cursorline'` over syntax-coloured lines,
 /// a predicted line motion moves the bar and its number at once; no cell
 /// changes when Neovim's frame lands.
@@ -6293,6 +6357,42 @@ fn a_diagnostic_cut_at_the_grids_edge_runs_on_in_the_margin() {
         "left in the editor: {}",
         left(&mut rpc)
     );
+}
+
+/// End-of-line virtual text: Neovim draws the part in the grid by its index,
+/// and the client's part in the margin must match it.
+#[test]
+fn a_tail_in_a_group_flagged_indexed_runs_on_by_its_index() {
+    require_nvim!();
+    let scratch = Scratch::new("client-flagged-tail");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-flagged-tail");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command(
+        "lua vim.api.nvim_set_hl(0, 'Flagged', { fg = '#808080', ctermfg = 8, fg_indexed = true, \
+           bg = '#2c2c2c', ctermbg = 236, bg_indexed = true }) \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, { string.rep('x', 56) }) \
+         vim.api.nvim_buf_set_extmark(0, vim.api.nvim_create_namespace('test'), 0, 0, \
+           { virt_text = { { 'the end of the line', 'Flagged' } } })",
+    )
+    .expect("a tail");
+    let row = format!("{}{} the end of the line", " ".repeat(50), "x".repeat(56));
+    let laid = |s: &str| s.lines().next() == Some(row.as_str());
+    assert!(
+        term.pump_until(Duration::from_secs(5), laid),
+        "not in the margin:\n{}",
+        term.text()
+    );
+    // The grid ends at column 110: Neovim drew "the", the client the rest.
+    let screen = term.parser.screen();
+    for col in [107, 111, 125] {
+        let colours = screen.cell(0, col).map(|c| (c.fgcolor(), c.bgcolor()));
+        let indices = (vt100::Color::Idx(8), vt100::Color::Idx(236));
+        assert_eq!(colours, Some(indices), "column {col}");
+    }
 }
 
 /// With concealed text, a line ends left of where the editor computes it, so
