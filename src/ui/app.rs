@@ -29,9 +29,10 @@ pub enum Mode {
         id: String,
         prompt: String,
     },
-    /// A session picked up and being moved. `was` is every visible row's
-    /// `(id, state.num)` at the start of the grab, for `Esc` to restore and
-    /// for `Space` to tell a real move from a no-op.
+    /// A session picked up and being moved. `was` is every row's `(id,
+    /// state.num)`, hidden ones too, as the grab found them or a listing
+    /// since left them: for `Esc` to restore and for `Space` to tell a real
+    /// move from a no-op.
     Reorder {
         id: String,
         was: Vec<(String, u32)>,
@@ -54,11 +55,16 @@ pub enum Request {
     NewSession,
     RenameSession(String),
     Kill(String),
-    /// Every visible session with the number to store. The whole arrangement,
-    /// not a diff: a stored [`Session::num`] can differ from the shown one
-    /// (`finish_listing` numbers rows by position), and a skipped row could
-    /// then collide with a number just written. Never empty; a no-op grab
-    /// returns [`Request::None`].
+    /// Sessions to store, each with the number it shows as its rank.
+    ///
+    /// Every session, hidden ones too, but orphans (no record to store it
+    /// in) and the unranked rows ending the list in listing order (listed
+    /// there anyway). Not a diff: a stored [`Session::num`] can differ from
+    /// the shown one (`finish_listing` numbers rows by position, so kills
+    /// leave holes in the ranks), and a ranked row left out could tie with
+    /// or pass a number just written. Empty when there is nothing to store,
+    /// as after a move undone before it was written; a no-op grab returns
+    /// [`Request::None`].
     Reorder(Vec<(String, u32)>),
     Help,
     Settings,
@@ -347,7 +353,9 @@ impl App {
     /// Replace the session list, keeping the selection on the same session
     /// (by id, not position, so it follows the session when rows shift).
     ///
-    /// Ends any effect on the old rows (erase, glow, fade, ...).
+    /// Ends any effect on the old rows (erase, glow, fade, ...). A grab goes
+    /// on over the new rows, and `Esc` puts back those: the floating picker
+    /// writes and relists once an effect ends, which may be mid-grab.
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         let previously = self.selected_id();
         let wanted = self
@@ -368,6 +376,12 @@ impl App {
             .and_then(|id| at(self, &id))
             .or_else(|| previously.and_then(|id| at(self, &id)))
             .unwrap_or_else(|| self.selected.min(self.visible().len().saturating_sub(1)));
+        if let Mode::Reorder { id, .. } = &self.mode {
+            self.mode = Mode::Reorder {
+                id: id.clone(),
+                was: self.snapshot(),
+            };
+        }
     }
 
     /// Select this session if visible. If not, the next listing selects it
@@ -402,6 +416,13 @@ impl App {
 
     pub fn filter(&self) -> &str {
         &self.filter
+    }
+
+    /// Apply `filter` without entering [`Mode::Filter`], the selection
+    /// clamped to the rows it shows.
+    pub fn set_filter(&mut self, filter: &str) {
+        self.filter = filter.to_string();
+        self.clamp_selection();
     }
 
     pub fn message(&self) -> Option<&str> {
@@ -586,7 +607,7 @@ impl App {
     /// Visible index (after the highlighted row, or 0 if empty) and number
     /// for a session created now.
     fn slot(&self) -> (usize, u32) {
-        let rows = self.snapshot();
+        let rows = self.shown();
         let at = if rows.is_empty() {
             0
         } else {
@@ -817,19 +838,49 @@ impl App {
     }
 
     /// Arrangement to store for the just-created `new_id`, placed after the
-    /// highlighted row. Treated as appended then moved up: visible numbers
-    /// plus a new last one are dealt down the new order, as in
-    /// [`App::shift_grabbed_to`]. Empty if it goes at the end anyway.
+    /// highlighted row, with the rows [`Request::Reorder`] names. Treated as
+    /// appended then moved up: visible numbers plus a new last one are dealt
+    /// down the new order, as in [`App::shift_grabbed_to`], and hidden rows
+    /// keep theirs. Empty if it goes last and every row but the orphans is
+    /// ranked: its own rank, one past the highest, then sorts it after them.
     pub fn placement_of(&self, new_id: &str) -> Vec<(String, u32)> {
-        let rows = self.snapshot();
-        let at = self.selected + 1;
-        if at >= rows.len() {
+        let rows = self.shown();
+        let at = (self.selected + 1).min(rows.len());
+        if at == rows.len() && self.sessions.iter().all(|s| s.num != 0 || s.state.orphan) {
             return Vec::new();
         }
         let numbers = rows.iter().map(|(_, num)| *num).chain([self.last_number()]);
         let mut ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
         ids.insert(at, new_id.to_string());
-        ids.into_iter().zip(numbers).collect()
+        let hidden = self
+            .snapshot()
+            .into_iter()
+            .filter(|(id, _)| !rows.iter().any(|(shown, _)| shown == id));
+        let mut placed: Vec<(String, u32)> = ids.into_iter().zip(numbers).chain(hidden).collect();
+        placed.sort_by_key(|&(_, num)| num);
+        self.to_store(placed)
+    }
+
+    /// `order`, every row as shown with its number, less the rows
+    /// [`Request::Reorder`] leaves out.
+    fn to_store(&self, mut order: Vec<(String, u32)>) -> Vec<(String, u32)> {
+        // How `finish_listing` orders unranked rows; `None` if ranked.
+        let unranked = |id: &str| {
+            self.session(id)
+                .filter(|s| s.num == 0)
+                .map(|s| (s.created, s.id.as_str()))
+        };
+        let mut end = order.len();
+        while let Some(here) = end.checked_sub(1).and_then(|i| unranked(&order[i].0)) {
+            let next = order.get(end).and_then(|(id, _)| unranked(id));
+            if next.is_some_and(|next| here > next) {
+                break;
+            }
+            end -= 1;
+        }
+        order.truncate(end);
+        order.retain(|(id, _)| self.session(id).is_none_or(|s| !s.state.orphan));
+        order
     }
 
     /// Pick up `id` (space or drag), saving the arrangement for `Esc` and
@@ -847,8 +898,16 @@ impl App {
         }
     }
 
-    /// Every visible row's `(id, resolved number)`, in display order.
+    /// Every row's `(id, resolved number)`, hidden ones too, in display order.
     fn snapshot(&self) -> Vec<(String, u32)> {
+        self.sessions
+            .iter()
+            .map(|s| (s.id.clone(), s.state.num))
+            .collect()
+    }
+
+    /// Every visible row's `(id, resolved number)`, in display order.
+    fn shown(&self) -> Vec<(String, u32)> {
         self.visible()
             .iter()
             .map(|s| (s.id.clone(), s.state.num))
@@ -860,7 +919,7 @@ impl App {
     /// stay distinct with gaps kept. One reassignment rather than a loop of
     /// adjacent swaps, which could spin forever.
     fn shift_grabbed_to(&mut self, to: usize) {
-        let rows = self.snapshot();
+        let rows = self.shown();
         if rows.len() < 2 {
             return;
         }
@@ -901,14 +960,15 @@ impl App {
             }
         }
 
-        // Hidden rows keep their numbers, so re-sorting keeps the whole list
-        // ordered.
+        // Hidden rows keep their numbers and so their places, but their
+        // stored ranks may disagree: placing stores them too (see
+        // `Request::Reorder`).
         self.sessions.sort_by_key(|s| s.state.num);
         self.selected = to;
     }
 
-    /// Restore the numbers from the grab's start and reselect `id` (by id, in
-    /// case the list moved underneath). Clears the swap effect.
+    /// Put back the numbers in `was` and reselect `id` by id, as putting them
+    /// back moves the rows. Clears the swap effect.
     fn restore(&mut self, was: &[(String, u32)], id: &str) {
         self.swap.clear();
         for (row, num) in was {
@@ -1209,7 +1269,7 @@ impl App {
                 if now == was {
                     return Request::None;
                 }
-                Request::Reorder(now)
+                Request::Reorder(self.to_store(now))
             }
             Mouse::ScrollDown => {
                 self.shift_grabbed_to(self.clamped(1));
@@ -1355,7 +1415,7 @@ impl App {
                     // No net move: nothing to write.
                     return Request::None;
                 }
-                Request::Reorder(now)
+                Request::Reorder(self.to_store(now))
             }
             Key::Esc => {
                 self.restore(&was, &id);
@@ -2113,6 +2173,65 @@ mod tests {
         )
     }
 
+    /// Every row's name, hidden ones too, in the order shown.
+    fn every_name(app: &App) -> Vec<String> {
+        app.sessions().iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// A picker on `names`, made in that order and ranked 1, 2, ... before
+    /// the `killed` went, so the stored ranks keep holes the shown numbers
+    /// close.
+    fn after_kills(names: &[&str], killed: &[&str]) -> App {
+        let rows = names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| !killed.contains(name))
+            .map(|(i, name)| {
+                let mut s = Session::new(format!("id{i:06}"), name.to_string(), 100, i as u32 + 1);
+                s.created = i as u64;
+                s
+            })
+            .collect();
+        App::new(crate::transport::finish_listing(rows))
+    }
+
+    /// The names the next listing of `rows` shows once `order` is stored, as
+    /// the pickers store it: each listed session's rank set to its number.
+    fn relisted(mut rows: Vec<Session>, order: &[(String, u32)]) -> Vec<String> {
+        for (id, num) in order {
+            if let Some(s) = rows.iter_mut().find(|s| s.id == *id) {
+                s.num = *num;
+            }
+        }
+        crate::transport::finish_listing(rows)
+            .into_iter()
+            .map(|s| s.name)
+            .collect()
+    }
+
+    /// `query` typed into the filter, then Normal mode with it still applied,
+    /// reached by staying after `Ctrl-c` asks about unsaved settings.
+    fn filtered_in_normal_mode(a: &mut App, query: &str) {
+        a.set_unsaved(1);
+        a.on_key(Key::Char('/'));
+        for c in query.chars() {
+            a.on_key(Key::Char(c));
+        }
+        a.on_key(Key::CtrlC);
+        a.on_key(Key::Esc);
+        assert_eq!((a.mode(), a.filter()), (&Mode::Normal, query));
+    }
+
+    /// A session listed without readable metadata, as a listing lists it.
+    fn orphan(id: &str) -> Session {
+        let listed = crate::transport::protocol::Listed {
+            id: id.to_string(),
+            pid_alive: true,
+            json: String::new(),
+        };
+        crate::transport::protocol::rows_to_sessions(vec![listed]).remove(0)
+    }
+
     #[test]
     fn space_picks_up_the_selected_session() {
         let mut a = app(&["aaa", "bbb"]);
@@ -2121,7 +2240,7 @@ mod tests {
         match a.mode() {
             Mode::Reorder { id, was } => {
                 assert_eq!(id, "id000001", "the row under the cursor");
-                assert_eq!(was.len(), 2, "the whole visible list is snapshotted");
+                assert_eq!(was.len(), 2, "every row is snapshotted");
             }
             other => panic!("expected Reorder, got {other:?}"),
         }
@@ -2355,14 +2474,228 @@ mod tests {
         let request = a.on_key(Key::Char(' '));
         assert_eq!(
             request,
-            Request::Reorder(vec![("id000002".into(), 1), ("id000000".into(), 3)]),
-            "only the rows on screen, and zzz is not one of them"
+            Request::Reorder(vec![
+                ("id000002".into(), 1),
+                ("id000001".into(), 2),
+                ("id000000".into(), 3),
+            ]),
+            "zzz is stored too, with the number it had"
         );
         assert_eq!(
             a.session("id000001").expect("zzz").state.num,
             2,
             "the hidden row kept its number"
         );
+    }
+
+    /// Killing "blog" leaves ranks 1, 3, 4, 5 shown as 1-4. Storing only the
+    /// rows on screen would give "web-app" the 4 that hidden "docs" still
+    /// ranks with, and the tie would come back "web-app" first.
+    #[test]
+    fn a_move_under_a_filter_comes_back_from_the_listing_as_shown() {
+        for by_mouse in [false, true] {
+            let mut a = after_kills(&["api", "blog", "web-app", "docs", "website"], &["blog"]);
+            let placed = if by_mouse {
+                // A drag works in the filter itself.
+                a.on_key(Key::Char('/'));
+                for c in "web".chars() {
+                    a.on_key(Key::Char(c));
+                }
+                assert_eq!(names(&a), ["web-app", "website"]);
+                a.on_mouse(Mouse::Press(Some(1)));
+                a.on_mouse(Mouse::Drag(Some(0)));
+                a.on_mouse(Mouse::Release)
+            } else {
+                filtered_in_normal_mode(&mut a, "web");
+                assert_eq!(names(&a), ["web-app", "website"]);
+                a.on_key(Key::Char('j'));
+                a.on_key(Key::Char(' '));
+                a.on_key(Key::Char('k'));
+                a.on_key(Key::Char(' '))
+            };
+            let Request::Reorder(order) = placed else {
+                panic!("by mouse {by_mouse}: {placed:?}");
+            };
+            let shown = ["api", "website", "docs", "web-app"];
+            assert_eq!(every_name(&a), shown, "by mouse {by_mouse}");
+            assert_eq!(
+                relisted(a.sessions().to_vec(), &order),
+                shown,
+                "by mouse {by_mouse}"
+            );
+        }
+    }
+
+    /// Unranked rows (legacy metadata) sort last. Storing only the rows on
+    /// screen would leave hidden "old" unranked, to come back below
+    /// "website", which moved down past it.
+    #[test]
+    fn a_move_under_a_filter_stores_a_hidden_unranked_row_where_it_shows() {
+        let mut rows = after_kills(&["web-api", "website", "old", "web-old"], &[])
+            .sessions()
+            .to_vec();
+        rows[2].num = 0;
+        rows[3].num = 0;
+        let mut a = App::new(crate::transport::finish_listing(rows));
+        a.on_key(Key::Char('/'));
+        for c in "web".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert_eq!(names(&a), ["web-api", "website", "web-old"]);
+        a.on_mouse(Mouse::Press(Some(2)));
+        a.on_mouse(Mouse::Drag(Some(0)));
+        let Request::Reorder(order) = a.on_mouse(Mouse::Release) else {
+            panic!("web-old moved");
+        };
+        let shown = ["web-old", "web-api", "old", "website"];
+        assert_eq!(every_name(&a), shown);
+        assert_eq!(relisted(a.sessions().to_vec(), &order), shown);
+    }
+
+    /// The floating picker writes a placed row once it has landed, then
+    /// relists, which may be during the next grab. Numbers kept from before
+    /// that listing would put back two rows numbered 1, and store the next
+    /// move as a tie.
+    #[test]
+    fn a_listing_during_a_move_is_what_esc_puts_back() {
+        let mut a = app(&["aaa", "bbb", "ccc"]);
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Down);
+        // Made elsewhere and listed first.
+        let mut listed = vec![session("id000009", "new", 1)];
+        for mut s in app(&["aaa", "bbb", "ccc"]).sessions().iter().cloned() {
+            s.state.num += 1;
+            listed.push(s);
+        }
+        a.set_sessions(listed);
+        assert!(matches!(a.mode(), Mode::Reorder { .. }), "still held");
+
+        assert_eq!(a.on_key(Key::Esc), Request::None);
+        let listed = (
+            vec![
+                "new".to_string(),
+                "aaa".to_string(),
+                "bbb".to_string(),
+                "ccc".to_string(),
+            ],
+            vec![1, 2, 3, 4],
+        );
+        assert_eq!(arrangement(&a), listed);
+
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('k'));
+        let Request::Reorder(order) = a.on_key(Key::Char(' ')) else {
+            panic!("bbb moved");
+        };
+        assert_eq!(every_name(&a), ["new", "bbb", "aaa", "ccc"]);
+        assert_eq!(relisted(a.sessions().to_vec(), &order), every_name(&a));
+    }
+
+    /// An orphan lists first of the unranked rows (`created` 0) and can take
+    /// no rank, so ranking hidden "old" would list "old" above it.
+    #[test]
+    fn a_move_under_a_filter_keeps_an_orphan_above_the_unranked_rows() {
+        let mut rows = after_kills(&["web-a", "web-b", "old"], &[])
+            .sessions()
+            .to_vec();
+        rows[2].num = 0;
+        rows.push(orphan("orphanzz"));
+        let mut a = App::new(crate::transport::finish_listing(rows));
+        assert_eq!(
+            every_name(&a),
+            ["web-a", "web-b", "<orphan orphanzz>", "old"]
+        );
+        a.on_key(Key::Char('/'));
+        for c in "web-".chars() {
+            a.on_key(Key::Char(c));
+        }
+        a.on_mouse(Mouse::Press(Some(1)));
+        a.on_mouse(Mouse::Drag(Some(0)));
+        let Request::Reorder(order) = a.on_mouse(Mouse::Release) else {
+            panic!("web-b moved");
+        };
+        assert_eq!(
+            order,
+            [("id000001".to_string(), 1), ("id000000".to_string(), 2)]
+        );
+        assert_eq!(relisted(a.sessions().to_vec(), &order), every_name(&a));
+    }
+
+    /// Storing an orphan would make its placeholder record real, or stop the
+    /// batch locally at a file that does not parse. No rank keeps it above a
+    /// ranked row anyway.
+    #[test]
+    fn a_move_or_a_placement_never_asks_to_store_an_orphan() {
+        let mut rows = after_kills(&["one", "two"], &[]).sessions().to_vec();
+        rows.push(orphan("orphanzz"));
+        let mut a = App::new(crate::transport::finish_listing(rows));
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('G'));
+        assert_eq!(every_name(&a), ["two", "<orphan orphanzz>", "one"]);
+        assert_eq!(
+            a.on_key(Key::Char(' ')),
+            Request::Reorder(vec![("id000001".into(), 1), ("id000000".into(), 3)])
+        );
+
+        // "old" unranked after it, so the new session does not go last.
+        let mut rows = after_kills(&["one", "old"], &[]).sessions().to_vec();
+        rows[1].num = 0;
+        rows.push(orphan("orphanzz"));
+        let mut a = App::new(crate::transport::finish_listing(rows));
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.selected_row_id(), Some("orphanzz"));
+        assert_eq!(
+            a.placement_of("new"),
+            [("id000000".to_string(), 1), ("new".to_string(), 3)]
+        );
+    }
+
+    /// A grab's snapshot must hold every row, as what Space or a release
+    /// compares it with does: with the rows shown only, every grab under a
+    /// filter would store every row.
+    #[test]
+    fn a_grab_under_a_filter_that_moves_nothing_asks_for_nothing() {
+        let mut a = after_kills(&["web-a", "zzz", "web-b"], &[]);
+        filtered_in_normal_mode(&mut a, "web");
+        a.on_key(Key::Char(' '));
+        assert_eq!(a.on_key(Key::Char(' ')), Request::None, "space space");
+        for c in [' ', 'j', 'k'] {
+            a.on_key(Key::Char(c));
+        }
+        assert_eq!(a.on_key(Key::Char(' ')), Request::None, "space j k space");
+
+        let mut a = after_kills(&["web-a", "zzz", "web-b"], &[]);
+        a.on_key(Key::Char('/'));
+        for c in "web".chars() {
+            a.on_key(Key::Char(c));
+        }
+        a.on_mouse(Mouse::Press(Some(0)));
+        a.on_mouse(Mouse::Drag(Some(1)));
+        a.on_mouse(Mouse::Drag(Some(0)));
+        assert_eq!(a.on_mouse(Mouse::Release), Request::None, "there and back");
+    }
+
+    /// The floating picker writes a move once its landing ends, and a move
+    /// placed before then replaces it. One that moves the rows back needs
+    /// nothing stored, but must still replace the first.
+    #[test]
+    fn a_move_undone_before_it_was_written_asks_to_store_nothing() {
+        let mut rows = after_kills(&["one", "two"], &[]).sessions().to_vec();
+        for s in &mut rows {
+            s.num = 0;
+        }
+        let mut a = App::new(crate::transport::finish_listing(rows));
+        a.on_key(Key::Char('j'));
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('k'));
+        assert_eq!(
+            a.on_key(Key::Char(' ')),
+            Request::Reorder(vec![("id000001".into(), 1)])
+        );
+        a.on_key(Key::Char(' '));
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.on_key(Key::Char(' ')), Request::Reorder(Vec::new()));
     }
 
     #[test]
@@ -2790,7 +3123,7 @@ mod tests {
 
     /// Unlike Space, a drag can start from the filter.
     #[test]
-    fn a_drag_reorders_the_filtered_rows_and_leaves_hidden_ones_alone() {
+    fn a_drag_reorders_the_filtered_rows_and_stores_hidden_ones_at_their_numbers() {
         let mut a = app(&["alpha", "zzz", "gamma"]);
         a.on_key(Key::Char('/'));
         a.on_key(Key::Char('a'));
@@ -2799,7 +3132,11 @@ mod tests {
         a.on_mouse(Mouse::Drag(Some(1)));
         assert_eq!(
             a.on_mouse(Mouse::Release),
-            Request::Reorder(vec![("id000002".into(), 1), ("id000000".into(), 3)])
+            Request::Reorder(vec![
+                ("id000002".into(), 1),
+                ("id000001".into(), 2),
+                ("id000000".into(), 3),
+            ])
         );
         assert_eq!(a.session("id000001").expect("zzz").state.num, 2);
         assert_eq!(*a.mode(), Mode::Normal);
@@ -3041,10 +3378,17 @@ mod tests {
         a.on_key(Key::Char('G'));
         assert!(a.placement_of("new").is_empty());
         assert!(app(&[]).placement_of("new").is_empty());
+
+        // No rank puts it below an orphan, so ranking the rest is no use.
+        let mut rows = app(&["aaa", "bbb"]).sessions().to_vec();
+        rows.push(orphan("orphanzz"));
+        let mut a = App::new(crate::transport::finish_listing(rows));
+        a.on_key(Key::Char('G'));
+        assert!(a.placement_of("new").is_empty());
     }
 
     #[test]
-    fn a_filtered_placement_leaves_the_hidden_rows_alone() {
+    fn a_filtered_placement_stores_the_hidden_rows_at_their_numbers() {
         let mut a = app(&["alpha", "zzz", "gamma"]);
         a.on_key(Key::Char('/'));
         a.on_key(Key::Char('a'));
@@ -3054,10 +3398,109 @@ mod tests {
             a.placement_of("new"),
             [
                 ("id000000".to_string(), 1),
+                ("id000001".to_string(), 2),
                 ("new".to_string(), 3),
                 ("id000002".to_string(), 4),
+            ],
+            "zzz is stored too, with the number it had"
+        );
+    }
+
+    /// Killing "blog" leaves ranks 1, 2, 4 shown as 1-3. Storing only the
+    /// rows on screen would give "website" the 4 that hidden "docs" still
+    /// ranks with, and the tie would come back "website" first.
+    #[test]
+    fn a_session_made_under_a_filter_comes_back_where_the_gap_showed_it() {
+        let mut a = after_kills(&["web-api", "website", "blog", "docs"], &["blog"]);
+        filtered_in_normal_mode(&mut a, "web");
+        assert_eq!(names(&a), ["web-api", "website"]);
+        assert_eq!(a.on_key(Key::Char('c')), Request::NewSession);
+        assert!(a.make_room("fresh"));
+        assert_eq!(
+            drawn(&a),
+            [
+                ("id000000".to_string(), 1),
+                (GHOST_ID.to_string(), 2),
+                ("id000001".to_string(), 4),
             ]
         );
+        a.close_room();
+
+        // Ranked one past the highest, as `transport::create` ranks it.
+        let mut made = Session::new("id000009".into(), "fresh".into(), 100, 5);
+        made.created = 9;
+        let order = a.placement_of(&made.id);
+        let mut rows = a.sessions().to_vec();
+        rows.push(made);
+        assert_eq!(
+            relisted(rows, &order),
+            ["web-api", "fresh", "docs", "website"]
+        );
+    }
+
+    /// After the last row shown, the gap is past every row, hidden "old"
+    /// included. Unranked, "old" sorts after any rank, so storing nothing
+    /// would leave the new session above it.
+    #[test]
+    fn a_session_made_last_under_a_filter_goes_past_a_hidden_unranked_row() {
+        let mut rows = after_kills(&["web-api", "website", "old"], &[])
+            .sessions()
+            .to_vec();
+        rows[2].num = 0;
+        let mut a = App::new(crate::transport::finish_listing(rows));
+        filtered_in_normal_mode(&mut a, "web");
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.on_key(Key::Char('c')), Request::NewSession);
+        assert!(a.make_room("fresh"));
+        let gap = drawn(&a);
+        assert_eq!(gap.last(), Some(&(GHOST_ID.to_string(), 4)));
+        a.close_room();
+
+        // One past the highest rank.
+        let mut made = Session::new("id000009".into(), "fresh".into(), 100, 3);
+        made.created = 9;
+        let order = a.placement_of(&made.id);
+        let mut rows = a.sessions().to_vec();
+        rows.push(made);
+        assert_eq!(
+            relisted(rows, &order),
+            ["web-api", "website", "old", "fresh"]
+        );
+    }
+
+    /// `/zzz` then Enter finds nothing to attach to, so the picker stays
+    /// with the filter on, no row shown and the highlight still on row 0.
+    /// The gap is then past every row, unranked "two" included.
+    #[test]
+    fn a_session_made_with_every_row_filtered_out_goes_past_them_all() {
+        let mut rows = after_kills(&["one", "two"], &[]).sessions().to_vec();
+        rows[1].num = 0;
+        let mut a = App::new(crate::transport::finish_listing(rows));
+        a.on_key(Key::Char('/'));
+        for c in "zzz".chars() {
+            a.on_key(Key::Char(c));
+        }
+        assert_eq!(a.on_key(Key::Enter), Request::None);
+        assert_eq!(a.on_key(Key::Char('c')), Request::NewSession);
+        assert!(a.make_room("fresh"));
+        assert_eq!(drawn(&a), [(GHOST_ID.to_string(), 3)]);
+        a.close_room();
+
+        // One past the highest rank.
+        let mut made = Session::new("id000009".into(), "fresh".into(), 100, 2);
+        made.created = 9;
+        let order = a.placement_of(&made.id);
+        assert_eq!(
+            order,
+            [
+                ("id000000".to_string(), 1),
+                ("id000001".to_string(), 2),
+                ("id000009".to_string(), 3),
+            ]
+        );
+        let mut rows = a.sessions().to_vec();
+        rows.push(made);
+        assert_eq!(relisted(rows, &order), ["one", "two", "fresh"]);
     }
 
     #[test]
@@ -3080,7 +3523,7 @@ mod tests {
     }
 
     /// For every highlight position, filtered or not, the gap matches
-    /// [`App::placement_of`].
+    /// [`App::placement_of`] on the rows it shows.
     #[test]
     fn the_gap_shows_the_placement_the_create_will_store() {
         let filtered = || {
@@ -3095,12 +3538,14 @@ mod tests {
             for at in 0..rows {
                 let mut a = build();
                 a.select_session(&a.visible()[at].id.clone());
-                let placement = a.placement_of(GHOST_ID);
+                let mut placement = a.placement_of(GHOST_ID);
                 assert!(a.make_room("session 9"));
                 if placement.is_empty() {
                     continue;
                 }
-                assert_eq!(drawn(&a), placement, "highlight on row {at}");
+                let gap = drawn(&a);
+                placement.retain(|row| gap.iter().any(|(id, _)| *id == row.0));
+                assert_eq!(gap, placement, "highlight on row {at}");
             }
         }
     }

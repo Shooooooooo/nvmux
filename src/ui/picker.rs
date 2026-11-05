@@ -15,8 +15,9 @@
 //! then the next panel opens on them and `<prefix>` switches are resolved
 //! among them ([`rows`]).
 //!
-//! `c` opens a gap after the cursor row, then leaves for the prompt
-//! ([`Leave::New`], [`super::prompt::Panel`]); `r` renames the cursor row
+//! `c` opens a gap after the cursor row, then leaves for the prompt, which
+//! places the session there under the panel's filter ([`Leave::New`],
+//! [`left_filter`], [`super::prompt::Panel`]); `r` renames the cursor row
 //! ([`Leave::Rename`]). A prompt that switches nowhere (a rename, a cancelled
 //! create) returns to the panel with the gap closed. With no room for the
 //! prompt beside the session, it goes full screen and the picker floats again
@@ -67,6 +68,9 @@ static IN_HAND: Mutex<Vec<Session>> = Mutex::new(Vec::new());
 /// or `r` was pressed on, back from its full-screen prompt.
 static ON: Mutex<Option<String>> = Mutex::new(None);
 
+/// See [`left_filter`].
+static FILTER: Mutex<String> = Mutex::new(String::new());
+
 /// Rows as a panel changed them, for the session loop to take back; until
 /// then, the rows as they stand (see [`rows`]).
 static CHANGED: Mutex<Option<Vec<Session>>> = Mutex::new(None);
@@ -81,11 +85,13 @@ pub fn lend(transport: &Shared) {
 }
 
 /// Set the rows the next panel opens on, and its cursor row if not the session
-/// behind it (back from a full-screen prompt). Clears any changed rows.
+/// behind it (back from a full-screen prompt). Clears any changed rows and
+/// the filter `c` left with.
 pub fn hand(rows: &[Session], on: Option<&str>) {
     *lock(&IN_HAND) = rows.to_vec();
     *lock(&ON) = on.map(str::to_string);
     lock(&CHANGED).take();
+    lock(&FILTER).clear();
 }
 
 /// Rows a panel changed (kill, move, create, rename, or a newer listing)
@@ -97,6 +103,12 @@ pub fn take_changed() -> Option<Vec<Session>> {
 /// For the floating prompt (see [`super::prompt::Panel`]).
 pub(super) fn transport() -> Option<Shared> {
     TRANSPORT.get().cloned()
+}
+
+/// The panel's filter when `c` left it for the prompt, which names and places
+/// the new session among the rows it shows, as the gap did.
+pub(super) fn left_filter() -> String {
+    lock(&FILTER).clone()
 }
 
 /// The changed rows if any, else the ones handed over: what the next panel
@@ -195,6 +207,16 @@ impl Panel {
     /// Carry out a request; switching session or opening another screen
     /// closes the panel.
     fn answer(&mut self, request: Request) -> Did {
+        // A move waits for its row to land. Whatever closes the panel, or
+        // numbers a new session from the stored order, writes it first.
+        if !matches!(
+            request,
+            Request::None | Request::Kill(_) | Request::Reorder(_)
+        ) {
+            if let Some(order) = self.placing.take() {
+                self.place(order);
+            }
+        }
         match request {
             Request::None => Did::Stay,
             Request::Attach(id) if id == self.behind => Did::Close,
@@ -206,6 +228,7 @@ impl Panel {
             // leave once it is up.
             Request::NewSession => {
                 let after = self.cursor();
+                *lock(&FILTER) = self.app.filter().to_string();
                 let number = Some(self.app.new_number());
                 let name = super::prompt::default_name(self.app.sessions(), number);
                 if self.app.make_room(&name) {
@@ -540,6 +563,8 @@ impl Floating for Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::app::Mode;
+    use crate::ui::prompt::Place;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
 
     fn rows(ids: &[&str]) -> Vec<Session> {
@@ -568,6 +593,28 @@ mod tests {
     fn key(panel: &mut Panel, code: KeyCode) -> Did {
         let key = KeyEvent::new(code, KeyModifiers::NONE);
         panel.on_key(key, Instant::now())
+    }
+
+    /// The rows drawn, the gap's included, by name and number.
+    fn gap(panel: &Panel) -> Vec<(String, u32)> {
+        panel
+            .app
+            .rows()
+            .iter()
+            .map(|r| (r.session.name.clone(), r.num))
+            .collect()
+    }
+
+    /// A mouse event on session `id`'s row as the panel lays it out now.
+    fn on_row(panel: &Panel, kind: MouseEventKind, id: &str) -> MouseEvent {
+        let local = Rect::new(0, 0, panel.drawn.width, panel.drawn.height);
+        let row = draw::row_rect(&panel.app, local, id).expect("on screen");
+        MouseEvent {
+            kind,
+            column: panel.drawn.x + row.x,
+            row: panel.drawn.y + row.y,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     /// `Esc` still returns to the session behind, and the next panel opens on
@@ -637,6 +684,127 @@ mod tests {
         assert!(panel.closing());
         let after = Id::new(two).expect("an id");
         assert_eq!(panel.leave(), Some(Leave::New(Some(after))));
+        hand(&[], None);
+    }
+
+    /// `/zzz` then Enter finds nothing to attach to, so the panel stays with
+    /// the filter on and no cursor row. The gap is past every row, where the
+    /// prompt puts the session only under the same filter.
+    #[test]
+    fn c_with_every_row_filtered_out_goes_to_put_the_session_last() {
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (one, two, behind) = ("aaaaaaaa", "bbbbbbbb", "cccccccc");
+        hand(&rows(&[one, two, behind]), None);
+        let mut panel = Panel::open(behind);
+        for c in ['/', 'z', 'z', 'z'] {
+            assert_eq!(press(&mut panel, c), Did::Stay);
+        }
+        assert_eq!(key(&mut panel, KeyCode::Enter), Did::Stay);
+        assert_eq!(press(&mut panel, 'c'), Did::Stay);
+        assert_eq!(gap(&panel), [("session 4".to_string(), 4)]);
+
+        let up = Instant::now() + effects::ROOM_HELD + Duration::from_millis(1);
+        assert!(panel.tick(up));
+        assert_eq!(panel.leave(), Some(Leave::New(None)));
+        assert_eq!(left_filter(), "zzz");
+        hand(&[], None);
+    }
+
+    /// Releasing a drag leaves the panel in Normal mode with the filter on,
+    /// and `c` then opens the gap past hidden "docs". Without the filter the
+    /// prompt would place among every row and offer "session 3".
+    #[test]
+    fn c_after_a_drag_in_the_filter_takes_the_filter_to_the_prompt() {
+        use ratatui::crossterm::event::MouseButton;
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (blog, web_a, docs, web_b) = ("aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd");
+        let mut listed = rows(&[blog, web_a, docs, web_b]);
+        for (s, name) in listed.iter_mut().zip(["blog", "web-a", "docs", "web-b"]) {
+            s.name = name.to_string();
+        }
+        hand(&listed, None);
+        let mut panel = Panel::open(blog);
+        for c in ['/', 'w', 'e', 'b'] {
+            assert_eq!(press(&mut panel, c), Did::Stay);
+        }
+        let area = panel.area(Rect::new(0, 0, 80, 24)).expect("room to float");
+        panel.draw(area);
+        for (kind, on) in [
+            (MouseEventKind::Down(MouseButton::Left), web_b),
+            (MouseEventKind::Drag(MouseButton::Left), web_a),
+            (MouseEventKind::Up(MouseButton::Left), web_a),
+        ] {
+            let at = on_row(&panel, kind, on);
+            assert_eq!(panel.on_mouse(at, Instant::now()), Did::Stay);
+        }
+        assert_eq!(
+            (panel.app.mode(), panel.app.filter()),
+            (&Mode::Normal, "web")
+        );
+        assert!(panel.placing.is_some(), "the row is still landing");
+
+        assert_eq!(press(&mut panel, 'c'), Did::Stay);
+        assert!(
+            panel.placing.is_none(),
+            "the move is written before the gap"
+        );
+        let shown = [("web-b", 2), ("session 4", 4), ("web-a", 5)];
+        assert_eq!(
+            gap(&panel),
+            shown.map(|(name, num)| (name.to_string(), num))
+        );
+        let up = Instant::now() + effects::ROOM_HELD + Duration::from_millis(1);
+        assert!(panel.tick(up));
+        let after = Id::new(web_b).expect("an id");
+        assert_eq!(panel.leave(), Some(Leave::New(Some(after))));
+        assert_eq!(left_filter(), "web");
+
+        // Without a transport `place` cannot relist; hand on the rows the move
+        // leaves.
+        panel.changed();
+        let mut prompt = crate::ui::prompt::Panel::create(Place::After(Some(after)));
+        let area = prompt.area(Rect::new(0, 0, 80, 24)).expect("room to float");
+        let said = rows_of(&prompt.draw(area), area);
+        assert!(said.iter().any(|r| r.contains("session 4")), "{said:#?}");
+        hand(&[], None);
+    }
+
+    /// The landing outlasts a quick key, which would otherwise close the
+    /// panel with the move unwritten.
+    #[test]
+    fn a_move_still_landing_is_written_before_the_panel_closes() {
+        use ratatui::crossterm::event::MouseButton;
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (blog, web, docs) = ("aaaaaaaa", "bbbbbbbb", "cccccccc");
+        let closers = [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('?'),
+            KeyCode::Char(','),
+            KeyCode::Char('r'),
+            KeyCode::Char('q'),
+        ];
+        for code in closers {
+            let name = format!("{code:?}");
+            hand(&rows(&[blog, web, docs]), None);
+            let mut panel = Panel::open(blog);
+            let area = panel.area(Rect::new(0, 0, 80, 24)).expect("room to float");
+            panel.draw(area);
+            for (kind, on) in [
+                (MouseEventKind::Down(MouseButton::Left), docs),
+                (MouseEventKind::Drag(MouseButton::Left), blog),
+                (MouseEventKind::Up(MouseButton::Left), blog),
+            ] {
+                let at = on_row(&panel, kind, on);
+                assert_eq!(panel.on_mouse(at, Instant::now()), Did::Stay, "{name}");
+            }
+            assert!(panel.placing.is_some(), "{name}: the row is still landing");
+            assert_eq!(key(&mut panel, code), Did::Close, "{name}");
+            assert!(
+                panel.placing.is_none(),
+                "{name}: the move went with the panel"
+            );
+        }
         hand(&[], None);
     }
 

@@ -36,8 +36,9 @@ pub enum Did {
 pub enum Leave {
     /// `Enter` on a row.
     Switch(crate::ids::Id),
-    /// `c`: new session placed after the given one (the cursor row), `None`
-    /// if there are no rows. The picker returns if the prompt is cancelled.
+    /// `c`: new session placed after the given one (the cursor row) among
+    /// the rows the filter shows, `None` if it shows none. The picker
+    /// returns if the prompt is cancelled.
     New(Option<crate::ids::Id>),
     /// `q`: exit nvmux, leaving sessions running.
     Quit,

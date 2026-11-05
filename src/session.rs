@@ -38,6 +38,9 @@ pub struct SessionState {
     /// Kept apart from `Session::num` because `SshTransport::rename_session`
     /// writes the in-memory session back to disk.
     pub num: u32,
+    /// Listed without readable metadata, under a placeholder name that
+    /// writing its record back would make real.
+    pub orphan: bool,
 }
 
 /// A session, as listed by a [`crate::transport::Transport`].

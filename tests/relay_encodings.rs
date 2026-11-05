@@ -117,6 +117,10 @@ const CHILD_OTHER_SOCK: &str = "NVMUX_TEST_RELAY_OTHER_SOCK";
 /// Written by a [`CHILD_OTHER_ID`] child after each switch.
 const SWITCHED: &[u8] = b"\x1b]9999;switched\x07";
 
+/// With [`CHILD_OTHER_ID`], relay as if twelve sessions were listed, and go
+/// to the other session on `<prefix> 1` instead (see [`numbered_relays`]).
+const CHILD_NUMBERED: &str = "NVMUX_TEST_RELAY_NUMBERED";
+
 /// Pty size for a [`Terminal`] unless its [`Asks`] give one; tests must agree
 /// with the child on which row is the last (the hint bar's).
 const ROWS: u16 = 40;
@@ -134,6 +138,22 @@ const XTERM_PUSH: &[u8] = b"\x1b[>4;2m";
 /// In-band resize (DEC mode 2048) query, and a "supported, not set" reply.
 const IN_BAND_QUERY: &[u8] = b"\x1b[?2048$p";
 const IN_BAND_REPLY: &[u8] = b"\x1b[?2048;2$y";
+/// The rest Neovim asks as a client attaches (`_core/defaults.lua`,
+/// `plugin/osc52.lua`), with replies as xterm gives them: the SGR (DECRQSS),
+/// the background (OSC 11), device status, and XTGETTCAP for `Ms`.
+const NVIM_ASKS: [(&[u8], &[u8]); 4] = [
+    (b"\x1bP$qm\x1b\\", b"\x1bP1$r0m\x1b\\"),
+    (b"\x1b]11;?\x07", b"\x1b]11;rgb:0000/0000/0000\x07"),
+    (b"\x1b[5n", b"\x1b[0n"),
+    (
+        b"\x1bP+q4D73\x1b\\",
+        b"\x1bP1+r4D73=1B5D35323B25703125733B257032257307\x1b\\",
+    ),
+];
+/// Focus reports on, which both clients set as they start, and the report
+/// Ghostty sends whenever the mode is set.
+const FOCUS_ON: &[u8] = b"\x1b[?1004h";
+const FOCUS_IN: &[u8] = b"\x1b[I";
 
 /// The child half: relay the session from the environment and report how it
 /// ended via the exit code. Ignored, so only the parent runs it (`--ignored
@@ -241,6 +261,9 @@ fn relay_child() {
     }
     if let Some((other_id, other_sock)) = other {
         let other_sock = std::path::PathBuf::from(other_sock);
+        if std::env::var_os(CHILD_NUMBERED).is_some() {
+            std::process::exit(numbered_relays(attachment, (&other_id, &other_sock), own));
+        }
         std::process::exit(preview_relays(
             attachment,
             &id,
@@ -270,8 +293,9 @@ fn relay_child() {
             })
         })
     };
+    let mut carry = nvmux::pty::Carry::default();
     let code = loop {
-        match nvmux::pty::relay(attachment, 0, &mut landing) {
+        match nvmux::pty::relay(attachment, 0, &mut carry, &mut landing) {
             Ok((nvmux::pty::Outcome::Detached, _)) => break 0,
             // Instead of the picker: park, wait, take back.
             Ok((nvmux::pty::Outcome::ToPicker, held)) if keep => {
@@ -353,6 +377,7 @@ fn preview_relays(
             s
         })
         .collect();
+    let mut carry = nvmux::pty::Carry::default();
     loop {
         nvmux::ui::picker::hand(&rows, None);
         let mut chosen = None;
@@ -361,7 +386,7 @@ fn preview_relays(
                 pool: &mut *pool,
                 chosen: &mut chosen,
             };
-            nvmux::pty::relay(attachment, 0, &mut neighbours)
+            nvmux::pty::relay(attachment, 0, &mut carry, &mut neighbours)
         };
         match ended {
             Ok((nvmux::pty::Outcome::Detached, _)) => return 0,
@@ -380,6 +405,44 @@ fn preview_relays(
                         other => panic!("nothing to switch to: {other:?}"),
                     },
                 };
+                let mut out = std::io::stdout();
+                let _ = out.write_all(SWITCHED);
+                let _ = out.flush();
+            }
+            Ok((other, _)) => {
+                eprintln!("relay ended with {other:?}");
+                return 3;
+            }
+            Err(e) => {
+                eprintln!("relay failed: {e}");
+                return 4;
+            }
+        }
+    }
+}
+
+/// The [`CHILD_NUMBERED`] child: relay `attachment` as if twelve sessions
+/// were listed, so a `1` waits for another digit, and on `<prefix> 1` start a
+/// client for `other` (nvmux's own if `own`) and relay it with what the
+/// switch carried, as `main` does. Returns the exit code: 0 for a detach.
+fn numbered_relays(
+    mut attachment: nvmux::pty::Attachment,
+    (other, other_sock): (&str, &Path),
+    own: bool,
+) -> i32 {
+    let mut carry = nvmux::pty::Carry::default();
+    let mut begin = |_: nvmux::pty::Target| None::<nvmux::card::Card>;
+    loop {
+        match nvmux::pty::relay(attachment, 12, &mut carry, &mut begin) {
+            Ok((nvmux::pty::Outcome::Detached, _)) => return 0,
+            Ok((nvmux::pty::Outcome::Switch(nvmux::pty::Target::Number(1)), _left)) => {
+                attachment = if own {
+                    let exe = Path::new(env!("CARGO_BIN_EXE_nvmux"));
+                    nvmux::pty::spawn_own_client(other, other_sock, "", exe)
+                } else {
+                    nvmux::pty::spawn(other, other_sock, "")
+                }
+                .expect("attach");
                 let mut out = std::io::stdout();
                 let _ = out.write_all(SWITCHED);
                 let _ = out.flush();
@@ -475,6 +538,7 @@ struct Asks {
     painted: bool,
     /// [`CHILD_OTHER_ID`] and [`CHILD_OTHER_SOCK`].
     other: Option<(String, std::path::PathBuf)>,
+    numbered: bool,
     /// Rows and columns, if not [`ROWS`] by [`COLS`].
     size: Option<(u16, u16)>,
 }
@@ -561,6 +625,7 @@ impl Terminal {
             bind,
             painted,
             other,
+            numbered,
             size,
         } = asks;
         let (pty, pts) = pty_process::blocking::open().expect("open a pty");
@@ -623,6 +688,9 @@ impl Terminal {
         if let Some((id, sock)) = other {
             cmd = cmd.env(CHILD_OTHER_ID, id).env(CHILD_OTHER_SOCK, sock);
         }
+        if numbered {
+            cmd = cmd.env(CHILD_NUMBERED, "1");
+        }
         // Moves the slave in, or the master never sees EOF after the child
         // exits.
         let child = cmd.spawn(pts).expect("spawn relay child");
@@ -681,13 +749,22 @@ impl Terminal {
     /// Answer new queries. One may straddle two reads, so the scan backs up a
     /// little and counts only matches ending past the last scan.
     fn answer(&mut self) {
-        let from = self.answered.saturating_sub(8);
-        let mut replies = Vec::new();
-        for (query, reply) in [
+        let asks = [
             (KITTY_QUERY, KITTY_REPLY),
             (DA1, DA1_REPLY),
             (IN_BAND_QUERY, IN_BAND_REPLY),
-        ] {
+            (FOCUS_ON, FOCUS_IN),
+        ]
+        .into_iter()
+        .chain(NVIM_ASKS);
+        let longest = asks
+            .clone()
+            .map(|(query, _)| query.len())
+            .max()
+            .unwrap_or(0);
+        let from = self.answered.saturating_sub(longest);
+        let mut replies = Vec::new();
+        for (query, reply) in asks {
             if query == KITTY_QUERY && self.protocol == Protocol::Xterm {
                 continue;
             }
@@ -2925,6 +3002,10 @@ fn the_floating_picker_shows_the_session_under_its_cursor() {
             "its mouse reporting was not put back; the child wrote: {}",
             term.since(entered)
         );
+        // On a first visit its server asks XTGETTCAP once the terminal's DA1
+        // answer reaches it, and Neovim's TUI takes an Esc typed within
+        // 'ttimeoutlen' of the reply as part of it.
+        term.pump_until(Duration::from_millis(300), |_| false);
         reaches(&mut term, sock, to, 'x');
     }
 
@@ -2958,6 +3039,261 @@ fn the_floating_picker_shows_the_session_under_its_cursor() {
     );
     reaches(&mut term, &b_sock, other, 'y');
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// Keys read with `<prefix> Space` never reach the floating picker; when it
+/// switches they stay behind, as past the full-screen picker, and so does a
+/// prefix read with them.
+#[test]
+fn keys_read_with_the_floating_picker_s_key_do_not_follow_its_switch() {
+    require_nvim!();
+    let scratch = Scratch::new("preview-keys");
+    let t = scratch.transport();
+    let session = |tag: &str, first: &str| {
+        let session = t
+            .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+            .expect("create");
+        let sock = t.local_socket_for(&session).expect("socket path");
+        // No swap file: these run in parallel and would race for the same one.
+        nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+            .expect("connect")
+            .command(&format!(
+                "setlocal noswapfile | call setline(1, ['{first}', 'two', 'three'])"
+            ))
+            .expect("setline");
+        (session, sock)
+    };
+    let (front, other) = ("the session floated over", "the session picked");
+    let (a, a_sock) = session("preview-keys-front", front);
+    let (b, b_sock) = session("preview-keys-other", other);
+    let mut term = Terminal::spawn_child(
+        &a_sock,
+        &a.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: true,
+            keep: true,
+            fade_ms: Some(100),
+            other: Some((b.id.clone(), b_sock.clone())),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| row_on_screen(out, 0)
+            .contains(front)),
+        "the session never painted; got: {}",
+        term.since(0)
+    );
+    // Parked by the switch only once its DA1 is answered.
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| find(out, DA1).is_some()),
+        "the client never asked its DA1; got: {}",
+        term.since(0)
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+
+    let mark = term.output.len();
+    let prefix = nvmux::keys::PREFIX;
+    term.type_bytes(&[prefix, b' ', b'j', prefix]);
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| row_on_screen(out, ROWS - 1)
+            .contains("esc back")),
+        "the picker never floated; the child wrote: {}",
+        term.since(mark)
+    );
+    term.type_bytes(b"j");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| row_on_screen(out, 0)
+            .contains(other)),
+        "{other:?} never showed behind the picker; the child wrote: {}",
+        term.since(mark)
+    );
+    let entered = term.output.len();
+    term.type_bytes(b"\r");
+    assert!(
+        term.pump_until(Duration::from_secs(5), |out| find(
+            &out[entered..],
+            SWITCHED
+        )
+        .is_some()),
+        "Enter did not switch; the child wrote: {}",
+        term.since(entered)
+    );
+    // A carried step would be taken on the new relay's first pass; a carried
+    // prefix would make this `d` a detach.
+    term.pump_until(Duration::from_millis(500), |_| false);
+    term.type_bytes(b"d");
+    assert_eq!(
+        term.exit_code(Duration::from_millis(500)),
+        None,
+        "the d detached: a prefix read with the picker's key was carried"
+    );
+    let pending = common::mode(&b_sock).expect("the mode is a fast call");
+    assert_eq!(pending.mode, "no", "the d did not reach {other:?}");
+    term.type_bytes(b"\x1b");
+    for (sock, name) in [(&a_sock, front), (&b_sock, other)] {
+        assert_eq!(cursor_line(sock), Some(1), "the j reached {name:?}");
+    }
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// Two sessions of three lines each, and a [`CHILD_NUMBERED`] child relaying
+/// the first, its client started (nvmux's own if `own`). The scratch keeps
+/// the sessions alive.
+fn numbered(tag: &str, own: bool) -> (Scratch, Terminal, std::path::PathBuf, std::path::PathBuf) {
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = |name: &str| {
+        let session = t
+            .create_session(
+                &common::unique(name),
+                &common::launch_with("--clean"),
+                common::anywhere(),
+            )
+            .expect("create");
+        let sock = t.local_socket_for(&session).expect("socket path");
+        // No swap file: these run in parallel and would race for the same one.
+        nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+            .expect("connect")
+            .command("setlocal noswapfile | call setline(1, ['one', 'two', 'three'])")
+            .expect("setline");
+        (session, sock)
+    };
+    let (a, a_sock) = session(&format!("{tag}-from"));
+    let (b, b_sock) = session(&format!("{tag}-to"));
+    let mut term = Terminal::spawn_child(
+        &a_sock,
+        &a.id,
+        Protocol::Kitty,
+        Asks {
+            other: Some((b.id, b_sock.clone())),
+            numbered: true,
+            own,
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| {
+            kitty_push_flags(out).is_some()
+        }),
+        "the client never started; got: {}",
+        term.since(0)
+    );
+    // Its startup asked and answered, so what comes after the switch is the
+    // next client's.
+    term.pump_until(Duration::from_millis(500), |_| false);
+    (scratch, term, a_sock, b_sock)
+}
+
+/// Each a read of its own, as typed: the prefix as the kitty protocol spells
+/// it (with its release, if the client asked for those), or a key.
+fn type_apart(term: &mut Terminal, keys: &[&[u8]]) {
+    let flags = kitty_push_flags(&term.output).unwrap_or(0);
+    for &key in keys {
+        if key == [nvmux::keys::PREFIX] {
+            term.type_bytes(b"\x1b[32;5u");
+            if flags & 2 != 0 {
+                term.type_bytes(b"\x1b[32;5:3u");
+            }
+        } else {
+            term.type_bytes(key);
+        }
+        term.pump_until(Duration::from_millis(150), |_| false);
+    }
+}
+
+/// Where the child said it switched, past `mark`.
+fn switched_after(term: &mut Terminal, mark: usize) -> usize {
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| find(&out[mark..], SWITCHED)
+            .is_some()),
+        "the relay did not switch; the child wrote: {}",
+        term.since(mark)
+    );
+    mark + find(&term.output[mark..], SWITCHED).expect("found") + SWITCHED.len()
+}
+
+fn cursor_line(sock: &Path) -> Option<u64> {
+    common::lua(sock, "return vim.fn.line('.')").as_u64()
+}
+
+/// With twelve sessions `<prefix> 1` waits for another digit, so the key
+/// after it ends the number and is a key of its own, for the session the
+/// number names; its client is started only as the relay ends.
+#[test]
+fn the_key_after_a_number_reaches_the_session_switched_to() {
+    require_nvim!();
+    let (_scratch, mut term, a_sock, b_sock) = numbered("carried", false);
+    let mark = term.output.len();
+    type_apart(&mut term, &[&[nvmux::keys::PREFIX], b"1", b"j"]);
+    switched_after(&mut term, mark);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cursor_line(&b_sock) != Some(2) && Instant::now() < deadline {
+        term.pump_until(Duration::from_millis(50), |_| false);
+    }
+    assert_eq!(
+        cursor_line(&b_sock),
+        Some(2),
+        "the j did not reach the session switched to; the child wrote: {}",
+        term.since(mark)
+    );
+    assert_eq!(
+        cursor_line(&a_sock),
+        Some(1),
+        "the session left was sent the j"
+    );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+#[test]
+fn a_prefix_that_ends_a_number_is_finished_in_the_session_switched_to() {
+    prefix_ends_a_number("rearmed", false);
+}
+
+/// Its startup asks less, but the server asks through it on attach.
+#[test]
+fn a_prefix_that_ends_a_number_is_finished_with_nvmux_s_own_client() {
+    prefix_ends_a_number("rearmed-own", true);
+}
+
+/// The prefix that ends the number arms the machine again, and the relay
+/// switched to takes it up: its hint row comes up there, and its command
+/// acts there. The new client's startup queries are answered meanwhile, the
+/// last (XTGETTCAP, after a DA1 round trip) well into the wait.
+fn prefix_ends_a_number(tag: &str, own: bool) {
+    require_nvim!();
+    let (_scratch, mut term, a_sock, b_sock) = numbered(tag, own);
+    let mark = term.output.len();
+    type_apart(
+        &mut term,
+        &[&[nvmux::keys::PREFIX], b"1", &[nvmux::keys::PREFIX]],
+    );
+    let switched = switched_after(&mut term, mark);
+    let hint_row = |out: &[u8]| {
+        find(&out[switched..], b"d detach").is_some()
+            && row_on_screen(out, ROWS - 1).contains("d detach")
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(10), hint_row),
+        "no hint row in the session switched to; it wrote: {}",
+        term.since(switched)
+    );
+    term.pump_until(Duration::from_millis(500), |_| false);
+    assert!(
+        hint_row(&term.output),
+        "the hint row went down; the child wrote: {}",
+        term.since(switched)
+    );
+    term.type_bytes(b"d");
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the d did not detach; the child wrote: {}",
+        term.since(switched)
+    );
+    for sock in [&a_sock, &b_sock] {
+        assert_eq!(cursor_line(sock), Some(1), "a session was sent keys");
+    }
 }
 
 /// A terminal whose frames are several times what a pty holds (about 14 KB

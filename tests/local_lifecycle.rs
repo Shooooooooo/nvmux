@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use common::{command_line, Scratch};
 use nvmux::session::{Liveness, Session};
 use nvmux::transport::Transport;
+use nvmux::ui::app::{App, Key, Mouse, Request};
 
 /// Make [`nvmux::pty::spawn`] start `nvim --remote-ui`. The default client is
 /// the running executable with `--client`, which here is this test binary.
@@ -405,6 +406,193 @@ fn a_reorder_never_writes_metadata_for_a_session_that_has_none() {
     assert!(
         !json.exists(),
         "metadata was conjured for a session that had none"
+    );
+}
+
+/// Sessions named `names`, made in that order. Their metadata says each was
+/// made a second after the last, so a tie in rank breaks the same way on
+/// every run.
+fn made_in_turn(scratch: &Scratch, t: &impl Transport, names: &[&str]) -> Vec<Session> {
+    names
+        .iter()
+        .zip(1u64..)
+        .map(|(name, created)| {
+            let s = t
+                .create_session(name, &common::launch(), common::anywhere())
+                .expect("create");
+            let json = scratch.0.join(format!("{}.json", s.id));
+            let mut v = common::read_meta(&json);
+            v["created"] = created.into();
+            common::write_meta(&json, &v);
+            s
+        })
+        .collect()
+}
+
+/// What the pickers write for a reorder or a placement: each session in
+/// `order` with its rank set to the number given.
+fn ranked(rows: &[Session], order: &[(String, u32)]) -> Vec<Session> {
+    order
+        .iter()
+        .filter_map(|(id, num)| {
+            let mut s = rows.iter().find(|s| s.id == *id)?.clone();
+            s.num = *num;
+            Some(s)
+        })
+        .collect()
+}
+
+fn numbered(rows: &[Session]) -> Vec<(String, u32)> {
+    rows.iter().map(|s| (s.name.clone(), s.state.num)).collect()
+}
+
+/// After the kill, hidden "docs" ranks 4 and shows 3, and the move takes
+/// "web-app" down to 4.
+#[test]
+fn a_move_under_a_filter_is_listed_as_the_picker_showed_it() {
+    require_nvim!();
+    let scratch = Scratch::new("filtered-move");
+    let t = scratch.transport();
+    let made = made_in_turn(&scratch, &t, &["api", "blog", "web-app", "docs", "website"]);
+    t.kill_session(&made[1]).expect("kill");
+    let listed = t.list_sessions().expect("list");
+    let ranks: Vec<u32> = listed.iter().map(|s| s.num).collect();
+    assert_eq!(ranks, [1, 3, 4, 5], "the kill's hole in the ranks");
+
+    let mut picker = App::new(listed);
+    picker.on_key(Key::Char('/'));
+    for c in "web".chars() {
+        picker.on_key(Key::Char(c));
+    }
+    // "website" dragged above "web-app", which a drag can do in the filter.
+    picker.on_mouse(Mouse::Press(Some(1)));
+    picker.on_mouse(Mouse::Drag(Some(0)));
+    let Request::Reorder(order) = picker.on_mouse(Mouse::Release) else {
+        panic!("the drag placed nothing");
+    };
+    let shown = numbered(picker.sessions());
+    assert_eq!(
+        shown,
+        [
+            ("api".to_string(), 1),
+            ("website".to_string(), 2),
+            ("docs".to_string(), 3),
+            ("web-app".to_string(), 4),
+        ]
+    );
+
+    t.renumber(&ranked(picker.sessions(), &order))
+        .expect("renumber");
+    assert_eq!(numbered(&t.list_sessions().expect("list")), shown);
+}
+
+/// After the kill, hidden "docs" ranks 4 and shows 3, and the gap moves
+/// "website" down to 4.
+#[test]
+fn a_session_made_under_a_filter_is_listed_where_the_gap_showed_it() {
+    require_nvim!();
+    let scratch = Scratch::new("filtered-create");
+    let t = scratch.transport();
+    let made = made_in_turn(&scratch, &t, &["web-api", "website", "blog", "docs"]);
+    t.kill_session(&made[2]).expect("kill");
+    let listed = t.list_sessions().expect("list");
+    let ranks: Vec<u32> = listed.iter().map(|s| s.num).collect();
+    assert_eq!(ranks, [1, 2, 4], "the kill's hole in the ranks");
+
+    // Normal mode with the filter applied: stay after Ctrl-c asks about an
+    // unsaved setting.
+    let mut picker = App::new(listed);
+    picker.set_unsaved(1);
+    picker.on_key(Key::Char('/'));
+    for c in "web".chars() {
+        picker.on_key(Key::Char(c));
+    }
+    picker.on_key(Key::CtrlC);
+    picker.on_key(Key::Esc);
+    assert_eq!(picker.on_key(Key::Char('c')), Request::NewSession);
+    assert!(picker.make_room("fresh"));
+    let gap: Vec<(String, u32)> = picker
+        .rows()
+        .iter()
+        .map(|r| (r.session.name.clone(), r.num))
+        .collect();
+    assert_eq!(
+        gap,
+        [
+            ("web-api".to_string(), 1),
+            ("fresh".to_string(), 2),
+            ("website".to_string(), 4),
+        ]
+    );
+    picker.close_room();
+
+    let fresh = t
+        .create_session("fresh", &common::launch(), common::anywhere())
+        .expect("create");
+    let order = picker.placement_of(&fresh.id);
+    let mut rows = picker.sessions().to_vec();
+    rows.push(fresh);
+    t.renumber(&ranked(&rows, &order)).expect("renumber");
+    assert_eq!(
+        numbered(&t.list_sessions().expect("list")),
+        [
+            ("web-api".to_string(), 1),
+            ("fresh".to_string(), 2),
+            ("docs".to_string(), 3),
+            ("website".to_string(), 4),
+        ]
+    );
+}
+
+/// "broken" lists as an orphan, hidden, and the drag leaves it above
+/// "web-a". A batch naming it stopped there with an error locally; over ssh
+/// its placeholder record would replace the file.
+#[test]
+fn a_move_under_a_filter_leaves_metadata_that_does_not_parse_alone() {
+    require_nvim!();
+    let scratch = Scratch::new("filtered-orphan");
+    let t = scratch.transport();
+    let made = made_in_turn(&scratch, &t, &["web-a", "broken", "web-old"]);
+    // As an nvmux before ranks wrote it.
+    let legacy = scratch.0.join(format!("{}.json", made[2].id));
+    let mut v = common::read_meta(&legacy);
+    v.as_object_mut().expect("an object").remove("num");
+    common::write_meta(&legacy, &v);
+    // `Scratch` kills by the pid in `<id>.json`, which "broken" loses.
+    struct Killed(u32);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let pid = nix::unistd::Pid::from_raw(self.0 as i32);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+    let _broken = Killed(made[1].pid);
+    let broken = scratch.0.join(format!("{}.json", made[1].id));
+    std::fs::write(&broken, "{1}").expect("break it");
+    let orphan = format!("<orphan {}>", made[1].id);
+    let names = |rows: &[Session]| -> Vec<String> { rows.iter().map(|s| s.name.clone()).collect() };
+
+    let mut picker = App::new(t.list_sessions().expect("list"));
+    assert_eq!(
+        names(picker.sessions()),
+        ["web-a", orphan.as_str(), "web-old"]
+    );
+    picker.on_key(Key::Char('/'));
+    for c in "web-".chars() {
+        picker.on_key(Key::Char(c));
+    }
+    picker.on_mouse(Mouse::Press(Some(1)));
+    picker.on_mouse(Mouse::Drag(Some(0)));
+    let Request::Reorder(order) = picker.on_mouse(Mouse::Release) else {
+        panic!("the drag placed nothing");
+    };
+    t.renumber(&ranked(picker.sessions(), &order))
+        .expect("renumber");
+    assert_eq!(std::fs::read_to_string(&broken).expect("read"), "{1}");
+    // No rank keeps the orphan above a ranked row.
+    assert_eq!(
+        names(&t.list_sessions().expect("list")),
+        ["web-old", "web-a", orphan.as_str()]
     );
 }
 
