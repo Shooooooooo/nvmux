@@ -63,6 +63,12 @@ const AHEAD: &[u8] = b"\x1b]9999;ahead\x07";
 /// Overrides [`AHEAD_FOR`], in milliseconds.
 const CHILD_AHEAD_MS: &str = "NVMUX_TEST_RELAY_AHEAD_MS";
 
+/// Child writes [`BEGUN`] once its fresh client has started, then relays it
+/// only once the terminal has been resized.
+const CHILD_LATE: &str = "NVMUX_TEST_RELAY_LATE";
+
+const BEGUN: &[u8] = b"\x1b]9999;begun\x07";
+
 /// Label announced on attach and each resume, as a switch would (a card; see
 /// [`nvmux::card`]). Unset, nothing is announced.
 const CHILD_LABEL: &str = "NVMUX_TEST_RELAY_LABEL";
@@ -218,6 +224,9 @@ fn relay_child() {
     } else {
         nvmux::pty::spawn(&id, Path::new(&sock), &label).expect("attach")
     };
+    if std::env::var_os(CHILD_LATE).is_some() {
+        wait_for_a_resize();
+    }
     let post = std::env::var(CHILD_POST)
         .ok()
         .and_then(|to| match to.strip_prefix("buf:") {
@@ -459,6 +468,19 @@ fn numbered_relays(
     }
 }
 
+/// The [`CHILD_LATE`] child's wait, with no relay and so no `SIGWINCH`
+/// handler.
+fn wait_for_a_resize() {
+    let started = nvmux::term::terminal_size();
+    let mut out = std::io::stdout();
+    let _ = out.write_all(BEGUN);
+    let _ = out.flush();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while nvmux::term::terminal_size() == started && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Start a client ahead as `main` does, pool it for [`AHEAD_FOR`] (or
 /// [`CHILD_AHEAD_MS`]), and take it back unrelayed with its probe answered (a
 /// local server answers well within that). nvmux's own client if `own`.
@@ -527,6 +549,7 @@ struct Asks {
     in_band: bool,
     ahead: bool,
     ahead_ms: Option<u64>,
+    late: bool,
     parked_ms: Option<u64>,
     label: Option<&'static str>,
     fade_ms: Option<u64>,
@@ -615,6 +638,7 @@ impl Terminal {
             in_band,
             ahead,
             ahead_ms,
+            late,
             parked_ms,
             label,
             fade_ms,
@@ -660,6 +684,9 @@ impl Terminal {
         }
         if let Some(ms) = ahead_ms {
             cmd = cmd.env(CHILD_AHEAD_MS, ms.to_string());
+        }
+        if late {
+            cmd = cmd.env(CHILD_LATE, "1");
         }
         if let Some(ms) = parked_ms {
             cmd = cmd.env(CHILD_PARKED_MS, ms.to_string());
@@ -1474,17 +1501,7 @@ fn a_kept_clients_screen_comes_back(tag: &str, in_band: bool, fade: bool) {
             .resize(pty_process::Size::new(ROWS, narrower))
             .expect("resize the terminal");
     });
-    let width = || {
-        nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
-            .and_then(|mut c| c.call("nvim_list_uis", vec![]))
-            .ok()
-            .and_then(|uis| {
-                let ui = uis.as_array()?.first()?.as_map()?.clone();
-                ui.iter()
-                    .find(|(k, _)| k.as_str() == Some("width"))
-                    .and_then(|(_, v)| v.as_u64())
-            })
-    };
+    let width = || ui_dimension(&sock, "width");
     assert!(
         common::wait_until(Duration::from_secs(5), || width()
             == Some(u64::from(narrower))),
@@ -2036,6 +2053,96 @@ fn a_client_started_ahead_is_dissolved_in_at_the_size_of_its_first_visit() {
         row_on_resized_screen(&term.output, at, rows, rows - 2)
     );
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// Under the attaching screen, the probe's round trip or a switch's fade, no
+/// relay acts on a resize. A fresh client left at the size it started at
+/// keeps the session there until the next resize, and its screen is cut
+/// short (nvmux's own client) or scrolled up (Neovim's).
+fn a_fresh_client_takes_the_size_its_relay_finds(tag: &str, own: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(
+            &common::unique(tag),
+            &common::launch_with("--clean"),
+            common::anywhere(),
+        )
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let marker = "the first line, on the first row";
+    nvmux::rpc::Client::connect(&sock, Duration::from_secs(3))
+        .expect("connect")
+        .command(&format!(
+            "setlocal noswapfile | call setline(1, '{marker}')"
+        ))
+        .expect("setline");
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: true,
+            late: true,
+            own,
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, BEGUN).is_some()),
+        "the child never started its client; it wrote: {}",
+        term.since(0)
+    );
+    let rows = ROWS - 10;
+    let at = term.output.len();
+    term.pty
+        .resize(pty_process::Size::new(rows, COLS))
+        .expect("resize the terminal");
+    let height = || ui_dimension(&sock, "height");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while height() != Some(u64::from(rows)) && Instant::now() < deadline {
+        term.pump_until(Duration::from_millis(100), |_| false);
+    }
+    assert_eq!(
+        height(),
+        Some(u64::from(rows)),
+        "the session does not have the client at the terminal's new height; the child wrote: {}",
+        term.since(at)
+    );
+    let fits = |out: &[u8]| {
+        row_on_resized_screen(out, at, rows, 0).contains(marker)
+            && row_on_resized_screen(out, at, rows, rows - 2).contains("[No Name]")
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(5), fits),
+        "the screen is not drawn for {rows} rows: the first says {:?}, the one above the last {:?}",
+        row_on_resized_screen(&term.output, at, rows, 0),
+        row_on_resized_screen(&term.output, at, rows, rows - 2)
+    );
+    assert_eq!(detach(&mut term), Some(0), "the child did not detach");
+}
+
+/// The `height` or `width` of the first UI the session at `sock` lists.
+fn ui_dimension(sock: &Path, which: &str) -> Option<u64> {
+    let uis = nvmux::rpc::Client::connect(sock, Duration::from_secs(3))
+        .and_then(|mut c| c.call("nvim_list_uis", vec![]))
+        .ok()?;
+    let ui = uis.as_array()?.first()?.as_map()?;
+    ui.iter()
+        .find(|(k, _)| k.as_str() == Some(which))
+        .and_then(|(_, v)| v.as_u64())
+}
+
+#[test]
+fn a_fresh_client_takes_the_size_its_relay_finds_under_neovims_client() {
+    a_fresh_client_takes_the_size_its_relay_finds("late-size", false);
+}
+
+#[test]
+fn a_fresh_client_takes_the_size_its_relay_finds_under_its_own_client() {
+    a_fresh_client_takes_the_size_its_relay_finds("late-size-own", true);
 }
 
 fn messages(sock: &Path) -> String {
