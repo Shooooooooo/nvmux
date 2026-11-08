@@ -127,6 +127,29 @@ const SWITCHED: &[u8] = b"\x1b]9999;switched\x07";
 /// to the other session on `<prefix> 1` instead (see [`numbered_relays`]).
 const CHILD_NUMBERED: &str = "NVMUX_TEST_RELAY_NUMBERED";
 
+/// After a detach, the child reads its input as the shell would, up to
+/// [`SHELL_END`], and says what came before it (see [`read_as_the_shell`]).
+const CHILD_SHELL: &str = "NVMUX_TEST_RELAY_SHELL";
+
+/// Written once the shell has the terminal.
+const SHELL: &[u8] = b"\x1b]9999;shell\x07";
+
+/// Typed for the shell once everything the child wrote has been answered.
+const SHELL_END: &[u8] = b"<<end>>";
+
+/// What the shell read before [`SHELL_END`], in hex, up to a BEL.
+const LEFT: &[u8] = b"\x1b]9999;left;";
+
+/// A name the child draws and carries into the relay, as the picker leaves
+/// one for the session it attaches (see [`nvmux::handoff`]).
+const CHILD_NAME: &str = "NVMUX_TEST_RELAY_NAME";
+
+/// Where the child draws [`CHILD_NAME`]: below what the test harness prints.
+const NAME_AT: (u16, u16) = (20, 30);
+
+/// A name for [`CHILD_NAME`] that nothing else puts on the screen.
+const NAME: &str = "left-by-the-picker";
+
 /// Pty size for a [`Terminal`] unless its [`Asks`] give one; tests must agree
 /// with the child on which row is the last (the hint bar's).
 const ROWS: u16 = 40;
@@ -227,6 +250,14 @@ fn relay_child() {
     if std::env::var_os(CHILD_LATE).is_some() {
         wait_for_a_resize();
     }
+    if let Ok(name) = std::env::var(CHILD_NAME) {
+        let (row, col) = NAME_AT;
+        let hand_off = nvmux::handoff::HandOff::new(&name, row, col, COLS - col).expect("a name");
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&hand_off.show());
+        let _ = out.flush();
+        attachment.carry_name(hand_off);
+    }
     let post = std::env::var(CHILD_POST)
         .ok()
         .and_then(|to| match to.strip_prefix("buf:") {
@@ -305,7 +336,12 @@ fn relay_child() {
     let mut carry = nvmux::pty::Carry::default();
     let code = loop {
         match nvmux::pty::relay(attachment, 0, &mut carry, &mut landing) {
-            Ok((nvmux::pty::Outcome::Detached, _)) => break 0,
+            Ok((nvmux::pty::Outcome::Detached, _)) => {
+                if std::env::var_os(CHILD_SHELL).is_some() {
+                    read_as_the_shell();
+                }
+                break 0;
+            }
             // Instead of the picker: park, wait, take back.
             Ok((nvmux::pty::Outcome::ToPicker, held)) if keep => {
                 assert!(pool.set_aside(held).is_none(), "the client was not parked");
@@ -443,7 +479,12 @@ fn numbered_relays(
     let mut begin = |_: nvmux::pty::Target| None::<nvmux::card::Card>;
     loop {
         match nvmux::pty::relay(attachment, 12, &mut carry, &mut begin) {
-            Ok((nvmux::pty::Outcome::Detached, _)) => return 0,
+            Ok((nvmux::pty::Outcome::Detached, _)) => {
+                if std::env::var_os(CHILD_SHELL).is_some() {
+                    read_as_the_shell();
+                }
+                return 0;
+            }
             Ok((nvmux::pty::Outcome::Switch(nvmux::pty::Target::Number(1)), _left)) => {
                 attachment = if own {
                     let exe = Path::new(env!("CARGO_BIN_EXE_nvmux"));
@@ -479,6 +520,29 @@ fn wait_for_a_resize() {
     while nvmux::term::terminal_size() == started && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// The [`CHILD_SHELL`] child's part once the relay has given the terminal
+/// back: read input up to [`SHELL_END`] in raw mode, as a line editor does,
+/// and write what came before it after [`LEFT`].
+fn read_as_the_shell() {
+    let _raw = nvmux::term::RawMode::enter().expect("raw mode");
+    let mut out = std::io::stdout();
+    let _ = out.write_all(SHELL);
+    let _ = out.flush();
+    let mut read = Vec::new();
+    let mut buf = [0u8; 1024];
+    let mut stdin = std::io::stdin().lock();
+    while !read.ends_with(SHELL_END) {
+        match stdin.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => read.extend_from_slice(&buf[..n]),
+        }
+    }
+    let before = read.strip_suffix(SHELL_END).unwrap_or(&read);
+    let hex: String = before.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = out.write_all(&[LEFT, hex.as_bytes(), b"\x07"].concat());
+    let _ = out.flush();
 }
 
 /// Start a client ahead as `main` does, pool it for [`AHEAD_FOR`] (or
@@ -536,6 +600,8 @@ struct Terminal {
     output: Vec<u8>,
     /// How far `output` was scanned for queries.
     answered: usize,
+    /// Read output without answering it, until [`Terminal::answer_to`].
+    withholding: bool,
     incoming: mpsc::Receiver<Vec<u8>>,
 }
 
@@ -564,6 +630,8 @@ struct Asks {
     numbered: bool,
     /// Rows and columns, if not [`ROWS`] by [`COLS`].
     size: Option<(u16, u16)>,
+    shell: bool,
+    name: Option<&'static str>,
 }
 
 impl Terminal {
@@ -651,6 +719,8 @@ impl Terminal {
             other,
             numbered,
             size,
+            shell,
+            name,
         } = asks;
         let (pty, pts) = pty_process::blocking::open().expect("open a pty");
         let (rows, cols) = size.unwrap_or((ROWS, COLS));
@@ -718,6 +788,12 @@ impl Terminal {
         if numbered {
             cmd = cmd.env(CHILD_NUMBERED, "1");
         }
+        if shell {
+            cmd = cmd.env(CHILD_SHELL, "1");
+        }
+        if let Some(name) = name {
+            cmd = cmd.env(CHILD_NAME, name);
+        }
         // Moves the slave in, or the master never sees EOF after the child
         // exits.
         let child = cmd.spawn(pts).expect("spawn relay child");
@@ -746,6 +822,7 @@ impl Terminal {
             pty,
             output: Vec::new(),
             answered: 0,
+            withholding: false,
             incoming,
         }
     }
@@ -765,7 +842,9 @@ impl Terminal {
             match self.incoming.recv_timeout(left) {
                 Ok(bytes) => {
                     self.output.extend_from_slice(&bytes);
-                    self.answer();
+                    if !self.withholding {
+                        self.answer();
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return done(&self.output),
@@ -776,6 +855,11 @@ impl Terminal {
     /// Answer new queries. One may straddle two reads, so the scan backs up a
     /// little and counts only matches ending past the last scan.
     fn answer(&mut self) {
+        self.answer_to(self.output.len());
+    }
+
+    /// Answer the queries that end in `output` by `end`, in the order asked.
+    fn answer_to(&mut self, end: usize) {
         let asks = [
             (KITTY_QUERY, KITTY_REPLY),
             (DA1, DA1_REPLY),
@@ -789,7 +873,7 @@ impl Terminal {
             .map(|(query, _)| query.len())
             .max()
             .unwrap_or(0);
-        let from = self.answered.saturating_sub(longest);
+        let from = self.answered.saturating_sub(longest).min(end);
         let mut replies = Vec::new();
         for (query, reply) in asks {
             if query == KITTY_QUERY && self.protocol == Protocol::Xterm {
@@ -799,7 +883,7 @@ impl Terminal {
                 continue;
             }
             let mut at = from;
-            while let Some(i) = find(&self.output[at..], query).map(|i| at + i) {
+            while let Some(i) = find(&self.output[at..end], query).map(|i| at + i) {
                 if i + query.len() > self.answered {
                     replies.push((i, reply));
                 }
@@ -811,7 +895,7 @@ impl Terminal {
         for (_, reply) in replies {
             self.reply(reply);
         }
-        self.answered = self.output.len();
+        self.answered = self.answered.max(end);
     }
 
     /// Reply unless the child exited: it does not wait for replies to what it
@@ -872,13 +956,7 @@ impl Terminal {
 
     /// What the child wrote after `mark`, for a failure message.
     fn since(&self, mark: usize) -> String {
-        let tail = &self.output[mark.min(self.output.len())..];
-        tail.iter()
-            .map(|&b| match b {
-                0x20..=0x7e => (b as char).to_string(),
-                _ => format!("\\x{b:02x}"),
-            })
-            .collect()
+        escaped(&self.output[mark.min(self.output.len())..])
     }
 }
 
@@ -893,6 +971,16 @@ impl Drop for Terminal {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn escaped(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x20..=0x7e => (b as char).to_string(),
+            _ => format!("\\x{b:02x}"),
+        })
+        .collect()
 }
 
 /// Flags of the client's kitty push `CSI > flags u`, if sent. Neovim 0.10 and
@@ -1816,6 +1904,209 @@ fn a_client_started_ahead_negotiates_on_its_first_visit_through_the_pty() {
 #[test]
 fn a_client_started_ahead_is_dissolved_in_on_its_first_visit() {
     a_client_started_ahead_negotiates_on_its_first_visit("ahead-fade", true);
+}
+
+/// A detach read with a fresh client's startup, as one typed during an attach
+/// or a switch is: the shell must find no answer from the terminal in its
+/// input, nor the name the picker left. The keys wait while the client is
+/// started ahead, so the relay reads them in its first pass: with the fade,
+/// the startup is still in its hold; without, it has just reached the
+/// terminal, whose answers come after the detach.
+fn a_detach_at_a_clients_startup_leaves_the_shell_nothing(tag: &str, own: bool, fade: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            shadow: fade,
+            keep: true,
+            ahead: true,
+            own,
+            shell: true,
+            // The picker leaves a name only with the fade.
+            name: fade.then_some(NAME),
+            ..Asks::default()
+        },
+    );
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, AHEAD).is_some()),
+        "the child never started its client; it wrote: {}",
+        term.since(0)
+    );
+    term.type_bytes(&[nvmux::keys::PREFIX, b'd']);
+    // Everything asked before this is answered by the time it is seen.
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, SHELL).is_some()),
+        "the relay never gave the terminal back; the child wrote: {}",
+        term.since(0)
+    );
+    term.type_bytes(SHELL_END);
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the child did not detach; it wrote: {}",
+        term.since(0)
+    );
+    let left = left_for_the_shell(&term.output).expect("the shell said what it read");
+    assert!(
+        left.is_empty(),
+        "the shell read {} before what was typed for it",
+        escaped(&left)
+    );
+    if fade {
+        // Its questions went with the paint, not asked and then waited on.
+        assert!(
+            find(&term.output, KITTY_QUERY).is_none(),
+            "the held paint's questions reached the terminal: {}",
+            term.since(0)
+        );
+    }
+    let rows = screen_rows(&term.output);
+    assert!(
+        !rows.iter().any(|row| row.contains(NAME)),
+        "the picker's name was left for the shell: {rows:#?}"
+    );
+}
+
+#[test]
+fn a_detach_during_the_held_first_paint_leaves_the_shell_nothing_under_neovims_client() {
+    a_detach_at_a_clients_startup_leaves_the_shell_nothing("held-detach", false, true);
+}
+
+#[test]
+fn a_detach_during_the_held_first_paint_leaves_the_shell_nothing_under_its_own_client() {
+    a_detach_at_a_clients_startup_leaves_the_shell_nothing("held-detach-own", true, true);
+}
+
+#[test]
+fn a_detach_before_the_terminal_answers_leaves_the_shell_nothing_under_neovims_client() {
+    a_detach_at_a_clients_startup_leaves_the_shell_nothing("unheld-detach", false, false);
+}
+
+#[test]
+fn a_detach_before_the_terminal_answers_leaves_the_shell_nothing_under_its_own_client() {
+    a_detach_at_a_clients_startup_leaves_the_shell_nothing("unheld-detach-own", true, false);
+}
+
+/// Clients ask more once their DA1s are answered: Neovim 0.12.6 asks
+/// XTGETTCAP `Ms` on a DA1 answer without 52, and its TUI sets focus
+/// reports 100 ms in, which Ghostty answers at once. A terminal some way off
+/// answers those after a detach typed meanwhile, which found no DA1 to wait
+/// for. Here each DA1 is answered as it comes, with what was asked before
+/// it; what comes after the last is answered only after the detach, well
+/// within a second of being asked.
+fn a_detach_waits_for_what_a_client_asked_after_its_last_da1(tag: &str, own: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let t = scratch.transport();
+    let session = t
+        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .expect("create");
+    let sock = t.local_socket_for(&session).expect("socket path");
+    let mut term = Terminal::spawn_child(
+        &sock,
+        &session.id,
+        Protocol::Kitty,
+        Asks {
+            own,
+            shell: true,
+            ..Asks::default()
+        },
+    );
+    term.withholding = true;
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, DA1).is_some()),
+        "the client never started; the child wrote: {}",
+        term.since(0)
+    );
+    let mut last = 0;
+    let mut quiet = Instant::now();
+    while quiet.elapsed() < Duration::from_millis(200) {
+        last = rfind(&term.output, DA1).expect("a DA1") + DA1.len();
+        term.answer_to(last);
+        let before = term.output.len();
+        if term.pump_until(Duration::from_millis(20), |out| out.len() > before) {
+            quiet = Instant::now();
+        }
+    }
+    let asked = &term.output[last..];
+    // nvmux's own client sets focus reports before its DA1, and before 0.12
+    // the server's XTGETTCAP never reached a UI's terminal.
+    let asks_nothing_late =
+        own && nvmux::nvim::local_version().is_some_and(|v| (v.major, v.minor) < (0, 12));
+    assert!(
+        find(asked, b"\x1bP+q").is_some() || find(asked, FOCUS_ON).is_some() || asks_nothing_late,
+        "the client asked nothing after its last DA1: {}",
+        term.since(last)
+    );
+    let detached = term.output.len();
+    term.type_bytes(&[nvmux::keys::PREFIX, b'd']);
+    // The DA1 nvmux asks if it waits for answers.
+    let settling = |out: &[u8]| find(&out[detached..], DA1).map(|at| detached + at);
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            settling(out).is_some() || find(&out[detached..], SHELL).is_some()
+        }),
+        "the relay did not detach; the child wrote: {}",
+        term.since(detached)
+    );
+    if let Some(at) = settling(&term.output) {
+        term.answer_to(at);
+        term.pump_until(Duration::from_millis(150), |_| false);
+    }
+    term.withholding = false;
+    term.answer();
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| find(&out[detached..], SHELL)
+            .is_some()),
+        "the relay never gave the terminal back; the child wrote: {}",
+        term.since(detached)
+    );
+    term.type_bytes(SHELL_END);
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the child did not detach; it wrote: {}",
+        term.since(detached)
+    );
+    let left = left_for_the_shell(&term.output).expect("the shell said what it read");
+    assert!(
+        left.is_empty(),
+        "the shell read {} before what was typed for it",
+        escaped(&left)
+    );
+}
+
+#[test]
+fn a_detach_waits_for_what_a_client_asked_after_its_last_da1_under_neovims_client() {
+    a_detach_waits_for_what_a_client_asked_after_its_last_da1("asked-late", false);
+}
+
+#[test]
+fn a_detach_waits_for_what_a_client_asked_after_its_last_da1_under_its_own_client() {
+    a_detach_waits_for_what_a_client_asked_after_its_last_da1("asked-late-own", true);
+}
+
+fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|w| w == needle)
+}
+
+/// What a [`CHILD_SHELL`] child read before [`SHELL_END`].
+fn left_for_the_shell(out: &[u8]) -> Option<Vec<u8>> {
+    let at = find(out, LEFT)? + LEFT.len();
+    let len = out[at..].iter().position(|&b| b == 0x07)?;
+    out[at..at + len]
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
 }
 
 /// The relay reports "painted" once, only after the screen reached the
@@ -3244,10 +3535,12 @@ fn keys_read_with_the_floating_picker_s_key_do_not_follow_its_switch() {
     assert_eq!(detach(&mut term), Some(0), "the child did not detach");
 }
 
-/// Two sessions of three lines each, and a [`CHILD_NUMBERED`] child relaying
-/// the first, its client started (nvmux's own if `own`). The scratch keeps
-/// the sessions alive.
-fn numbered(tag: &str, own: bool) -> (Scratch, Terminal, std::path::PathBuf, std::path::PathBuf) {
+/// A session and its socket.
+type Opened = (nvmux::session::Session, std::path::PathBuf);
+
+/// Two sessions of three lines each, for a [`CHILD_NUMBERED`] child to
+/// relay the first of. The scratch keeps them alive.
+fn two_sessions(tag: &str) -> (Scratch, Opened, Opened) {
     let scratch = Scratch::new(tag);
     let t = scratch.transport();
     let session = |name: &str| {
@@ -3266,8 +3559,16 @@ fn numbered(tag: &str, own: bool) -> (Scratch, Terminal, std::path::PathBuf, std
             .expect("setline");
         (session, sock)
     };
-    let (a, a_sock) = session(&format!("{tag}-from"));
-    let (b, b_sock) = session(&format!("{tag}-to"));
+    let a = session(&format!("{tag}-from"));
+    let b = session(&format!("{tag}-to"));
+    (scratch, a, b)
+}
+
+/// Two sessions of three lines each, and a [`CHILD_NUMBERED`] child relaying
+/// the first, its client started (nvmux's own if `own`). The scratch keeps
+/// the sessions alive.
+fn numbered(tag: &str, own: bool) -> (Scratch, Terminal, std::path::PathBuf, std::path::PathBuf) {
+    let (scratch, (a, a_sock), (b, b_sock)) = two_sessions(tag);
     let mut term = Terminal::spawn_child(
         &a_sock,
         &a.id,
@@ -3401,6 +3702,129 @@ fn prefix_ends_a_number(tag: &str, own: bool) {
     for sock in [&a_sock, &b_sock] {
         assert_eq!(cursor_line(sock), Some(1), "a session was sent keys");
     }
+}
+
+/// Terminals answer in order, so the answers to a client switched away from
+/// come before the next client's. Taken for the next client's, they paid
+/// off its requests, and a detach there left its own answers to the shell.
+/// The first client's answers come once the startup of the last of
+/// `switches` clients switched to has gone out: `before_the_detach`, or
+/// after it, each batch in a read of its own.
+fn a_detach_waits_for_answers_owed_from_before_a_switch(
+    tag: &str,
+    own: bool,
+    switches: usize,
+    before_the_detach: bool,
+) {
+    require_nvim!();
+    let (_scratch, (a, a_sock), (b, b_sock)) = two_sessions(tag);
+    let mut term = Terminal::spawn_child(
+        &a_sock,
+        &a.id,
+        Protocol::Kitty,
+        Asks {
+            other: Some((b.id, b_sock)),
+            numbered: true,
+            own,
+            shell: true,
+            ..Asks::default()
+        },
+    );
+    term.withholding = true;
+    assert!(
+        term.pump_until(Duration::from_secs(15), |out| find(out, DA1).is_some()),
+        "the client never started; the child wrote: {}",
+        term.since(0)
+    );
+    // The rest of its startup.
+    term.pump_until(Duration::from_millis(500), |_| false);
+    let mut batches = Vec::new();
+    // A prefix after the number ends it and waits in the relay switched to.
+    let mut keys = &[nvmux::keys::PREFIX, b'1', nvmux::keys::PREFIX][..];
+    for _ in 0..switches {
+        let mark = term.output.len();
+        for key in keys {
+            term.type_bytes(&[*key]);
+            term.pump_until(Duration::from_millis(150), |_| false);
+        }
+        keys = &keys[1..];
+        let switched = switched_after(&mut term, mark);
+        assert!(
+            term.pump_until(Duration::from_secs(15), |out| find(&out[switched..], DA1)
+                .is_some()),
+            "the next client never started; the child wrote: {}",
+            term.since(switched)
+        );
+        term.pump_until(Duration::from_millis(500), |_| false);
+        batches.push(switched);
+    }
+    if before_the_detach {
+        for end in std::mem::take(&mut batches) {
+            term.answer_to(end);
+            term.pump_until(Duration::from_millis(500), |_| false);
+        }
+    }
+    let detached = term.output.len();
+    term.type_bytes(b"d");
+    // The DA1 nvmux asks if it waits for answers.
+    let settling = |out: &[u8]| find(&out[detached..], DA1).map(|at| detached + at);
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| {
+            settling(out).is_some() || find(&out[detached..], SHELL).is_some()
+        }),
+        "the relay did not detach; the child wrote: {}",
+        term.since(detached)
+    );
+    batches.extend(settling(&term.output));
+    for end in batches {
+        term.answer_to(end);
+        term.pump_until(Duration::from_millis(150), |_| false);
+    }
+    term.withholding = false;
+    term.answer();
+    assert!(
+        term.pump_until(Duration::from_secs(10), |out| find(&out[detached..], SHELL)
+            .is_some()),
+        "the relay never gave the terminal back; the child wrote: {}",
+        term.since(detached)
+    );
+    term.type_bytes(SHELL_END);
+    assert_eq!(
+        term.exit_code(Duration::from_secs(10)),
+        Some(0),
+        "the child did not detach; it wrote: {}",
+        term.since(detached)
+    );
+    let left = left_for_the_shell(&term.output).expect("the shell said what it read");
+    assert!(
+        left.is_empty(),
+        "the shell read {} before what was typed for it",
+        escaped(&left)
+    );
+}
+
+#[test]
+fn answers_owed_from_before_a_switch_are_not_the_next_clients() {
+    a_detach_waits_for_answers_owed_from_before_a_switch("owed-switch", false, 1, true);
+}
+
+#[test]
+fn answers_owed_from_before_a_switch_are_not_the_next_clients_under_its_own_client() {
+    a_detach_waits_for_answers_owed_from_before_a_switch("owed-switch-own", true, 1, true);
+}
+
+/// The relay in between passes on what it was left, not only what its own
+/// client asked.
+#[test]
+fn answers_owed_from_before_two_switches_are_not_the_last_clients() {
+    a_detach_waits_for_answers_owed_from_before_a_switch("owed-switches", false, 2, true);
+}
+
+/// Taken for the next client's, they ended the wait before its last answer
+/// and nvmux's own came.
+#[test]
+fn answers_owed_from_before_a_switch_are_waited_for_too() {
+    a_detach_waits_for_answers_owed_from_before_a_switch("owed-switch-late", false, 1, false);
 }
 
 /// A terminal whose frames are several times what a pty holds (about 14 KB

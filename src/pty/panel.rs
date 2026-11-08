@@ -1021,6 +1021,7 @@ fn tell_the_client(a: &mut Attachment) {
 fn hold(a: &mut Attachment, chunk: &[u8], held: &mut Vec<u8>, boundary: &mut Boundary) {
     a.ledger_saw(chunk);
     a.shadow_saw(chunk);
+    a.unanswered.sent(chunk);
     held.extend(boundary.relay_whole(chunk));
 }
 
