@@ -232,7 +232,7 @@ pub(crate) fn create(
         let written = match writing {
             Ok(thread) => thread
                 .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                .unwrap_or_else(|panic| crate::panics::resume(panic)),
             Err(_) => h.write_meta(&session),
         };
         (local, reached, written)
