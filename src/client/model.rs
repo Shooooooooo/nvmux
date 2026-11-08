@@ -175,6 +175,8 @@ pub struct Changes {
     pub mouse: bool,
     /// The server is exiting with this status.
     pub exit: Option<i64>,
+    /// [`Event::Restart`] came.
+    pub restart: bool,
 }
 
 /// [`Highlights::ids`] entry for a Neovim id not yet defined.
@@ -730,6 +732,7 @@ impl Model {
                 | Event::SetTitle(_)
                 | Event::UiSend(_)
                 | Event::ErrorExit(_)
+                | Event::Restart
                 | Event::Flush
         );
         if !cells_alone {
@@ -983,6 +986,7 @@ impl Model {
             }
             Event::UiSend(bytes) => changes.sent.push(bytes),
             Event::ErrorExit(status) => changes.exit = Some(status),
+            Event::Restart => changes.restart = true,
             Event::Flush => {}
         }
     }

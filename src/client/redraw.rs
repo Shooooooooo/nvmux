@@ -136,6 +136,11 @@ pub enum Event {
     UiSend(Vec<u8>),
     /// The server is exiting with this status.
     ErrorExit(i64),
+    /// `:restart`: a new server took over this one's `--listen` address, and
+    /// this one quits next, unless it cannot, which undoes the restart. The
+    /// address it gives is not needed: the client's own socket reaches the
+    /// new server (see `super::run`).
+    Restart,
 }
 
 /// Where `win_float_pos` puts a float.
@@ -669,12 +674,13 @@ fn event(name: &str, a: &[ValueRef<'_>]) -> Option<Option<Event>> {
         "set_title" => Event::SetTitle(as_str(a.first()?)?.to_string()),
         "ui_send" => Event::UiSend(bytes(a.first()?)?.to_vec()),
         "error_exit" => Event::ErrorExit(int(a.first()?)?),
+        "restart" => Event::Restart,
         // Known and ignored: the terminal has nowhere for an icon title;
         // directories, menus and screenshots are a GUI's; `suspend` has no
-        // shell to return to (see `pty::check_child`); `connect` and `restart`
-        // would leave the session nvmux chose; `win_extmark` and
-        // `win_external_pos` answer requests this client never makes.
-        "set_icon" | "chdir" | "update_menu" | "screenshot" | "suspend" | "connect" | "restart"
+        // shell to return to (see `pty::check_child`); `connect` would leave
+        // the session nvmux chose; `win_extmark` and `win_external_pos`
+        // answer requests this client never makes.
+        "set_icon" | "chdir" | "update_menu" | "screenshot" | "suspend" | "connect"
         | "win_extmark" | "win_external_pos" => return Some(None),
         _ => return None,
     }))

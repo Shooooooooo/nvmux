@@ -1710,6 +1710,8 @@ pub struct App {
     say: Vec<u8>,
     /// The server said it is exiting.
     done: bool,
+    /// The server said a `:restart` replaced it ([`App::restarting`]).
+    restart: bool,
     predict: Option<Predictor>,
     /// The latest ack, for the frame it preceded: the sequence number of the
     /// last key it covers, and the ack ([`App::heard_ack`]).
@@ -1827,6 +1829,7 @@ impl App {
             away: false,
             say: Vec::new(),
             done: false,
+            restart: false,
             predict: predict.then(Predictor::default),
             ack: None,
             passed: None,
@@ -2884,6 +2887,55 @@ impl App {
         }
     }
 
+    /// Whether to follow a `:restart` once the connection closes. An exit or
+    /// detach told after it means the old server could not quit, which undid
+    /// the restart. Counts what is not yet flushed: `:detach` sends
+    /// `error_exit` without a `flush`, as 0.12.0 does `restart`.
+    fn restarting(&self) -> bool {
+        let told = self.batch.iter().fold(self.restart, |told, e| match e {
+            Event::Restart => true,
+            Event::ErrorExit(_) => false,
+            _ => told,
+        });
+        told && !self.done
+    }
+
+    /// Attaches afresh, on a new connection, to the server a `:restart`
+    /// started: forgets the old server, what was asked of it and what was
+    /// queued for it. Settings, the terminal's state and nvmux's cards stay.
+    fn restarted(&mut self) {
+        self.reset();
+        self.outbox = Outbox::default();
+        self.asked.clear();
+        self.asked_at.clear();
+        self.attach = Attach::Asking;
+        self.chan = None;
+        self.checking = false;
+        self.recheck = false;
+        self.recheck_at = None;
+        self.refresh = false;
+        self.agent = false;
+        self.bufs.clear();
+        self.switched.clear();
+        self.pointed = (0, 0, 0);
+        self.flushed_since = false;
+        self.remaking = false;
+        self.restart = false;
+        self.lefts.clear();
+        self.measuring = false;
+        self.narrowed.clear();
+        self.cut.clear();
+        self.unanswered.clear();
+        self.wants.clear();
+        self.unapplied = false;
+        self.ahead_since = None;
+        self.looked.clear();
+        if let Some(partial) = self.partial.as_mut() {
+            *partial = Partial::default();
+        }
+        self.start();
+    }
+
     /// Applies every complete batch received so far.
     fn take_flushes(&mut self, now: Instant) {
         while let Some(end) = self.batch.iter().position(|e| *e == Event::Flush) {
@@ -2974,6 +3026,10 @@ impl App {
             self.say
                 .extend_from_slice(term::mouse(want.0, want.1 && want.0));
             self.mouse = want;
+        }
+        if changes.restart {
+            tracing::info!("client: the server is restarting");
+            self.restart = true;
         }
         if let Some(status) = changes.exit {
             tracing::info!(status, "client: the server says it is exiting");
@@ -6012,9 +6068,7 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let effects = Effects::from_settings(&settings);
     let term = palette_from_env().unwrap_or(FALLBACK);
 
-    let mut stream =
-        UnixStream::connect(sock).with_context(|| format!("connecting to {}", sock.display()))?;
-    stream.set_nonblocking(true)?;
+    let mut stream = connect(sock).with_context(|| format!("connecting to {}", sock.display()))?;
 
     let _raw = term::Raw::enter()?;
     let hangup = term::Hangup::install()?;
@@ -6086,7 +6140,32 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         if n > 0 && fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
             match inbox.fill(&mut stream) {
                 Ok(true) => {}
-                Ok(false) => break Ok(()),
+                Ok(false) => {
+                    // Frames read with the end would be dropped, and a
+                    // `restart` may be among them.
+                    while let Ok(Some(frame)) = inbox.take_frame() {
+                        app.message(frame, now);
+                    }
+                    if !app.restarting() {
+                        break Ok(());
+                    }
+                    // Neovim gives the new server the old one's `--listen`
+                    // address and has it listening before the old one quits,
+                    // so the same socket (or ssh forward) reaches it.
+                    match connect(sock) {
+                        Ok(next) => {
+                            tracing::info!("client: attaching to the restarted server");
+                            stream = next;
+                            inbox = Inbox::default();
+                            app.restarted();
+                            continue 'session;
+                        }
+                        Err(e) => {
+                            tracing::info!(error = %e, "client: no server after the restart");
+                            break Ok(());
+                        }
+                    }
+                }
                 Err(e) => break Err(anyhow::Error::from(e).context("reading from the session")),
             }
             loop {
@@ -6146,6 +6225,12 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     }
     let _ = crate::term::write_stdout(term::CLOSING);
     outcome
+}
+
+fn connect(sock: &Path) -> std::io::Result<UnixStream> {
+    let stream = UnixStream::connect(sock)?;
+    stream.set_nonblocking(true)?;
+    Ok(stream)
 }
 
 /// How long an exiting client waits for Neovim to process its last requests
@@ -6381,12 +6466,18 @@ mod tests {
     }
 
     /// One `redraw` notification of the events given, a `flush` at its end.
-    fn redraw(app: &mut App, events: Vec<(&str, Vec<Value>)>, now: Instant) {
-        let mut batches: Vec<Value> = events
+    fn redraw(app: &mut App, mut events: Vec<(&str, Vec<Value>)>, now: Instant) {
+        events.push(("flush", vec![]));
+        unflushed(app, events, now);
+    }
+
+    /// One `redraw` notification of the events given alone, as Neovim sends
+    /// `error_exit`, and 0.12.0 `restart`.
+    fn unflushed(app: &mut App, events: Vec<(&str, Vec<Value>)>, now: Instant) {
+        let batches = events
             .into_iter()
             .map(|(name, args)| Value::Array(vec![name.into(), Value::Array(args)]))
             .collect();
-        batches.push(Value::Array(vec!["flush".into(), Value::Array(vec![])]));
         let v = Value::Array(vec![2.into(), "redraw".into(), Value::Array(batches)]);
         app.message(&encoded(v), now);
     }
@@ -7779,6 +7870,80 @@ mod tests {
         let mut a = app(false);
         a.start();
         assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(false));
+    }
+
+    fn restart() -> (&'static str, Vec<Value>) {
+        ("restart", vec!["/tmp/nvmux-0/abcdefgh.sock".into()])
+    }
+
+    /// An `error_exit` after `restart` (a `:detach` or `:cquit`) means the
+    /// old server could not quit and the restart was undone.
+    #[test]
+    fn a_restart_is_followed_unless_the_server_exits_or_detaches_after() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        assert!(!a.restarting());
+        redraw(&mut a, vec![restart()], t0);
+        assert!(a.restarting());
+        unflushed(&mut a, vec![("error_exit", vec![0.into()])], t0);
+        assert!(!a.restarting(), "a detach after an undone restart");
+
+        let mut a = attached(false, t0);
+        unflushed(&mut a, vec![restart()], t0);
+        assert!(a.restarting(), "0.12.0's, unflushed");
+
+        let mut a = attached(false, t0);
+        redraw(&mut a, vec![restart()], t0);
+        redraw(&mut a, vec![("error_exit", vec![1.into()])], t0);
+        assert!(!a.restarting(), "`:cquit` after an undone restart");
+    }
+
+    /// Nothing of the old server's carries over: what was queued for it, its
+    /// editor, the agent it ran, the channel it gave the client (on the new
+    /// server, another client's). What nvmux told the client does.
+    #[test]
+    fn a_restarted_client_attaches_afresh_and_stays_put_aside() {
+        use crate::card::Command::Away;
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        redraw(&mut a, vec![line(1, 0, "old")], t0);
+        a.frame(t0);
+        told(&mut a, &Away, t0);
+        a.keys(b"j", t0);
+        redraw(&mut a, vec![restart()], t0);
+
+        a.restarted();
+        assert!(!a.restarting());
+        assert!(a.model.grids.is_empty(), "the old editor forgotten");
+        assert!(a.away, "still put aside");
+        let sent = calls(&mut a);
+        assert!(
+            !sent.iter().any(|(_, m, _)| m == "nvim_input"),
+            "a key queued for the old server sent to the new: {sent:?}"
+        );
+        let mine = sent
+            .iter()
+            .find(|(id, ..)| *id == Some(asks_uis(&sent)))
+            .and_then(|(_, _, args)| args.get(1)?.as_array()?.first()?.as_i64());
+        assert_eq!(mine, Some(-1), "the old channel left out of the UIs");
+        answer(
+            &mut a,
+            request(&sent, "nvim_get_api_info", ""),
+            Value::Array(vec![9.into()]),
+            t0,
+        );
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        let sent = calls(&mut a);
+        assert_eq!(attached_with_multigrid(&sent), Some(true));
+        let agent = sent.iter().find(|(_, m, args)| {
+            m == "nvim_exec_lua"
+                && args
+                    .first()
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.starts_with(AGENT_LUA))
+        });
+        let chan = agent.and_then(|(_, _, args)| args.get(1)?.as_array()?.first()?.as_u64());
+        assert_eq!(chan, Some(9), "the agent installed for the new channel");
     }
 
     /// Only cells changed since the other UI saw them arrive; refreshed like
