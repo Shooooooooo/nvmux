@@ -42,7 +42,7 @@ use crate::rpc;
 
 /// Watcher version. A session with any other version gets this watcher,
 /// keeping its record.
-pub const VERSION: i64 = 9;
+pub const VERSION: i64 = 10;
 
 /// Picker read interval.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -329,7 +329,7 @@ function N.snapshot()
       busy = p
     end
   end
-  local out = { v = N.version }
+  local out = { v = N.version, seq = N.seq }
   if busy then
     out.busy = { title = busy.title, text = busy.text, percent = busy.percent, age = now - busy.at }
   end
@@ -366,10 +366,10 @@ return N.snapshot()
 "#;
 
 /// Returns the record map, or `false` if the watcher is missing or another
-/// version. Keys, each present only when set: `busy` (latest-started progress
-/// or LSP work: `title`, `text`, `percent`, `age` in seconds); `note` (`kind`
-/// `notify` or `failed`) and `finished`, both with `title`, `body`, `age`,
-/// `seq`, `shown`, `buf`, `tab`.
+/// version. Keys: `seq`, the last number given; and, each present only when
+/// set, `busy` (latest-started progress or LSP work: `title`, `text`,
+/// `percent`, `age` in seconds), `note` (`kind` `notify` or `failed`) and
+/// `finished`, both with `title`, `body`, `age`, `seq`, `shown`, `buf`, `tab`.
 ///
 /// With a listener channel ([`listen`]) it registers it and reports whether it
 /// already was (`listening`).
@@ -484,9 +484,13 @@ pub struct News {
 /// Result of [`hear`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Heard {
-    /// Kept news, oldest first (up to two), and whether the named listener
-    /// was already registered (it is now).
-    Said { news: Vec<News>, listening: bool },
+    /// Kept news, oldest first (up to two), whether the named listener was
+    /// already registered (it is now), and the last number the watcher gave.
+    Said {
+        news: Vec<News>,
+        listening: bool,
+        numbered: u64,
+    },
     /// No answer now; nothing was left queued in the session.
     Unknown,
     /// Refused or reset: nothing listens on its socket, or on macOS its
@@ -510,6 +514,7 @@ pub fn hear(sock: &Path, listener: Option<u64>) -> Heard {
             news: news_of(&v),
             listening: listener.is_some()
                 && field(&v, "listening").and_then(Value::as_bool) == Some(true),
+            numbered: field(&v, "seq").and_then(number).unwrap_or(0),
         },
         Ok(None) => Heard::Unknown,
         Err(e) if e.is_definitely_dead() => Heard::Gone,

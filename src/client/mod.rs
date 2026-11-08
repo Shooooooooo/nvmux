@@ -321,9 +321,15 @@ end)
 au('WinClosed', {}, function(ev)
   send('closed', tonumber(ev.match))
 end)
-au('OptionSet', { pattern = { 'laststatus', 'splitright', 'splitbelow' } }, function()
+local function options()
   send('options', vim.o.laststatus, vim.o.splitright, vim.o.splitbelow)
-end)
+end
+au('OptionSet', { pattern = { 'laststatus', 'splitright', 'splitbelow' } }, options)
+-- Settings made as Neovim starts fire no OptionSet, and a server :restart
+-- started takes the client's requests before the user's config.
+if vim.v.vim_did_enter == 0 then
+  au('VimEnter', { once = true }, options)
+end
 au('UILeave', {}, function()
   if vim.v.event.chan == chan then
     leave()
@@ -6124,14 +6130,12 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut buf = vec![0u8; 64 * 1024];
 
-    let outcome = 'session: loop {
+    let outcome = loop {
         app.tick(Instant::now());
         if app.take_refresh() {
             refresh(sock, app.size());
         }
-        if let Err(e) = app.outbox.send(&mut stream) {
-            break Err(anyhow::Error::from(e).context("writing to the session"));
-        }
+        let unsent = send(&mut app, &mut stream);
         let said = app.take_said();
         if !said.is_empty() {
             if let Err(e) = crate::term::write_stdout(&said) {
@@ -6142,7 +6146,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         let timeout = app.wake_at(now).map_or(-1, |at| {
             at.saturating_duration_since(now).as_micros().div_ceil(1000) as libc::c_int
         });
-        let sock_events = if app.outbox.is_empty() {
+        // After a failed write the socket can poll writable yet take nothing,
+        // so the next write waits for something else to wake the loop.
+        let sock_events = if app.outbox.is_empty() || unsent.is_some() {
             libc::POLLIN
         } else {
             libc::POLLIN | libc::POLLOUT
@@ -6175,46 +6181,25 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             app.resized(term::size());
         }
         if n > 0 && fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            match inbox.fill(&mut stream) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Frames read with the end would be dropped, and a
-                    // `restart` may be among them.
-                    while let Ok(Some(frame)) = inbox.take_frame() {
-                        app.message(frame, now);
+            match read(&mut app, &mut inbox, &mut stream, unsent, now) {
+                None => {}
+                Some(Ended::Leave(outcome)) => break outcome,
+                // Neovim gives the new server the old one's `--listen`
+                // address and has it listening before the old one quits, so
+                // the same socket (or ssh forward) reaches it.
+                Some(Ended::Restart) => match connect(sock) {
+                    Ok(next) => {
+                        tracing::info!("client: attaching to the restarted server");
+                        stream = next;
+                        inbox = Inbox::default();
+                        app.restarted();
+                        continue;
                     }
-                    if !app.restarting() {
+                    Err(e) => {
+                        tracing::info!(error = %e, "client: no server after the restart");
                         break Ok(());
                     }
-                    // Neovim gives the new server the old one's `--listen`
-                    // address and has it listening before the old one quits,
-                    // so the same socket (or ssh forward) reaches it.
-                    match connect(sock) {
-                        Ok(next) => {
-                            tracing::info!("client: attaching to the restarted server");
-                            stream = next;
-                            inbox = Inbox::default();
-                            app.restarted();
-                            continue 'session;
-                        }
-                        Err(e) => {
-                            tracing::info!(error = %e, "client: no server after the restart");
-                            break Ok(());
-                        }
-                    }
-                }
-                Err(e) => break Err(anyhow::Error::from(e).context("reading from the session")),
-            }
-            loop {
-                match inbox.take_frame() {
-                    Ok(Some(frame)) => app.message(frame, now),
-                    Ok(None) => break,
-                    Err(e) => {
-                        break 'session Err(
-                            anyhow::Error::from(e).context("reading from the session")
-                        );
-                    }
-                }
+                },
             }
         }
         if n > 0 && crate::pty::ready(&fds[0]) {
@@ -6231,10 +6216,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         }
         // Send keys before composing the frame they may have predicted,
         // which would otherwise delay them about a millisecond each on an
-        // already slow link.
-        if let Err(e) = app.outbox.send(&mut stream) {
-            break Err(anyhow::Error::from(e).context("writing to the session"));
-        }
+        // already slow link. A failed write is tried again, and kept, at the
+        // top of the loop.
+        let _ = send(&mut app, &mut stream);
         if app.due(now) {
             // Empty when nothing changed and nothing was queued (see
             // `Screen::draw_into`).
@@ -6262,6 +6246,63 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     }
     let _ = crate::term::write_stdout(term::CLOSING);
     outcome
+}
+
+/// What follows the end of the connection to the server.
+#[derive(Debug)]
+enum Ended {
+    /// Attach to the server a `:restart` started.
+    Restart,
+    /// End the client with this.
+    Leave(anyhow::Result<()>),
+}
+
+/// Sends what `app` queued; the error if a write failed. A failed write does
+/// not end the client: the server has gone or is going, and the `restart` it
+/// sent first may still be unread, so the read of the end decides ([`read`]).
+fn send(app: &mut App, stream: &mut UnixStream) -> Option<anyhow::Error> {
+    let e = app.outbox.send(stream).err()?;
+    Some(anyhow::Error::from(e).context("writing to the session"))
+}
+
+/// Reads what the server sent into `app`: `None` while the connection lasts,
+/// else what follows its end. A failed read is an end as EOF is, since Linux
+/// resets the connection of a server that quits with keys unread. Frames
+/// read with the end count: the `restart` may be among them. Without one,
+/// `unsent`, a write that failed first, is the client's outcome.
+fn read(
+    app: &mut App,
+    inbox: &mut Inbox,
+    stream: &mut impl Read,
+    unsent: Option<anyhow::Error>,
+    now: Instant,
+) -> Option<Ended> {
+    let end = match inbox.fill(stream) {
+        Ok(true) => None,
+        Ok(false) => Some(Ok(())),
+        Err(e) => Some(Err(
+            anyhow::Error::from(e).context("reading from the session")
+        )),
+    };
+    loop {
+        match inbox.take_frame() {
+            Ok(Some(frame)) => app.message(frame, now),
+            Ok(None) => break,
+            // At the end, the frames before a bad one still decide.
+            Err(_) if end.is_some() => break,
+            Err(e) => {
+                return Some(Ended::Leave(Err(
+                    anyhow::Error::from(e).context("reading from the session")
+                )));
+            }
+        }
+    }
+    let end = end?;
+    Some(if app.restarting() {
+        Ended::Restart
+    } else {
+        Ended::Leave(unsent.map_or(end, Err))
+    })
 }
 
 fn connect(sock: &Path) -> std::io::Result<UnixStream> {
@@ -6511,12 +6552,20 @@ mod tests {
     /// One `redraw` notification of the events given alone, as Neovim sends
     /// `error_exit`, and 0.12.0 `restart`.
     fn unflushed(app: &mut App, events: Vec<(&str, Vec<Value>)>, now: Instant) {
+        app.message(&redraws(events), now);
+    }
+
+    /// The bytes of one `redraw` notification of `events`.
+    fn redraws(events: Vec<(&str, Vec<Value>)>) -> Vec<u8> {
         let batches = events
             .into_iter()
             .map(|(name, args)| Value::Array(vec![name.into(), Value::Array(args)]))
             .collect();
-        let v = Value::Array(vec![2.into(), "redraw".into(), Value::Array(batches)]);
-        app.message(&encoded(v), now);
+        encoded(Value::Array(vec![
+            2.into(),
+            "redraw".into(),
+            Value::Array(batches),
+        ]))
     }
 
     /// Calls sent since last asked, as `(id, method, args)`; notifications
@@ -8001,6 +8050,105 @@ mod tests {
         });
         let chan = agent.and_then(|(_, _, args)| args.get(1)?.as_array()?.first()?.as_u64());
         assert_eq!(chan, Some(9), "the agent installed for the new channel");
+    }
+
+    /// The old server's last redraw, with a `restart` if `due`.
+    fn last_redraw(due: bool) -> Vec<u8> {
+        let mut events = vec![("flush", vec![])];
+        if due {
+            events.insert(0, restart());
+        }
+        redraws(events)
+    }
+
+    fn io_kind(e: &anyhow::Error) -> Option<std::io::ErrorKind> {
+        e.downcast_ref::<std::io::Error>().map(std::io::Error::kind)
+    }
+
+    /// Keys come as a `:restart` runs, and the old server quits with them
+    /// unread: Linux then fails the read after its last redraw with
+    /// ECONNRESET, before EOF.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reset_connection_follows_a_restart_or_ends_the_client() {
+        use std::io::Write;
+        for due in [true, false] {
+            let t0 = Instant::now();
+            let mut a = attached(false, t0);
+            let (mut near, mut far) = UnixStream::pair().expect("a socket pair");
+            near.write_all(b"j")
+                .expect("a key the server leaves unread");
+            far.write_all(&last_redraw(due)).expect("the last redraw");
+            drop(far);
+            near.set_nonblocking(true).expect("non-blocking");
+            let mut inbox = Inbox::default();
+            assert!(read(&mut a, &mut inbox, &mut near, None, t0).is_none());
+            match read(&mut a, &mut inbox, &mut near, None, t0) {
+                Some(Ended::Restart) => assert!(due, "followed a restart never sent"),
+                Some(Ended::Leave(Err(e))) => {
+                    assert!(!due, "the restart was not followed: {e:#}");
+                    assert_eq!(io_kind(&e), Some(std::io::ErrorKind::ConnectionReset));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A first read that fills the buffer it is given with `frames`, padded
+    /// with fixints (frames of a byte, which the client ignores), and a
+    /// second that fails.
+    struct Reset(Option<Vec<u8>>);
+
+    impl Read for Reset {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let frames = self.0.take().ok_or(std::io::ErrorKind::ConnectionReset)?;
+            buf.fill(0);
+            buf[..frames.len()].copy_from_slice(&frames);
+            Ok(buf.len())
+        }
+    }
+
+    /// The inbox reads on after a full read, so a fill that ends in a failed
+    /// read can bring the `restart` with it.
+    #[test]
+    fn a_restart_read_with_the_end_is_followed() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut inbox = Inbox::default();
+        let mut conn = Reset(Some(last_redraw(true)));
+        assert!(matches!(
+            read(&mut a, &mut inbox, &mut conn, None, t0),
+            Some(Ended::Restart)
+        ));
+    }
+
+    /// A key typed as the old server goes fails its write, maybe before the
+    /// client has read the `restart`.
+    #[test]
+    fn a_failed_write_leaves_the_end_to_the_read() {
+        use std::io::Write;
+        for due in [true, false] {
+            let t0 = Instant::now();
+            let mut a = attached(false, t0);
+            let (mut near, mut far) = UnixStream::pair().expect("a socket pair");
+            far.write_all(&last_redraw(due)).expect("the last redraw");
+            drop(far);
+            near.set_nonblocking(true).expect("non-blocking");
+            a.keys(b"j", t0);
+            let unsent = send(&mut a, &mut near);
+            assert!(unsent.is_some(), "the key was written");
+            let mut inbox = Inbox::default();
+            assert!(read(&mut a, &mut inbox, &mut near, unsent, t0).is_none());
+            let unsent = send(&mut a, &mut near);
+            match read(&mut a, &mut inbox, &mut near, unsent, t0) {
+                Some(Ended::Restart) => assert!(due, "followed a restart never sent"),
+                Some(Ended::Leave(Err(e))) => {
+                    assert!(!due, "the restart was not followed: {e:#}");
+                    assert_eq!(io_kind(&e), Some(std::io::ErrorKind::BrokenPipe));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     /// Only cells changed since the other UI saw them arrive; refreshed like

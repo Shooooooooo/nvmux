@@ -37,6 +37,10 @@ const DA1_REPLY_OSC52: &[u8] = b"\x1b[?62;22;52c";
 /// The kitty keyboard query and "supported, no flags set".
 const KITTY_QUERY: &[u8] = b"\x1b[?u";
 const KITTY_REPLY: &[u8] = b"\x1b[?0u";
+/// A status report request and "OK". Neovim 0.12 starting with a UI attached
+/// waits 100 ms for it, then warns (E1568).
+const DSR: &[u8] = b"\x1b[5n";
+const DSR_REPLY: &[u8] = b"\x1b[0n";
 
 struct Terminal {
     child: std::process::Child,
@@ -298,6 +302,16 @@ impl Terminal {
         cells
     }
 
+    /// Whether the client has not exited; reaps it if it has.
+    fn running(&mut self) -> bool {
+        if self.exited.is_none() {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exited = Some(common::exit_code(status));
+            }
+        }
+        self.exited.is_none()
+    }
+
     /// SIGHUP the client, as nvmux retires one; returns its exit code.
     fn hang_up(&mut self) -> Option<u32> {
         self.signal(Signal::SIGHUP)
@@ -393,9 +407,22 @@ fn session(
     nvmux::rpc::Client<std::os::unix::net::UnixStream>,
     PathBuf,
 ) {
+    session_launched(scratch, tag, &common::launch())
+}
+
+/// [`session`], started with `launch`.
+fn session_launched(
+    scratch: &Scratch,
+    tag: &str,
+    launch: &nvmux::launch::Launch,
+) -> (
+    PathBuf,
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    PathBuf,
+) {
     let t = scratch.transport();
     let session = t
-        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .create_session(&common::unique(tag), launch, common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
     let rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(5)).expect("connect");
@@ -594,6 +621,334 @@ fn an_undone_restart_leaves_the_client_where_it_was() {
         Vec::<bool>::new(),
         "no UI came back"
     );
+}
+
+/// The write fails as it does once a quitting server has gone, but before
+/// the client has read its `restart`. A stand-in server, as Neovim makes
+/// that order rare.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_key_that_cannot_be_sent_leaves_the_restart_to_be_followed() {
+    let scratch = Scratch::new("client-unsent");
+    let (mut term, listener, mut server) = unsent(&scratch);
+    let restart = Value::Array(vec![
+        2.into(),
+        "redraw".into(),
+        Value::Array(vec![
+            Value::Array(vec!["restart".into(), Value::Array(vec!["x".into()])]),
+            Value::Array(vec!["flush".into(), Value::Array(Vec::new())]),
+        ]),
+    ]);
+    let mut frame = Vec::new();
+    rmpv::encode::write_value(&mut frame, &restart).expect("encode the restart");
+    server.write_all(&frame).expect("send the restart");
+    drop(server);
+    // Held: the client ends once a connection closes under it.
+    let next = connection(&mut term, &listener);
+    assert!(
+        next.is_some(),
+        "the client did not connect again; exit {:?}",
+        term.exited
+    );
+    assert!(term.running(), "the client ended: {:?}", term.exited);
+}
+
+/// With no `restart` sent, the write's error is the client's exit.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_key_that_cannot_be_sent_ends_the_client_with_its_server() {
+    let scratch = Scratch::new("client-unsent-end");
+    let (mut term, _listener, server) = unsent(&scratch);
+    drop(server);
+    assert_eq!(term.exit_within(Duration::from_secs(5)), Some(1));
+}
+
+/// A client whose stand-in server has stopped reading, failing the key
+/// typed next; checks it then waits rather than spins, as its socket still
+/// polls writable. macOS would drop the write instead of failing it.
+#[cfg(target_os = "linux")]
+fn unsent(
+    scratch: &Scratch,
+) -> (
+    Terminal,
+    std::os::unix::net::UnixListener,
+    std::os::unix::net::UnixStream,
+) {
+    std::fs::create_dir_all(&scratch.0).expect("create the scratch");
+    let sock = scratch.0.join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the socket");
+    listener
+        .set_nonblocking(true)
+        .expect("a non-blocking listener");
+    let config = scratch.0.join("config.toml");
+    std::fs::write(&config, "").expect("write the config");
+    let mut term = Terminal::spawn(&sock, &config);
+    let Some(mut server) = connection(&mut term, &listener) else {
+        panic!("the client never connected; exit {:?}", term.exited);
+    };
+    // Read the client's start, which it sends in one write: left unread, it
+    // would have the close reset the connection, and the client end on that
+    // read rather than on the failed write.
+    server
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("a read timeout");
+    let mut buf = vec![0u8; 64 * 1024];
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && matches!(server.read(&mut buf), Ok(1..)) {}
+    server
+        .shutdown(std::net::Shutdown::Read)
+        .expect("stop reading");
+    let before = cpu_time(term.child.id());
+    term.type_bytes(b"j");
+    term.pump_until(Duration::from_secs(1), |_| false);
+    assert!(
+        term.running(),
+        "the write ended the client: {:?}",
+        term.exited
+    );
+    let spent = cpu_time(term.child.id()) - before;
+    assert!(
+        spent < Duration::from_millis(250),
+        "the client spun for {spent:?} of the second after the failed write"
+    );
+    (term, listener, server)
+}
+
+/// The client's next connection to `listener`, a non-blocking one, unless it
+/// exits first or 5 s pass.
+#[cfg(target_os = "linux")]
+fn connection(
+    term: &mut Terminal,
+    listener: &std::os::unix::net::UnixListener,
+) -> Option<std::os::unix::net::UnixStream> {
+    let mut conn = None;
+    common::wait_until(Duration::from_secs(5), || {
+        term.pump_until(Duration::from_millis(20), |_| false);
+        conn = listener.accept().ok().map(|(conn, _)| conn);
+        conn.is_some() || !term.running()
+    });
+    conn
+}
+
+/// The user and system CPU time process `pid` has used.
+#[cfg(target_os = "linux")]
+fn cpu_time(pid: u32) -> Duration {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read the stat");
+    // utime and stime, fields 14 and 15; the name before them, field 2, is
+    // in parentheses and may hold spaces.
+    let (_, rest) = stat.rsplit_once(')').expect("a stat line");
+    let ticks: u64 = rest
+        .split_whitespace()
+        .skip(11)
+        .take(2)
+        .map(|n| n.parse::<u64>().expect("a tick count"))
+        .sum();
+    // SAFETY: sysconf takes no pointers.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    Duration::from_millis(ticks * 1000 / hz as u64)
+}
+
+/// [`session`] without ShaDa, which the restart's `:qall` would write the
+/// command line to, and with `init` as its config if given. A restarted
+/// server keeps both arguments.
+fn restartable(
+    scratch: &Scratch,
+    tag: &str,
+    init: Option<&str>,
+) -> (
+    PathBuf,
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    PathBuf,
+) {
+    let launch = match init {
+        Some(lua) => {
+            let path = scratch.0.join("init.lua");
+            // Makes the directory private, as the transport requires.
+            scratch.transport();
+            std::fs::write(&path, lua).expect("write the init file");
+            common::launch_with(&format!("-u {} -i NONE", path.display()))
+        }
+        None => common::launch_with("-i NONE"),
+    };
+    session_launched(scratch, tag, &launch)
+}
+
+/// Whether the screen's first line is `line`, wherever it is centred.
+fn first(screen: &str, line: &str) -> bool {
+    screen.lines().next().map(str::trim) == Some(line)
+}
+
+/// A client drawing the session, restarted by typing `restart` (`:restart`
+/// or `:restart!`), and a connection to the new server once the client draws
+/// it. The new server puts "after the restart" on its first line.
+fn restarted(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    sock: &Path,
+    config: &Path,
+    restart: &str,
+) -> (Terminal, nvmux::rpc::Client<std::os::unix::net::UnixStream>) {
+    let old = server_pid(sock).expect("the server's pid");
+    // Unmodified, or the restart's `:qall` refuses to quit.
+    rpc.command(
+        "setlocal noswapfile | call setline(1, 'before the restart') | setlocal nomodified",
+    )
+    .expect("setline");
+    let mut term = Terminal::spawn(sock, config).answering(DSR, DSR_REPLY);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| first(s, "before the restart")),
+        "the session was never drawn:\n{}",
+        term.text()
+    );
+    term.type_bytes(
+        format!(":{restart} setlocal noswapfile | call setline(1, 'after the restart')\r")
+            .as_bytes(),
+    );
+    let mut new = None;
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            // So the new server's `DSR` is answered in time.
+            term.pump_until(Duration::from_millis(20), |_| false);
+            new = server_pid(sock).filter(|pid| *pid != old);
+            new.is_some()
+        }),
+        "no new server took the socket:\n{}",
+        term.text()
+    );
+    // The scratch stops sessions by their recorded pid.
+    let json = sock.with_extension("json");
+    let mut meta = common::read_meta(&json);
+    meta["pid"] = serde_json::json!(new);
+    common::write_meta(&json, &meta);
+
+    let rpc = nvmux::rpc::Client::connect(sock, Duration::from_secs(5)).expect("connect");
+    let shown = term.pump_until(Duration::from_secs(15), |s| first(s, "after the restart"));
+    assert!(term.running(), "the client left with the old server");
+    assert!(
+        shown,
+        "the restarted session was never drawn:\n{}",
+        term.text()
+    );
+    (term, rpc)
+}
+
+/// Hangs up `term`'s client once it settles, and checks that a fresh one
+/// draws the same screen.
+fn drawn_as_afresh(
+    mut term: Terminal,
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    sock: &Path,
+    config: &Path,
+) {
+    assert!(settle(
+        &mut term,
+        Duration::from_millis(400),
+        Duration::from_secs(10)
+    ));
+    let (drawn, text) = (term.cells(), term.text());
+    assert_eq!(term.hang_up(), Some(0));
+    assert!(
+        common::wait_until(Duration::from_secs(5), || rpc.list_uis().ok() == Some(0)),
+        "the client stayed attached"
+    );
+
+    let mut fresh = Terminal::spawn(sock, config);
+    assert!(
+        fresh.pump_until(Duration::from_secs(15), |s| first(s, "after the restart")),
+        "never drawn afresh:\n{}",
+        fresh.text()
+    );
+    assert!(settle(
+        &mut fresh,
+        Duration::from_millis(400),
+        Duration::from_secs(10)
+    ));
+    assert!(
+        drawn == fresh.cells(),
+        "the client's screen:\n{text}\nis not a fresh one's:\n{}",
+        fresh.text()
+    );
+}
+
+/// The row of the screen that is all `'laststatus'` 3's divider between
+/// windows one above another, if any.
+fn divider(screen: &vt100::Screen) -> Option<u16> {
+    (0..ROWS).find(|r| (0..COLS).all(|c| screen.cell(*r, c).is_some_and(|x| x.contents() == "─")))
+}
+
+/// A server `:restart` starts (0.12.1 on) takes the client's requests before
+/// running the user's config, whose settings fire no OptionSet as Neovim
+/// starts. With the config's `'laststatus'` 3, a window closed flies out
+/// behind the divider Neovim draws, not a blank status line.
+#[test]
+fn options_set_as_a_restarted_session_starts_reach_the_client() {
+    require_nvim!();
+    let scratch = Scratch::new("client-restart-ls");
+    let init = "vim.o.laststatus = 3";
+    let (sock, mut rpc, config) = restartable(&scratch, "client-restart-ls", Some(init));
+    if !restarts(&mut rpc) {
+        eprintln!("skipping: :restart needs Neovim 0.12");
+        return;
+    }
+    let (mut term, mut rpc) = restarted(&mut rpc, &sock, &config, "restart");
+    rpc.command("split").expect("split");
+    let row = rpc.eval("winheight(0)").expect("the height").as_u64();
+    let row = u16::try_from(row.expect("a number")).expect("on the screen");
+    assert!(
+        term.pump(Duration::from_secs(5), |t| divider(t.parser.screen())
+            == Some(row)),
+        "never split:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+
+    let from = term.output.len();
+    rpc.command("close").expect("close");
+    assert!(
+        term.pump(Duration::from_secs(5), |t| divider(t.parser.screen())
+            .is_none()),
+        "never closed:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+    let mut replay = vt100::Parser::new(ROWS, COLS, 0);
+    replay.process(&term.output[..from]);
+    let mut seen = Vec::new();
+    let mut at = from;
+    while let Some(i) = find(&term.output[at..], SYNC_END) {
+        replay.process(&term.output[at..at + i + SYNC_END.len()]);
+        at += i + SYNC_END.len();
+        seen.push(divider(replay.screen()));
+    }
+    assert!(
+        seen.iter().flatten().any(|r| *r < row),
+        "the divider did not fly out with the window: {seen:?}"
+    );
+}
+
+/// As [`options_set_as_a_restarted_session_starts_reach_the_client`], for a
+/// centring client's measure, which checks again after any window or buffer
+/// event. Here the config's buffer fires BufWinEnter, its wait runs that
+/// check, and Neovim, finding the buffer loaded, enters none as it starts:
+/// measured with `'laststatus'` 2, the global status line would be drawn as
+/// the centred window's own, narrowed with it.
+#[test]
+fn a_restarted_session_is_measured_once_it_has_started() {
+    require_nvim!();
+    let scratch = Scratch::new("client-restart-mid");
+    let init = "vim.cmd.enew()\nvim.wait(20)\nvim.o.laststatus = 3\n";
+    let (sock, mut rpc, config) = restartable(&scratch, "client-restart-mid", Some(init));
+    if !restarts(&mut rpc) {
+        eprintln!("skipping: :restart needs Neovim 0.12");
+        return;
+    }
+    std::fs::write(&config, "[client]\ncentre = \"fixed\"\nwindow_width = 40\n")
+        .expect("write the config");
+    // From 0.12.5 a restart without the bang restores a session, whose
+    // windows are measured anew.
+    let bang = rpc.eval("has('nvim-0.12.5')").ok().and_then(|v| v.as_i64()) == Some(1);
+    let restart = if bang { "restart!" } else { "restart" };
+    let (term, mut rpc) = restarted(&mut rpc, &sock, &config, restart);
+    drawn_as_afresh(term, &mut rpc, &sock, &config);
 }
 
 /// A card (`nvmux::card`), sent in the client's input, is drawn in the margin

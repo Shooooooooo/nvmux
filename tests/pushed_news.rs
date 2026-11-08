@@ -280,3 +280,76 @@ fn a_session_not_listened_to_is_read_as_ever() {
         "the card took {took:?}"
     );
 }
+
+/// `:restart` (Neovim 0.12) leaves a new server at the session's socket, so
+/// the listener stops and the watcher there, installed by the next read,
+/// numbers its news from 1 again. That news is still news.
+#[test]
+fn a_restarted_session_still_tells_its_news() {
+    require_nvim!();
+    let _turn = one_at_a_time();
+    let scratch = Scratch::new("push-restart");
+    let (front, front_sock) = a_session(&scratch, "front");
+    let (other, other_sock) = a_session(&scratch, "other");
+    // 0.12.0 restarts only for the UI that asks.
+    if lua(&other_sock, "return vim.fn.has('nvim-0.12.1') == 1") != rmpv::Value::Boolean(true) {
+        eprintln!("skipping: no :restart without a UI before Neovim 0.12.1");
+        return;
+    }
+    card::board().take();
+
+    let notifier = Notifier::start();
+    notifier.watch(&front.id, "front", front_sock.clone());
+    notifier.watch(&other.id, "other", other_sock.clone());
+    notifier.front(Some(&front.id));
+    // The first round only takes each session's news as heard.
+    let watched = |sock: &Path| {
+        lua(
+            sock,
+            "return pcall(vim.api.nvim_get_autocmds, { group = 'nvmux_notes' })",
+        ) == rmpv::Value::Boolean(true)
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || watched(&other_sock)),
+        "the first round never watched the session"
+    );
+    for code in [1, 2] {
+        let started = Instant::now();
+        a_job_that_exits(&other_sock, &format!("exit {code}"), false);
+        card_saying(&format!("sh: exited with code {code}"), started);
+    }
+
+    let pid = |sock: &Path| {
+        Client::connect(sock, Duration::from_secs(2))
+            .and_then(|mut c| c.eval("getpid()"))
+            .ok()
+            .and_then(|v| v.as_u64())
+    };
+    let old = pid(&other_sock).expect("the server's pid");
+    // Unanswered: the server quits. From 0.12.5 the bang saves no session,
+    // whose file only a UI's arrival would remove.
+    let _ = Client::connect(&other_sock, Duration::from_secs(2))
+        .and_then(|mut c| c.command("execute has('nvim-0.12.5') ? 'restart!' : 'restart'"));
+    let mut new = None;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            new = pid(&other_sock).filter(|p| *p != old);
+            new.is_some()
+        }),
+        "no new server took the socket"
+    );
+    // Killed with the scratch, as the old one would have been.
+    let json = other_sock.with_extension("json");
+    let mut meta = common::read_meta(&json);
+    meta["pid"] = serde_json::json!(new);
+    common::write_meta(&json, &meta);
+    // The watcher keeps nothing from before it is installed.
+    assert!(
+        wait_until(Duration::from_secs(10), || watched(&other_sock)),
+        "the new server was never watched"
+    );
+
+    let started = Instant::now();
+    a_job_that_exits(&other_sock, "exit 3", false);
+    card_saying("sh: exited with code 3", started);
+}

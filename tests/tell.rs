@@ -29,7 +29,8 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
         notes::hear(&sock, None),
         Heard::Said {
             news: Vec::new(),
-            listening: false
+            listening: false,
+            numbered: 0,
         },
         "given the watcher"
     );
@@ -50,7 +51,7 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
 
     let hidden = a_job_that_exits(&sock, "exit 3", false);
     let shown = a_job_that_exits(&sock, "exit 0", true);
-    let Heard::Said { news, .. } = notes::hear(&sock, None) else {
+    let Heard::Said { news, numbered, .. } = notes::hear(&sock, None) else {
         panic!("the session said nothing");
     };
     assert_eq!(
@@ -64,6 +65,7 @@ fn the_watcher_numbers_what_it_keeps_and_knows_where_its_terminal_is() {
         "{news:?}"
     );
     assert!(news[0].seq < news[1].seq, "{news:?}");
+    assert_eq!(numbered, news[1].seq, "the last number given");
 
     lua(
         &sock,
