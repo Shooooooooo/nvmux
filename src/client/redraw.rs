@@ -749,6 +749,8 @@ pub fn attrs(v: &ValueRef<'_>) -> Option<Attrs> {
             "foreground" => a.fg = colour(value),
             "background" => a.bg = colour(value),
             "special" => a.sp = colour(value),
+            "fg_indexed" => a.fg_indexed = on,
+            "bg_indexed" => a.bg_indexed = on,
             "reverse" | "standout" => a.reverse |= on,
             "bold" => a.bold = on,
             "italic" => a.italic = on,
@@ -1245,6 +1247,7 @@ mod tests {
             (Value::from("dim"), Value::from(true)),
             (Value::from("overline"), Value::from(true)),
             (Value::from("url"), Value::from("https://neovim.io")),
+            (Value::from("fg_indexed"), Value::from(true)),
         ]);
         let cterm = Value::Map(vec![(Value::from("foreground"), Value::from(10))]);
         let call = arr(vec![Value::from(59), rgb, cterm, arr(vec![])]);
@@ -1261,7 +1264,104 @@ mod tests {
         assert_eq!(rgb.blend, 30);
         assert!(rgb.dim && rgb.overline && !rgb.blink && !rgb.conceal);
         assert_eq!(rgb.url.as_deref(), Some("https://neovim.io"));
+        assert!(rgb.fg_indexed && !rgb.bg_indexed);
         assert_eq!(cterm.fg, Some(10));
+    }
+
+    /// Neovim's definitions for a `:terminal` printing `\e[31m`, `\e[41m`,
+    /// `\e[38;5;200m`, `\e[91m`, `\e[7;32m` and `\e[38;2;1;2;3m`: with
+    /// `'termguicolors'` each palette colour is an RGB guess flagged indexed,
+    /// which must not reach the terminal.
+    #[test]
+    fn a_terminals_palette_colours_are_written_as_indices() {
+        use crate::client::style::Colors;
+        use crate::palette::{Palette, Rgb};
+        let map = |pairs: Vec<(&str, Value)>| {
+            Value::Map(pairs.into_iter().map(|(k, v)| (k.into(), v)).collect())
+        };
+        let on = || Value::from(true);
+        // GUI form, cterm form, and the SGR with and without 'termguicolors'.
+        let defs = [
+            (
+                map(vec![("foreground", 0xe00000.into()), ("fg_indexed", on())]),
+                map(vec![("foreground", 1.into())]),
+                "\x1b[0;31m",
+                "\x1b[0;31m",
+            ),
+            (
+                map(vec![("background", 0xe00000.into()), ("bg_indexed", on())]),
+                map(vec![("background", 1.into())]),
+                "\x1b[0;41m",
+                "\x1b[0;41m",
+            ),
+            (
+                map(vec![("foreground", 0xff00cc.into()), ("fg_indexed", on())]),
+                map(vec![("foreground", 200.into())]),
+                "\x1b[0;38;5;200m",
+                "\x1b[0;38;5;200m",
+            ),
+            (
+                map(vec![("foreground", 0xff4040.into()), ("fg_indexed", on())]),
+                map(vec![("foreground", 9.into())]),
+                "\x1b[0;91m",
+                "\x1b[0;91m",
+            ),
+            (
+                map(vec![
+                    ("reverse", on()),
+                    ("foreground", 0x00e000.into()),
+                    ("fg_indexed", on()),
+                ]),
+                map(vec![("reverse", on()), ("foreground", 2.into())]),
+                "\x1b[0;7;32m",
+                "\x1b[0;7;32m",
+            ),
+            (
+                map(vec![("foreground", 0x010203.into())]),
+                map(vec![]),
+                "\x1b[0;38;2;1;2;3m",
+                "\x1b[0m",
+            ),
+        ];
+        let calls = defs
+            .iter()
+            .enumerate()
+            .map(|(i, (rgb, cterm, ..))| {
+                arr(vec![
+                    Value::from(59 + i),
+                    rgb.clone(),
+                    cterm.clone(),
+                    arr(vec![]),
+                ])
+            })
+            .collect();
+        let (out, dropped) = events(arr(vec![batch("hl_attr_define", calls)]));
+        assert_eq!((out.len(), dropped), (defs.len(), 0));
+        let written = |termguicolors: bool, rgb: &Attrs, cterm: &Attrs| {
+            let colors = Colors {
+                rgb: termguicolors,
+                defaults: DefaultColors::default(),
+                term: Palette {
+                    fg: Rgb(200, 200, 200),
+                    bg: Rgb(0, 0, 0),
+                    ansi: [Rgb(10, 20, 30); 16],
+                },
+            };
+            let mut out = Vec::new();
+            crate::client::screen::sgr(&mut out, &colors.style(rgb, cterm));
+            String::from_utf8(out).expect("ASCII")
+        };
+        for (event, (_, _, rgb_sgr, cterm_sgr)) in out.iter().zip(&defs) {
+            let Event::HlAttr { id, rgb, cterm } = event else {
+                panic!("{event:?}")
+            };
+            assert_eq!(written(true, rgb, cterm), *rgb_sgr, "highlight {id}");
+            assert_eq!(
+                written(false, rgb, cterm),
+                *cterm_sgr,
+                "highlight {id}, cterm"
+            );
+        }
     }
 
     /// `default_colors_set` sends cterm colours 1-based, with 0 for none.

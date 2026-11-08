@@ -722,6 +722,40 @@ fn a_client_draws_the_screen_a_fresh_one_does() {
     );
 }
 
+/// With `'termguicolors'` Neovim sends a `:terminal`'s palette colours as RGB
+/// guesses flagged indexed; the terminal must get the index, as from
+/// Neovim's own TUI, so that its theme applies.
+#[test]
+fn a_terminals_palette_colours_reach_the_terminal_as_indices() {
+    require_nvim!();
+    let scratch = Scratch::new("client-palette");
+    let (sock, mut rpc, config) = session(&scratch, "client-palette");
+    rpc.command(
+        "set termguicolors | terminal printf '\\033[31mRED\\033[0m \\033[44mBLUE\\033[0m \
+         \\033[93mYELLOW\\033[0m \\033[38;5;200mPINK\\033[0m \\033[38;2;1;2;3mTRUE\\033[0m'",
+    )
+    .expect("open a terminal");
+
+    let mut term = Terminal::spawn(&sock, &config);
+    let line = "RED BLUE YELLOW PINK TRUE";
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with(line)),
+        "the terminal's line was never drawn:\n{}",
+        term.text()
+    );
+    let screen = term.parser.screen();
+    let at = |word: &str| {
+        let col = line.find(word).expect("a word of the line");
+        screen.cell(0, col as u16).expect("on the screen")
+    };
+    use vt100::Color::{Idx, Rgb};
+    assert_eq!(at("RED").fgcolor(), Idx(1));
+    assert_eq!(at("BLUE").bgcolor(), Idx(4));
+    assert_eq!(at("YELLOW").fgcolor(), Idx(11));
+    assert_eq!(at("PINK").fgcolor(), Idx(200));
+    assert_eq!(at("TRUE").fgcolor(), Rgb(1, 2, 3), "a true colour");
+}
+
 #[test]
 fn reads_that_cut_a_character_in_two_draw_it_whole() {
     let written = "漢字 é ─ ab".as_bytes();
@@ -1306,6 +1340,27 @@ impl Trace {
             .collect()
     }
 
+    /// The keys the agent's last shape for window `win` lists as mapped
+    /// (`nvmux::client::predict::Shape::mapped`); `None` before one.
+    fn mapped(&self, win: u64) -> Option<Vec<String>> {
+        self.messages(true)
+            .into_iter()
+            .rev()
+            .find_map(|(_, _, v)| match notification(&v) {
+                Some(("nvmux_client", [kind, w, shape]))
+                    if kind.as_str() == Some("shape") && w.as_u64() == Some(win) =>
+                {
+                    let keys = shape.as_array()?.get(18)?.as_array()?;
+                    Some(
+                        keys.iter()
+                            .filter_map(|k| k.as_str().map(String::from))
+                            .collect(),
+                    )
+                }
+                _ => None,
+            })
+    }
+
     /// Acks not followed by a frame with their top, as (count, the ack's top,
     /// the next frame's top or `None` if another ack came first). An ack for
     /// the top the last frame showed needs none: Neovim flushes nothing when
@@ -1815,6 +1870,65 @@ fn the_agent_acks_each_key_neovim_takes() {
     // As many keys taken as the client sent.
     let to = (count(&link), link.trace.inputs());
     assert_eq!(to.0 - from.0, (to.1 - from.1) as u64);
+}
+
+/// Neovim's `nv_down` gives an unmapped `<CR>` another meaning in a
+/// quickfix or location list, a prompt buffer and the command-line window;
+/// not in a file's window.
+#[test]
+fn the_agent_counts_enter_as_mapped_where_it_is_no_motion() {
+    require_nvim!();
+    let scratch = Scratch::new("client-cr-mapped");
+    let (mut rpc, mut term, link) =
+        drawn_slowly_with(&scratch, "client-cr-mapped", SCROLLING, MOTIONS);
+    let entries = "[{'bufnr': bufnr(), 'lnum': 2}, {'bufnr': bufnr(), 'lnum': 5}]";
+    // The keys the current window's last shape lists, once it has one.
+    let mapped = |term: &mut Terminal,
+                  rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+                  name: &str| {
+        let win = rpc.eval("win_getid()").expect("the window");
+        let win = win.as_u64().expect("its id");
+        term.pump(Duration::from_secs(5), |_| link.trace.mapped(win).is_some());
+        let keys = link.trace.mapped(win);
+        keys.unwrap_or_else(|| panic!("{name}: no shape"))
+    };
+    for (name, command, listed) in [
+        ("a file", String::new(), false),
+        (
+            "a quickfix list",
+            format!("call setqflist({entries}) | copen"),
+            true,
+        ),
+        (
+            "a location list",
+            format!("cclose | call setloclist(0, {entries}) | lopen"),
+            true,
+        ),
+        (
+            "a prompt buffer",
+            "lclose | new | setlocal buftype=prompt".into(),
+            true,
+        ),
+    ] {
+        if !command.is_empty() {
+            rpc.command(&command).expect(name);
+        }
+        let keys = mapped(&mut term, &mut rpc, name);
+        assert_eq!(keys.iter().any(|k| k == "<CR>"), listed, "{name}: {keys:?}");
+    }
+    term.type_bytes(b"q:");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            rpc.eval("getcmdwintype()").ok() == Some(Value::from(":"))
+        }),
+        "no command-line window"
+    );
+    let keys = mapped(&mut term, &mut rpc, "the command-line window");
+    assert!(
+        keys.iter().any(|k| k == "<CR>"),
+        "the command-line window: {keys:?}"
+    );
 }
 
 /// Starting at the end of a short line, reached from column 40 of a long
@@ -2763,6 +2877,42 @@ fn a_motion_to_a_character_mapped_is_left_to_neovim() {
     term.pump_until(Duration::from_secs(2), |_| false);
     typed(&mut term, b"0");
     left_to_neovim(&mut term, "to, o taken for e", b"to");
+}
+
+/// `<CR>` opens the entry under the cursor in a quickfix list, and runs the
+/// line in the command-line window, rather than moving a line down.
+#[test]
+fn enter_is_left_to_neovim_where_it_is_no_motion() {
+    require_nvim!();
+    let scratch = Scratch::new("client-cr-unmoved");
+    let setline = format!(
+        "{SCROLLING} | call setqflist(map(range(1, 30, 3), \
+         {{_, l -> {{'bufnr': bufnr(), 'lnum': l}}}})) | copen"
+    );
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-cr-unmoved", &setline, MOTIONS);
+    predicted(&mut term, "j in the quickfix list", b"j");
+    left_to_neovim(&mut term, "<CR> in the quickfix list", b"\r");
+    term.type_bytes(b":let g:a = 1\r:let g:b = 2\rq:");
+    term.pump_until(Duration::from_secs(2), |_| false);
+    predicted(&mut term, "k in the command-line window", b"k");
+    left_to_neovim(&mut term, "<CR> in the command-line window", b"\r");
+}
+
+/// Scrolls alone never follow `<CR>`, so the agent lists it as mapped in a
+/// quickfix list only with acks: listed, it would leave this scroll to
+/// Neovim. No ruler: the client does not draw the one in the window's status
+/// line.
+#[test]
+fn a_scroll_after_enter_in_a_quickfix_list_shows_at_once_with_scrolls_only() {
+    require_nvim!();
+    let scratch = Scratch::new("client-cr-scrolls");
+    let setline = format!(
+        "set noruler | {SCROLLING} | call setqflist(map(range(1, 30, 3), \
+         {{_, l -> {{'bufnr': bufnr(), 'lnum': l}}}})) | copen"
+    );
+    let (_rpc, mut term, _) = drawn_slowly(&scratch, "client-cr-scrolls", &setline);
+    typed(&mut term, b"\r");
+    predicted(&mut term, "<C-e> in the entry's window", b"\x05");
 }
 
 /// With `'number'` and `'relativenumber'`: the gutter must match too.
@@ -4790,6 +4940,36 @@ fn predicted_rows_wear_the_colours_neovim_gives_them() {
     step(&mut term, "<C-b> back over it", b"\x02");
 }
 
+/// Neovim draws the comments by index; the rows a scroll uncovers must too,
+/// or they change colour when Neovim's land.
+#[test]
+fn predicted_rows_draw_a_group_flagged_indexed_by_its_index() {
+    require_nvim!();
+    let scratch = Scratch::new("client-flagged");
+    let (_rpc, mut term, _) = drawn_slowly(
+        &scratch,
+        "client-flagged",
+        "call setline(1, map(range(1, 600), \
+         '\"local v\" . v:val . \" = \" . v:val . \" -- line \" . v:val')) | \
+         set termguicolors | lua vim.api.nvim_set_hl(0, 'Comment', \
+         { fg = '#808080', ctermfg = 8, fg_indexed = true, \
+           bg = '#2c2c2c', ctermbg = 236, bg_indexed = true }) vim.treesitter.start(0, 'lua')",
+    );
+    let drawn = ahead(&mut term, "<C-f>", b"\x06");
+    let predicted = colours_of(&drawn);
+    let indices = (vt100::Color::Idx(8), vt100::Color::Idx(236));
+    let grey = predicted
+        .iter()
+        .filter(|row| row.iter().any(|&(fg, bg, ..)| (fg, bg) == indices))
+        .count();
+    assert_eq!(grey, 22, "rows with a comment drawn by its indices");
+    let landed = last_frame(&mut term, 4 * SLOW);
+    assert_eq!(sight(&drawn), sight(&landed), "the text moved");
+    for (r, (p, l)) in predicted.iter().zip(&colours_of(&landed)).enumerate() {
+        assert_eq!(p, l, "row {r} changed colour when Neovim's landed");
+    }
+}
+
 /// With the default colorscheme's `'cursorline'` over syntax-coloured lines,
 /// a predicted line motion moves the bar and its number at once; no cell
 /// changes when Neovim's frame lands.
@@ -6293,6 +6473,42 @@ fn a_diagnostic_cut_at_the_grids_edge_runs_on_in_the_margin() {
         "left in the editor: {}",
         left(&mut rpc)
     );
+}
+
+/// End-of-line virtual text: Neovim draws the part in the grid by its index,
+/// and the client's part in the margin must match it.
+#[test]
+fn a_tail_in_a_group_flagged_indexed_runs_on_by_its_index() {
+    require_nvim!();
+    let scratch = Scratch::new("client-flagged-tail");
+    let (mut term, mut rpc, _) = wide(&scratch, "client-flagged-tail");
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.contains("the left window")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    rpc.command(
+        "lua vim.api.nvim_set_hl(0, 'Flagged', { fg = '#808080', ctermfg = 8, fg_indexed = true, \
+           bg = '#2c2c2c', ctermbg = 236, bg_indexed = true }) \
+         vim.api.nvim_buf_set_lines(0, 0, -1, false, { string.rep('x', 56) }) \
+         vim.api.nvim_buf_set_extmark(0, vim.api.nvim_create_namespace('test'), 0, 0, \
+           { virt_text = { { 'the end of the line', 'Flagged' } } })",
+    )
+    .expect("a tail");
+    let row = format!("{}{} the end of the line", " ".repeat(50), "x".repeat(56));
+    let laid = |s: &str| s.lines().next() == Some(row.as_str());
+    assert!(
+        term.pump_until(Duration::from_secs(5), laid),
+        "not in the margin:\n{}",
+        term.text()
+    );
+    // The grid ends at column 110: Neovim drew "the", the client the rest.
+    let screen = term.parser.screen();
+    for col in [107, 111, 125] {
+        let colours = screen.cell(0, col).map(|c| (c.fgcolor(), c.bgcolor()));
+        let indices = (vt100::Color::Idx(8), vt100::Color::Idx(236));
+        assert_eq!(colours, Some(indices), "column {col}");
+    }
 }
 
 /// With concealed text, a line ends left of where the editor computes it, so

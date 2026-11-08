@@ -193,7 +193,9 @@ pub struct ClientSettings {
     /// agent keeps, but never to reveal a line with virtual text or a sign.
     /// With `predict_scrolls`, scrolls and motions chain from each other.
     /// Line-changing motions in a window with a `'statuscolumn'` (as LazyVim
-    /// has) are left to Neovim.
+    /// has) are left to Neovim. `<CR>` is left to Neovim in a quickfix list,
+    /// the command-line window and a prompt buffer, which give it another
+    /// meaning.
     ///
     /// Costs (shared with `predict_typing`): ~40 bytes back per key for the
     /// cursor position; as the view moves, a few bytes per run of lines with

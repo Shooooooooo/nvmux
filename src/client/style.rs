@@ -2,9 +2,11 @@
 //!
 //! Neovim defines each highlight once (`hl_attr_define`) in GUI and cterm
 //! forms. As in Neovim's TUI, `'termguicolors'` picks RGB or the terminal's
-//! 256 colours. A colour set by neither the highlight nor
-//! `default_colors_set` is drawn as the terminal default, not a guess, so a
-//! transparent background stays transparent.
+//! 256 colours, and a colour flagged indexed (a `:terminal`'s palette colour,
+//! or a group set with `fg_indexed`), whose RGB only approximates its index,
+//! is drawn by index either way, so the terminal's theme applies. A colour set
+//! by neither the highlight nor `default_colors_set` is drawn as the terminal
+//! default, not a guess, so a transparent background stays transparent.
 //!
 //! Animations mix colours, so a [`Style`] can also be resolved to the RGB it
 //! looks like ([`Colors::visual_fg`], [`Colors::visual_bg`]) using the
@@ -12,7 +14,8 @@
 //!
 //! With `ext_multigrid` the client draws `'winblend'` itself;
 //! [`blend_over`] and [`blend_through`] follow Neovim's `hl_blend_attrs`
-//! (`highlight.c`) exactly.
+//! (`highlight.c`) exactly, but mix the terminal's own colours where Neovim
+//! mixes its guesses at them.
 
 use crate::palette::{Palette, Rgb};
 
@@ -34,6 +37,11 @@ pub struct Attrs {
     pub fg: Option<u32>,
     pub bg: Option<u32>,
     pub sp: Option<u32>,
+    /// GUI form only: `fg` approximates the cterm form's palette index (a
+    /// `:terminal`'s colour, or a group set with `fg_indexed`).
+    pub fg_indexed: bool,
+    /// `fg_indexed` for `bg`.
+    pub bg_indexed: bool,
     pub reverse: bool,
     pub bold: bool,
     pub italic: bool,
@@ -125,30 +133,37 @@ pub struct Colors {
 
 impl Colors {
     /// Resolve a highlight in the form `'termguicolors'` selects: its own
-    /// colours, else the editor's defaults, else the terminal's.
+    /// colours, else the editor's defaults, else the terminal's. A colour
+    /// flagged indexed comes from the cterm form either way, as in Neovim's
+    /// TUI.
     pub fn style(&self, rgb: &Attrs, cterm: &Attrs) -> Style {
         let d = &self.defaults;
+        let gui = |c: Option<u32>, dflt: Option<u32>| {
+            c.or(dflt)
+                .map_or(Color::Default, |n| Color::Rgb(self::rgb(n)))
+        };
+        let index = |c: Option<u32>, dflt: Option<u8>| {
+            c.and_then(|n| u8::try_from(n).ok())
+                .or(dflt)
+                .map_or(Color::Default, Color::Index)
+        };
         let (a, fg, bg, sp) = if self.rgb {
-            let pick = |c: Option<u32>, dflt: Option<u32>| {
-                c.or(dflt)
-                    .map_or(Color::Default, |n| Color::Rgb(self::rgb(n)))
+            let fg = if rgb.fg_indexed {
+                index(cterm.fg, d.cterm_fg)
+            } else {
+                gui(rgb.fg, d.rgb_fg)
             };
-            (
-                rgb,
-                pick(rgb.fg, d.rgb_fg),
-                pick(rgb.bg, d.rgb_bg),
-                pick(rgb.sp, d.rgb_sp),
-            )
+            let bg = if rgb.bg_indexed {
+                index(cterm.bg, d.cterm_bg)
+            } else {
+                gui(rgb.bg, d.rgb_bg)
+            };
+            (rgb, fg, bg, gui(rgb.sp, d.rgb_sp))
         } else {
-            let pick = |c: Option<u32>, dflt: Option<u8>| {
-                c.and_then(|n| u8::try_from(n).ok())
-                    .or(dflt)
-                    .map_or(Color::Default, Color::Index)
-            };
             (
                 cterm,
-                pick(cterm.fg, d.cterm_fg),
-                pick(cterm.bg, d.cterm_bg),
+                index(cterm.fg, d.cterm_fg),
+                index(cterm.bg, d.cterm_bg),
                 Color::Default,
             )
         };
@@ -341,6 +356,79 @@ mod tests {
             "the GUI form's attributes are not the cterm form's"
         );
         assert_eq!(s.underline, Underline::Line);
+    }
+
+    #[test]
+    fn a_colour_flagged_indexed_is_drawn_by_its_index() {
+        let gui = Attrs {
+            fg: Some(0xe00000),
+            bg: Some(0x0000e0),
+            fg_indexed: true,
+            ..Attrs::default()
+        };
+        let cterm = Attrs {
+            fg: Some(1),
+            bg: Some(4),
+            ..Attrs::default()
+        };
+        let s = colors(true).style(&gui, &cterm);
+        assert_eq!((s.fg, s.bg), (Color::Index(1), Color::Rgb(Rgb(0, 0, 0xe0))));
+        let both = Attrs {
+            bg_indexed: true,
+            ..gui
+        };
+        let s = colors(true).style(&both, &cterm);
+        assert_eq!((s.fg, s.bg), (Color::Index(1), Color::Index(4)));
+        // `nvim_set_hl` takes the flag without a cterm colour; the TUI then
+        // writes Normal's cterm colour, else the terminal's default.
+        let s = colors(true).style(&both, &Attrs::default());
+        assert_eq!((s.fg, s.bg), (Color::Default, Color::Index(4)));
+        let normal = Colors {
+            defaults: DefaultColors {
+                cterm_fg: Some(7),
+                ..colors(true).defaults
+            },
+            ..colors(true)
+        };
+        assert_eq!(normal.style(&both, &Attrs::default()).fg, Color::Index(7));
+    }
+
+    /// Neovim mixes its guess at the colour, here 0xe00000; the client mixes
+    /// the terminal's own.
+    #[test]
+    fn a_palette_colour_blends_as_the_terminal_shows_it() {
+        let mut c = colors(true);
+        c.term.ansi[1] = Rgb(200, 40, 40);
+        c.term.ansi[4] = Rgb(40, 40, 200);
+        let under = c.style(
+            &Attrs {
+                fg: Some(0xe00000),
+                bg: Some(0x0000e0),
+                fg_indexed: true,
+                bg_indexed: true,
+                ..Attrs::default()
+            },
+            &Attrs {
+                fg: Some(1),
+                bg: Some(4),
+                ..Attrs::default()
+            },
+        );
+        let float = Style {
+            fg: Color::Rgb(Rgb(250, 250, 250)),
+            bg: Color::Rgb(Rgb(0, 0, 100)),
+            ..Style::default()
+        };
+        let through = blend_through(&c, &under, &float, 50);
+        assert_eq!(
+            (through.fg, through.bg),
+            (Color::Rgb(Rgb(100, 20, 70)), Color::Rgb(Rgb(20, 20, 150)))
+        );
+        let over = blend_over(&c, &under, &float, 50);
+        assert_eq!(
+            (over.fg, over.bg),
+            (Color::Rgb(Rgb(237, 197, 197)), Color::Rgb(Rgb(20, 20, 150)))
+        );
     }
 
     #[test]

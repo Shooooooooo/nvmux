@@ -1414,6 +1414,22 @@ impl Attachment {
         }
     }
 
+    /// Ready a fresh client for its first relay at `size`, the terminal's,
+    /// before its output is read, so the shadow and its redraw match the
+    /// terminal. Its pty may be at a size the terminal has since left: a
+    /// resize after it started may have reached no relay that resized it.
+    fn fit_to(&mut self, size: PtySize) {
+        // Only one started ahead can be away, as a parked client has been
+        // relayed before. It is told it is back before it is resized, or it
+        // would redraw at a crawl, after the held paint is released.
+        if std::mem::take(&mut self.away) {
+            self.tell_client(&card::Command::Clear);
+        }
+        if pty_size(&self.master) != Some(size) {
+            self.resize_to(size);
+        }
+    }
+
     /// After a fade in, restore the terminal's pen and cursor to where the
     /// client's last write left them (see [`shadow::Shadow::hand_back`]).
     fn hand_back_the_pen(&self) {
@@ -2630,19 +2646,7 @@ pub fn relay(
         if attachment.hand_off.is_none() && !(lit && attachment.shadow.is_some()) {
             term::leave_alt_screen_and_clear();
         }
-        // A client started ahead was sized at startup; resize it before its
-        // output is read, so the shadow and its redraw match the terminal.
-        // Tell it it is back first, or it would redraw at a crawl, after the
-        // held paint is released.
-        if attachment.started_ahead() {
-            if std::mem::take(&mut attachment.away) {
-                attachment.tell_client(&card::Command::Clear);
-            }
-            let size = term::terminal_size();
-            if pty_size(&attachment.master) != Some(size) {
-                attachment.resize_to(size);
-            }
-        }
+        attachment.fit_to(term::terminal_size());
         attachment.shadow_saw(term::HANDOVER);
     }
     let mut raw = match attachment.raw.take() {
@@ -6485,6 +6489,34 @@ mod tests {
             !wait_briefly_for(&a, b'|'),
             "a report reached a client that asked for none"
         );
+    }
+
+    /// The copy, which the fades and floating panels draw from, must follow
+    /// the pty: the client's redraw at the new size does not resize it.
+    #[test]
+    fn a_fresh_client_and_its_copy_take_the_terminals_size() {
+        type Field = fn(&mut Attachment) -> &mut Option<shadow::Shadow>;
+        let copies: [(&str, Field); 2] = [
+            ("shadow", |a| &mut a.shadow),
+            ("screen copy", |a| &mut a.screen),
+        ];
+        for (name, copy) in copies {
+            let mut a = attached_to("exec sleep 30");
+            let at = PtySize::default();
+            a.master.resize(at.into()).expect("size the pty");
+            *copy(&mut a) = Some(shadow::Shadow::new(at.rows, at.cols));
+            let new = PtySize {
+                rows: at.rows - 4,
+                ..at
+            };
+            a.fit_to(new);
+            assert_eq!(pty_size(&a.master), Some(new), "the pty kept its size");
+            assert_eq!(
+                copy(&mut a).as_ref().map(shadow::Shadow::size),
+                Some((new.rows, new.cols)),
+                "the {name} kept the old size"
+            );
+        }
     }
 
     /// A client reading the return and the card apart draws a frame before the
