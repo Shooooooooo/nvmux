@@ -5948,6 +5948,231 @@ fn auto_predicts_over_ssh_and_on_here_as_well() {
     }
 }
 
+/// The number of open uv timers, and of `changedtree` callbacks on the tree
+/// of the buffer given.
+const HELD_LUA: &str = "local timers = 0
+  vim.uv.walk(function(h)
+    if h:get_type() == 'timer' and not h:is_closing() then
+      timers = timers + 1
+    end
+  end)
+  local buf = ...
+  return { timers, #vim.treesitter.highlighter.active[buf].tree._callbacks_rec.changedtree }";
+
+/// Holds weakly, in `_G.nvmux_probe`, every function the newest
+/// `changedtree` callback on the given buffer's tree reaches through
+/// upvalues, and the trees of the other highlighted buffers; returns how
+/// many functions.
+const PROBE_LUA: &str = "local buf = ...
+  local cbs = vim.treesitter.highlighter.active[buf].tree._callbacks_rec.changedtree
+  local fns, trees, n = setmetatable({}, { __mode = 'k' }), setmetatable({}, { __mode = 'k' }), 0
+  local function walk(f)
+    if type(f) == 'function' and not fns[f] then
+      fns[f], n = true, n + 1
+      local i, name, v = 1, debug.getupvalue(f, 1)
+      while name do
+        walk(v)
+        i = i + 1
+        name, v = debug.getupvalue(f, i)
+      end
+    end
+  end
+  walk(cbs[#cbs])
+  for b, hl in pairs(vim.treesitter.highlighter.active) do
+    if b ~= buf then
+      trees[hl.tree] = true
+    end
+  end
+  _G.nvmux_probe = { fns, trees }
+  return n";
+
+/// How many of the functions, and of the trees, in `_G.nvmux_probe` are
+/// alive. JIT traces hold what they were compiled from, so they go first.
+const PROBED_LUA: &str = "if jit then
+    jit.flush()
+  end
+  collectgarbage('collect')
+  collectgarbage('collect')
+  local alive = {}
+  for i, held in ipairs(_G.nvmux_probe) do
+    alive[i] = 0
+    for _ in pairs(held) do
+      alive[i] = alive[i] + 1
+    end
+  end
+  return alive";
+
+/// Runs `lua` with `args` in the editor; its result.
+fn exec_lua(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    lua: &str,
+    args: Vec<Value>,
+) -> Value {
+    rpc.call("nvim_exec_lua", vec![lua.into(), Value::Array(args)])
+        .expect("ask the editor")
+}
+
+/// The `i`th count in `v`, an array of them.
+fn count(v: &Value, i: usize) -> i64 {
+    v.as_array()
+        .and_then(|a| a.get(i))
+        .and_then(Value::as_i64)
+        .expect("a count")
+}
+
+/// See [`HELD_LUA`].
+fn held(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>, buf: &Value) -> (i64, i64) {
+    let v = exec_lua(rpc, HELD_LUA, vec![buf.clone()]);
+    (count(&v, 0), count(&v, 1))
+}
+
+/// Two buffers of Lua highlighted by tree-sitter, `local v1 = 1` to `local
+/// v300 = 300` and the same with `w`, the second current in a window split
+/// above the first's.
+fn highlighted_pair(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+) -> (Value, Value) {
+    let lua = |name: &str| {
+        format!(
+            "setlocal noswapfile | \
+             call setline(1, map(range(1, 300), '\"local {name}\" . v:val . \" = \" . v:val')) | \
+             lua vim.treesitter.start(0, 'lua')"
+        )
+    };
+    rpc.command(&lua("v")).expect("a highlighted buffer");
+    let one = rpc.eval("bufnr()").expect("its number");
+    rpc.command(&format!("new | {}", lua("w")))
+        .expect("another, split");
+    let two = rpc.eval("bufnr()").expect("its number");
+    (one, two)
+}
+
+/// A predicting client of the session at `sock`, once its agent follows the
+/// trees of `bufs` ([`highlighted_pair`]). `what` names it in failures.
+fn following(
+    sock: &Path,
+    config: &Path,
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    bufs: [&Value; 2],
+    what: &str,
+) -> Terminal {
+    let callbacks = bufs.map(|buf| held(rpc, buf).1);
+    let mut term = Terminal::spawn_told(sock, config, &over_ssh(""));
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| s.contains("local v1 = 1")),
+        "{what}: never drawn:\n{}",
+        term.text()
+    );
+    // The push that sends a window's lines follows its buffer's tree.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            bufs.iter()
+                .zip(callbacks)
+                .all(|(buf, n)| held(rpc, buf).1 > n)
+        }),
+        "{what}: the agent never followed both trees"
+    );
+    term
+}
+
+/// Guards against the agent's timer left open (deleting its group skips its
+/// later UILeave handlers), and against a tree's callbacks, which Neovim
+/// keeps for good, holding on to the agent or to another buffer's tree. The
+/// departed agents' buffer callbacks go at the last edit and the wipe, before
+/// anything is counted.
+#[test]
+fn the_agent_lets_go_of_its_timer_and_state_when_its_client_leaves() {
+    require_nvim!();
+    let tag = "client-gone";
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    let (one, two) = highlighted_pair(&mut rpc);
+    let timers = held(&mut rpc, &one).0;
+    let mut probed = 0;
+    for round in 0..3 {
+        let what = format!("round {round}");
+        let mut term = following(&sock, &config, &mut rpc, [&one, &two], &what);
+        if round == 0 {
+            probed = exec_lua(&mut rpc, PROBE_LUA, vec![one.clone()])
+                .as_i64()
+                .expect("a count");
+            // Gives the agent's timer a callback, which holds the agent.
+            rpc.command("call setline(1, 'local w1 = 0')")
+                .expect("an edit");
+        }
+        assert_eq!(term.hang_up(), Some(0), "{what}: the client's exit");
+        assert!(
+            common::wait_until(Duration::from_secs(5), || agent_autocmds(&mut rpc).0 == 0),
+            "{what}: the agent never left"
+        );
+    }
+    rpc.command(&format!(
+        "call setbufline({one}, 300, 'local x = 0') | bwipeout! {two}"
+    ))
+    .expect("an edit and a wipe");
+    // The agents' `vim.defer_fn` timers close as they run, within a second.
+    common::wait_until(Duration::from_secs(5), || held(&mut rpc, &one).0 == timers);
+    let open = held(&mut rpc, &one).0;
+    let alive = exec_lua(&mut rpc, PROBED_LUA, vec![]);
+    let (functions, trees) = (count(&alive, 0), count(&alive, 1));
+    assert_eq!(open, timers, "uv timers open after, and before");
+    // Neovim keeps the first agent's tree callback, and the little it names.
+    assert!(
+        functions * 4 <= probed,
+        "{functions} of the {probed} functions its tree callback reached are alive"
+    );
+    assert_eq!(trees, 0, "the wiped buffer's tree is alive");
+}
+
+/// Counts `nvim_buf_attach` calls in `_G.nvmux_attaches`.
+const COUNT_ATTACHES_LUA: &str = "_G.nvmux_attaches = 0
+  local attach = vim.api.nvim_buf_attach
+  vim.api.nvim_buf_attach = function(...)
+    _G.nvmux_attaches = _G.nvmux_attaches + 1
+    return attach(...)
+  end";
+
+/// Makes `vim.rpcnotify` fail for the client's channel, as for a closed one,
+/// and changes the shape of the current window, the first one pushed.
+const REFUSE_LUA: &str = "local chan = vim.api.nvim_list_uis()[1].chan
+  _G.nvmux_rpcnotify = vim.rpcnotify
+  vim.rpcnotify = function(c, ...)
+    if c == chan then
+      error('refused')
+    end
+    return _G.nvmux_rpcnotify(c, ...)
+  end
+  vim.cmd('set number!')";
+
+/// A send that fails midway through a push calls leave(), which empties the
+/// tables of trees followed and buffers attached to. Were the rest of the push
+/// to follow and attach anew, a tree would keep for good a callback holding
+/// the other buffer's tree. The send fails at the first window; the second is
+/// then pushed as new, and attaches.
+#[test]
+fn a_send_failing_midway_through_a_push_leaves_no_new_callbacks() {
+    require_nvim!();
+    let tag = "client-refused";
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    let (one, two) = highlighted_pair(&mut rpc);
+    exec_lua(&mut rpc, COUNT_ATTACHES_LUA, vec![]);
+    let mut term = following(&sock, &config, &mut rpc, [&one, &two], tag);
+    let callbacks = [held(&mut rpc, &one).1, held(&mut rpc, &two).1];
+    let attaches = exec_lua(&mut rpc, "return _G.nvmux_attaches", vec![]);
+    assert_eq!(attaches.as_i64(), Some(2), "the agent's buffer attaches");
+    exec_lua(&mut rpc, REFUSE_LUA, vec![]);
+    let left = common::wait_until(Duration::from_secs(5), || agent_autocmds(&mut rpc).0 == 0);
+    exec_lua(&mut rpc, "vim.rpcnotify = _G.nvmux_rpcnotify", vec![]);
+    let after = [held(&mut rpc, &one).1, held(&mut rpc, &two).1];
+    let attached = exec_lua(&mut rpc, "return _G.nvmux_attaches", vec![]);
+    assert!(left, "the agent never left");
+    assert_eq!(after, callbacks, "changedtree callbacks after, and before");
+    assert_eq!(attached, attaches, "buffer attaches after, and before");
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
 /// A remote client, or a local one on `"on"`, scrolls at once on a wheel turn
 /// while Neovim is busy for 1.5 s, and Neovim's scroll later lands where the
 /// client is. A local one on `"auto"` waits for Neovim.

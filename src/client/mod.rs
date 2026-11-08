@@ -289,14 +289,18 @@ return out";
 const AGENT_LUA: &str = "local chan, predict, keys, ikeys, reach, acks, typing = ...
 local api = vim.api
 local group = api.nvim_create_augroup('nvmux_client_' .. chan, { clear = true })
--- `gone` stops the agent once the client is gone; `unkey` drops its key count.
-local gone, unkey = false, nil
+-- `gone` stops the agent once the client is gone. leave() runs `cleanups`
+-- for what deleting the augroup does not free: a later UILeave handler
+-- would not run, as Neovim skips the rest of a group deleted while it runs.
+local gone, cleanups = false, {}
 local function leave()
   gone = true
-  if unkey then
-    unkey()
-  end
   pcall(api.nvim_del_augroup_by_id, group)
+  local undo = cleanups
+  cleanups = {}
+  for _, f in ipairs(undo) do
+    pcall(f)
+  end
 end
 local function send(...)
   if not pcall(vim.rpcnotify, chan, 'nvmux_client', ...) then
@@ -372,7 +376,7 @@ if predict then
     local keyns = api.nvim_create_namespace('nvmux_client_keys_' .. chan)
     _G.nvmux_taken = _G.nvmux_taken or {}
     _G.nvmux_taken[chan] = 0
-    unkey = function()
+    cleanups[#cleanups + 1] = function()
       vim.on_key(nil, keyns)
       _G.nvmux_taken[chan] = nil
     end
@@ -752,7 +756,7 @@ if predict then
   end
   local function follow(buf)
     local hl = vim.treesitter.highlighter.active[buf]
-    if not hl or followed[buf] == hl.tree then
+    if gone or not hl or followed[buf] == hl.tree then
       return
     end
     local tree = hl.tree
@@ -839,7 +843,7 @@ if predict then
     e.over = e.size > 2000 or #e.list > 100
   end
   local function attach(buf)
-    if attached[buf] then
+    if gone or attached[buf] then
       return
     end
     attached[buf] = api.nvim_buf_attach(buf, false, {
@@ -1056,6 +1060,15 @@ if predict then
     end
   end
   local timer = vim.uv.new_timer()
+  -- Neovim keeps a tree's callbacks for good and a buffer's until its next
+  -- change (see edited): once gone they reach empty tables and a `soon` that
+  -- does nothing, not the rest of the agent. A push whose send fails goes on
+  -- after this, so follow() and attach() check `gone`.
+  cleanups[#cleanups + 1] = function()
+    timer:close()
+    soon = function() end
+    have, edits, attached, ticks, stale, followed = {}, {}, {}, {}, {}, {}
+  end
   au({ 'WinResized', 'BufWinEnter', 'WinNew', 'TabEnter', 'VimResized', 'CursorHold',
     'CursorHoldI' }, {}, function()
     soon()
@@ -1269,11 +1282,6 @@ if predict then
     reach = tonumber(ev.data) or reach
     said, fixed, decorated = nil, nil, nil
     soon()
-  end)
-  au('UILeave', {}, function()
-    if vim.v.event.chan == chan then
-      timer:close()
-    end
   end)
   -- With typing prediction, what would make an Insert-mode key differ from
   -- plain typing (typing::Facts). Sent after InsertEnter has run its course
