@@ -1134,6 +1134,77 @@ fn a_ui_without_windows_of_its_own_is_made_room_for() {
     );
 }
 
+/// Both settings cards reach the client before Neovim answers its detach.
+#[test]
+fn effects_turned_off_and_on_while_neovim_is_busy_keep_windows_of_their_own() {
+    require_nvim!();
+    let scratch = Scratch::new("client-toggled");
+    let (sock, mut rpc, config) = session(&scratch, "client-toggled");
+    rpc.command("setlocal noswapfile | call setline(1, 'toggled')")
+        .expect("setline");
+    rpc.command(
+        "lua _G.left = 0 vim.api.nvim_create_autocmd('UILeave', \
+         { callback = function() _G.left = _G.left + 1 end })",
+    )
+    .expect("count detaches");
+    let on = nvmux::config::Drawing::default();
+    let mut term = Terminal::spawn_told(&sock, &config, &on);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with("toggled")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(5), || multigrid_uis(&mut rpc)
+            == vec![true]),
+        "attached without ext_multigrid: {:?}",
+        multigrid_uis(&mut rpc)
+    );
+
+    // Neovim reads nothing until `go` exists; capped in case the test dies.
+    let busy = scratch.0.join("busy");
+    let go = scratch.0.join("go");
+    let mut other = nvmux::rpc::Client::connect(&sock, Duration::from_secs(30)).expect("connect");
+    let held = other
+        .ask(
+            "nvim_exec_lua",
+            vec![
+                Value::from(
+                    "local busy, go = ... io.open(busy, 'w'):close() local t = vim.uv.hrtime() \
+                     while not vim.uv.fs_stat(go) and vim.uv.hrtime() - t < 2e10 do \
+                     vim.uv.sleep(5) end",
+                ),
+                Value::Array(vec![
+                    Value::from(busy.to_str().expect("a UTF-8 path")),
+                    Value::from(go.to_str().expect("a UTF-8 path")),
+                ]),
+            ],
+        )
+        .expect("keep Neovim busy");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || busy.exists()),
+        "Neovim never got busy"
+    );
+    let mut off = on;
+    off.effects.enabled = false;
+    term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Settings(off)));
+    term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Settings(on)));
+    // Time for the client to read both.
+    term.pump_until(Duration::from_millis(500), |_| false);
+    std::fs::write(&go, "").expect("let Neovim go");
+    other.reply_to(held).expect("Neovim let go");
+
+    // Until a UI has left, the list is the first attach's.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            let left = rpc.eval("luaeval('_G.left')").expect("the count");
+            left.as_i64().is_some_and(|n| n >= 1) && multigrid_uis(&mut rpc) == vec![true]
+        }),
+        "the client attached again without ext_multigrid: {:?}",
+        multigrid_uis(&mut rpc)
+    );
+}
+
 /// The (row, column) of each place `lines` are drawn one under another.
 fn drawn_at(screen: &str, lines: &[&str]) -> Vec<(usize, usize)> {
     let rows: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();

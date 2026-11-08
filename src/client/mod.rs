@@ -2542,6 +2542,7 @@ impl App {
                 self.leave(wanted, now);
                 true
             }
+            // Not turned back on here: the UIs decide after the re-attach.
             Attach::Leaving { multigrid } => {
                 self.attach = Attach::Leaving {
                     multigrid: multigrid && wanted,
@@ -2712,6 +2713,12 @@ impl App {
                         if let Attach::Leaving { multigrid } = self.attach {
                             self.reset();
                             self.attach_as(multigrid);
+                            // The UIs decide again: multigrid may be wanted
+                            // back since the detach, or the UI that kept it
+                            // away gone unseen while leaving.
+                            if !multigrid {
+                                self.uis_changed(now);
+                            }
                         }
                     }
                     Some(Ask::Fence { sent, fenced }) => {
@@ -6713,6 +6720,26 @@ mod tests {
         assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
     }
 
+    /// Settings toggled twice within a round trip do this, or twice while
+    /// Neovim is busy.
+    #[test]
+    fn a_client_told_off_and_on_again_while_leaving_takes_its_windows_back() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut off = drawing();
+        off.effects.enabled = false;
+        a.reconfigure(&off, t0);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
+        a.reconfigure(&drawing(), t0);
+        answer(&mut a, detach, Value::Nil, t0);
+        let sent = calls(&mut a);
+        assert_eq!(attached_with_multigrid(&sent), Some(false));
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t0);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
+    }
+
     #[test]
     fn a_client_told_to_predict_attaches_again_for_the_agent() {
         let t0 = Instant::now();
@@ -8155,7 +8182,13 @@ mod tests {
         redraw(&mut a, vec![resize(9, 3, 3)], t0);
         assert!(!a.model.grids.contains_key(&9), "the old attach's");
         answer(&mut a, detach, Value::Nil, t0);
-        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(false));
+        let sent = calls(&mut a);
+        assert_eq!(attached_with_multigrid(&sent), Some(false));
+        answer(&mut a, asks_uis(&sent), uis(true, false), t0);
+        assert!(
+            calls(&mut a).iter().all(|(_, m, _)| m != "nvim_ui_detach"),
+            "the foreign UI is still there"
+        );
         assert!(!a.due(t0), "not drawn before the new attach's first flush");
         redraw(&mut a, vec![resize(1, 20, 6)], t0);
         assert!(a.due(t0), "on grid 1, nothing to wait for");
@@ -8163,6 +8196,26 @@ mod tests {
         redraw(&mut a, vec![ui_change()], t0);
         let uis_id = asks_uis(&calls(&mut a));
         answer(&mut a, uis_id, uis(false, false), t0);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t0);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
+    }
+
+    /// The redraw telling of it came while leaving, dropped with the old
+    /// attach's.
+    #[test]
+    fn a_foreign_ui_gone_while_the_client_leaves_for_it_keeps_it_off_grid_1() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        redraw(&mut a, vec![ui_change()], t0);
+        let uis_id = asks_uis(&calls(&mut a));
+        answer(&mut a, uis_id, uis(true, false), t0);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
+        redraw(&mut a, vec![ui_change()], t0);
+        answer(&mut a, detach, Value::Nil, t0);
+        let sent = calls(&mut a);
+        assert_eq!(attached_with_multigrid(&sent), Some(false));
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
         let detach = request(&calls(&mut a), "nvim_ui_detach", "");
         answer(&mut a, detach, Value::Nil, t0);
         assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
