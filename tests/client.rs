@@ -321,6 +321,19 @@ impl Terminal {
         self.pump_until(Duration::from_millis(200), |_| false);
         self.exited
     }
+
+    /// Waits up to `within` for the client to exit on its own; its exit code.
+    fn exit_within(&mut self, within: Duration) -> Option<u32> {
+        let deadline = Instant::now() + within;
+        while self.exited.is_none() && Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exited = Some(common::exit_code(status));
+                self.hung_up = true;
+            }
+            self.pump_until(Duration::from_millis(20), |_| false);
+        }
+        self.exited
+    }
 }
 
 impl Drop for Terminal {
@@ -430,6 +443,146 @@ fn the_client_draws_a_session_and_types_into_it() {
     assert!(
         term.output.ends_with(b"\x1b[?1049l"),
         "the terminal was not handed back off the alternate screen"
+    );
+}
+
+fn server_pid(sock: &Path) -> Option<u64> {
+    let mut rpc = nvmux::rpc::Client::connect(sock, Duration::from_secs(1)).ok()?;
+    rpc.eval("getpid()").ok()?.as_u64()
+}
+
+/// Whether the session's Neovim has `:restart` (0.12 on).
+fn restarts(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>) -> bool {
+    rpc.eval("exists(':restart')").ok().and_then(|v| v.as_i64()) == Some(2)
+}
+
+/// `:restart` starts a new server on the session's socket and quits the old
+/// one; the client follows it there, and keeps drawing, instead of ending as
+/// for a quit.
+#[test]
+fn the_client_follows_a_restart_to_the_new_server() {
+    follows_a_restart("client-restart", false);
+}
+
+/// As over ssh: through a slow forward that connects each connection on
+/// anew, with predictions on.
+#[test]
+fn the_client_follows_a_restart_through_a_forward() {
+    follows_a_restart("client-restart-fwd", true);
+}
+
+fn follows_a_restart(tag: &str, forwarded: bool) {
+    require_nvim!();
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    if !restarts(&mut rpc) {
+        eprintln!("skipping: :restart needs Neovim 0.12");
+        return;
+    }
+    let old = server_pid(&sock).expect("the server's pid");
+    // Unmodified, so the old server can quit.
+    rpc.command(
+        "setlocal noswapfile | call setline(1, 'before the restart') | setlocal nomodified",
+    )
+    .expect("setline");
+    let mut term = if forwarded {
+        let link = slow_link(&scratch.0.join("link"), &sock, Duration::from_millis(50));
+        Terminal::spawn_told(&link, &config, &over_ssh(""))
+    } else {
+        Terminal::spawn(&sock, &config)
+    };
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s
+            .starts_with("before the restart")),
+        "never drawn:\n{}",
+        term.text()
+    );
+
+    // Not `:restart!`, which 0.12.0 lacks.
+    term.type_bytes(b":restart\r");
+    let mut new = None;
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            new = server_pid(&sock).filter(|pid| *pid != old);
+            new.is_some()
+        }),
+        "no new server on the socket:\n{}",
+        term.text()
+    );
+    // The scratch stops sessions by their recorded pid.
+    let json = sock.with_extension("json");
+    let mut meta = common::read_meta(&json);
+    meta["pid"] = serde_json::json!(new);
+    common::write_meta(&json, &meta);
+
+    let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(5)).expect("connect");
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            multigrid_uis(&mut rpc) == vec![true]
+                && rpc.eval("v:vim_did_enter").ok().and_then(|v| v.as_i64()) == Some(1)
+        }),
+        "the client never attached to the new server:\n{}",
+        term.text()
+    );
+    // Again until drawn: a session `:restart` saved may still be restoring.
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let _ = rpc.command("setlocal noswapfile | call setline(1, 'after the restart')");
+            term.pump_until(Duration::from_millis(100), |s| {
+                s.starts_with("after the restart")
+            })
+        }),
+        "the new server was never drawn:\n{}",
+        term.text()
+    );
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
+}
+
+/// A `:restart` the old server cannot finish (`:qall` refused for a modified
+/// buffer) is undone, and the client stays on that server. A `:detach` later
+/// still ends the client: its `error_exit` says the restart is not coming.
+#[test]
+fn an_undone_restart_leaves_the_client_where_it_was() {
+    require_nvim!();
+    let scratch = Scratch::new("client-unrestart");
+    let (sock, mut rpc, config) = session(&scratch, "client-unrestart");
+    if !restarts(&mut rpc) {
+        eprintln!("skipping: :restart needs Neovim 0.12");
+        return;
+    }
+    let old = server_pid(&sock).expect("the server's pid");
+    rpc.command("setlocal noswapfile | call setline(1, 'not saved')")
+        .expect("setline");
+    let mut term = Terminal::spawn(&sock, &config);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with("not saved")),
+        "never drawn:\n{}",
+        term.text()
+    );
+
+    term.type_bytes(b":restart\r");
+    assert!(
+        term.pump_until(Duration::from_secs(10), |s| s
+            .contains("No write since last change")),
+        "the restart was not refused:\n{}",
+        term.text()
+    );
+    assert_eq!(server_pid(&sock), Some(old), "the old server goes on");
+    assert_eq!(multigrid_uis(&mut rpc), vec![true], "the client on it");
+
+    term.type_bytes(b":detach\r");
+    assert!(
+        term.exit_within(Duration::from_secs(10)).is_some(),
+        "the client did not leave on :detach:\n{}",
+        term.text()
+    );
+    assert_eq!(server_pid(&sock), Some(old));
+    assert_eq!(
+        multigrid_uis(&mut rpc),
+        Vec::<bool>::new(),
+        "no UI came back"
     );
 }
 
