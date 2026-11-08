@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use memchr::memmem;
 use pty_process::blocking::{Command, Pty};
 
+use crate::client::input::{PASTE_END, PASTE_START};
 use crate::error::{NvmuxError, Result};
 use crate::handoff::HandOff;
 use crate::keys::{self, Action, Held, Pending, Prefix, Step, Wait};
@@ -169,14 +170,15 @@ impl Outcome {
     /// machine holds predates a panel, as when one closes. Keys read with a
     /// panel's key never reached it: on into a session it switched to, they
     /// would land after whatever was done there, as past the full-screen
-    /// picker.
+    /// picker. The rest of a paste the input is left in goes on there as a
+    /// paste all the same, or the prefix in it would act.
     ///
     /// [`carries_keys`]: Outcome::carries_keys
     fn leaves(self, keyed: Outcome, floated: bool) -> Leaves {
         let by_a_panel = self != keyed;
         match self {
             _ if !self.carries_keys() => Leaves::Nothing,
-            Outcome::Switch(_) if by_a_panel => Leaves::Nothing,
+            Outcome::Switch(_) if by_a_panel => Leaves::Paste,
             _ if by_a_panel || floated => Leaves::Keys,
             _ => Leaves::KeysAndHeld,
         }
@@ -234,7 +236,9 @@ pub enum Target {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leaves {
     Nothing,
-    /// The steps after it, not what the machine held.
+    /// Only a paste the input is still in (see [`after_panels`]).
+    Paste,
+    /// The steps after it, and of what the machine held only a paste.
     Keys,
     KeysAndHeld,
 }
@@ -254,11 +258,55 @@ pub struct Carry {
 }
 
 impl Carry {
-    /// Drop what the machine held, keeping the steps, and the answers owed:
-    /// for when the terminal was read elsewhere (the attaching screen), which
-    /// took the keys that would end the machine's wait and those answers.
+    /// What a relay leaves the next, as `leaves` says. `steps` are the keys
+    /// after the one that ended it; what `prefix` holds is due at `due`, and
+    /// panels read on from it to leave the input at `paste` (see
+    /// [`panel::float`]).
+    fn left(
+        leaves: Leaves,
+        mut steps: Vec<Step>,
+        prefix: &mut Prefix,
+        due: Option<Instant>,
+        paste: Option<usize>,
+    ) -> Self {
+        match leaves {
+            Leaves::Nothing => Self::default(),
+            // The next client was sent nothing of the paste.
+            Leaves::Paste => {
+                let (held, start) = after_panels(Held::default(), paste);
+                Self {
+                    steps: start.into_iter().collect(),
+                    held,
+                    ..Self::default()
+                }
+            }
+            Leaves::Keys => {
+                let (held, marker) = after_panels(prefix.take_held(), paste);
+                steps.extend(marker);
+                Self {
+                    steps,
+                    held,
+                    ..Self::default()
+                }
+            }
+            Leaves::KeysAndHeld => Self {
+                steps,
+                held: prefix.take_held(),
+                due,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// Drop what the machine held, for when the keys after it were read
+    /// elsewhere (the attaching screen). The steps are kept, and a paste
+    /// begun in them is ended from what of its end marker they hold: its own
+    /// end went with those keys. The answers owed go too: the attaching
+    /// screen read them.
     pub fn forget_held(&mut self) {
-        self.held = Held::default();
+        if let Some(sent) = std::mem::take(&mut self.held).paste() {
+            self.steps.push(Step::Forward(PASTE_END[sent..].to_vec()));
+        }
         self.due = None;
         self.owed = Owed::default();
     }
@@ -3354,14 +3402,28 @@ fn pump(
         let backlogged = attachment.input.backlogged();
 
         // Float pending settings or picker once the screen is back, before
-        // reading keys, so keys typed meanwhile go to them.
-        if let Some(outcome) = attachment.to_float.filter(|_| attachment.screen_is_back()) {
-            if let Some(outcome) = float_over(attachment, master_fd, winch, outcome, others)? {
-                return Ok(outcome);
+        // reading keys, so keys typed meanwhile go to them. Not inside a
+        // paste: the client has its start, so the rest is its too.
+        if let Some(outcome) = attachment
+            .to_float
+            .filter(|_| prefix.paste().is_none() && attachment.screen_is_back())
+        {
+            let mut paste = None;
+            let floating = float_over(attachment, master_fd, winch, outcome, others, &mut paste)?;
+            if let Some(ended) = floating {
+                // As past a panel a key opened, with no keys after it.
+                let leaves = ended.leaves(outcome, false);
+                *carry = Carry::left(leaves, Vec::new(), &mut prefix, None, paste);
+                return Ok(ended);
+            }
+            let (held, marker) = after_panels(prefix.take_held(), paste);
+            if let Some(marker) = marker {
+                take_step(attachment, marker)?;
             }
             // Re-read what they may have changed, as after `<prefix> ,` below.
             keys = crate::config::get().keys;
             prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
+            steps.extend(prefix.resume(held));
             prefix_timeout = Duration::from_millis(keys.timeout_ms);
             deadline = None;
             size = term::terminal_size();
@@ -3605,6 +3667,9 @@ fn pump(
 
         // Whether a floating panel came and went (keys may change).
         let mut floated = false;
+        // Where the input is in a paste, as this read left it, then as each
+        // panel that read on from there did.
+        let mut paste = prefix.paste();
         let mut taking = std::mem::take(&mut steps).into_iter();
         while let Some(step) = taking.next() {
             let Some(keyed) = take_step(attachment, step)? else {
@@ -3612,7 +3677,8 @@ fn pump(
             };
             // `<prefix> ,`, `?`, `Space` or `c`: float the panel and return
             // here, unless it cannot float or leads to the session loop.
-            let Some(outcome) = float_over(attachment, master_fd, winch, keyed, others)? else {
+            let floating = float_over(attachment, master_fd, winch, keyed, others, &mut paste)?;
+            let Some(outcome) = floating else {
                 floated = true;
                 continue;
             };
@@ -3626,6 +3692,12 @@ fn pump(
                     };
                     bar.ask(Some(leave.question(unsaved)));
                     leaving = Some(leave);
+                    // The steps after the `d` are dropped, and what the
+                    // machine holds came from the same keys; the question
+                    // reads those that would settle it, a paste's end too.
+                    drop(prefix.take_held());
+                    paste = None;
+                    deadline = None;
                     break;
                 }
             }
@@ -3639,24 +3711,18 @@ fn pump(
                     after.push(step);
                 }
             }
-            *carry = match outcome.leaves(keyed, floated) {
-                Leaves::Nothing => Carry::default(),
-                Leaves::Keys => Carry {
-                    steps: after,
-                    ..Carry::default()
-                },
-                Leaves::KeysAndHeld => Carry {
-                    steps: after,
-                    held: prefix.take_held(),
-                    due: deadline,
-                    ..Carry::default()
-                },
-            };
+            let leaves = outcome.leaves(keyed, floated);
+            *carry = Carry::left(leaves, after, &mut prefix, deadline, paste);
             return Ok(outcome);
         }
         if floated {
+            let (held, marker) = after_panels(prefix.take_held(), paste);
+            if let Some(marker) = marker {
+                take_step(attachment, marker)?;
+            }
             keys = crate::config::get().keys;
             prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
+            steps.extend(prefix.resume(held));
             prefix_timeout = Duration::from_millis(keys.timeout_ms);
             deadline = None;
             // A resize while they floated was theirs.
@@ -3925,18 +3991,20 @@ fn take_carry(carry: &mut Carry, prefix: &mut Prefix) -> (Vec<Step>, Option<Inst
 }
 
 /// Float `outcome`'s panel over the session if it floats and `[style] float`
-/// allows. `None` once it is taken down; else how the relay ends.
+/// allows. `None` once it is taken down; else how the relay ends. `paste` as
+/// [`panel::float`] takes it.
 fn float_over(
     attachment: &mut Attachment,
     master_fd: RawFd,
     winch: &winch::Winch,
     outcome: Outcome,
     others: &mut dyn Others,
+    paste: &mut Option<usize>,
 ) -> Result<Option<Outcome>> {
     attachment.to_float = None;
     match panel::What::of(outcome, config::get().style.float) {
         Some(what) => {
-            let floated = panel::float(attachment, master_fd, winch, what, others);
+            let floated = panel::float(attachment, master_fd, winch, what, others, paste);
             // However it went, drop what its frames were diffed against.
             if let Some(copy) = attachment.copy() {
                 copy.forget_under();
@@ -3945,6 +4013,33 @@ fn float_over(
         }
         None => Ok(Some(outcome)),
     }
+}
+
+/// What a machine holding `held` leaves once panels have read on from it to
+/// leave the input at `paste`: the paste the input is in, and nothing else,
+/// as they read the keys that would settle the rest. With it, the markers
+/// that take the client from where the machine left it to where the input
+/// is: the rest of the end of the client's paste, then the start of the
+/// input's and as much of its end as the input ends with. Where both are in
+/// a paste but differ in how far into its end, the panels may have read its
+/// end and another's start, so the client's paste is ended all the same.
+/// The panels may also have read one end and another start where both are
+/// as far into it: those two pastes reach the client as one.
+fn after_panels(held: Held, paste: Option<usize>) -> (Held, Option<Step>) {
+    let sent = held.paste();
+    let mut markers = Vec::new();
+    if sent != paste {
+        if let Some(sent) = sent {
+            markers.extend_from_slice(&PASTE_END[sent..]);
+        }
+        if let Some(read) = paste {
+            markers.extend_from_slice(PASTE_START);
+            markers.extend_from_slice(&PASTE_END[..read]);
+        }
+    }
+    let held = paste.map_or_else(Held::default, Held::in_paste);
+    let step = (!markers.is_empty()).then_some(Step::Forward(markers));
+    (held, step)
 }
 
 /// How long a sequence cut off by a read boundary waits for its rest.
@@ -5202,7 +5297,7 @@ mod tests {
     /// a switch later in the same read.
     #[test]
     fn a_panel_that_switches_takes_no_keys_with_it() {
-        use Leaves::{Keys, KeysAndHeld, Nothing};
+        use Leaves::{Keys, KeysAndHeld, Nothing, Paste};
         use Outcome::{
             ChildExited, CreateNew, Detached, Resettle, ShowHelp, ShowSettings, ToPicker,
         };
@@ -5213,9 +5308,9 @@ mod tests {
             (number, number, false, KeysAndHeld),
             (number, number, true, Keys),
             (picked, picked, false, KeysAndHeld),
-            (picked, ToPicker, false, Nothing),
-            (picked, ToPicker, true, Nothing),
-            (picked, CreateNew, false, Nothing),
+            (picked, ToPicker, false, Paste),
+            (picked, ToPicker, true, Paste),
+            (picked, CreateNew, false, Paste),
             (Resettle, ShowSettings, false, Keys),
             (Resettle, ShowSettings, true, Keys),
             (Detached, ToPicker, false, Nothing),
@@ -5298,6 +5393,93 @@ mod tests {
             (vec![Step::Forward(b"x".to_vec())], None)
         );
         assert_eq!(next.wait(), None, "nothing held");
+    }
+
+    /// `Keys` is what a relay leaves where a panel read the keys after these:
+    /// the paste's end among them, or not yet, or the start of another.
+    /// `Paste` is past a panel's switch, whose session was sent none of them.
+    #[test]
+    fn a_paste_left_to_the_next_relay_goes_on_or_is_ended() {
+        let begun = [&[keys::PREFIX, b'1'][..], b"\x1b[200~abc"].concat();
+        let left = |typed: &[u8], leaves, paste| {
+            let mut p = Prefix::new(12);
+            let mut steps = p.feed(typed);
+            assert_eq!(steps.remove(0), Step::Act(Action::Switch(1)));
+            Carry::left(leaves, steps, &mut p, None, paste)
+        };
+        let paste = Step::Forward(begun[2..].to_vec());
+        let carry = left(&begun, Leaves::KeysAndHeld, Some(0));
+        assert_eq!(carry.steps, vec![paste.clone()]);
+        assert_eq!(carry.held, Held::in_paste(0));
+
+        let carry = left(&begun, Leaves::Keys, None);
+        let end = Step::Forward(PASTE_END.to_vec());
+        assert_eq!(carry.steps, [paste.clone(), end]);
+        assert_eq!(carry.held, Held::default());
+
+        let carry = left(&begun, Leaves::Keys, Some(0));
+        assert_eq!(carry.steps, [paste]);
+        assert_eq!(
+            carry.held,
+            Held::in_paste(0),
+            "the rest of the paste is text"
+        );
+
+        let carry = left(&[keys::PREFIX, b'1', b'x'], Leaves::Keys, Some(0));
+        let start = Step::Forward(PASTE_START.to_vec());
+        assert_eq!(carry.steps, [Step::Forward(b"x".to_vec()), start.clone()]);
+        assert_eq!(carry.held, Held::in_paste(0));
+
+        let carry = left(&begun, Leaves::Paste, Some(0));
+        assert_eq!(carry.steps, [start]);
+        assert_eq!(carry.held, Held::in_paste(0));
+        let carry = left(&begun, Leaves::Paste, None);
+        assert!(carry.steps.is_empty());
+        assert_eq!(carry.held, Held::default());
+
+        assert!(left(&begun, Leaves::Nothing, Some(0)).steps.is_empty());
+    }
+
+    /// Reads cut a paste's end marker anywhere, so the client may hold part
+    /// of one, and the input end with part of one, as panels leave it. Not
+    /// brought level, the client missed the end the relay saw, or saw one it
+    /// did not.
+    #[test]
+    fn panels_leave_the_client_as_far_into_a_paste_as_the_input() {
+        let held = |paste: Option<usize>| paste.map_or_else(Held::default, Held::in_paste);
+        for (sent, read, markers) in [
+            (None, None, &b""[..]),
+            (None, Some(0), b"\x1b[200~"),
+            (None, Some(4), b"\x1b[200~\x1b[20"),
+            (Some(0), None, b"\x1b[201~"),
+            (Some(4), None, b"1~"),
+            (Some(4), Some(4), b""),
+            (Some(4), Some(1), b"1~\x1b[200~\x1b"),
+            (Some(0), Some(2), b"\x1b[201~\x1b[200~\x1b["),
+        ] {
+            let (left, step) = after_panels(held(sent), read);
+            assert_eq!(left, held(read), "{sent:?} then {read:?}");
+            let want = (!markers.is_empty()).then(|| Step::Forward(markers.to_vec()));
+            assert_eq!(step, want, "{sent:?} then {read:?}");
+        }
+    }
+
+    /// The attaching screen read the rest of a paste whose carried keys end
+    /// in part of its end marker: a whole marker after that part left it
+    /// pasted as text.
+    #[test]
+    fn a_forgotten_paste_is_ended_from_what_of_its_end_was_carried() {
+        let mut p = Prefix::new(12);
+        let mut steps = p.feed(&[&[keys::PREFIX, b'1'][..], b"\x1b[200~abc\x1b[20"].concat());
+        assert_eq!(steps.remove(0), Step::Act(Action::Switch(1)));
+        let mut carry = Carry {
+            steps,
+            held: p.take_held(),
+            ..Carry::default()
+        };
+        carry.forget_held();
+        assert_eq!(carry.steps.last(), Some(&Step::Forward(b"1~".to_vec())));
+        assert_eq!(carry.held, Held::default());
     }
 
     /// Too narrow leaves the old session on screen through the spawn; too wide
@@ -6317,6 +6499,31 @@ mod tests {
     /// listened.
     const SWITCH_LISTENS: &str = "NVMUX_TEST_SWITCH_LISTENS";
 
+    /// Set for that child to have a setting unsaved, so `<prefix> d` asks.
+    const SWITCH_UNSAVED: &str = "NVMUX_TEST_SWITCH_UNSAVED";
+
+    /// Set for that child to float panels over a screen copy of each client,
+    /// whose screen comes back as it reads its first byte. To `settings`, the
+    /// settings are also due to float over session 3 once it is back.
+    const SWITCH_FLOATS: &str = "NVMUX_TEST_SWITCH_FLOATS";
+
+    /// What the child of [`switching`] does besides relaying.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Also {
+        Nothing,
+        /// [`SWITCH_LISTENS`].
+        Listens,
+        /// [`SWITCH_UNSAVED`]; the detach that ends a run answers `d`.
+        Unsaved,
+        /// [`SWITCH_FLOATS`].
+        Floats,
+        /// [`SWITCH_FLOATS`], with the settings due.
+        FloatsSettings,
+        /// As [`Also::FloatsSettings`], for keys that change `client` there:
+        /// the relay resettles, and the detach that ends a run answers `d`.
+        Resettles,
+    }
+
     /// The session a run of [`switching`] detached from, and what sessions 1,
     /// 2 and 3 were sent, escaped.
     type Landed = (Option<u32>, [String; 3]);
@@ -6345,21 +6552,42 @@ mod tests {
     /// `chunks` into it, one read each. Once it has landed as `want` says, or
     /// failed to, detach.
     fn switching(tag: &str, chunks: &[&[u8]], slow: Duration, want: &Landed) -> Run {
-        switching_with(tag, chunks, slow, false, want)
+        switching_with(tag, chunks, slow, Also::Nothing, want)
     }
 
-    /// [`switching`], with [`SWITCH_LISTENS`] if `listens`.
+    /// [`switching`], with a child that does `also`.
     fn switching_with(
         tag: &str,
         chunks: &[&[u8]],
         slow: Duration,
-        listens: bool,
+        also: Also,
         want: &Landed,
     ) -> Run {
         let dir = crate::test_support::scratch_dir(tag);
         let mut command = std::process::Command::new(std::env::current_exe().expect("the tests"));
-        if listens {
-            command.env(SWITCH_LISTENS, "1");
+        let set = match also {
+            Also::Nothing => None,
+            Also::Listens => Some((SWITCH_LISTENS, "1")),
+            Also::Unsaved => Some((SWITCH_UNSAVED, "1")),
+            Also::Floats => Some((SWITCH_FLOATS, "1")),
+            Also::FloatsSettings | Also::Resettles => Some((SWITCH_FLOATS, "settings")),
+        };
+        if let Some((name, value)) = set {
+            command.env(name, value);
+        }
+        if matches!(also, Also::Floats | Also::FloatsSettings | Also::Resettles) {
+            // With no controlling terminal, a panel measures crossterm's
+            // fallbacks (`tput`, which reads these), not the terminal the
+            // tests run in: it fits in 80x24.
+            command.env("COLUMNS", "80").env("LINES", "24");
+            // SAFETY: `setsid(2)` neither allocates nor locks, as a pre-exec
+            // hook requires, and cannot fail in a fresh child.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
         }
         let mut child = command
             .args([
@@ -6431,6 +6659,9 @@ mod tests {
             .then(|| relayed.elapsed());
         typing(&[keys::PREFIX]);
         typing(b"d");
+        if matches!(also, Also::Unsaved | Also::Resettles) {
+            typing(b"d");
+        }
         let ended = crate::test_support::wait_until(Duration::from_secs(10), || {
             child.try_wait().is_ok_and(|status| status.is_some())
         });
@@ -6469,14 +6700,34 @@ mod tests {
             .and_then(|ms| ms.parse().ok())
             .map_or(Duration::ZERO, Duration::from_millis);
         let listens = std::env::var_os(SWITCH_LISTENS).is_some();
-        // The picker full screen, so it ends the relay without a panel.
+        let floats = std::env::var(SWITCH_FLOATS).ok();
+        // Unless floating, the picker full screen, so it ends the relay
+        // without a panel.
         let mut settings = config::Settings::default();
-        settings.style.float = false;
+        settings.style.float = floats.is_some();
         config::init(settings);
+        if std::env::var_os(SWITCH_UNSAVED).is_some() {
+            config::set_saved(config::Settings::default());
+        }
         let winch = winch::Winch::install().expect("the SIGWINCH pipe");
         let mut others = |_: Target| None::<card::Card>;
-        let client = |n: u32| attached_to(&format!("exec cat > '{}/{n}'", dir.display()));
+        let client = |n: u32| {
+            let file = dir.join(n.to_string());
+            if floats.is_none() {
+                return attached_to(&format!("exec cat > '{}'", file.display()));
+            }
+            // `dd` reads no more than the byte it keeps.
+            let mut a = attached_to(&format!(
+                "dd bs=1 count=1 of='{0}' 2>/dev/null; printf x; exec cat >> '{0}'",
+                file.display()
+            ));
+            a.screen = Some(shadow::Shadow::new(24, 80));
+            a
+        };
         let mut clients = vec![(3, client(3))];
+        if floats.as_deref() == Some("settings") {
+            clients[0].1.float_the_settings();
+        }
         let mut on = 3;
         let mut carry = Carry::default();
         loop {
@@ -6504,6 +6755,11 @@ mod tests {
                 Ok(Outcome::Switch(Target::Step(Direction::Prev))) => (on + 1) % 3 + 1,
                 Ok(Outcome::Switch(_)) => on,
                 Ok(Outcome::ToPicker) => 2,
+                // As `main` attaches again after a change to `client`.
+                Ok(Outcome::Resettle) => {
+                    eprintln!("resettled on {on}");
+                    on
+                }
                 other => {
                     eprintln!("ended {other:?} on {on}");
                     break;
@@ -6613,12 +6869,189 @@ mod tests {
         let slow = Duration::from_millis(1500);
         let want = landed(Some(1), ["", "", ""]);
         let chunks: &[&[u8]] = &[&[keys::PREFIX], b"1", &[keys::PREFIX], b"2"];
-        let run = switching_with("pty-switch-listened", chunks, slow, true, &want);
+        let run = switching_with("pty-switch-listened", chunks, slow, Also::Listens, &want);
         assert_eq!(run.landed, want, "{}", run.said);
 
         let want = landed(Some(1), ["j", "", ""]);
         let chunks: &[&[u8]] = &[&[keys::PREFIX, b'1', b'j']];
-        let run = switching_with("pty-switch-listened-j", chunks, slow, true, &want);
+        let run = switching_with("pty-switch-listened-j", chunks, slow, Also::Listens, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The prefix and a digit in a paste's second read switched mid-paste,
+    /// leaving the session without the paste's end: in one relay, and in
+    /// the relay a switch read with the paste's start leads to.
+    #[test]
+    fn a_paste_over_two_reads_reaches_one_session_whole() {
+        let p = keys::PREFIX;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~a\\01b\\u{1b}[201~"]);
+        let end = [&[p, b'1', b'b'][..], b"\x1b[201~"].concat();
+        let chunks: &[&[u8]] = &[b"\x1b[200~a", &end];
+        let run = switching("pty-paste", chunks, Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let want = landed(Some(1), ["\\u{1b}[200~a\\02b\\u{1b}[201~", "", ""]);
+        let start = [&[p, b'1'][..], b"\x1b[200~a"].concat();
+        let end = [&[p, b'2', b'b'][..], b"\x1b[201~"].concat();
+        let chunks: &[&[u8]] = &[&start, &end];
+        let run = switching("pty-switch-paste", chunks, Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The question unsaved settings ask reads the keys after the `d`, but
+    /// the machine was left as they made it: in a paste whose end the
+    /// question read, so the `<prefix> 1` after a stay went on as text, or
+    /// armed, so the prefix timed out into a literal under the question.
+    #[test]
+    fn what_is_read_with_a_detach_that_asks_goes_with_the_keys_after_it() {
+        let p = keys::PREFIX;
+        let also = Also::Unsaved;
+        let want = landed(Some(1), ["", "", ""]);
+        let asked = [&[p, b'd'][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&asked, b"xyz\x1b[201~", b"\x1b", &[p], b"1"];
+        let run = switching_with("pty-ask-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        // The stay comes past the prefix's timeout.
+        let (armed, prefix) = ([p, b'd', p], [p]);
+        let mut chunks = vec![&armed[..]];
+        chunks.extend([&b""[..]; 13]);
+        chunks.extend([&b"\x1b"[..], &prefix, b"1"]);
+        let run = switching_with("pty-ask-prefix", &chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The attaching screen read the rest of a paste begun with the switch:
+    /// the session was sent its start and left waiting for its end.
+    #[test]
+    fn a_paste_an_attaching_screen_read_the_end_of_is_ended() {
+        let want = landed(Some(1), ["\\u{1b}[200~abc\\u{1b}[201~", "", ""]);
+        let start = [&[keys::PREFIX, b'1'][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"def\x1b[201~"];
+        let slow = Duration::from_millis(1500);
+        let run = switching_with("pty-listened-paste", chunks, slow, Also::Listens, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// A settings panel read the end of a paste begun with its key: the
+    /// steps after the key took the paste's start to the session once the
+    /// panel closed, here or past a switch read with it.
+    #[test]
+    fn a_paste_a_panel_read_the_end_of_is_ended() {
+        let p = keys::PREFIX;
+        let also = Also::Floats;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~abc\\u{1b}[201~"]);
+        let start = [&[p, b','][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"\x1b[201~", b"\x1b"];
+        let run = switching_with("pty-panel-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let want = landed(Some(1), ["\\u{1b}[200~abc\\u{1b}[201~", "", ""]);
+        let start = [&[p, b',', p, b'1'][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"\x1b[201~", b"\x1b"];
+        let tag = "pty-panel-switch-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// A panel whose key came with a paste's start read the paste as keys: a
+    /// `q` in it closed the settings, the relay took the rest as typed, and
+    /// the prefix in it switched to session 1 mid-paste. The second run
+    /// opens the help and the settings with one read: the help reads the
+    /// paste's end, and the settings, opened after it, read keys again.
+    #[test]
+    fn a_panel_opened_with_a_paste_drops_the_paste_through_its_end() {
+        let p = keys::PREFIX;
+        let also = Also::Floats;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~abc\\u{1b}[201~"]);
+        let end = [&b"def"[..], &[p, b'1'], b"g\x1b[201~"].concat();
+        let start = [&[p, b','][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"q", &end, b"\x1b"];
+        let run = switching_with("pty-panel-in-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let start = [&[p, b'?', p, b','][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"q", &end, b"q", b"\x1b"];
+        let tag = "pty-panels-in-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// A paste begun as a panel closed: the panel read its start, and the
+    /// relay took the rest as typed, the prefix in it switching to session
+    /// 1, where the rest goes to the session as a paste. In the second run
+    /// the panel also read the start of the end marker, which the session
+    /// never got: it took everything after as pasted, the detach included.
+    #[test]
+    fn a_paste_a_panel_read_the_start_of_goes_on_as_a_paste() {
+        let p = keys::PREFIX;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~def\\01g\\u{1b}[201~"]);
+        let end = [&b"def"[..], &[p, b'1'], b"g\x1b[201~"].concat();
+        let chunks: &[&[u8]] = &[&[p, b','], b"q\x1b[200~abc", &end];
+        let tag = "pty-panel-closed-in-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, Also::Floats, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let want = landed(Some(1), ["g", "", "\\u{1b}[200~\\u{1b}[201~def"]);
+        let rest = [&b"1~def"[..], &[p, b'1'], b"g"].concat();
+        let chunks: &[&[u8]] = &[&[p, b','], b"q\x1b[200~abc\x1b[20", &rest];
+        let tag = "pty-panel-closed-in-paste-end";
+        let run = switching_with(tag, chunks, Duration::ZERO, Also::Floats, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// A panel took over with the relay having read the start of a paste's
+    /// end marker, and never saw it: the settings took the rest of the input
+    /// as pasted, their `q` included, and stayed up. In the second run a
+    /// pause after the marker's start timed it out in the panel, with the
+    /// same result.
+    #[test]
+    fn a_paste_ends_across_a_panel_wherever_reads_cut_its_end() {
+        let p = keys::PREFIX;
+        let also = Also::Floats;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~abc\\u{1b}[201~"]);
+        let start = [&[p, b','][..], b"\x1b[200~abc\x1b[20"].concat();
+        let chunks: &[&[u8]] = &[&start, b"1~", b"q"];
+        let run = switching_with("pty-panel-cut-end", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let start = [&[p, b','][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"def\x1b[20", b"1~", b"q"];
+        let run = switching_with("pty-panel-paused-end", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The session's screen came back mid-paste, and the settings due to
+    /// float over it came up to read the paste's end.
+    #[test]
+    fn settings_due_to_float_wait_for_a_paste_to_end() {
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~abc\\u{1b}[201~"]);
+        let chunks: &[&[u8]] = &[b"\x1b[200~abc", b"\x1b[201~", b"\x1b"];
+        let also = Also::FloatsSettings;
+        let run = switching_with("pty-float-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// Settings due to float over the session read a paste's start as they
+    /// closed, and the rest must reach the session as a paste. Resettling
+    /// after a change, they left the next relay nothing: it took the rest as
+    /// typed, and the prefix in it switched to session 1.
+    #[test]
+    fn settings_due_to_float_pass_on_a_paste_they_read_the_start_of() {
+        let p = keys::PREFIX;
+        let want = landed(Some(3), ["", "", "z\\u{1b}[200~def\\01g\\u{1b}[201~"]);
+        let end = [&b"def"[..], &[p, b'1'], b"g\x1b[201~"].concat();
+        // The `z` brings the session's screen back.
+        let chunks: &[&[u8]] = &[b"z", b"q\x1b[200~abc", &end];
+        let tag = "pty-float-closed-in-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, Also::FloatsSettings, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        // Turns `client.per_session`, on the third tab, second row.
+        let chunks: &[&[u8]] = &[b"z", b"\t", b"\t", b"j", b"l", b"q\x1b[200~abc", &end];
+        let tag = "pty-float-resettled-in-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, Also::Resettles, &want);
+        assert!(run.said.contains("resettled on 3"), "{}", run.said);
         assert_eq!(run.landed, want, "{}", run.said);
     }
 

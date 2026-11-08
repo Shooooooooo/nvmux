@@ -500,16 +500,31 @@ impl Glimpse {
 /// Float `what` over the session until it closes. Returns `None` to go on
 /// relaying, or how the relay ends: full screen, client or terminal gone,
 /// clients to settle after `client.ui` or `client.per_session` changed (see
-/// `main`'s `settle`), or where the picker went.
+/// `main`'s `settle`), or where the picker went. `paste` is where the input
+/// it reads starts, then where it leaves it, as [`Decoder::paste`] puts it.
 pub(super) fn float(
     a: &mut Attachment,
     master_fd: RawFd,
     winch: &winch::Winch,
     what: What,
     others: &mut dyn Others,
+    paste: &mut Option<usize>,
 ) -> Result<Option<Outcome>> {
     let mut glimpse = None;
-    let floated = float_with(a, master_fd, winch, what, others, &mut glimpse);
+    let mut decoder = match *paste {
+        Some(matched) => Decoder::in_paste(matched),
+        None => Decoder::new(),
+    };
+    let floated = float_with(
+        a,
+        master_fd,
+        winch,
+        what,
+        others,
+        &mut glimpse,
+        &mut decoder,
+    );
+    *paste = decoder.paste();
     // However it ended, a client still lent goes back.
     if let Some(glimpse) = glimpse {
         glimpse.close(others);
@@ -525,6 +540,7 @@ fn float_with(
     what: What,
     others: &mut dyn Others,
     glimpse: &mut Option<Glimpse>,
+    decoder: &mut Decoder,
 ) -> Result<Option<Outcome>> {
     let mut what = what;
     let mut panel = what.open(&a.session_id);
@@ -550,7 +566,6 @@ fn float_with(
         Some(palette) => Look::Dimmed(palette),
         None => Look::Faint,
     };
-    let mut decoder = Decoder::new();
     let mut boundary = Boundary::new();
     // Client output since the last frame, owed to the terminal.
     let mut held: Vec<u8> = Vec::new();
