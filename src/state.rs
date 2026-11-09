@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::nonempty;
+use crate::config::{nonempty, xdg_base};
 use crate::transport::Location;
 
 #[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -39,7 +39,8 @@ fn key(location: &Location) -> String {
 }
 
 /// `$NVMUX_STATE` (exact path) > `$XDG_STATE_HOME/nvmux/` >
-/// `$HOME/.local/state/nvmux/`, as in [`crate::config`]; empty counts as unset.
+/// `$HOME/.local/state/nvmux/`, as in [`crate::config`]; empty counts as
+/// unset, and so does a relative `$XDG_STATE_HOME`.
 fn resolve_state_path(
     nvmux_state: Option<&OsStr>,
     xdg_state_home: Option<&OsStr>,
@@ -48,8 +49,8 @@ fn resolve_state_path(
     if let Some(explicit) = nonempty(nvmux_state) {
         return Some(PathBuf::from(explicit));
     }
-    if let Some(xdg) = nonempty(xdg_state_home) {
-        return Some(Path::new(xdg).join("nvmux").join("state.toml"));
+    if let Some(xdg) = xdg_base(xdg_state_home) {
+        return Some(xdg.join("nvmux").join("state.toml"));
     }
     nonempty(home).map(|home| {
         Path::new(home)
@@ -169,6 +170,16 @@ mod tests {
             resolve_state_path(Some(empty), Some(empty), Some(OsStr::new("/home/u"))),
             Some(PathBuf::from("/home/u/.local/state/nvmux/state.toml"))
         );
+    }
+
+    #[test]
+    fn a_relative_xdg_state_home_is_ignored() {
+        let relative = OsStr::new(".local/state");
+        assert_eq!(
+            resolve_state_path(None, Some(relative), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.local/state/nvmux/state.toml"))
+        );
+        assert_eq!(resolve_state_path(None, Some(relative), None), None);
     }
 
     // --- the file (touches process-global env; guarded) --------------------

@@ -1211,13 +1211,20 @@ enum ConfigSource {
     Explicit(PathBuf),
     /// A default search path; may be absent.
     Default(PathBuf),
-    /// Neither `$XDG_CONFIG_HOME` nor `$HOME` is set; use the defaults.
+    /// Neither `$HOME` nor an absolute `$XDG_CONFIG_HOME` is set; use the
+    /// defaults.
     None,
 }
 
 /// An empty value counts as unset. Also used by [`crate::state`].
 pub(crate) fn nonempty(value: Option<&OsStr>) -> Option<&OsStr> {
     value.filter(|s| !s.is_empty())
+}
+
+/// An XDG base directory, or `None` if unset, empty or relative: the spec
+/// says to ignore a relative one. Also used by [`crate::state`].
+pub(crate) fn xdg_base(value: Option<&OsStr>) -> Option<&Path> {
+    value.map(Path::new).filter(|dir| dir.is_absolute())
 }
 
 /// Resolve the config path from the given environment (pure). Precedence:
@@ -1231,8 +1238,8 @@ fn resolve_config_path(
     if let Some(explicit) = nonempty(nvmux_config) {
         return ConfigSource::Explicit(PathBuf::from(explicit));
     }
-    if let Some(xdg) = nonempty(xdg_config_home) {
-        return ConfigSource::Default(Path::new(xdg).join("nvmux").join("config.toml"));
+    if let Some(xdg) = xdg_base(xdg_config_home) {
+        return ConfigSource::Default(xdg.join("nvmux").join("config.toml"));
     }
     if let Some(home) = nonempty(home) {
         return ConfigSource::Default(
@@ -1289,8 +1296,9 @@ fn parse(path: &Path, contents: &str) -> Result<Settings, ConfigError> {
 
 /// Where to write a first-run config, or `None` if nvmux must not offer one:
 /// `$NVMUX_CONFIG` is set (the user owns it), no default path can be formed
-/// (no `$HOME`/`$XDG_CONFIG_HOME`), or a config already exists. `exists`
-/// follows symlinks, as [`load`] does, so a dangling one is a first run.
+/// (no `$HOME` or absolute `$XDG_CONFIG_HOME`), or a config already exists.
+/// `exists` follows symlinks, as [`load`] does, so a dangling one is a first
+/// run.
 pub fn first_run_target() -> Option<PathBuf> {
     let nvmux_config = std::env::var_os("NVMUX_CONFIG");
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
@@ -3436,6 +3444,23 @@ fade.enabled = false   # too slow over ssh
         );
     }
 
+    /// Otherwise each directory nvmux is run from gets its own config.
+    #[test]
+    fn a_relative_xdg_config_home_is_ignored() {
+        let home = OsStr::new("/home/u");
+        for relative in [".config", "~/.config"] {
+            assert_eq!(
+                resolve_config_path(None, Some(OsStr::new(relative)), Some(home)),
+                ConfigSource::Default(PathBuf::from("/home/u/.config/nvmux/config.toml")),
+                "{relative}"
+            );
+        }
+        assert_eq!(
+            resolve_config_path(None, Some(OsStr::new(".config")), None),
+            ConfigSource::None
+        );
+    }
+
     // --- load() (touches process-global env; guarded) ----------------------
 
     /// `load` reads `HOME`/`XDG_CONFIG_HOME`/`NVMUX_CONFIG`, which are
@@ -3591,6 +3616,20 @@ fade.enabled = false   # too slow over ssh
             Some(xdg.join("nvmux").join("config.toml"))
         );
         std::fs::remove_dir_all(&xdg).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn the_first_run_target_ignores_a_relative_xdg_config_home() {
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        let home = scratch("first-run-relative-xdg");
+        env.set("XDG_CONFIG_HOME", ".config");
+        env.set("HOME", &home);
+        assert_eq!(
+            first_run_target(),
+            Some(home.join(".config").join("nvmux").join("config.toml"))
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
