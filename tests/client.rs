@@ -59,6 +59,8 @@ struct Terminal {
     /// How far `output` has been scanned for queries.
     answered: usize,
     da1: &'static [u8],
+    /// Queries answered besides the kitty keyboard's and DA1, with replies.
+    more: Vec<(&'static [u8], &'static [u8])>,
     /// Columns, rows.
     size: (u16, u16),
     incoming: mpsc::Receiver<Vec<u8>>,
@@ -137,6 +139,7 @@ impl Terminal {
             fed: 0,
             answered: 0,
             da1,
+            more: Vec::new(),
             size,
             incoming,
         }
@@ -227,7 +230,8 @@ impl Terminal {
         }
         let from = self.answered.saturating_sub(8);
         let mut replies = Vec::new();
-        for (query, reply) in [(KITTY_QUERY, KITTY_REPLY), (DA1, self.da1)] {
+        let known = [(KITTY_QUERY, KITTY_REPLY), (DA1, self.da1)];
+        for &(query, reply) in known.iter().chain(&self.more) {
             let mut at = from;
             while let Some(i) = find(&self.output[at..], query).map(|i| at + i) {
                 if i + query.len() > self.answered {
@@ -320,6 +324,12 @@ impl Terminal {
         // Collect its last output.
         self.pump_until(Duration::from_millis(200), |_| false);
         self.exited
+    }
+
+    /// Answers `query` with `reply` too, from now on.
+    fn answering(mut self, query: &'static [u8], reply: &'static [u8]) -> Self {
+        self.more.push((query, reply));
+        self
     }
 
     /// Waits up to `within` for the client to exit on its own; its exit code.
@@ -984,6 +994,75 @@ fn a_yank_reaches_the_terminals_clipboard() {
         ),
         "the yank never reached the terminal"
     );
+}
+
+/// Neovim's truecolor probe asks the SGR it has just set, a 24-bit
+/// background, and a terminal with truecolor gives it back.
+const SGR_QUERY: &[u8] = b"\x1bP$qm\x1b\\";
+const SGR_TRUECOLOR: &[u8] = b"\x1bP1$r0;48:2::1:2:3m\x1b\\";
+
+/// From 0.13 Neovim turns `'termguicolors'` on as a terminal UI attaches if
+/// the UI says its terminal shows 24-bit colour, and otherwise asks the
+/// terminal. The client cannot tell, so a terminal that never answers keeps
+/// 256 colours, and one that answers gets `'termguicolors'`.
+#[test]
+fn termguicolors_comes_on_only_for_a_terminal_that_says_truecolor() {
+    require_nvim!();
+    for truecolor in [false, true] {
+        let scratch = Scratch::new("client-truecolor");
+        let t = scratch.transport();
+        // `$COLORTERM` would decide it before the terminal is asked.
+        let launch =
+            nvmux::launch::Launch::parse("env -u COLORTERM nvim --headless --listen {sock}")
+                .expect("a valid command");
+        let session = t
+            .create_session(
+                &common::unique("client-truecolor"),
+                &launch,
+                common::anywhere(),
+            )
+            .expect("create");
+        let sock = t.local_socket_for(&session).expect("socket path");
+        let mut rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(5)).expect("connect");
+        if rpc.eval("has('nvim-0.13')").ok().and_then(|v| v.as_i64()) != Some(1) {
+            eprintln!("skipping: Neovim detects 'termguicolors' on attach from 0.13");
+            return;
+        }
+        rpc.command("setlocal noswapfile | call setline(1, 'in colour')")
+            .expect("setline");
+        let config = scratch.0.join("config.toml");
+        std::fs::write(&config, "").expect("write the config");
+        let mut term = Terminal::spawn(&sock, &config);
+        if truecolor {
+            term = term.answering(SGR_QUERY, SGR_TRUECOLOR);
+        }
+        assert!(
+            term.pump_until(Duration::from_secs(15), |s| s.starts_with("in colour")),
+            "never drawn:\n{}",
+            term.text()
+        );
+        let tgc = |rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>| {
+            rpc.eval("&termguicolors").ok().and_then(|v| v.as_i64())
+        };
+        if truecolor {
+            assert!(
+                common::wait_until(Duration::from_secs(5), || {
+                    term.pump_until(Duration::from_millis(20), |_| false);
+                    tgc(&mut rpc) == Some(1)
+                }),
+                "a terminal that says truecolor did not get 'termguicolors'"
+            );
+        } else {
+            // Long enough for the probe's round trip.
+            term.pump_until(Duration::from_secs(1), |_| false);
+            assert_eq!(
+                tgc(&mut rpc),
+                Some(0),
+                "'termguicolors' on for a terminal that never said truecolor"
+            );
+        }
+        assert_eq!(term.hang_up(), Some(0), "the client's exit");
+    }
 }
 
 /// While a UI without `ext_multigrid` is attached, the client draws
@@ -3688,6 +3767,22 @@ fn every_jump_predicted_lands_where_neovim_puts_it() {
     predicted(&mut term, "j with 'scrolloff'", b"j");
     predicted(&mut term, "5+", b"5+");
     predicted(&mut term, "12j", b"12j");
+}
+
+/// With a `'scrolljump'` of half the window or more, a long move up scrolls
+/// by it from Neovim 0.13 and centres the cursor before; the agent says
+/// which.
+#[test]
+fn a_long_jump_up_with_a_large_scrolljump_lands_where_neovim_puts_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-jump-up");
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-jump-up", SCROLLING, MOTIONS);
+    typed(&mut term, b":set sj=15\r");
+    typed(&mut term, b"200G");
+    typed(&mut term, b"H");
+    predicted(&mut term, "12k", b"12k");
+    typed(&mut term, b"H");
+    predicted(&mut term, "15k", b"15k");
 }
 
 /// Each prediction in a mixed run starts from where the previous one left
@@ -7982,6 +8077,8 @@ fn views_go_where_neovim_takes_them() {
     let scratch = Scratch::new("client-views");
     let (_sock, mut rpc, _config) = session(&scratch, "client-views");
     rpc.command("setlocal noswapfile").expect("noswapfile");
+    // As the agent tells the client.
+    let jump_up = rpc.eval("has('nvim-0.13')").ok().and_then(|v| v.as_i64()) == Some(1);
     let mut checked = 0;
     let mut cases = Vec::new();
     for rows in [4i64, 5, 6, 7, 9, 12, 21, 22, 23, 40] {
@@ -8054,7 +8151,11 @@ fn views_go_where_neovim_takes_them() {
             for &jump in &jumps {
                 for &to in &targets {
                     let [was, after, cursor] = theirs.next().expect("as many");
-                    let how = Scrolling { jump, smooth };
+                    let how = Scrolling {
+                        jump,
+                        smooth,
+                        jump_up,
+                    };
                     let ours =
                         moves::keep_in_view((was, to), (rows, count - 1), so, how, &|l| l < count);
                     // A 'scrolljump' larger than the window scrolls past
