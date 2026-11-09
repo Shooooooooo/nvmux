@@ -247,7 +247,10 @@ pub(crate) fn create(
         // an answer proves the session.
         return Err(not_ready("the session never answered".into()));
     }
-    written?;
+    if let Err(e) = written {
+        discard(h, &id, spawned.pid);
+        return Err(e);
+    }
     // The caller attaches without re-listing, so give it the number a
     // listing would.
     session.state.num = numbered_in(existing, &session);
@@ -266,8 +269,8 @@ fn numbered_in(existing: Vec<Session>, session: &Session) -> u32 {
         .map_or(session.num, |s| s.state.num)
 }
 
-/// End a session that never came up. `pid` is only a hint: the script finds
-/// the process by its socket.
+/// End the session a failed create spawned. `pid` is only a hint: the script
+/// finds the process by its socket.
 fn discard(h: &impl Host, id: &str, pid: Option<u32>) {
     h.unreach(id);
     let pid = opt_pid_arg(pid);
@@ -666,6 +669,164 @@ mod tests {
                 NvmuxError::Session(SessionError::NotKilled { .. })
             ));
         }
+    }
+
+    /// Reported as failed, the editor must not run on: it would be listed as
+    /// an orphan, and a retry would start a second one.
+    #[test]
+    fn a_create_whose_metadata_write_fails_leaves_nothing_running() {
+        let sock = crate::test_support::scratch_sock("transport-nometa");
+        stand_in_neovim(&sock);
+        let host = MetadataFails::reaching(sock.clone());
+        let launch = Launch::parse("nvim --listen {sock}").expect("parses");
+
+        let created = create(&host, "fresh", &launch, "/");
+        let _ = std::fs::remove_file(&sock);
+
+        let err = created.expect_err("created without metadata");
+        assert!(
+            matches!(&err, NvmuxError::Io(e) if e.raw_os_error() == Some(libc::ENOSPC)),
+            "not the metadata write's error: {err}"
+        );
+        host.assert_ended_once();
+    }
+
+    /// The write's error would hide that the editor never answered, and the
+    /// tail of its log that says why. Waits out [`REACHABLE_TIMEOUT`].
+    #[test]
+    fn a_create_that_never_answers_is_not_ready_even_if_its_write_failed() {
+        let unserved = crate::test_support::scratch_sock("transport-unserved");
+        let host = MetadataFails::reaching(unserved);
+        let launch = Launch::parse("nvim --listen {sock}").expect("parses");
+
+        let err = create(&host, "fresh", &launch, "/").expect_err("created unanswered");
+        assert!(
+            matches!(err, NvmuxError::Session(SessionError::NotReady { .. })),
+            "not reported as not ready: {err}"
+        );
+        host.assert_ended_once();
+    }
+
+    /// Spawns sessions, reached at `neovim`, that cannot write their metadata.
+    struct MetadataFails {
+        location: Location,
+        neovim: PathBuf,
+        ran: Mutex<Vec<(&'static str, Vec<String>)>>,
+        unreached: Mutex<Vec<String>>,
+    }
+
+    impl MetadataFails {
+        fn reaching(neovim: PathBuf) -> Self {
+            MetadataFails {
+                location: Location::Local,
+                neovim,
+                ran: Mutex::default(),
+                unreached: Mutex::default(),
+            }
+        }
+
+        /// Ended: its forward undone and the kill script run for the spawned
+        /// id and pid.
+        fn assert_ended_once(&self) {
+            let ran = self.ran.lock().expect("lock");
+            let id = ran
+                .iter()
+                .find(|(script, _)| *script == "spawn")
+                .map(|(_, args)| args[1].clone())
+                .expect("a spawn");
+            let kills: Vec<&Vec<String>> = ran
+                .iter()
+                .filter(|(script, _)| *script == "kill")
+                .map(|(_, args)| args)
+                .collect();
+            let kill = vec![self.dir().to_string(), id.clone(), "4242".to_string()];
+            assert_eq!(kills, [&kill], "not killed exactly once");
+            assert_eq!(
+                *self.unreached.lock().expect("lock"),
+                [id],
+                "its forward not undone exactly once"
+            );
+        }
+    }
+
+    impl Host for MetadataFails {
+        fn location(&self) -> &Location {
+            &self.location
+        }
+
+        fn dir(&self) -> &str {
+            "/nvmux-test"
+        }
+
+        fn run(&self, script: &str, args: &[&str]) -> Result<Output> {
+            let (name, stdout) = match script {
+                shell::LIST_SCRIPT => ("list", "NVMUX_END\n"),
+                shell::SPAWN_SCRIPT => ("spawn", "PID 4242\nSOCK ok\nNVMUX_END\n"),
+                shell::KILL_SCRIPT => ("kill", "RESULT killed\nNVMUX_END\n"),
+                _ => panic!("an unexpected script"),
+            };
+            let args = args.iter().map(|a| a.to_string()).collect();
+            self.ran.lock().expect("lock").push((name, args));
+            Ok(Output {
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                status: 0,
+            })
+        }
+
+        fn settle(&self, listed: Vec<Session>) -> Result<Vec<Session>> {
+            Ok(listed)
+        }
+
+        fn host_sock(&self, id: &str) -> Result<PathBuf> {
+            Ok(Path::new(self.dir()).join(format!("{id}.sock")))
+        }
+
+        fn reach(&self, _id: &str, _host_sock: &Path) -> Result<PathBuf> {
+            Ok(self.neovim.clone())
+        }
+
+        fn unreach(&self, id: &str) {
+            self.unreached.lock().expect("lock").push(id.to_string());
+        }
+
+        fn write_meta(&self, _session: &Session) -> Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC).into())
+        }
+
+        fn log_path(&self, id: &str) -> PathBuf {
+            Path::new(self.dir()).join(format!("{id}.log"))
+        }
+    }
+
+    /// Serve one connection as an idle Neovim answers the create's probe.
+    fn stand_in_neovim(sock: &Path) {
+        use rmpv::Value;
+        use std::io::Write;
+
+        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind");
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut requests = std::io::BufReader::new(&stream);
+            while let Ok(request) = rmpv::decode::read_value(&mut requests) {
+                let result = match request[2].as_str() {
+                    Some("nvim_get_mode") => Value::Map(vec![
+                        (Value::from("mode"), Value::from("n")),
+                        (Value::from("blocking"), Value::from(false)),
+                    ]),
+                    _ => Value::Nil,
+                };
+                let reply =
+                    Value::Array(vec![Value::from(1), request[1].clone(), Value::Nil, result]);
+                let mut frame = Vec::new();
+                rmpv::encode::write_value(&mut frame, &reply).expect("encode");
+                if (&stream).write_all(&frame).is_err() {
+                    return;
+                }
+            }
+        });
     }
 
     fn session(id: &str, num: u32, created: u64) -> Session {
