@@ -8,8 +8,9 @@
 # expansion. <cwd> arrives absolute with `~` already expanded (src/session.rs).
 #
 # Output:
-#   PID <pid>        the *validated* pid of the new nvim, or empty if we could
-#                    not confirm it (see the note on `pid` below)
+#   PID <pid>        the pid found with `--listen <sock>` in its command line:
+#                    nvim's, or a wrapper's that does not exec nvim; empty if
+#                    none was found (see the note on `pid` below)
 #   SOCK ok|timeout  whether the listen socket appeared
 #   NVMUX_END
 [ -n "${NVMUX_PRELUDE:-}" ] || . "$(dirname -- "$0")/_prelude.sh"
@@ -109,9 +110,9 @@ while [ "$i" -lt 500 ]; do
   fi
 done
 
-# Report the pid only once confirmed as the nvim serving this socket: a later
-# `kill -KILL` targets it, and pids are reused. `$!` may be setsid's own pid,
-# as it forks when the caller already leads a process group.
+# Report a pid only if its command line names this socket: kill.sh may signal
+# it, and pids are reused. `$!` may be setsid's own pid, as it forks when the
+# caller already leads a process group.
 pid=''
 if [ -n "$guess" ] && kill -0 "$guess" 2>/dev/null; then
   if owns_socket "$guess" "$sock"; then
@@ -119,7 +120,7 @@ if [ -n "$guess" ] && kill -0 "$guess" 2>/dev/null; then
   fi
 fi
 
-# Otherwise find the process actually serving this socket.
+# Otherwise find a process of ours that names the socket.
 if [ -z "$pid" ]; then
   pid=$(serving_pid "$sock")
 fi
