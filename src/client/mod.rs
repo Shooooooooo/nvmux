@@ -4798,7 +4798,7 @@ impl App {
             );
             let until = p.deadline(cause.at);
             let Some(rows) = self.side_rows(grid, left) else {
-                self.give_up(grid);
+                self.give_up(grid, now);
                 return false;
             };
             // Rows moved sideways do not also slide.
@@ -4986,7 +4986,7 @@ impl App {
     fn fill_in(&mut self, now: Instant) {
         for grid in self.anim.held() {
             if !self.fill_in_grid(grid, now) {
-                self.give_up(grid);
+                self.give_up(grid, now);
                 if let Some(p) = self.predict.as_mut() {
                     p.typed.missed();
                 }
@@ -4997,8 +4997,8 @@ impl App {
 
     /// Stops scrolling `grid` ahead: it shows Neovim's view again, and the
     /// scrolls' inputs are replayed from the next ack ([`App::replay`]).
-    fn give_up(&mut self, grid: u64) {
-        let seqs = self.anim.give_up(grid);
+    fn give_up(&mut self, grid: u64, now: Instant) {
+        let seqs = self.anim.give_up(grid, now);
         if let Some(p) = self.predict.as_mut() {
             p.given_up(&seqs);
         }
@@ -5281,7 +5281,7 @@ impl App {
                 k,
                 "client: a scroll ahead its key's frame did not make, given up"
             );
-            self.give_up(grid);
+            self.give_up(grid, now);
             self.dirty = true;
         }
         // Whether the screen is this ack's frame (not one drawn after more
@@ -5434,7 +5434,7 @@ impl App {
                     }
                     // Drop their scrolls ahead too (a hidden step made none,
                     // nor any after it).
-                    self.give_up(grid);
+                    self.give_up(grid, now);
                     let seqs = self.anim.drop_chain(&self.model, grid, now);
                     let rest: Vec<u64> = seqs.into_iter().filter(|&q| q != k).collect();
                     self.forget(&rest);
@@ -5519,7 +5519,7 @@ impl App {
     /// ([`predict::Typed::blinded`]).
     fn drop_steps(&mut self, grid: u64, now: Instant) {
         if self.anim.chain(grid).is_some() {
-            self.give_up(grid);
+            self.give_up(grid, now);
         }
         let seqs = self.anim.drop_chain(&self.model, grid, now);
         self.forget(&seqs);
@@ -5954,7 +5954,7 @@ impl App {
         // Steps not acked in time are dropped like scrolls ahead, blind
         // until the next ack.
         for (grid, seqs) in self.anim.lapsed(&self.model, now) {
-            self.give_up(grid);
+            self.give_up(grid, now);
             self.forget(&seqs);
         }
         self.anim.advance(now);
