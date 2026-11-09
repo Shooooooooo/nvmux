@@ -263,7 +263,8 @@ fn write_atomic_as(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::
 /// Atomically rewrite the file `path` resolves to through symlinks, keeping
 /// its mode. Used for the config: renaming over `path` would replace a
 /// dotfiles symlink with a plain file and apply nvmux's 077 umask. A missing
-/// file is created at the end of the links.
+/// file is created at the end of the links. A file without write permission
+/// is replaced too, as the rename needs only the directory's write permission.
 pub(crate) fn write_through(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let target = follow_links(path)?;
@@ -273,6 +274,13 @@ pub(crate) fn write_through(path: &Path, contents: &[u8]) -> std::io::Result<()>
         Err(e) => return Err(e),
     };
     write_atomic_as(&target, contents, mode)
+}
+
+/// Whether the file `path` resolves to is read-only: it has no owner write
+/// bit, or we may not write it. Root may write any file, hence the bit.
+pub(crate) fn read_only(path: &Path) -> std::io::Result<bool> {
+    let mode = std::fs::metadata(path)?.mode();
+    Ok(mode & 0o200 == 0 || nix::unistd::access(path, nix::unistd::AccessFlags::W_OK).is_err())
 }
 
 /// Follow the last component's symlinks, even to a target that does not
@@ -541,6 +549,29 @@ mod tests {
             .file_type()
             .is_symlink());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As root, `access` passes each of these; only the owner's bit tells.
+    #[test]
+    fn a_file_without_its_owner_write_bit_is_read_only() {
+        let dir = crate::test_support::scratch_dir("paths-read-only");
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "").expect("write");
+        for (mode, want) in [(0o644, false), (0o444, true), (0o464, true)] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            assert_eq!(read_only(&file).expect("stat"), want, "{mode:o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_we_may_not_write_is_read_only() {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: root may write any file");
+            return;
+        }
+        // Root's, and 0755 on most systems: only `access` tells.
+        assert!(read_only(Path::new("/bin/sh")).expect("stat"));
     }
 
     /// Each test constructs the attack the check must stop.

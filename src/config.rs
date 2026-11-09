@@ -1517,7 +1517,7 @@ impl std::fmt::Display for Saved {
 /// template's line if not, else at the end of its table. One reset to its
 /// default is commented back out. With no file, the first-run template is
 /// written with the changes. Symlinks are followed and the target's mode kept
-/// (see [`crate::paths::write_through`]).
+/// (see [`crate::paths::write_through`]); a read-only target is not written.
 pub fn save(live: &Settings, saved: &Settings, overwrite: bool) -> Result<Saved, SaveError> {
     let path = config_path().ok_or(SaveError::Nowhere)?;
     let text = match std::fs::read_to_string(&path) {
@@ -1525,17 +1525,28 @@ pub fn save(live: &Settings, saved: &Settings, overwrite: bool) -> Result<Saved,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(SaveError::Read { path, error }),
     };
-    let (contents, count) = match saved_text(text.as_deref(), live, saved, overwrite) {
+    let write = |error| SaveError::Write {
+        path: path.clone(),
+        error,
+    };
+    let edited = saved_text(text.as_deref(), live, saved, overwrite);
+    // A save that would write is refused over a read-only file, and so is a
+    // clash, since the overwrite it offers would write.
+    let writes = match &edited {
+        Ok((_, count)) => *count > 0,
+        Err(Refusal::Changed(_)) => true,
+        Err(Refusal::Unreadable(_) | Refusal::Unedited) => false,
+    };
+    if writes && text.is_some() && crate::paths::read_only(&path).map_err(write)? {
+        return Err(SaveError::ReadOnly { path });
+    }
+    let (contents, count) = match edited {
         Ok(edited) => edited,
         Err(Refusal::Unreadable(message)) => return Err(SaveError::Unreadable { path, message }),
         Err(Refusal::Changed(settings)) => return Err(SaveError::Changed { path, settings }),
         Err(Refusal::Unedited) => return Err(SaveError::Unedited { path }),
     };
     if count > 0 {
-        let write = |error| SaveError::Write {
-            path: path.clone(),
-            error,
-        };
         if text.is_none() {
             crate::paths::create_private_parent(&path).map_err(write)?;
         }
@@ -3608,6 +3619,51 @@ fade.enabled = false   # too slow over ssh
             save(&live, &saved, false),
             Err(SaveError::Nowhere)
         ));
+    }
+
+    /// The save renames over the file, which needs only the directory's
+    /// write permission, and as root `access` passes a 0444 file too.
+    #[test]
+    fn a_save_leaves_a_read_only_file_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        let dir = scratch("save-read-only");
+        let real = dir.join("real.toml");
+        let link = dir.join("link.toml");
+        std::fs::write(&real, "[client]\nlazy = true\n").expect("write");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        std::os::unix::fs::symlink("real.toml", &link).expect("link");
+
+        for file in [&real, &link] {
+            env.set("NVMUX_CONFIG", file);
+            let read_only = format!("not saved: {} is read-only", file.display());
+            let saved = load().expect("load");
+            let live = with(&saved, "effects.smear.enabled", Value::Switch(true));
+            let refused = save(&live, &saved, false).expect_err("a read-only file");
+            assert_eq!(refused.to_string(), read_only);
+            // With nothing to write there is nothing to refuse.
+            assert_eq!(save(&saved, &saved, false).expect("no change").count, 0);
+            // The file had keys.timeout_ms = 300 when read and has changed it
+            // since: a clash, but the overwrite it offers would be refused.
+            let was = with(&saved, "keys.timeout_ms", Value::Number(300));
+            let live = with(&was, "keys.timeout_ms", Value::Number(1100));
+            let refused = save(&live, &was, false).expect_err("a read-only file");
+            assert_eq!(refused.to_string(), read_only);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("read"),
+            "[client]\nlazy = true\n"
+        );
+        let mode = std::fs::metadata(&real).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
+
+        // With no file there is no mode to check: the save creates it.
+        env.set("NVMUX_CONFIG", dir.join("new.toml"));
+        let live = with(&Settings::default(), "client.lazy", Value::Switch(true));
+        let created = save(&live, &Settings::default(), false).expect("created");
+        assert_eq!(created.count, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

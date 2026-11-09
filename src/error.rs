@@ -269,6 +269,11 @@ pub enum SaveError {
         settings: Vec<String>,
     },
 
+    /// The file is [`read_only`](crate::paths::read_only), so it is not
+    /// overwritten.
+    #[error("not saved: {} is read-only", crate::config::shown(.path))]
+    ReadOnly { path: PathBuf },
+
     #[error("not saved: could not write {}: {error}", crate::config::shown(.path))]
     Write {
         path: PathBuf,
