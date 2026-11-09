@@ -7582,8 +7582,8 @@ mod tests {
         );
     }
 
-    /// Neither an fd nvmux made without close-on-exec (like the SIGWINCH
-    /// self-pipe) nor one nvmux inherited (see `before_exec`).
+    /// Not even one without close-on-exec, as nvmux may have inherited (see
+    /// `before_exec`).
     #[test]
     fn a_client_inherits_no_descriptor_but_its_terminal() {
         let (read, write) = nix::unistd::pipe().expect("a pipe without close-on-exec");
