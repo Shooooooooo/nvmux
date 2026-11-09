@@ -532,14 +532,14 @@ impl Floating for Panel {
 
     fn close(&self) {}
 
-    /// Return from help, settings or a prompt: reload effects, close the `c`
-    /// gap, and take up rows a prompt changed (see [`App::reload_effects`],
-    /// [`App::close_room`]). A listing in flight is dropped with them, since
-    /// it predates the prompt's change.
+    /// Return from help, settings or a prompt: reload its copies of the
+    /// settings, close the `c` gap, and take up rows a prompt changed (see
+    /// `super::reload`, [`App::close_room`]). A listing in flight is dropped
+    /// with them, since it predates the prompt's change.
     fn back(&mut self) {
         self.leave = None;
         self.closing = false;
-        self.app.reload_effects();
+        super::reload(&mut self.app, &mut self.colours);
         self.app.close_room();
         if let Some(rows) = lock(&CHANGED).clone() {
             self.listing = None;
@@ -854,6 +854,54 @@ mod tests {
         panel.back();
         assert!(!panel.app.has_room(), "the gap closed");
         assert!(!panel.closing());
+        hand(&[], None);
+    }
+
+    /// The first cell of session `id`'s row in `buf`, as the panel last drew
+    /// it; effects colour a row's cells alike.
+    fn row_start<'a>(panel: &Panel, buf: &'a Buffer, id: &str) -> &'a ratatui::buffer::Cell {
+        let local = Rect::new(0, 0, panel.drawn.width, panel.drawn.height);
+        let row = draw::row_rect(&panel.app, local, id).expect("on screen");
+        &buf[(panel.drawn.x + row.x, panel.drawn.y + row.y)]
+    }
+
+    /// The settings can change `[style] color`; the theme pass draws the bar
+    /// in the new ink at once, but the effects kept the ink the panel opened
+    /// with. Here that is a theme the settings turned off, as under test
+    /// there is none.
+    #[test]
+    fn back_from_the_settings_the_effects_start_from_the_bars_colour() {
+        use ratatui::style::Color;
+        let _turn = lock(&crate::ui::test_support::PANELS);
+        let (other, behind) = ("aaaaaaaa", "bbbbbbbb");
+        hand(&rows(&[other, behind]), None);
+        let mut panel = Panel::open(behind);
+        let palette = crate::test_support::palette();
+        panel.colours = Some(effects::Colours {
+            palette,
+            theme: Some(crate::palette::Rgb(0x7a, 0xa2, 0xf7)),
+        });
+        assert_eq!(press(&mut panel, ','), Did::Close);
+        assert_eq!(panel.leave(), Some(Leave::Settings));
+        panel.back();
+        panel.app.set_effects(true);
+        let area = panel.area(Rect::new(0, 0, 80, 24)).expect("room to float");
+
+        let buf = panel.draw(area);
+        let bar = crate::fade::drawn_in(row_start(&panel, &buf, behind), &palette);
+        assert_eq!(press(&mut panel, 'k'), Did::Stay);
+        let buf = panel.draw(area);
+        let glow = row_start(&panel, &buf, behind).bg;
+        assert_eq!(press(&mut panel, 'x'), Did::Stay);
+        let buf = panel.draw(area);
+        let strike = row_start(&panel, &buf, other).bg;
+
+        let bar = Color::Rgb(bar.0, bar.1, bar.2);
+        assert_eq!(
+            [glow, strike],
+            [bar, bar],
+            "the glow and the strike start from the ink the panel opened with"
+        );
         hand(&[], None);
     }
 

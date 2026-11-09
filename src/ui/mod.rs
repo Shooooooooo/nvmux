@@ -429,9 +429,8 @@ fn run_loop(
     // When animations were last advanced; the clock lives here, like the
     // deadline.
     let mut ticked = Instant::now();
-    // Queried once: neither the palette nor `NO_COLOR` changes during the run.
-    let colours = effects::colours();
-    let colours = colours.as_ref();
+    // Queried once; `reload` takes up the theme's ink after the settings.
+    let mut colours = effects::colours();
     // Last draw time and area; `None` until the first frame, always drawn.
     let mut drawn: Option<Instant> = None;
     let mut area = ratatui::layout::Rect::default();
@@ -470,7 +469,7 @@ fn run_loop(
         let waiting = event::poll(Duration::ZERO)?;
         if !waiting || drawn.is_none_or(|at| at.elapsed() >= crate::fade::FRAME) {
             // Clicks resolve against the area as last drawn.
-            area = terminal.draw(|f| frame(f, &app, colours))?.area;
+            area = terminal.draw(|f| frame(f, &app, colours.as_ref()))?.area;
             if paced && app.animating() {
                 paced = caught_up();
             }
@@ -518,7 +517,9 @@ fn run_loop(
         // through the I/O. Skipped with neither: the loop draws next, and a
         // second frame per key would let a held key fall behind.
         if app.landing().is_some() || request != Request::None {
-            play_out(terminal, &mut app, colours, |app| app.landing().is_some())?;
+            play_out(terminal, &mut app, colours.as_ref(), |app| {
+                app.landing().is_some()
+            })?;
         }
         deadline = app
             .pending()
@@ -543,7 +544,7 @@ fn run_loop(
                 // Open a gap and bring the prompt up out of it (`make_room`),
                 // or just replace the picker if that is off. On create, the
                 // prompt fades itself out.
-                let arrival = make_room(terminal, &mut app, colours)?;
+                let arrival = make_room(terminal, &mut app, colours.as_ref())?;
                 let outcome = prompt::run_on(
                     terminal,
                     transport,
@@ -593,7 +594,7 @@ fn run_loop(
 
             Request::Kill(id) => {
                 if let Some(session) = app.session(&id).cloned() {
-                    erase(terminal, &mut app, &id, colours)?;
+                    erase(terminal, &mut app, &id, colours.as_ref())?;
                     if let Err(e) = transport.kill_session(&session) {
                         app.set_message(e.one_line());
                     }
@@ -621,8 +622,8 @@ fn run_loop(
 
             Request::Help => help::run_on(terminal, false)?,
 
-            // Afterwards, reload the picker's copies of the effects settings;
-            // the rest is read live.
+            // Afterwards, reload the picker's copies of the settings; the rest
+            // is read live.
             Request::Settings => {
                 let remote = matches!(transport.location(), crate::transport::Location::Ssh(_));
                 let behind = app.came_from().cloned();
@@ -642,7 +643,7 @@ fn run_loop(
                         });
                     }
                     _ => {
-                        app.reload_effects();
+                        reload(&mut app, &mut colours);
                         app.set_unsaved(unsaved());
                     }
                 }
@@ -687,6 +688,15 @@ fn caught_up() -> bool {
 /// Number of unsaved setting changes, for the quit prompt.
 fn unsaved() -> usize {
     crate::settings::changed(&crate::config::get(), &crate::config::saved()).len()
+}
+
+/// Re-read what the picker copies from the settings: the effect switches and
+/// the theme's ink. The palette and `NO_COLOR` hold for the run.
+fn reload(app: &mut App, colours: &mut Option<effects::Colours>) {
+    app.reload_effects();
+    if let Some(c) = colours {
+        c.theme = crate::theme::ink();
+    }
 }
 
 fn tick(app: &mut App, ticked: &mut Instant) {
