@@ -2268,7 +2268,11 @@ impl App {
         self.unanswered.clear();
         self.looked.clear();
         let mut opts = vec![
-            ("rgb", Arg::Bool(true)),
+            // Whether the terminal shows 24-bit colour, as Neovim's TUI
+            // reports it; 0.13 turns 'termguicolors' on for it. Unknown here,
+            // so Neovim asks the terminal itself. Both colour forms come with
+            // `ext_linegrid` either way.
+            ("rgb", Arg::Bool(false)),
             ("ext_linegrid", Arg::Bool(true)),
             ("ext_termcolors", Arg::Bool(true)),
             ("term_name", Arg::str(&term)),
