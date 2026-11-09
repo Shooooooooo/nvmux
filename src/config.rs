@@ -1289,7 +1289,8 @@ fn parse(path: &Path, contents: &str) -> Result<Settings, ConfigError> {
 
 /// Where to write a first-run config, or `None` if nvmux must not offer one:
 /// `$NVMUX_CONFIG` is set (the user owns it), no default path can be formed
-/// (no `$HOME`/`$XDG_CONFIG_HOME`), or a config already exists.
+/// (no `$HOME`/`$XDG_CONFIG_HOME`), or a config already exists. `exists`
+/// follows symlinks, as [`load`] does, so a dangling one is a first run.
 pub fn first_run_target() -> Option<PathBuf> {
     let nvmux_config = std::env::var_os("NVMUX_CONFIG");
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
@@ -1453,17 +1454,17 @@ fn command_width() -> usize {
         .unwrap_or(0)
 }
 
-/// Write the first-run config to `path` atomically
-/// ([`crate::paths::write_atomic`]). The parent is made with
-/// [`crate::paths::create_private_parent`], not the `/tmp`-hardened path,
-/// since an existing `~/.config` must be accepted.
+/// Write the first-run config to `path` atomically, through any symlink
+/// there, as [`save`] does ([`crate::paths::write_through`]). Only `path`'s
+/// own parent is made, with [`crate::paths::create_private_parent`], not the
+/// `/tmp`-hardened path, since an existing `~/.config` must be accepted.
 pub fn write_default(path: &Path, prefix: u8) -> Result<(), ConfigError> {
     let err = |error| ConfigError::Write {
         path: path.to_path_buf(),
         error,
     };
     crate::paths::create_private_parent(path).map_err(err)?;
-    crate::paths::write_atomic(path, render_default_config(prefix).as_bytes()).map_err(err)
+    crate::paths::write_through(path, render_default_config(prefix).as_bytes()).map_err(err)
 }
 
 // --- saving ---------------------------------------------------------------
@@ -3571,6 +3572,9 @@ fade.enabled = false   # too slow over ssh
             None,
             "a present config is not first-run"
         );
+        std::fs::rename(cfg.join("config.toml"), home.join("dotfiles.toml")).expect("move");
+        std::os::unix::fs::symlink("../../dotfiles.toml", cfg.join("config.toml")).expect("link");
+        assert_eq!(first_run_target(), None, "nor is one behind a link");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -3679,6 +3683,40 @@ fade.enabled = false   # too slow over ssh
         // It is no longer a first-run target, and load() reads the choice back.
         assert_eq!(first_run_target(), None);
         assert_eq!(load().expect("load").keys.prefix, 0x01);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A dotfiles link whose target is not made yet reads as no config.
+    #[test]
+    fn the_first_run_writes_through_a_dangling_link() {
+        let _lock = guard();
+        let env = ScrubbedEnv::new();
+        let home = scratch("first-run-dangling");
+        let cfg = home.join(".config").join("nvmux");
+        std::fs::create_dir_all(&cfg).expect("mkdir");
+        std::fs::create_dir(home.join("dotfiles")).expect("mkdir");
+        let link = cfg.join("config.toml");
+        std::os::unix::fs::symlink("../../dotfiles/nvmux.toml", &link).expect("link");
+        env.set("HOME", &home);
+        let is_link = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .expect("stat")
+                .file_type()
+                .is_symlink()
+        };
+
+        assert_eq!(first_run_target(), Some(link.clone()));
+        write_default(&link, 0x01).expect("write");
+        assert!(is_link(&link), "the link was replaced");
+        assert!(home.join("dotfiles").join("nvmux.toml").is_file());
+        assert_eq!(first_run_target(), None);
+        assert_eq!(load().expect("load").keys.prefix, 0x01);
+
+        // A link into a missing directory: the write fails and the link stays.
+        let stray = home.join("stray.toml");
+        std::os::unix::fs::symlink("missing/nvmux.toml", &stray).expect("link");
+        assert!(write_default(&stray, 0x01).is_err());
+        assert!(is_link(&stray), "the link was replaced");
         std::fs::remove_dir_all(&home).ok();
     }
 }
