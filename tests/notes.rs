@@ -546,6 +546,22 @@ fn a_programs_own_progress_bar_is_not_a_note() {
     assert_eq!(n.text, "then this", "nothing before it was taken for one");
 }
 
+/// Neovim passes a Latin-1 program's `é` on as the one byte it sent, which is
+/// not UTF-8.
+#[test]
+fn a_notification_that_is_not_utf8_still_shows() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-latin1");
+    let (_, sock) = a_session(&scratch, "latin1");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+    in_a_terminal(&sock, r"\033]777;notify;Build;caf\351 failed\007");
+    let n = read_until(&sock, |n| n.is_some()).expect("the notification");
+    assert_eq!(
+        (n.title.as_str(), n.text.as_str()),
+        ("Build", "caf\u{fffd} failed")
+    );
+}
+
 /// Programs in two terminals use the same id; within one terminal, a part
 /// with another id starts a new notification.
 #[test]

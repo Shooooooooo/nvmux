@@ -782,9 +782,9 @@ fn field<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
 
 /// A record string, safe to draw. The watcher already strips control
 /// characters, but the text comes from whoever sent the notification, so it is
-/// not trusted.
+/// not trusted, nor even UTF-8: a Latin-1 program's `é` comes as one byte.
 fn text(v: Option<&Value>) -> String {
-    let s = v.and_then(Value::as_str).unwrap_or_default();
+    let s = String::from_utf8_lossy(v.and_then(Value::as_slice).unwrap_or_default());
     let clean: String = s
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -1141,6 +1141,36 @@ mod tests {
         );
         assert_eq!(note.text, "a b c d");
         assert_eq!(note.age, Duration::ZERO, "a clock that went back");
+    }
+
+    /// A Latin-1 program's `é` is one byte that is not UTF-8; it must not
+    /// blank the whole title or body.
+    #[test]
+    fn text_that_is_not_utf8_still_shows() {
+        // A msgpack str, as Neovim sends any Lua string, whatever its bytes.
+        let raw = |bytes: &[u8]| {
+            assert!(bytes.len() < 32, "a fixstr");
+            let packed = [&[0xa0 | bytes.len() as u8][..], bytes].concat();
+            rmpv::decode::read_value(&mut &packed[..]).expect("a str")
+        };
+        let record = map(vec![(
+            "note",
+            map(vec![
+                ("kind", Value::from("notify")),
+                ("title", raw(b"Build \xe9")),
+                ("body", raw(b"caf\xe9 failed")),
+            ]),
+        )]);
+        let note = note_of(&record, Instant::now()).expect("a note");
+        assert_eq!(
+            (note.title.as_str(), note.text.as_str()),
+            ("Build \u{fffd}", "caf\u{fffd} failed")
+        );
+        let news = news_of(&record);
+        assert_eq!(
+            (news[0].title.as_str(), news[0].text.as_str()),
+            ("Build \u{fffd}", "caf\u{fffd} failed")
+        );
     }
 
     #[test]
