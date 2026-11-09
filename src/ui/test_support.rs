@@ -1,13 +1,14 @@
 //! Shared helpers for the screen tests, which render to a `TestBackend`.
 //! [`emitted`] renders through the binary's crossterm backend instead, for
 //! what is only visible in the escape stream. Also the picker builders shared
-//! by the picker and renderer tests.
+//! by the picker and renderer tests, and the prefix chords ([`prefix_chords`]).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
@@ -172,4 +173,17 @@ pub(super) fn filtering(names: &[&str], query: &str) -> App {
         a.on_key(Key::Char(c));
     }
     a
+}
+
+/// Every prefix the config accepts, as its byte and the event crossterm reads
+/// for its chord.
+pub(super) fn prefix_chords() -> Vec<(u8, KeyEvent)> {
+    ('a'..='z')
+        .map(|c| (format!("C-{c}"), c))
+        .chain([("C-Space".to_string(), ' ')])
+        .filter_map(|(spelled, c)| {
+            let byte = crate::keys::parse_prefix(&spelled).ok()?;
+            Some((byte, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)))
+        })
+        .collect()
 }

@@ -936,7 +936,9 @@ pub fn highest_num(sessions: &[Session]) -> u32 {
 /// Control chords other than `Ctrl-c`, `Ctrl-n` and `Ctrl-p` become
 /// `Key::Other`, never the bare letter: the prefix is configurable, and a
 /// reflexive `<prefix>` must not open the kill confirm (`x`) or quit (`q`),
-/// nor close the help and forward its second key.
+/// nor close the help and forward its second key. For the same reason
+/// `Ctrl-c`, which quits or closes every screen, cannot be the prefix
+/// ([`crate::keys::parse_prefix`]).
 fn translate(k: KeyEvent) -> Key {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     match k.code {

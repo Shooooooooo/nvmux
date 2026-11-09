@@ -258,8 +258,9 @@ impl Keymap {
 /// Only `Ctrl-<letter>` or `Ctrl-Space` (`NUL`): a single raw-mode byte that
 /// is typable and never ordinary text. `C-h`, `C-i`, `C-j` are refused (they
 /// mean something else on the wire), and `C-m` would clash with `ENTER`, which
-/// ends a number. `C-c` and `C-z` are allowed, as in tmux; that byte just stops
-/// reaching Neovim.
+/// ends a number. `C-c` is refused too: every nvmux screen quits, closes or
+/// cancels on it, so a `<prefix>` typed on one would end it. `C-z` is allowed,
+/// as in tmux; that byte just stops reaching Neovim.
 pub fn parse_prefix(s: &str) -> Result<u8, String> {
     let lower = s.trim().to_ascii_lowercase();
     let key = lower
@@ -282,6 +283,10 @@ pub fn parse_prefix(s: &str) -> Result<u8, String> {
     // 'a' (0x61) -> 0x01 ... 't' (0x74) -> 0x14 ... 'z' (0x7a) -> 0x1a.
     let byte = b & 0x1f;
     match byte {
+        0x03 => Err(
+            "C-c quits the picker and closes nvmux's other screens, so it cannot also be the prefix"
+                .into(),
+        ),
         0x08 => Err("C-h is Backspace and would never reach the prefix machine".into()),
         0x09 => Err("C-i is Tab and would never reach the prefix machine".into()),
         0x0a => Err("C-j is a line feed and would never reach the prefix machine".into()),
@@ -2264,8 +2269,8 @@ mod tests {
     #[test]
     fn the_prefix_string_round_trips() {
         for byte in 1u8..=26 {
-            // Enter, newline, Tab and Backspace are refused by design.
-            if matches!(byte, 0x08 | 0x09 | 0x0a | 0x0d) {
+            // Ctrl-c, Backspace, Tab, newline and Enter are refused by design.
+            if matches!(byte, 0x03 | 0x08 | 0x09 | 0x0a | 0x0d) {
                 continue;
             }
             let label = prefix_label(byte);
@@ -2302,9 +2307,17 @@ mod tests {
 
     /// Allowed, as in tmux: the byte just stops reaching Neovim.
     #[test]
-    fn ctrl_c_and_ctrl_z_are_accepted_as_prefixes() {
-        assert_eq!(parse_prefix("C-c"), Ok(0x03));
+    fn ctrl_z_is_accepted_as_a_prefix() {
         assert_eq!(parse_prefix("C-z"), Ok(0x1a));
+    }
+
+    /// In any spelling, saying why.
+    #[test]
+    fn ctrl_c_is_refused_as_the_prefix() {
+        for s in ["C-c", "Ctrl-c", "ctrl-C"] {
+            let why = parse_prefix(s).expect_err(s);
+            assert!(why.contains("quits the picker"), "{s:?}: {why}");
+        }
     }
 
     /// The old default is then an ordinary key.

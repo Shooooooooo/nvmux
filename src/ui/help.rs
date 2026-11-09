@@ -9,10 +9,11 @@
 //! the screen cannot list a key that does nothing; a test pins the other
 //! rows to the machine.
 //!
-//! Only named keys close it. `<prefix>` arrives as `Key::Other` (`translate`
-//! maps every control chord but `Ctrl-c`, `Ctrl-n`, `Ctrl-p` to it), so if
-//! any key closed it, typing "Ctrl-Space d" would close on the prefix and
-//! send a bare `d` to the session. Nothing typed here is forwarded.
+//! Only named keys close it, and `<prefix>` is none of them: `translate` maps
+//! every control chord but `Ctrl-c`, `Ctrl-n`, `Ctrl-p` to `Key::Other`, and
+//! `Ctrl-c` cannot be the prefix. If any key closed it, typing "Ctrl-Space d"
+//! would close on the prefix and send a bare `d` to the session. Nothing typed
+//! here is forwarded.
 
 use std::time::Instant;
 
@@ -644,5 +645,15 @@ mod tests {
         };
         assert_eq!(panel.on_mouse(click, now), Did::Stay);
         assert!(!panel.moving() && panel.wake_at().is_none() && !panel.tick(now));
+    }
+
+    /// One that closed it would hand the key after it to the session.
+    #[test]
+    fn no_prefix_closes_it() {
+        let now = Instant::now();
+        for (byte, chord) in test_support::prefix_chords() {
+            let label = keys::prefix_label(byte);
+            assert_eq!(panel().on_key(chord, now), Did::Stay, "{label}");
+        }
     }
 }

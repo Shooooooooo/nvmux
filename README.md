@@ -271,7 +271,7 @@ which you can also edit by hand.
 
 ```toml
 [keys]
-prefix     = "Ctrl-Space"   # Ctrl-Space, or a Ctrl-<letter> chord
+prefix     = "Ctrl-Space"   # Ctrl-Space, or Ctrl and a letter other than c, h, i, j or m
 timeout_ms = 1000           # how long a lone prefix or half-typed number waits
 
 [keys.bind]          # the key after the prefix: one character, "Space" or "Enter"

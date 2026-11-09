@@ -1355,7 +1355,7 @@ pub(crate) fn render_default_config(prefix: u8) -> String {
          # to start over. See the README for what each option does.\n\
          \n\
          [keys]\n\
-         prefix = {prefix:<12}   # Ctrl-Space, or a Ctrl-<letter> chord\n\
+         prefix = {prefix:<12}   # Ctrl-Space, or Ctrl and a letter other than c, h, i, j or m\n\
          # timeout_ms = {timeout:<6}   # how long a lone prefix or half-typed number waits\n\
          \n\
          [keys.bind]   # the key after the prefix: one character, \"Space\" or \"Enter\"\n\
@@ -2635,6 +2635,18 @@ mod tests {
     fn a_remapped_prefix_parses_to_its_byte() {
         let s: Settings = toml::from_str("[keys]\nprefix = \"C-a\"\n").expect("valid");
         assert_eq!(s.keys.prefix, 0x01);
+    }
+
+    /// Saying why, at its line.
+    #[test]
+    fn a_ctrl_c_prefix_is_refused() {
+        let doc = "[keys]\ntimeout_ms = 500\nprefix = \"C-c\"\n";
+        let err = parse(Path::new("config.toml"), doc).expect_err(doc);
+        let printed = err.to_string();
+        assert!(
+            printed.contains("line 3") && printed.contains("quits the picker"),
+            "{printed}"
+        );
     }
 
     /// As a table and inline.
