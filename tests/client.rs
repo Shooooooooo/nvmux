@@ -3690,6 +3690,22 @@ fn every_jump_predicted_lands_where_neovim_puts_it() {
     predicted(&mut term, "12j", b"12j");
 }
 
+/// With a `'scrolljump'` of half the window or more, a long move up scrolls
+/// by it from Neovim 0.13 and centres the cursor before; the agent says
+/// which.
+#[test]
+fn a_long_jump_up_with_a_large_scrolljump_lands_where_neovim_puts_it() {
+    require_nvim!();
+    let scratch = Scratch::new("client-jump-up");
+    let (_rpc, mut term, _) = drawn_slowly_with(&scratch, "client-jump-up", SCROLLING, MOTIONS);
+    typed(&mut term, b":set sj=15\r");
+    typed(&mut term, b"200G");
+    typed(&mut term, b"H");
+    predicted(&mut term, "12k", b"12k");
+    typed(&mut term, b"H");
+    predicted(&mut term, "15k", b"15k");
+}
+
 /// Each prediction in a mixed run starts from where the previous one left
 /// the cursor and view. With 'number', 'relativenumber' and 'scrolloff'.
 #[test]
@@ -7982,6 +7998,8 @@ fn views_go_where_neovim_takes_them() {
     let scratch = Scratch::new("client-views");
     let (_sock, mut rpc, _config) = session(&scratch, "client-views");
     rpc.command("setlocal noswapfile").expect("noswapfile");
+    // As the agent tells the client.
+    let jump_up = rpc.eval("has('nvim-0.13')").ok().and_then(|v| v.as_i64()) == Some(1);
     let mut checked = 0;
     let mut cases = Vec::new();
     for rows in [4i64, 5, 6, 7, 9, 12, 21, 22, 23, 40] {
@@ -8054,7 +8072,11 @@ fn views_go_where_neovim_takes_them() {
             for &jump in &jumps {
                 for &to in &targets {
                     let [was, after, cursor] = theirs.next().expect("as many");
-                    let how = Scrolling { jump, smooth };
+                    let how = Scrolling {
+                        jump,
+                        smooth,
+                        jump_up,
+                    };
                     let ours =
                         moves::keep_in_view((was, to), (rows, count - 1), so, how, &|l| l < count);
                     // A 'scrolljump' larger than the window scrolls past

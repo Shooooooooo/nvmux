@@ -515,6 +515,8 @@ if predict then
     end
     return classesof[isk]
   end
+  -- vim-patch 9.2.0591 (predict::Stepping::jump_up), not in 0.12.
+  local jump_up = vim.fn.has('nvim-0.13') == 1
   local function shape(buf, info)
     -- With acks, 'vartabstop' windows are not followed: tabs are not
     -- 'tabstop' wide there.
@@ -584,7 +586,7 @@ if predict then
         vim.wo.conceallevel > 0 and not vim.wo.concealcursor:find('n'),
         colorcolumn(info.winid), vim.o.scrolljump, vim.wo.conceallevel > 0, classes(buf),
         vim.bo[buf].iminsert == 1, vim.o.sections, vim.o.paragraphs,
-        vim.wo.wrap and vim.wo.smoothscroll })
+        vim.wo.wrap and vim.wo.smoothscroll, jump_up })
     end
     return s
   end

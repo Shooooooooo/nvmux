@@ -779,25 +779,31 @@ pub struct Scrolling {
     pub jump: i64,
     /// `'smoothscroll'` in a wrapping window: centre by rows, not lines.
     pub smooth: bool,
+    /// Neovim 0.13 on (Vim 9.2.0591): a long move up centres the cursor only
+    /// with a `'scrolljump'` under half the window; a larger one scrolls by
+    /// it, as a move down does.
+    pub jump_up: bool,
 }
 
 impl Default for Scrolling {
-    /// Neovim's defaults.
+    /// Neovim's defaults; with `'scrolljump'` 1, versions do not differ.
     fn default() -> Self {
         Self {
             jump: 1,
             smooth: false,
+            jump_up: false,
         }
     }
 }
 
-/// The top line Neovim 0.12.6's `update_topline` gives a view of `h` rows at
-/// `top` once a motion puts the cursor on `cursor` (buffer's last line
-/// `last`, `'scrolloff'` `so`, scrolling per `how`). The view stays if the
-/// cursor is at least `so` lines from its edges (buffer edges aside); for a
-/// short move it scrolls just far enough, by at least `'scrolljump'`
-/// (`scroll_cursor_top`/`scroll_cursor_bot`); for a longer one it centres the
-/// cursor (`scroll_cursor_halfway`). Lines must take one row each: `None` if
+/// The top line Neovim's `update_topline` (0.12.6's, or 0.13's per
+/// [`Scrolling::jump_up`]) gives a view of `h` rows at `top` once a motion
+/// puts the cursor on `cursor` (buffer's last line `last`, `'scrolloff'`
+/// `so`, scrolling per `how`). The view stays if the cursor is at least `so`
+/// lines from its edges (buffer edges aside); for a short move it scrolls
+/// just far enough, by at least `'scrolljump'` (`scroll_cursor_top`/
+/// `scroll_cursor_bot`); for a longer one it centres the cursor
+/// (`scroll_cursor_halfway`). Lines must take one row each: `None` if
 /// `one_row` says a consulted line does not, or if `so` exceeds half the
 /// window (Neovim then keeps the cursor centred by other rules). Checked
 /// against Neovim for windows of 4 to 40 rows and every `'scrolloff'` up to
@@ -823,6 +829,7 @@ pub fn keep_in_view(
         so,
         jump,
         smooth: how.smooth,
+        jump_up: how.jump_up,
         one_row,
     };
     Some(view.update(top.checked_add(1)?, cursor.checked_add(1)?)? - 1)
@@ -837,6 +844,7 @@ struct Topline<'a> {
     so: i64,
     jump: i64,
     smooth: bool,
+    jump_up: bool,
     one_row: &'a dyn Fn(i64) -> bool,
 }
 
@@ -879,7 +887,8 @@ impl Topline<'_> {
         let mut check_botline = true;
         if check_topline {
             let halfheight = (h / 2 - 1).max(2);
-            if t.saturating_add(so) - c >= halfheight {
+            let far = t.saturating_add(so) - c >= halfheight;
+            if far && !(self.jump_up && self.jump >= halfheight) {
                 t = self.halfway(c, false)?;
                 check_botline = false;
             } else {
@@ -2254,6 +2263,36 @@ mod tests {
         keep_in_view((top, cursor), (h, last), so, Scrolling::default(), &|_| {
             true
         })
+    }
+
+    /// Each case is `(top, cursor, rows, 'scrolloff', 'scrolljump', last)`
+    /// and the tops Neovim 0.12.6 and 0.13 give. `-100` is Vim's report.
+    #[test]
+    fn a_long_move_up_scrolls_by_a_large_scrolljump_from_0_13() {
+        for ((top, cursor, h, so, jump, last), old, new) in [
+            ((4, 3, 7, 1, 3, 5), 0, 1),
+            ((100, 88, 22, 0, 15, 299), 78, 74),
+            ((100, 88, 22, 0, -100, 299), 78, 67),
+            ((100, 90, 22, 3, 15, 299), 80, 76),
+            // Not far: scrolled by 'scrolljump' in both.
+            ((100, 95, 22, 0, 15, 299), 81, 81),
+            // Under half the window: centred in both.
+            ((100, 88, 22, 0, 9, 299), 78, 78),
+        ] {
+            for (jump_up, want) in [(false, old), (true, new)] {
+                let how = Scrolling {
+                    jump,
+                    smooth: false,
+                    jump_up,
+                };
+                assert_eq!(
+                    keep_in_view((top, cursor), (h, last), so, how, &|_| true),
+                    Some(want),
+                    "{cursor} from top {top}, {h} rows, 'scrolloff' {so}, \
+                     'scrolljump' {jump}, jump_up {jump_up}"
+                );
+            }
+        }
     }
 
     /// [`keep_in_view`] scrolls minimally exactly where [`TOPLINE`] says

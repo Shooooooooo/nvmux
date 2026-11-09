@@ -158,6 +158,8 @@ pub struct Stepping {
     pub paragraphs: Option<String>,
     /// In a wrapping window: Neovim centres views by rows.
     pub smoothscroll: bool,
+    /// Neovim 0.13 on: see [`moves::Scrolling::jump_up`].
+    pub jump_up: bool,
 }
 
 /// `'cursorlineopt'` parts drawn (none when off); `number` covers
@@ -250,6 +252,7 @@ impl Stepping {
         moves::Scrolling {
             jump: self.scrolljump,
             smooth: self.smoothscroll,
+            jump_up: self.jump_up,
         }
     }
 }
@@ -324,6 +327,7 @@ impl Shape {
                 sections: v.get(42).and_then(redraw::as_str).map(String::from),
                 paragraphs: v.get(43).and_then(redraw::as_str).map(String::from),
                 smoothscroll: flag(44),
+                jump_up: flag(45),
             }),
         })
     }
@@ -4234,6 +4238,7 @@ mod tests {
                 sections: None,
                 paragraphs: None,
                 smoothscroll: false,
+                jump_up: false,
             }),
             ..shape()
         }

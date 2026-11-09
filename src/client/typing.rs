@@ -928,6 +928,7 @@ mod tests {
                 sections: None,
                 paragraphs: None,
                 smoothscroll: false,
+                jump_up: false,
             }),
         }
     }
