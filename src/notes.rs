@@ -42,7 +42,7 @@ use crate::rpc;
 
 /// Watcher version. A session with any other version gets this watcher,
 /// keeping its record.
-pub const VERSION: i64 = 10;
+pub const VERSION: i64 = 11;
 
 /// Picker read interval.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -109,7 +109,10 @@ N.lsp = {}
 N.seq = type(N.seq) == 'number' and N.seq or 0
 N.listeners = type(N.listeners) == 'table' and N.listeners or {}
 local group = api.nvim_create_augroup('nvmux_notes', { clear = true })
-local function clean(s)
+-- `open` is for a kitty part, which later parts extend, perhaps mid-character:
+-- its trailing blanks stay, and it is cut by bytes, at 1200 for 200 characters
+-- of up to 6 bytes as strcharpart counts them.
+local function clean(s, open)
   if type(s) == 'table' then
     local parts = {}
     for _, c in ipairs(s) do
@@ -121,6 +124,9 @@ local function clean(s)
     return ''
   end
   s = s:gsub('[%z\1-\31\127]', ' '):gsub('\194[\128-\159]', ' ')
+  if open then
+    return (s:gsub('^%s+', '')):sub(1, 1200)
+  end
   return vim.fn.strcharpart(vim.trim(s), 0, 200)
 end
 local function shown(buf)
@@ -219,7 +225,7 @@ api.nvim_create_autocmd('LspProgress', {
   end,
 })
 local function program(buf)
-  local name = api.nvim_buf_is_valid(buf) and api.nvim_buf_get_name(buf) or ''
+  local name = buf and api.nvim_buf_is_valid(buf) and api.nvim_buf_get_name(buf) or ''
   local command = name:match('^term://.-//%d+:(.*)$') or name
   return (command:gsub('^%S*/', ''))
 end
@@ -235,26 +241,33 @@ api.nvim_create_autocmd('TermRequest', {
     if type(seq) ~= 'string' or seq:sub(1, 2) ~= '\27]' then
       return
     end
+    -- Nil for a buffer an earlier TermRequest autocommand wiped, which keeps
+    -- nothing here; 0.11 sends the terminal's later requests for buffer 0.
+    local buf = ev.buf > 0 and api.nvim_buf_is_valid(ev.buf) and ev.buf or nil
     local osc = seq:sub(3)
     local title, body = osc:match('^777;notify;([^;]*);?(.*)$')
     if title then
-      return note('notify', title, body, ev.buf)
+      return note('notify', title, body, buf)
     end
     local mark, args = osc:match('^133;(%a)(.*)$')
     if mark == 'C' then
       local url = args:match(';cmdline_url=([^;]*)')
-      commands[ev.buf] = url and vim.uri_decode(url) or false
+      if buf then
+        commands[buf] = url and vim.uri_decode(url) or false
+      end
       return
     elseif mark == 'D' then
       local status = tonumber(args:match('^;(%d+)'))
-      local command = commands[ev.buf]
-      commands[ev.buf] = nil
+      local command = buf and commands[buf]
+      if buf then
+        commands[buf] = nil
+      end
       if status and (status > 0 or command ~= nil) then
         local kind = status > 0 and 'failed' or 'finished'
         if command then
-          note(kind, command, 'exited with code ' .. status, ev.buf)
+          note(kind, command, 'exited with code ' .. status, buf)
         else
-          note(kind, program(ev.buf), 'a command exited with code ' .. status, ev.buf)
+          note(kind, program(buf), 'a command exited with code ' .. status, buf)
         end
       end
       return
@@ -262,7 +275,7 @@ api.nvim_create_autocmd('TermRequest', {
     local text = osc:match('^9;(.*)$')
     if text then
       if not text:match('^%d+;') and not text:match('^%d+$') then
-        note('notify', '', text, ev.buf)
+        note('notify', '', text, buf)
       end
       return
     end
@@ -276,20 +289,37 @@ api.nvim_create_autocmd('TermRequest', {
         local ok, decoded = pcall(vim.base64.decode, payload)
         payload = ok and decoded or ''
       end
+      -- One unfinished notification per terminal, as kitty keeps one per
+      -- window; a part with another id starts a new one, as does one on another
+      -- channel: a terminal a TermClose autocommand starts fires no TermOpen
+      -- unless the autocommand is nested.
       local id = m.i or ''
-      local p = parts[id] or { title = '', body = '' }
-      if (m.p or 'title') == 'title' then
-        p.title = p.title .. payload
-      elseif m.p == 'body' then
-        p.body = p.body .. payload
+      local chan = buf and vim.bo[buf].channel or 0
+      local p = buf and parts[buf]
+      if not p or p.id ~= id or p.chan ~= chan then
+        p = { id = id, chan = chan, title = '', body = '' }
       end
-      if m.d == '0' then
-        parts[id] = p
-      else
-        parts[id] = nil
-        note('notify', p.title, p.body, ev.buf)
+      local field = m.p or 'title'
+      if field == 'title' or field == 'body' then
+        p[field] = clean(p[field] .. payload, true)
+      end
+      if buf then
+        parts[buf] = m.d == '0' and p or nil
+      end
+      if m.d ~= '0' then
+        note('notify', p.title, p.body, buf)
       end
     end
+  end,
+})
+-- Neovim holds back a terminal's sequences while lines it scrolled are pending,
+-- so they can come after its TermClose: its parts and command go when its
+-- buffer is wiped or another terminal opens in it, and sequences held back
+-- past that are taken as the new terminal's.
+api.nvim_create_autocmd({ 'TermOpen', 'BufWipeout' }, {
+  group = group,
+  callback = function(ev)
+    parts[ev.buf], commands[ev.buf] = nil, nil
   end,
 })
 api.nvim_create_autocmd('TermClose', {

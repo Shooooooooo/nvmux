@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::Scratch;
-use nvmux::notes::{self, Kind, Note, Poller, Reading};
+use nvmux::notes::{self, Heard, Kind, Note, Poller, Reading};
 use nvmux::transport::Transport;
 use rmpv::Value;
 
@@ -71,6 +71,58 @@ end"#
         ),
         Duration::from_secs(15),
     );
+}
+
+/// Run `script` in a hidden terminal buffer; returns its channel, for
+/// [`enter`].
+fn a_terminal(sock: &Path, script: &str) -> u64 {
+    lua(
+        sock,
+        &format!(
+            r#"local buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({{ 'sh', '-c', [=[{script}]=] }}, {{ term = true }})
+end)
+return vim.bo[buf].channel"#
+        ),
+    )
+    .as_u64()
+    .expect("its channel")
+}
+
+/// Press Enter in the terminal on `chan`, ending its program's `read`.
+fn enter(sock: &Path, chan: u64) {
+    lua(sock, &format!("vim.api.nvim_chan_send({chan}, '\\r')"));
+}
+
+/// Terminals with something in the watcher's table `name`: `parts`, their
+/// unfinished kitty notifications, or `commands`, their shells' commands.
+/// Nothing else shows them.
+fn held(sock: &Path, name: &str) -> u64 {
+    lua(
+        sock,
+        &format!(
+            r"local f = vim.api.nvim_get_autocmds({{ group = 'nvmux_notes', event = 'TermRequest' }})[1].callback
+for i = 1, math.huge do
+  local name, value = debug.getupvalue(f, i)
+  if name == nil or name == '{name}' then
+    return value and vim.tbl_count(value)
+  end
+end"
+        ),
+    )
+    .as_u64()
+    .expect("the watcher's table")
+}
+
+/// The session's Lua memory in KB, after a full collection.
+fn lua_memory(sock: &Path) -> f64 {
+    lua(
+        sock,
+        "collectgarbage('collect') collectgarbage('collect') return collectgarbage('count')",
+    )
+    .as_f64()
+    .expect("a size")
 }
 
 /// Read until `want` holds, or 5 s pass.
@@ -494,6 +546,290 @@ fn a_programs_own_progress_bar_is_not_a_note() {
     assert_eq!(n.text, "then this", "nothing before it was taken for one");
 }
 
+/// Programs in two terminals use the same id; within one terminal, a part
+/// with another id starts a new notification.
+#[test]
+fn kitty_notifications_are_pieced_together_by_terminal_and_id() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-kitty-own");
+    let (_, sock) = a_session(&scratch, "pieced");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    let building = a_terminal(
+        &sock,
+        r"printf '\033]99;i=1:d=0;Build\033\134\033]777;notify;x;begun\007'; read x; printf '\033]99;i=1:p=body;finished\033\134'; sleep 30",
+    );
+    read_until(&sock, |n| n.is_some_and(|n| n.text == "begun")).expect("its first part");
+    notes::seen(&sock);
+    in_a_terminal(&sock, r"\033]99;i=1:p=body;Tests passed\033\134");
+    let other = read_until(&sock, |n| n.is_some()).expect("the other terminal's");
+    assert_eq!(
+        (other.title.as_str(), other.text.as_str()),
+        ("", "Tests passed"),
+        "nothing of the first terminal's"
+    );
+
+    notes::seen(&sock);
+    enter(&sock, building);
+    let own = read_until(&sock, |n| n.is_some()).expect("the first terminal's");
+    assert_eq!(
+        (own.title.as_str(), own.text.as_str()),
+        ("Build", "finished"),
+        "its first part kept through the other's"
+    );
+
+    notes::seen(&sock);
+    in_a_terminal(
+        &sock,
+        r"\033]99;i=2:d=0;Abandoned\033\134\033]99;i=3;Fresh\033\134",
+    );
+    let fresh = read_until(&sock, |n| n.is_some()).expect("the new one");
+    assert_eq!((fresh.title.as_str(), fresh.text.as_str()), ("Fresh", ""));
+}
+
+/// However many parts come, it holds at most what 200 characters can take;
+/// the 200 shown start at the first that is not blank.
+#[test]
+fn an_unfinished_kitty_notification_is_bounded() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-kitty-cut");
+    let (_, sock) = a_session(&scratch, "cut");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    // 1300 blanks, past the 1200 bytes kept, and 400 KB of title in parts of
+    // 1000 characters; then a mark once all are in.
+    let sending = a_terminal(
+        &sock,
+        r"read x; printf '\033]99;i=big:d=0;%1300sLong \033\134' ''; a=$(head -c 1000 /dev/zero | tr '\0' A); i=0; while [ $i -lt 400 ]; do printf '\033]99;i=big:d=0;%s\033\134' $a; i=$((i+1)); done; printf '\033]777;notify;x;sent\007'; read x; printf '\033]99;i=big:p=body;done\033\134'; sleep 30",
+    );
+    let before = lua_memory(&sock);
+    enter(&sock, sending);
+    read_until(&sock, |n| n.is_some_and(|n| n.text == "sent")).expect("all its parts");
+    let held = lua_memory(&sock) - before;
+    assert!(held < 100.0, "400 KB sent, {held:.0} KB held");
+
+    notes::seen(&sock);
+    enter(&sock, sending);
+    let n = read_until(&sock, |n| n.is_some()).expect("the notification");
+    assert_eq!(n.title, format!("Long {}", "A".repeat(195)));
+    assert_eq!(n.text, "done");
+}
+
+/// Here the 200th character, the last shown, is split between base64 parts,
+/// which kitty joins before decoding.
+#[test]
+fn a_character_split_between_kitty_parts_is_kept_whole() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-kitty-split");
+    let (_, sock) = a_session(&scratch, "split");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    // In base64: 199 A's and the first two of 中's three bytes, then its last
+    // and "BC".
+    in_a_terminal(
+        &sock,
+        &format!(
+            r"\033]99;i=u:d=0:e=1;{}QeS4\033\134\033]99;i=u:e=1;rUJD\033\134",
+            "QUFB".repeat(66)
+        ),
+    );
+    let n = read_until(&sock, |n| n.is_some()).expect("the notification");
+    assert_eq!(n.title, format!("{}中", "A".repeat(199)));
+}
+
+/// The part and the command come after `TermClose`, as when output that
+/// scrolled holds them back: a terminal's requests wait for the Lua that sent
+/// them to return, and `chanclose` closes the terminal within it.
+#[test]
+fn an_unfinished_kitty_notification_goes_with_its_terminal() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-kitty-gone");
+    let (_, sock) = a_session(&scratch, "gone");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    let buf = lua(
+        &sock,
+        r"local buf = vim.api.nvim_create_buf(true, false)
+local chan = vim.api.nvim_open_term(buf, {})
+vim.api.nvim_chan_send(chan, '\27]99;i=1:d=0;Unfinished\27\\\27]133;C;cmdline_url=exit\27\\')
+vim.fn.chanclose(chan)
+return buf",
+    )
+    .as_i64()
+    .expect("its buffer");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            (held(&sock, "parts"), held(&sock, "commands")) == (1, 1)
+        }),
+        "the part and the command were never held"
+    );
+    lua(
+        &sock,
+        &format!("vim.api.nvim_buf_delete({buf}, {{ force = true }})"),
+    );
+    assert_eq!(
+        (held(&sock, "parts"), held(&sock, "commands")),
+        (0, 0),
+        "gone with its buffer"
+    );
+}
+
+/// The new terminal gets neither the old one's unfinished notification nor
+/// its command, whose OSC 133;C came after `TermClose`, following output that
+/// scrolled. nvim_open_term sets no 'channel', so only `TermOpen` tells the
+/// two apart.
+#[test]
+fn a_buffer_given_a_new_terminal_forgets_the_old_one() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-kitty-reused");
+    let (_, sock) = a_session(&scratch, "reused");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    let buf = common::a_job_that_exits(
+        &sock,
+        r"seq 1 300; printf '\033]99;i=1:d=0;Old\033\134\033]133;C;cmdline_url=exit\033\134\033]777;notify;x;sent\007'",
+        false,
+    );
+    read_until(&sock, |n| n.is_some_and(|n| n.text == "sent")).expect("its last sequences");
+    notes::seen(&sock);
+    lua(
+        &sock,
+        &format!(
+            r"local chan = vim.api.nvim_open_term({buf}, {{}})
+vim.api.nvim_chan_send(chan, '\27]133;D;0\27\\\27]99;i=1;Fresh\27\\')"
+        ),
+    );
+    let n = read_until(&sock, |n| n.is_some_and(|n| n.kind == Kind::Notified))
+        .expect("the new notification");
+    assert_eq!(n.title, "Fresh");
+    let Heard::Said { news, .. } = notes::hear(&sock, None) else {
+        panic!("the session said nothing");
+    };
+    assert_eq!(
+        news.iter().map(|n| n.kind).collect::<Vec<_>>(),
+        [Kind::Notified],
+        "no finish of the old command: {news:?}"
+    );
+}
+
+/// A `TermRequest` autocommand defined before the watcher's, as a user's or
+/// a plugin's is, wipes each terminal's buffer at its first request, before
+/// the watcher sees it. 0.11 sends the first terminal's later requests for
+/// buffer 0; 0.12 drops them.
+#[test]
+fn a_notification_shows_though_its_buffer_was_wiped_first() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-kitty-wiped");
+    let (_, sock) = a_session(&scratch, "wiped");
+    lua(
+        &sock,
+        r"vim.v.errmsg = ''
+vim.api.nvim_create_autocmd('TermRequest', {
+  callback = function(ev)
+    if ev.buf > 0 then
+      vim.api.nvim_buf_delete(ev.buf, { force = true })
+    end
+  end,
+})",
+    );
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+    let wiped = |printf: &str| {
+        let buf = lua(
+            &sock,
+            &format!(
+                r#"local buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({{ 'sh', '-c', [=[printf '{printf}'; sleep 30]=] }}, {{ term = true }})
+end)
+return buf"#
+            ),
+        )
+        .as_i64()
+        .expect("its buffer");
+        assert!(
+            common::wait_until(Duration::from_secs(5), || {
+                lua(&sock, &format!("return vim.api.nvim_buf_is_valid({buf})"))
+                    == Value::Boolean(false)
+            }),
+            "{printf} never wiped its buffer"
+        );
+    };
+    wiped(
+        r"\033]99;i=1:d=0;Part\033\134\033]133;C;cmdline_url=make\033\134\033]99;i=2:d=0;More\033\134",
+    );
+    wiped(r"\033]133;C;cmdline_url=make\033\134");
+    wiped(r"\033]99;i=3;Hi\033\134");
+    let n = read_until(&sock, |n| n.is_some()).expect("the notification");
+    assert_eq!(n.title, "Hi");
+    assert_eq!(
+        (held(&sock, "parts"), held(&sock, "commands")),
+        (0, 0),
+        "kept for a buffer gone"
+    );
+    assert_eq!(lua(&sock, "return vim.v.errmsg"), Value::from(""));
+}
+
+/// The old program's part came before `TermClose`, as nothing scrolled, and a
+/// terminal a `TermClose` autocommand starts fires no `TermOpen` unless the
+/// autocommand is nested.
+#[test]
+fn a_terminal_started_from_termclose_forgets_the_old_ones_part() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-kitty-restart");
+    let (_, sock) = a_session(&scratch, "restarted");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    let old = lua(
+        &sock,
+        r"local buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_create_autocmd('TermClose', {
+  buffer = buf,
+  once = true,
+  callback = function()
+    vim.bo[buf].modified = false
+    vim.api.nvim_buf_call(buf, function()
+      vim.fn.jobstart({ 'sh', '-c', [=[printf '\033]99;i=1;Fresh\033\134'; sleep 30]=] }, { term = true })
+    end)
+  end,
+})
+vim.api.nvim_buf_call(buf, function()
+  vim.fn.jobstart({ 'sh', '-c', [=[printf '\033]99;i=1:d=0;Old\033\134'; read x]=] }, { term = true })
+end)
+return vim.bo[buf].channel",
+    )
+    .as_u64()
+    .expect("its channel");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || held(&sock, "parts") == 1),
+        "the old program's part never came"
+    );
+    enter(&sock, old);
+    let n = read_until(&sock, |n| n.is_some_and(|n| n.kind == Kind::Notified))
+        .expect("the new notification");
+    assert_eq!(n.title, "Fresh");
+}
+
+/// Its last part, sent after output that scrolled just before the program
+/// exited, comes after `TermClose`; the part before must still be kept.
+#[test]
+fn a_kitty_notification_finished_as_its_program_exits_is_whole() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-kitty-late");
+    let (_, sock) = a_session(&scratch, "late");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+
+    let building = a_terminal(
+        &sock,
+        r"printf '\033]99;i=1:d=0;Build\033\134\033]777;notify;x;begun\007'; read x; seq 1 300; printf '\033]99;i=1:p=body;finished\033\134'",
+    );
+    read_until(&sock, |n| n.is_some_and(|n| n.text == "begun")).expect("its first part");
+    notes::seen(&sock);
+    enter(&sock, building);
+    let n = read_until(&sock, |n| n.is_some_and(|n| n.kind == Kind::Notified))
+        .expect("the notification");
+    assert_eq!((n.title.as_str(), n.text.as_str()), ("Build", "finished"));
+}
+
 /// An older watcher version is replaced, keeping what it recorded.
 #[test]
 fn a_watcher_is_replaced_in_place() {
@@ -517,7 +853,7 @@ fn a_watcher_is_replaced_in_place() {
             "return #vim.api.nvim_get_autocmds({ group = 'nvmux_notes' })"
         )
         .as_u64(),
-        Some(if has_progress(&sock) { 4 } else { 3 }),
+        Some(if has_progress(&sock) { 6 } else { 5 }),
         "the autocommands replaced, not added to"
     );
 }
