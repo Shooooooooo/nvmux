@@ -152,6 +152,20 @@ fn has_progress(sock: &Path) -> bool {
     lua(sock, "return vim.fn.has('nvim-0.12') == 1") == Value::Boolean(true)
 }
 
+/// The watcher's version and its autocommands' ids, which an install
+/// replaces.
+fn watcher(sock: &Path) -> Value {
+    lua(
+        sock,
+        "return { require('nvmux.notes').version, vim.tbl_map(function(a) return a.id end, \
+         vim.api.nvim_get_autocmds({ group = 'nvmux_notes' })) }",
+    )
+}
+
+/// A listener for [`notes::hear`] to name. No such channel exists, but no
+/// news comes after it is named to have it dropped.
+const LISTENER: Option<u64> = Some(1_000_000);
+
 fn a_session(scratch: &Scratch, name: &str) -> (nvmux::session::Session, std::path::PathBuf) {
     let t = scratch.transport();
     let s = t
@@ -871,6 +885,125 @@ fn a_watcher_is_replaced_in_place() {
         .as_u64(),
         Some(if has_progress(&sock) { 6 } else { 5 }),
         "the autocommands replaced, not added to"
+    );
+}
+
+/// A newer nvmux watches the session too. Were its watcher replaced at each
+/// read, a command started before a read and finished after it would be
+/// lost, and no listener would be reported as listening.
+#[test]
+fn a_newer_watcher_is_read_as_it_is() {
+    require_nvim!();
+    let scratch = Scratch::new("notes-newer");
+    let (_, sock) = a_session(&scratch, "newer");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+    lua(
+        &sock,
+        &format!("require('nvmux.notes').version = {}", notes::VERSION + 1),
+    );
+    let newer = watcher(&sock);
+
+    let make = a_terminal(
+        &sock,
+        r"printf '\033]133;C;cmdline_url=make\033\134\033]777;notify;make;started\007'; read x; printf '\033]133;D;0\033\134'; sleep 30",
+    );
+    // Not waited for with a read: the first read must come between C and D.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            lua(&sock, "return require('nvmux.notes').note ~= nil") == Value::Boolean(true)
+        }),
+        "the command never started"
+    );
+    let started = notes::read(&sock);
+    assert!(
+        matches!(&started, Reading::Said(Some(n)) if n.text == "started"),
+        "{started:?}"
+    );
+    assert_eq!(watcher(&sock), newer, "the newer watcher kept");
+
+    notes::seen(&sock);
+    enter(&sock, make);
+    let finished = read_until(&sock, |n| n.is_some()).expect("the command's end");
+    assert_eq!(
+        (finished.kind, finished.title.as_str()),
+        (Kind::Finished, "make")
+    );
+
+    notes::hear(&sock, LISTENER);
+    assert!(
+        matches!(
+            notes::hear(&sock, LISTENER),
+            Heard::Said {
+                listening: true,
+                ..
+            }
+        ),
+        "a listener named by the read before"
+    );
+    assert_eq!(watcher(&sock), newer);
+}
+
+#[test]
+fn a_newer_watcher_installed_since_the_read_is_kept() {
+    require_nvim!();
+    installed_since_the_read("notes-since-newer", notes::VERSION + 1);
+}
+
+/// Two nvmux of one version read a fresh session at once.
+#[test]
+fn a_watcher_of_the_same_version_installed_since_the_read_is_kept() {
+    require_nvim!();
+    installed_since_the_read("notes-since-same", notes::VERSION);
+}
+
+/// Another nvmux installs a watcher of `version` between this one's read,
+/// which found none, and this one's install. Here the read finds none in
+/// `package.loaded`, and a callback it sets off puts the other one back
+/// before the next request.
+fn installed_since_the_read(tag: &str, version: i64) {
+    let scratch = Scratch::new(tag);
+    let (_, sock) = a_session(&scratch, "since");
+    assert_eq!(notes::read(&sock), Reading::Said(None));
+    in_a_terminal(&sock, r"\033]777;notify;Build;finished\007");
+    read_until(&sock, |n| n.is_some()).expect("recorded");
+    lua(
+        &sock,
+        &format!("require('nvmux.notes').version = {version}"),
+    );
+    let installed = watcher(&sock);
+    lua(
+        &sock,
+        r"local N = package.loaded['nvmux.notes']
+package.loaded['nvmux.notes'] = nil
+setmetatable(package.loaded, {
+  __index = function(loaded, name)
+    if name == 'nvmux.notes' then
+      setmetatable(loaded, nil)
+      vim.schedule(function()
+        loaded[name] = N
+      end)
+    end
+  end,
+})",
+    );
+
+    let Heard::Said { news, .. } = notes::hear(&sock, LISTENER) else {
+        panic!("the session said nothing");
+    };
+    assert_eq!(
+        news.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(),
+        ["finished"]
+    );
+    assert_eq!(watcher(&sock), installed, "the other watcher kept");
+    assert!(
+        matches!(
+            notes::hear(&sock, LISTENER),
+            Heard::Said {
+                listening: true,
+                ..
+            }
+        ),
+        "the listener registered with it"
     );
 }
 

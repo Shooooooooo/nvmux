@@ -40,8 +40,11 @@ use rmpv::Value;
 use crate::error::RpcError;
 use crate::rpc;
 
-/// Watcher version. A session with any other version gets this watcher,
-/// keeping its record.
+/// Watcher version. A session with an older watcher, or none, gets this one,
+/// keeping its record. An older nvmux reads a newer watcher with its own
+/// [`READ`] and [`SEEN`], and waits for [`NEWS`] on the channel its READ
+/// registers, so a new version may add to what those use and to the record,
+/// but must not change any of them.
 pub const VERSION: i64 = 11;
 
 /// Picker read interval.
@@ -55,9 +58,10 @@ const BUDGET: Duration = Duration::from_secs(1);
 const SETTLE: Duration = Duration::from_millis(30);
 
 /// The watcher, run with `nvim_exec_lua` (args: version, optional listener
-/// channel); returns the record as [`READ`] does. Reinstalling replaces the
-/// autocommands and keeps the record, except LSP work, which restarts since
-/// another version's watcher may have missed its end.
+/// channel) where [`READ`] found none or an older one; returns the record as
+/// [`READ`] does. One at least as new installed since, by another read, is
+/// kept. Replacing keeps the record, except LSP work, which restarts since
+/// the older watcher may have missed its end.
 ///
 /// It records:
 /// - running progress by source and id (title, text, start time, percent;
@@ -90,13 +94,19 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// registered ([`READ`], [`listen`]). Failing channels are dropped (channel ids
 /// are never reused); listeners survive reinstalling. A listener passed here
 /// is registered, but the record does not report it as `listening`, since the
-/// replaced watcher may not have told it.
+/// watcher this one replaces, or one another read installed since, may not
+/// have told it.
 const WATCHER: &str = r#"local version, listener = ...
 local api = vim.api
 local N = package.loaded['nvmux.notes']
 if type(N) ~= 'table' then
   N = { progress = {} }
   package.loaded['nvmux.notes'] = N
+elseif type(N.version) == 'number' and N.version >= version and type(N.snapshot) == 'function' then
+  if listener then
+    N.listeners[listener] = true
+  end
+  return N.snapshot()
 end
 N.version = version
 N.progress = type(N.progress) == 'table' and N.progress or {}
@@ -395,17 +405,18 @@ end
 return N.snapshot()
 "#;
 
-/// Returns the record map, or `false` if the watcher is missing or another
-/// version. Keys: `seq`, the last number given; and, each present only when
-/// set, `busy` (latest-started progress or LSP work: `title`, `text`,
-/// `percent`, `age` in seconds), `note` (`kind` `notify` or `failed`) and
-/// `finished`, both with `title`, `body`, `age`, `seq`, `shown`, `buf`, `tab`.
+/// Returns the record map, or `false` if the watcher is missing or older.
+/// Keys: `seq`, the last number given; and, each present only when set,
+/// `busy` (latest-started progress or LSP work: `title`, `text`, `percent`,
+/// `age` in seconds), `note` (`kind` `notify` or `failed`) and `finished`,
+/// both with `title`, `body`, `age`, `seq`, `shown`, `buf`, `tab`.
 ///
 /// With a listener channel ([`listen`]) it registers it and reports whether it
 /// already was (`listening`).
 const READ: &str = r#"local version, listener = ...
 local N = package.loaded['nvmux.notes']
-if type(N) ~= 'table' or N.version ~= version or type(N.snapshot) ~= 'function' then
+local v = type(N) == 'table' and N.version
+if type(v) ~= 'number' or v < version or type(N.snapshot) ~= 'function' then
   return false
 end
 local out = N.snapshot()
@@ -471,8 +482,7 @@ pub enum Reading {
     Gone,
 }
 
-/// Read the session on `sock`, installing the watcher if missing or another
-/// version.
+/// Read the session on `sock`, installing the watcher if missing or older.
 pub fn read(sock: &Path) -> Reading {
     let mut client = match rpc::Client::connect(sock, BUDGET) {
         Ok(c) => c,
@@ -668,8 +678,8 @@ impl Seeing {
     }
 }
 
-/// The record, installing the watcher if missing or another version; `None`
-/// while the editor is blocked on a key (deferred calls go unanswered).
+/// The record, installing the watcher if missing or older; `None` while the
+/// editor is blocked on a key (deferred calls go unanswered).
 ///
 /// The read is pipelined with the mode: one round trip. If blocked, it runs
 /// harmlessly once the key comes (it only drops LSP work of dead servers); the
