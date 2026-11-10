@@ -106,8 +106,9 @@ uid_of() {
     set -- $(ls -ldn "/proc/$1" 2>/dev/null)
     [ -n "${3:-}" ] && printf '%s\n' "$3"
   else
+    # Parenthesized: BWK awk, macOS's, takes no bare `<` in printf's arguments.
     set -- $(ps -o uid= -p "$1" 2>/dev/null |
-      awk '{ printf "%.0f\n", $1 < 0 ? $1 + 4294967296 : $1 }')
+      awk '{ printf "%.0f\n", ($1 < 0 ? $1 + 4294967296 : $1) }')
     [ -n "${1:-}" ] && printf '%s\n' "$1"
   fi
 }
