@@ -1401,6 +1401,51 @@ mod tests {
         );
     }
 
+    /// A language server's warning and a deprecated name as the client draws
+    /// them, far enough from the panel for one shade. The frame draws over
+    /// the held bytes, so it must draw them as they did.
+    #[test]
+    fn a_wavy_underline_and_a_line_through_show_behind_the_panel() {
+        let area = Rect::new(24, 6, 72, 23);
+        let session =
+            b"\x1b[1;1H\x1b[0;4m\x1b[4:3m\x1b[58:2::224:174:104munused\x1b[0;9mold\x1b[0m";
+        for (look, drawn) in [
+            (
+                Look::Dimmed(palette()),
+                &b"\x1b[0;4;38;2;100;100;100m\x1b[4:3m\x1b[58:2::112:87:52munused\
+                   \x1b[0;9;38;2;100;100;100mold"[..],
+            ),
+            (
+                Look::Faint,
+                b"\x1b[0;2;4m\x1b[4:3m\x1b[58:2::224:174:104munused\x1b[0;2;9mold",
+            ),
+        ] {
+            let mut copy = Shadow::new(42, 120);
+            let mut boundary = Boundary::new();
+            copy.feed(session);
+            let held = boundary.relay_whole(session);
+            let out = frame_bytes(
+                &mut copy,
+                look,
+                &[],
+                area,
+                HINTS,
+                1.0,
+                0.0,
+                &held,
+                &mut boundary,
+            )
+            .expect("a frame");
+            let frame = &out[fade::SYNC_BEGIN.len() + held.len()..];
+            assert_eq!(
+                count(frame, drawn),
+                1,
+                "{look:?}: {:?}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+    }
+
     /// Once part of an unterminated string has gone out, nothing more goes
     /// out until it ends.
     #[test]

@@ -15,8 +15,8 @@
 //! never presents the box wiped. No gap within [`GIVE_UP`] means no box.
 //!
 //! The box cross-fades ([`crate::fade`]) with the session's cells from
-//! [`crate::shadow`]. The repaint still runs, as the shadow lacks undercurl
-//! and strikethrough; without a shadow the interior is blank until then. The
+//! [`crate::shadow`]. The repaint still runs, as the shadow lacks
+//! hyperlinks; without a shadow the interior is blank until then. The
 //! relay cannot sleep between frames, so the popup holds a
 //! [`fade::Schedule`] and is asked for one clock-paced frame at a time. With
 //! [`fade::enabled`] false there is no fade phase.
