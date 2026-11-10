@@ -185,28 +185,34 @@ take_listening() {
   [ -z "$NVMUX_LISTENING_TAKEN" ] || return 0
   NVMUX_LISTENING_TAKEN=1
 
-  # `ps` first, as in `serving_pid`. A `/proc` entry takes the shape of a
-  # `ps -o uid= -o args=` line, so one extractor reads both: the uid, then the
-  # command line joined by `tr`, newlines included, or an argument holding
-  # one could start a line with our uid.
+  # `ps` first, as in `serving_pid`; `proc_listening` gives `/proc` the shape
+  # of its lines, so one extractor reads both.
   if command -v ps >/dev/null 2>&1; then
     NVMUX_LISTENING=$(ps -ww -A -o uid= -o args= 2>/dev/null | listen_args)
   elif [ -r /proc/self/cmdline ]; then
-    NVMUX_LISTENING=$(for c in /proc/[0-9]*/cmdline; do
-      nvmux_args=$(tr '\0\n' '  ' 2>/dev/null < "$c")
-      case $nvmux_args in
-        *" --listen "*)
-          c=${c#/proc/}
-          nvmux_owner=$(uid_of "${c%/cmdline}") &&
-            printf '%s %s\n' "$nvmux_owner" "$nvmux_args"
-          ;;
-      esac
-    done | listen_args)
+    NVMUX_LISTENING=$(proc_listening | listen_args)
   fi
 
   NVMUX_LISTENING="
 $NVMUX_LISTENING
 "
+}
+
+# Each /proc command line that names a `--listen`, as a `ps -o uid= -o args=`
+# line: the uid, then the command line joined by `tr`, newlines included, or
+# an argument holding one could start a line with our uid. Not inline in a
+# `$( )`: bash 3.2, macOS's sh, ends that at a `case` pattern's `)`.
+proc_listening() {
+  for c in /proc/[0-9]*/cmdline; do
+    nvmux_args=$(tr '\0\n' '  ' 2>/dev/null < "$c")
+    case $nvmux_args in
+      *" --listen "*)
+        c=${c#/proc/}
+        nvmux_owner=$(uid_of "${c%/cmdline}") &&
+          printf '%s %s\n' "$nvmux_owner" "$nvmux_args"
+        ;;
+    esac
+  done
 }
 
 # The `--listen` argument of each command line of ours on stdin, where every
