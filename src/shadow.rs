@@ -9,11 +9,13 @@
 //! parse; a kept client (`[client] per_session`) parses anyway for its own
 //! copy (see `pty::Attachment::paint_kept_screen`).
 //!
-//! `vt100` keeps one bit of a cell's underline. So a twin parser is fed the
-//! same bytes with each SGR replaced by one whose colours stand for the
-//! underline's style and colour (see `Stroke`). Its grid holds those cell for
-//! cell through every scroll and erase, and a wavy underline stays wavy
-//! behind a floating screen. It costs a second parse and a second grid.
+//! `vt100` keeps one bit of a cell's underline, and nothing of its blink,
+//! conceal, strikethrough, alternate font or overline. So a twin parser is
+//! fed the same bytes with each SGR replaced by one whose colours stand for
+//! what the first drops (see `Extra`). Its grid holds that cell for cell
+//! through every scroll and erase: behind a floating screen a wavy underline
+//! stays wavy, and a line through a word stays through it. It costs a second
+//! parse and a second grid.
 //!
 //! # Painters
 //!
@@ -308,6 +310,7 @@ struct Painted {
     underline: Underline,
     /// The underline's colour; `None` is the text's.
     sp: Option<Rgb>,
+    flags: Flags,
 }
 
 impl Painted {
@@ -322,13 +325,14 @@ impl Painted {
             italic: false,
             underline: Underline::None,
             sp: None,
+            flags: Flags::NONE,
         }
     }
 
     /// Whether a space in this pen is invisible: default background, no
-    /// underline.
+    /// line under, through or over it.
     fn shows_nothing(&self) -> bool {
-        self.bg.is_none() && self.underline == Underline::None
+        self.bg.is_none() && self.underline == Underline::None && !self.flags.lined()
     }
 
     /// Whether a space in this pen looks as one in `other` does.
@@ -340,8 +344,8 @@ impl Painted {
 pub struct Shadow {
     parser: vt100::Parser,
     /// `parser`'s twin (see the module docs): each cell's colours stand for
-    /// its [`Stroke`], and its pen's for the session's.
-    underlines: vt100::Parser,
+    /// its [`Extra`], and its pen's for the session's.
+    twin: vt100::Parser,
     /// Keeps the parsers' OSC buffers small: they ignore OSCs, and an
     /// `OSC 52` copy would otherwise stay buffered for the client's lifetime
     /// (see [`crate::ledger::OscCap`]).
@@ -378,7 +382,7 @@ impl Shadow {
         let parser = || vt100::Parser::new(rows.max(MIN_SIZE), cols.max(MIN_SIZE), 0);
         Self {
             parser: parser(),
-            underlines: parser(),
+            twin: parser(),
             osc: crate::ledger::OscCap::default(),
             cut: Vec::new(),
             painted: Vec::new(),
@@ -408,9 +412,9 @@ impl Shadow {
         let end = whole(bytes);
         self.cut.extend_from_slice(&bytes[end..]);
         let bytes = &bytes[..end];
-        self.guard(|parser, underlines| {
+        self.guard(|parser, twin| {
             parser.process(bytes);
-            follow(underlines, bytes);
+            follow(twin, bytes);
         });
         self.invalidate();
     }
@@ -419,8 +423,8 @@ impl Shadow {
         if self.broken {
             return;
         }
-        self.guard(|parser, underlines| {
-            for parser in [parser, underlines] {
+        self.guard(|parser, twin| {
+            for parser in [parser, twin] {
                 parser
                     .screen_mut()
                     .set_size(rows.max(MIN_SIZE), cols.max(MIN_SIZE));
@@ -430,8 +434,8 @@ impl Shadow {
     }
 
     fn guard(&mut self, f: impl FnOnce(&mut vt100::Parser, &mut vt100::Parser)) {
-        let (parser, underlines) = (&mut self.parser, &mut self.underlines);
-        if crate::panics::caught(|| f(parser, underlines)).is_err() {
+        let (parser, twin) = (&mut self.parser, &mut self.twin);
+        if crate::panics::caught(|| f(parser, twin)).is_err() {
             tracing::warn!("the shadow grid's parser panicked; the session will not dissolve");
             self.broken = true;
         }
@@ -443,7 +447,7 @@ impl Shadow {
     }
 
     fn screen(&self) -> Screen<'_> {
-        Screen::of(&self.parser, &self.underlines)
+        Screen::of(&self.parser, &self.twin)
     }
 
     /// The session's mouse reporting mode, to restore after nvmux used the
@@ -489,7 +493,7 @@ impl Shadow {
     }
 
     /// The terminal was written behind the shadow's back, so the next frame
-    /// paints every cell. The fade diff is freed, not cleared (15 bytes a
+    /// paints every cell. The fade diff is freed, not cleared (16 bytes a
     /// cell while a kept client is parked); [`Shadow::frame_under`]'s is kept
     /// for reuse until [`Shadow::forget_under`].
     pub fn invalidate(&mut self) {
@@ -728,9 +732,8 @@ impl Shadow {
     ///
     /// Ends with the cursor on the session's cell and the session's pen
     /// current, since Neovim writes its next change without placement or
-    /// colour when it thinks neither moved. Attributes beyond bold or dim,
-    /// italic, underline (with its style and colour) and inverse wait for the
-    /// server's repaint.
+    /// colour when it thinks neither moved. Hyperlinks wait for the server's
+    /// repaint.
     pub fn paint(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(SYNC_BEGIN);
@@ -799,16 +802,12 @@ impl Shadow {
     /// what follows a fade in for a client that writes before its server
     /// repaints (see `pty::relay`). A retired shadow hands back a reset.
     pub fn hand_back(&self) -> Vec<u8> {
-        let mut out = RESET_SGR.to_vec();
         if self.broken {
-            return out;
+            return RESET_SGR.to_vec();
         }
-        let screen = self.parser.screen();
-        // A reset, and then the session's pen from there: `vt100`'s part
-        // of it, then the twin's.
-        out.extend_from_slice(&screen.attributes_formatted());
-        let stroke = Stroke::of_pen(self.underlines.screen());
-        writer::underline(&mut out, stroke.style, styled(stroke.colour));
+        let screen = self.screen();
+        let mut out = Vec::new();
+        Pen::of_session(screen).write(&mut out);
         let (row, col) = screen.cursor_position();
         let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
         out
@@ -866,6 +865,7 @@ impl Shadow {
             italic: false,
             underline: Underline::None,
             sp: None,
+            flags: Flags::NONE,
         };
         // The stream's SGR, carried across rows as in `frame`.
         let mut sgr: Option<Painted> = None;
@@ -980,7 +980,7 @@ impl Shadow {
         cursor: Cursor,
     ) -> Vec<u8> {
         // Not `self.screen()`: `under` is written while the screen is read.
-        let screen = Screen::of(&self.parser, &self.underlines);
+        let screen = Screen::of(&self.parser, &self.twin);
         let (rows, cols) = if self.broken { (0, 0) } else { screen.size() };
         let total = usize::from(rows) * usize::from(cols);
         let diff = self.under_valid && self.under.len() == total;
@@ -1135,21 +1135,21 @@ impl Shadow {
 #[derive(Clone, Copy)]
 struct Screen<'a> {
     cells: &'a vt100::Screen,
-    underlines: &'a vt100::Screen,
+    twin: &'a vt100::Screen,
 }
 
 impl<'a> Screen<'a> {
-    fn of(parser: &'a vt100::Parser, underlines: &'a vt100::Parser) -> Self {
+    fn of(parser: &'a vt100::Parser, twin: &'a vt100::Parser) -> Self {
         Self {
             cells: parser.screen(),
-            underlines: underlines.screen(),
+            twin: twin.screen(),
         }
     }
 
     fn cell(self, row: u16, col: u16) -> Option<Cell<'a>> {
         Some(Cell {
             cell: self.cells.cell(row, col)?,
-            underlines: self.underlines,
+            twin: self.twin,
             at: (row, col),
         })
     }
@@ -1163,12 +1163,13 @@ impl std::ops::Deref for Screen<'_> {
     }
 }
 
-/// A cell of the parser's, and where the twin has its own: looked up only
-/// for a cell whose underline matters.
+/// A cell of the parser's, and where the twin has its own, looked up only
+/// when asked for. `Deref` reaches `vt100`'s one bit of underline: ask
+/// [`Cell::extra`].
 #[derive(Clone, Copy)]
 struct Cell<'a> {
     cell: &'a vt100::Cell,
-    underlines: &'a vt100::Screen,
+    twin: &'a vt100::Screen,
     at: (u16, u16),
 }
 
@@ -1178,19 +1179,17 @@ impl<'a> Cell<'a> {
         self.cell.contents()
     }
 
-    /// A colour is kept only with an underline to draw in it.
-    fn stroke(self) -> Stroke {
+    /// An underline's colour is kept only with an underline to draw in it.
+    fn extra(self) -> Extra {
         let (row, col) = self.at;
-        let twin = self.underlines.cell(row, col);
-        match twin.map(|c| Stroke::read(c.fgcolor(), c.bgcolor())) {
-            Some(stroke) if stroke.style != Underline::None => stroke,
-            _ => Stroke::NONE,
+        let Some(twin) = self.twin.cell(row, col) else {
+            return Extra::NONE;
+        };
+        let mut extra = Extra::read(twin.fgcolor(), twin.bgcolor());
+        if extra.underline == Underline::None {
+            extra.sp = vt100::Color::Default;
         }
-    }
-
-    /// The twin's word, in place of the one bit `Deref` would reach.
-    fn underline(self) -> Underline {
-        self.stroke().style
+        extra
     }
 }
 
@@ -1202,15 +1201,70 @@ impl std::ops::Deref for Cell<'_> {
     }
 }
 
-/// An underline's style and colour (the default is the text's): what the
-/// twin holds of a cell, or of the session's pen.
+/// What `vt100` drops of a pen, which the twin holds for a cell or for the
+/// session's pen: the underline's style and its colour (the default is the
+/// text's), and the [`Flags`].
 ///
-/// The twin's foreground is the colour, and its background the style as SGR
-/// `4:n` numbers it, with the default for none.
+/// The twin's foreground is the colour. Its background is an indexed colour,
+/// or the default for 0: the style as SGR `4:n` numbers it in the low three
+/// bits, the flags above them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stroke {
-    style: Underline,
-    colour: vt100::Color,
+struct Extra {
+    underline: Underline,
+    sp: vt100::Color,
+    flags: Flags,
+}
+
+/// The attributes `vt100` has no bit for, a bit each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Flags(u8);
+
+impl Flags {
+    const NONE: Flags = Flags(0);
+    const BLINK: Flags = Flags(1);
+    const CONCEAL: Flags = Flags(1 << 1);
+    const STRIKETHROUGH: Flags = Flags(1 << 2);
+    const ALTFONT: Flags = Flags(1 << 3);
+    const OVERLINE: Flags = Flags(1 << 4);
+
+    /// Each with the SGR parameter that sets it and the one that clears it.
+    const ALL: [(Flags, u8, u8); 5] = [
+        (Flags::BLINK, 5, 25),
+        (Flags::CONCEAL, 8, 28),
+        (Flags::STRIKETHROUGH, 9, 29),
+        (Flags::ALTFONT, 11, 10),
+        (Flags::OVERLINE, 53, 55),
+    ];
+
+    fn has(self, flag: Flags) -> bool {
+        self.0 & flag.0 != 0
+    }
+
+    /// Whether a space shows them: a line through it or over it.
+    fn lined(self) -> bool {
+        self.has(Flags::STRIKETHROUGH) || self.has(Flags::OVERLINE)
+    }
+
+    /// After an SGR parameter.
+    fn after(mut self, code: u32) -> Self {
+        for (flag, set, clear) in Flags::ALL {
+            if code == u32::from(set) {
+                self.0 |= flag.0;
+            } else if code == u32::from(clear) {
+                self.0 &= !flag.0;
+            }
+        }
+        self
+    }
+
+    /// As SGR parameters, each after a `;`.
+    fn write(self, out: &mut Vec<u8>) {
+        for (flag, set, _) in Flags::ALL {
+            if self.has(flag) {
+                let _ = write!(out, ";{set}");
+            }
+        }
+    }
 }
 
 /// Underline styles by their number in SGR `4:n`.
@@ -1223,39 +1277,48 @@ const STYLES: [Underline; 6] = [
     Underline::Dashed,
 ];
 
-impl Stroke {
-    const NONE: Stroke = Stroke {
-        style: Underline::None,
-        colour: vt100::Color::Default,
+impl Extra {
+    const NONE: Extra = Extra {
+        underline: Underline::None,
+        sp: vt100::Color::Default,
+        flags: Flags::NONE,
     };
 
     fn read(fg: vt100::Color, bg: vt100::Color) -> Self {
-        let style = match bg {
-            vt100::Color::Idx(n) => STYLES.get(usize::from(n)).copied(),
-            _ => None,
+        let n = match bg {
+            vt100::Color::Idx(n) => n,
+            _ => 0,
         };
-        Stroke {
-            style: style.unwrap_or(Underline::None),
-            colour: fg,
+        let style = STYLES.get(usize::from(n & 7)).copied();
+        Extra {
+            underline: style.unwrap_or(Underline::None),
+            sp: fg,
+            flags: Flags(n >> 3),
         }
     }
 
-    fn of_pen(underlines: &vt100::Screen) -> Self {
-        Self::read(underlines.fgcolor(), underlines.bgcolor())
+    fn of_pen(twin: &vt100::Screen) -> Self {
+        Self::read(twin.fgcolor(), twin.bgcolor())
+    }
+
+    /// Whether a space shows it: a line under, through or over it.
+    fn lined(self) -> bool {
+        self.underline != Underline::None || self.flags.lined()
     }
 
     /// The SGR that makes the twin's pen stand for it.
     fn write(self, out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b[0");
-        write_colour(out, self.colour, 30, 90, 38);
-        let n = STYLES.iter().position(|s| *s == self.style);
-        if let Some(n) = n.filter(|n| *n > 0) {
-            write_colour(out, vt100::Color::Idx(n as u8), 40, 100, 48);
+        write_colour(out, self.sp, 30, 90, 38);
+        let style = STYLES.iter().position(|s| *s == self.underline);
+        let n = style.unwrap_or(0) as u8 | self.flags.0 << 3;
+        if n > 0 {
+            write_colour(out, vt100::Color::Idx(n), 40, 100, 48);
         }
         out.push(b'm');
     }
 
-    /// The pen's stroke after an SGR with these parameters (the bytes
+    /// As the pen holds it after an SGR with these parameters (the bytes
     /// between `CSI` and `m`). Reads both forms of a colour, `58:2::r:g:b`
     /// and `58;2;r;g;b`.
     fn after(mut self, params: &[u8]) -> Self {
@@ -1264,13 +1327,13 @@ impl Stroke {
             let mut subs = param.split(|&b| b == b':').map(number);
             let code = subs.next().unwrap_or(0);
             match (code, subs.next()) {
-                (0, None) => self = Stroke::NONE,
-                (4, None) => self.style = Underline::Line,
+                (0, None) => self = Extra::NONE,
+                (4, None) => self.underline = Underline::Line,
                 (4, Some(n)) => {
-                    self.style = STYLES.get(n as usize).copied().unwrap_or(Underline::Line);
+                    self.underline = STYLES.get(n as usize).copied().unwrap_or(Underline::Line);
                 }
-                (24, None) => self.style = Underline::None,
-                (59, None) => self.colour = vt100::Color::Default,
+                (24, None) => self.underline = Underline::None,
+                (59, None) => self.sp = vt100::Color::Default,
                 (58, Some(kind)) => {
                     let mut arguments = [0; 4];
                     let mut n = 0;
@@ -1280,7 +1343,7 @@ impl Stroke {
                     }
                     // Red, green and blue may follow a colour space.
                     let from = usize::from(kind == 2 && n == 4);
-                    self.colour = colour(kind, &arguments[from..n]).unwrap_or(self.colour);
+                    self.sp = colour(kind, &arguments[from..n]).unwrap_or(self.sp);
                 }
                 // A colour's arguments are no parameters of their own: the 4
                 // of `38;5;4` underlines nothing. `vt100` gives up on the SGR
@@ -1290,9 +1353,10 @@ impl Stroke {
                         return self;
                     };
                     if code == 58 {
-                        self.colour = colour;
+                        self.sp = colour;
                     }
                 }
+                (code, None) => self.flags = self.flags.after(code),
                 _ => {}
             }
         }
@@ -1359,23 +1423,23 @@ fn is_parameter(byte: u8) -> bool {
 }
 
 /// Feed the twin `bytes`, but for each SGR the one that makes its pen stand
-/// for the session's stroke after it.
-fn follow(underlines: &mut vt100::Parser, bytes: &[u8]) {
+/// for what the session's pen has of [`Extra`] after it.
+fn follow(twin: &mut vt100::Parser, bytes: &[u8]) {
     let mut fed = 0;
     let mut sgr = Vec::new();
     for (start, m) in sgrs(bytes) {
-        underlines.process(&bytes[fed..start]);
+        twin.process(&bytes[fed..start]);
         fed = m + 1;
-        let was = Stroke::of_pen(underlines.screen());
+        let was = Extra::of_pen(twin.screen());
         let now = was.after(&bytes[start + 2..m]);
         // Only the twin's own SGRs set its pen, so it stands for `was`.
         if now != was {
             sgr.clear();
             now.write(&mut sgr);
-            underlines.process(&sgr);
+            twin.process(&sgr);
         }
     }
-    underlines.process(&bytes[fed..]);
+    twin.process(&bytes[fed..]);
 }
 
 /// A session cell as [`Shadow::frame_under`] draws it: its text (blank if
@@ -1391,13 +1455,13 @@ fn shaded<'a>(
         Some(c) if c.has_contents() && !cut => c.contents(),
         _ => " ",
     };
-    // A space `resolve` would give no background or underline at any `t`:
-    // most cells, which end as the blank pen, so skip resolving colours.
+    // A space `resolve` would give no background or line at any `t`: most
+    // cells, which end as the blank pen, so skip resolving colours.
     let bare = text == " "
         && cell.is_none_or(|c| {
             c.bgcolor() == vt100::Color::Default
                 && !c.inverse()
-                && !(c.has_contents() && c.underline() != Underline::None)
+                && !(c.has_contents() && c.extra().lined())
         });
     match (shade, palette) {
         (Shade::Blank, _) => (" ", Pen::BLANK),
@@ -1405,8 +1469,8 @@ fn shaded<'a>(
         (Shade::Toward(_), Some(_)) if bare => (" ", Pen::BLANK),
         (Shade::Toward(t), Some(palette)) => {
             let pen = Pen::painted(resolve(cell, palette, t));
-            // A space without underline or background shows no colour, so
-            // use the blank pen rather than an SGR per falloff shade.
+            // A space without a line or background shows no colour, so use
+            // the blank pen rather than an SGR per falloff shade.
             let bare = text == " " && pen.shows_nothing();
             (text, if bare { Pen::BLANK } else { pen })
         }
@@ -1431,6 +1495,7 @@ struct Pen {
     underline: Underline,
     /// The underline's colour; the default is the text's.
     sp: vt100::Color,
+    flags: Flags,
     inverse: bool,
 }
 
@@ -1444,13 +1509,17 @@ impl Pen {
         italic: false,
         underline: Underline::None,
         sp: vt100::Color::Default,
+        flags: Flags::NONE,
         inverse: false,
     };
 
     /// Whether a space in this pen is invisible: default background, not
-    /// inverse, no underline.
+    /// inverse, no line under, through or over it.
     fn shows_nothing(&self) -> bool {
-        self.bg == vt100::Color::Default && self.underline == Underline::None && !self.inverse
+        self.bg == vt100::Color::Default
+            && self.underline == Underline::None
+            && !self.flags.lined()
+            && !self.inverse
     }
 
     /// Whether a space in this pen looks as one in `other` does.
@@ -1470,6 +1539,7 @@ impl Pen {
             italic: p.italic,
             underline: p.underline,
             sp: p.sp.map_or(vt100::Color::Default, rgb),
+            flags: p.flags,
             inverse: false,
         }
     }
@@ -1512,6 +1582,11 @@ impl Pen {
                 Underline::None
             },
             sp: vt100::Color::Default,
+            flags: if m.contains(Modifier::CROSSED_OUT) {
+                Flags::STRIKETHROUGH
+            } else {
+                Flags::NONE
+            },
             inverse: m.contains(Modifier::REVERSED),
         }
     }
@@ -1521,16 +1596,33 @@ impl Pen {
         let Some(c) = cell else {
             return Pen::BLANK;
         };
-        let stroke = c.stroke();
+        let extra = c.extra();
         Pen {
             fg: c.fgcolor(),
             bg: c.bgcolor(),
             bold: c.bold(),
             dim: c.dim(),
             italic: c.italic(),
-            underline: stroke.style,
-            sp: stroke.colour,
+            underline: extra.underline,
+            sp: extra.sp,
+            flags: extra.flags,
             inverse: c.inverse(),
+        }
+    }
+
+    /// The session's own, as its parsers have it.
+    fn of_session(screen: Screen) -> Self {
+        let extra = Extra::of_pen(screen.twin);
+        Pen {
+            fg: screen.fgcolor(),
+            bg: screen.bgcolor(),
+            bold: screen.bold(),
+            dim: screen.dim(),
+            italic: screen.italic(),
+            underline: extra.underline,
+            sp: extra.sp,
+            flags: extra.flags,
+            inverse: screen.inverse(),
         }
     }
 
@@ -1550,6 +1642,7 @@ impl Pen {
                 let _ = write!(out, ";{code}");
             }
         }
+        self.flags.write(out);
         write_colour(out, self.fg, 30, 90, 38);
         write_colour(out, self.bg, 40, 100, 48);
         out.push(b'm');
@@ -1835,10 +1928,10 @@ fn standing(cell: Option<Cell>, palette: &Palette, t: f32) -> Painted {
 }
 
 /// A cell `t` of the way to the background. Blank cells (nothing written, or
-/// a space with no background or underline) get the background as foreground
-/// and no attributes, so the diff skips them; Neovim underlines blanks with
-/// written spaces, so those are glyphs. Inverse is applied here, so the
-/// terminal never inverts an interpolated pair.
+/// a space with no background and no line on it) get the background as
+/// foreground and no attributes, so the diff skips them; Neovim underlines
+/// blanks with written spaces, so those are glyphs. Inverse is applied here,
+/// so the terminal never inverts an interpolated pair.
 fn resolve(cell: Option<Cell>, palette: &Palette, t: f32) -> Painted {
     let Some(cell) = cell else {
         return Painted::blank(palette);
@@ -1856,13 +1949,12 @@ fn resolve(cell: Option<Cell>, palette: &Palette, t: f32) -> Painted {
     } else {
         (fg, bg)
     };
-    let stroke = if cell.has_contents() {
-        cell.stroke()
+    let extra = if cell.has_contents() {
+        cell.extra()
     } else {
-        Stroke::NONE
+        Extra::NONE
     };
-    let blank = !cell.has_contents()
-        || (cell.contents() == " " && bg.is_none() && stroke.style == Underline::None);
+    let blank = !cell.has_contents() || (cell.contents() == " " && bg.is_none() && !extra.lined());
     if blank {
         return Painted {
             bg: bg.map(|b| b.lerp(palette.bg, t)),
@@ -1875,8 +1967,9 @@ fn resolve(cell: Option<Cell>, palette: &Palette, t: f32) -> Painted {
         bold: cell.bold(),
         dim: cell.dim(),
         italic: cell.italic(),
-        underline: stroke.style,
-        sp: seen(stroke.colour).map(|sp| sp.lerp(palette.bg, t)),
+        underline: extra.underline,
+        sp: seen(extra.sp).map(|sp| sp.lerp(palette.bg, t)),
+        flags: extra.flags,
     }
 }
 
@@ -1977,6 +2070,7 @@ fn write_sgr(out: &mut Vec<u8>, p: Painted) {
     if p.underline != Underline::None {
         out.extend_from_slice(b";4");
     }
+    p.flags.write(out);
     let _ = write!(out, ";38;2;{};{};{}", p.fg.0, p.fg.1, p.fg.2);
     if let Some(bg) = p.bg {
         let _ = write!(out, ";48;2;{};{};{}", bg.0, bg.1, bg.2);
@@ -2622,8 +2716,9 @@ mod tests {
 
     #[test]
     fn every_attribute_the_grid_holds_survives_a_fade() {
-        let mut s = Shadow::new(1, 8);
+        let mut s = Shadow::new(1, 16);
         s.feed(b"\x1b[1mb\x1b[0;2md\x1b[0;3mi\x1b[0;4mu\x1b[0;3;4mx");
+        s.feed(b"\x1b[0;5mk\x1b[0;8mc\x1b[0;9ms\x1b[0;11ma\x1b[0;53mo\x1b[0;3;9;53my");
         for t in [1.0, 0.5, 0.0] {
             s.invalidate();
             let cells = painted_cells(&s.frame(t, &palette(), Cursor::Hidden));
@@ -2639,6 +2734,15 @@ mod tests {
             assert!(sgr("i").starts_with("0;3;38;"), "italic at {t}");
             assert!(sgr("u").starts_with("0;4;38;"), "underline at {t}");
             assert!(sgr("x").starts_with("0;3;4;38;"), "both at {t}");
+            assert!(sgr("k").starts_with("0;5;38;"), "blink at {t}");
+            assert!(sgr("c").starts_with("0;8;38;"), "conceal at {t}");
+            assert!(sgr("s").starts_with("0;9;38;"), "strikethrough at {t}");
+            assert!(
+                sgr("a").starts_with("0;11;38;"),
+                "the alternate font at {t}"
+            );
+            assert!(sgr("o").starts_with("0;53;38;"), "overline at {t}");
+            assert!(sgr("y").starts_with("0;3;9;53;38;"), "three at {t}");
         }
     }
 
@@ -2673,13 +2777,24 @@ mod tests {
             .unwrap_or_else(|| panic!("{glyph:?} not painted: {:?}", text(frame)))
     }
 
-    /// The stroke of the cell at 0-based (`row`, `col`).
-    fn stroke_at(s: &Shadow, row: u16, col: u16) -> Stroke {
-        s.screen().cell(row, col).expect("a cell").stroke()
+    /// What the twin holds of the cell at 0-based (`row`, `col`).
+    fn extra_at(s: &Shadow, row: u16, col: u16) -> Extra {
+        s.screen().cell(row, col).expect("a cell").extra()
     }
 
-    fn stroke(style: Underline, colour: vt100::Color) -> Stroke {
-        Stroke { style, colour }
+    fn underlined(underline: Underline, sp: vt100::Color) -> Extra {
+        Extra {
+            underline,
+            sp,
+            flags: Flags::NONE,
+        }
+    }
+
+    fn flagged(flags: &[Flags]) -> Extra {
+        Extra {
+            flags: Flags(flags.iter().fold(0, |all, flag| all | flag.0)),
+            ..Extra::NONE
+        }
     }
 
     #[test]
@@ -2701,6 +2816,20 @@ mod tests {
             "0;2;4;38;2;200;200;200 4:3 58:2::250:0:0"
         );
         assert_eq!(pen_of(&faint, "f"), "0;2;4");
+    }
+
+    #[test]
+    fn what_vt100_has_no_bit_for_shows_behind_a_floating_screen() {
+        let mut s = Shadow::new(2, 20);
+        s.feed(b"\x1b[0;9ms\x1b[0;53mo\x1b[0;5mb\x1b[0;8mc\x1b[0;11ma\x1b[0;1;7;5;9mx");
+        let half = |_, _| Shade::Toward(0.5);
+        let dimmed = s.frame_under(&half, Some(&palette()), &[], Cursor::Hidden);
+        let faint = s.frame_under(&|_, _| Shade::Faint, None, &[], Cursor::Hidden);
+        for (glyph, code) in [("s", 9), ("o", 53), ("b", 5), ("c", 8), ("a", 11)] {
+            assert_eq!(pen_of(&dimmed, glyph), format!("0;{code};38;2;100;100;100"));
+            assert_eq!(pen_of(&faint, glyph), format!("0;2;{code}"));
+        }
+        assert_eq!(pen_of(&s.paint(), "x"), "0;1;7;5;9", "with the rest");
     }
 
     #[test]
@@ -2734,40 +2863,103 @@ mod tests {
                 s.feed(format!("\x1b[{sgr}m").as_bytes());
             }
             s.feed(b"x");
-            stroke_at(&s, 0, 0)
+            extra_at(&s, 0, 0)
         };
         for (sgrs, expected) in [
-            (&["4"][..], stroke(Line, Default)),
-            (&["4:1"], stroke(Line, Default)),
-            (&["4", "4:3"], stroke(Curl, Default)),
+            (&["4"][..], underlined(Line, Default)),
+            (&["4:1"], underlined(Line, Default)),
+            (&["4", "4:3"], underlined(Curl, Default)),
             // Neovim's own client sends no `4` first.
-            (&["4:3"], stroke(Curl, Default)),
-            (&["4:2"], stroke(Double, Default)),
-            (&["4:4"], stroke(Dotted, Default)),
-            (&["4:5"], stroke(Dashed, Default)),
-            (&["4:3", "4:0"], Stroke::NONE),
-            (&["4:3", "24"], Stroke::NONE),
-            (&["4:3", "0"], Stroke::NONE),
-            (&["4:3", ""], Stroke::NONE),
-            (&["4:3;1"], stroke(Curl, Default)),
-            (&["4;58:2::1:2:3"], stroke(Line, Rgb(1, 2, 3))),
-            (&["4;58:2:1:2:3"], stroke(Line, Rgb(1, 2, 3))),
-            (&["4;58;2;1;2;3"], stroke(Line, Rgb(1, 2, 3))),
-            (&["4;58:5:9"], stroke(Line, Idx(9))),
-            (&["4;58;5;9"], stroke(Line, Idx(9))),
-            (&["4;58;5;9;4:3"], stroke(Curl, Idx(9))),
-            (&["4;58:5:9", "59"], stroke(Line, Default)),
-            (&["4;58:5:9", "38;5;1;48;5;2"], stroke(Line, Idx(9))),
+            (&["4:3"], underlined(Curl, Default)),
+            (&["4:2"], underlined(Double, Default)),
+            (&["4:4"], underlined(Dotted, Default)),
+            (&["4:5"], underlined(Dashed, Default)),
+            (&["4:3", "4:0"], Extra::NONE),
+            (&["4:3", "24"], Extra::NONE),
+            (&["4:3", "0"], Extra::NONE),
+            (&["4:3", ""], Extra::NONE),
+            (&["4:3;1"], underlined(Curl, Default)),
+            (&["4;58:2::1:2:3"], underlined(Line, Rgb(1, 2, 3))),
+            (&["4;58:2:1:2:3"], underlined(Line, Rgb(1, 2, 3))),
+            (&["4;58;2;1;2;3"], underlined(Line, Rgb(1, 2, 3))),
+            (&["4;58:5:9"], underlined(Line, Idx(9))),
+            (&["4;58;5;9"], underlined(Line, Idx(9))),
+            (&["4;58;5;9;4:3"], underlined(Curl, Idx(9))),
+            (&["4;58:5:9", "59"], underlined(Line, Default)),
+            (&["4;58:5:9", "38;5;1;48;5;2"], underlined(Line, Idx(9))),
             // The colour waits for its underline.
-            (&["58:5:9"], Stroke::NONE),
-            (&["58:5:9", "4"], stroke(Line, Idx(9))),
+            (&["58:5:9"], Extra::NONE),
+            (&["58:5:9", "4"], underlined(Line, Idx(9))),
             // A colour's arguments are not parameters.
-            (&["38;5;4"], Stroke::NONE),
-            (&["38;2;4;4;4"], Stroke::NONE),
-            (&["48;5;4"], Stroke::NONE),
-            (&["38;5;4;4"], stroke(Line, Default)),
-            (&["4:3", "38;5;0"], stroke(Curl, Default)),
-            (&["4:3", "38;2;0;0;0;48;2;0;0;0"], stroke(Curl, Default)),
+            (&["38;5;4"], Extra::NONE),
+            (&["38;2;4;4;4"], Extra::NONE),
+            (&["48;5;4"], Extra::NONE),
+            (&["38;5;4;4"], underlined(Line, Default)),
+            (&["4:3", "38;5;0"], underlined(Curl, Default)),
+            (&["4:3", "38;2;0;0;0;48;2;0;0;0"], underlined(Curl, Default)),
+        ] {
+            assert_eq!(after(sgrs), expected, "{sgrs:?}");
+        }
+    }
+
+    #[test]
+    fn each_attribute_vt100_drops_is_set_and_cleared_by_its_parameters() {
+        use Flags as F;
+        let after = |sgrs: &[&str]| {
+            let mut s = Shadow::new(1, 4);
+            for sgr in sgrs {
+                s.feed(format!("\x1b[{sgr}m").as_bytes());
+            }
+            s.feed(b"x");
+            extra_at(&s, 0, 0)
+        };
+        for (sgrs, expected) in [
+            (&["5"][..], flagged(&[F::BLINK])),
+            (&["8"], flagged(&[F::CONCEAL])),
+            (&["9"], flagged(&[F::STRIKETHROUGH])),
+            (&["11"], flagged(&[F::ALTFONT])),
+            (&["53"], flagged(&[F::OVERLINE])),
+            (&["5", "25"], Extra::NONE),
+            (&["8", "28"], Extra::NONE),
+            (&["9", "29"], Extra::NONE),
+            (&["11", "10"], Extra::NONE),
+            (&["53", "55"], Extra::NONE),
+            // As the client writes them: all in one sequence.
+            (
+                &["0;1;2;3;4;5;7;8;9;11;53;38;5;200;48;2;1;2;3"],
+                Extra {
+                    underline: Underline::Line,
+                    ..flagged(&[
+                        F::BLINK,
+                        F::CONCEAL,
+                        F::STRIKETHROUGH,
+                        F::ALTFONT,
+                        F::OVERLINE,
+                    ])
+                },
+            ),
+            // As Neovim's own client does: one to a sequence.
+            (&["", "9", "53"], flagged(&[F::STRIKETHROUGH, F::OVERLINE])),
+            (&["9;53", "29"], flagged(&[F::OVERLINE])),
+            (
+                &["9;53", "1;38;5;4"],
+                flagged(&[F::STRIKETHROUGH, F::OVERLINE]),
+            ),
+            (&["9;53", "0"], Extra::NONE),
+            (&["9;53", ""], Extra::NONE),
+            (
+                &["4:3;9"],
+                Extra {
+                    underline: Underline::Curl,
+                    ..flagged(&[F::STRIKETHROUGH])
+                },
+            ),
+            // A colour's arguments are not parameters.
+            (&["38;5;9"], Extra::NONE),
+            (&["48;5;53"], Extra::NONE),
+            (&["38;2;5;8;9"], Extra::NONE),
+            (&["58;5;9"], Extra::NONE),
+            (&["38;5;9;9"], flagged(&[F::STRIKETHROUGH])),
         ] {
             assert_eq!(after(sgrs), expected, "{sgrs:?}");
         }
@@ -2779,7 +2971,7 @@ mod tests {
     fn a_key_mode_underlines_nothing() {
         let mut s = Shadow::new(1, 4);
         s.feed(b"\x1b[>4;2mx");
-        assert_eq!(stroke_at(&s, 0, 0), Stroke::NONE);
+        assert_eq!(extra_at(&s, 0, 0), Extra::NONE);
     }
 
     #[test]
@@ -2791,21 +2983,26 @@ mod tests {
             s.feed(&written[..k]);
             s.feed(&written[k..]);
             assert_eq!(
-                stroke_at(&s, 0, 0),
-                stroke(Underline::Curl, vt100::Color::Rgb(250, 0, 0)),
+                extra_at(&s, 0, 0),
+                underlined(Underline::Curl, vt100::Color::Rgb(250, 0, 0)),
                 "read in two at byte {k}"
             );
             assert_eq!(s.parser.screen().contents(), "x");
         }
     }
 
-    /// Why the twin is a parser: a cell's underline moves with it.
+    /// Why the twin is a parser: what it holds of a cell moves with it.
     #[test]
-    fn an_underline_goes_where_its_cell_goes() {
+    fn what_the_twin_holds_goes_where_its_cell_goes() {
         let mut s = Shadow::new(4, 10);
-        s.feed(b"\x1b[3;3H\x1b[4:3mab\x1b[0m\x1b[4;1Hcd");
-        // 0-based cells whose underline is wavy, and those holding `a` or `b`.
-        let wavy_and_lettered = |s: &Shadow| {
+        s.feed(b"\x1b[3;3H\x1b[4:3;9mab\x1b[0m\x1b[4;1Hcd");
+        let wavy_struck = Extra {
+            underline: Underline::Curl,
+            ..flagged(&[Flags::STRIKETHROUGH])
+        };
+        // 0-based cells the twin has as `wavy_struck`, and those holding `a`
+        // or `b`.
+        let marked_and_lettered = |s: &Shadow| {
             let screen = s.screen();
             let cells = |want: &dyn Fn(Cell) -> bool| -> Vec<(u16, u16)> {
                 (0..screen.size().0)
@@ -2814,12 +3011,12 @@ mod tests {
                     .collect()
             };
             (
-                cells(&|c| c.underline() == Underline::Curl),
+                cells(&|c| c.extra() == wavy_struck),
                 cells(&|c| matches!(c.contents(), "a" | "b")),
             )
         };
         let at = |s: &Shadow, cells: [(u16, u16); 2]| {
-            assert_eq!(wavy_and_lettered(s), (cells.to_vec(), cells.to_vec()));
+            assert_eq!(marked_and_lettered(s), (cells.to_vec(), cells.to_vec()));
         };
         at(&s, [(2, 2), (2, 3)]);
         s.feed(b"\x1b[S");
@@ -2833,14 +3030,21 @@ mod tests {
         s.resize(6, 12);
         at(&s, [(2, 4), (2, 5)]);
         s.feed(b"\x1b[3;6H\x1b[K");
-        assert_eq!(wavy_and_lettered(&s), (vec![(2, 4)], vec![(2, 4)]));
+        assert_eq!(marked_and_lettered(&s), (vec![(2, 4)], vec![(2, 4)]));
     }
 
     #[test]
-    fn a_restored_cursor_brings_its_pens_underline_back() {
+    fn a_restored_cursor_brings_back_what_its_pen_had() {
         let mut s = Shadow::new(1, 4);
-        s.feed(b"\x1b[4:3m\x1b7\x1b[0ma\x1b8b");
-        assert_eq!(stroke_at(&s, 0, 0).style, Underline::Curl, "b, over the a");
+        s.feed(b"\x1b[4:3;9m\x1b7\x1b[0ma\x1b8b");
+        assert_eq!(
+            extra_at(&s, 0, 0),
+            Extra {
+                underline: Underline::Curl,
+                ..flagged(&[Flags::STRIKETHROUGH])
+            },
+            "b, over the a"
+        );
     }
 
     /// A terminal never underlines an erase, wavy or not.
@@ -2864,53 +3068,134 @@ mod tests {
         );
     }
 
+    /// A line through a space or over it shows, as one under it does; a
+    /// space that blinks or is concealed shows nothing, nor does an erase.
+    #[test]
+    fn a_space_is_painted_for_the_line_on_it() {
+        let mut s = Shadow::new(1, 16);
+        s.feed(b"\x1b[0;9m \x1b[0;53m \x1b[0;5m \x1b[0;8m \x1b[0;9;53m\x1b[K");
+        for frame in [
+            s.frame(0.5, &palette(), Cursor::Hidden),
+            s.frame_under(
+                &|_, _| Shade::Toward(0.5),
+                Some(&palette()),
+                &[],
+                Cursor::Hidden,
+            ),
+        ] {
+            let cells = painted_cells(&frame);
+            let pens: Vec<_> = cells
+                .iter()
+                .map(|(at, sgr, _)| (at.1, sgr.as_str()))
+                .collect();
+            assert_eq!(
+                pens,
+                [(1, "0;9;38;2;100;100;100"), (2, "0;53;38;2;100;100;100")],
+                "{:?}",
+                text(&frame)
+            );
+        }
+    }
+
     /// Neovim may write on without setting its pen again.
     #[test]
-    fn a_paint_hands_back_the_pens_underline() {
+    fn a_paint_hands_back_what_vt100_drops_of_the_pen() {
         let mut s = Shadow::new(2, 8);
-        s.feed(b"text\x1b[0;4m\x1b[4:3m\x1b[58:5:9m");
+        s.feed(b"text\x1b[0;4;9;53m\x1b[4:3m\x1b[58:5:9m");
         let mut again = Shadow::new(2, 8);
         again.feed(&s.paint());
         again.feed(b"x");
         assert_eq!(
-            stroke_at(&again, 0, 4),
-            stroke(Underline::Curl, vt100::Color::Idx(9))
+            extra_at(&again, 0, 4),
+            Extra {
+                underline: Underline::Curl,
+                sp: vt100::Color::Idx(9),
+                ..flagged(&[Flags::STRIKETHROUGH, Flags::OVERLINE])
+            }
         );
-        assert_eq!(stroke_at(&again, 0, 0), Stroke::NONE);
+        assert_eq!(extra_at(&again, 0, 0), Extra::NONE);
     }
 
-    /// Each style in each kind of colour, from the client's own writer.
+    /// Each underline in each kind of colour, and each attribute `vt100` has
+    /// no bit for, from the client's own writer.
     #[test]
-    fn every_painter_underlines_as_the_client_did() {
+    fn every_painter_draws_what_vt100_drops_as_the_client_did() {
         use crate::client::compose::Frame;
         use crate::client::grid::Text;
         use crate::client::screen::{Cursor as Shown, Screen as Client};
         use crate::client::style::{Color, Style};
 
-        let styles = [
-            Underline::Line,
-            Underline::Curl,
-            Underline::Double,
-            Underline::Dotted,
-            Underline::Dashed,
-        ];
+        let plain = Style::default();
         let sps = [
             Color::Default,
             Color::Index(9),
             Color::Rgb(Rgb(250, 100, 0)),
         ];
-        // A row per colour: each style's cell, a plain one after it.
-        let (w, h) = (styles.len() * 2, sps.len());
-        let mut f = Frame::new(w, h, Style::default());
-        for (r, sp) in sps.iter().enumerate() {
-            for (c, underline) in styles.iter().enumerate() {
+        let mut rows: Vec<Vec<(Style, Extra)>> = sps
+            .iter()
+            .map(|&sp| {
+                STYLES[1..]
+                    .iter()
+                    .map(|&underline| {
+                        let style = Style {
+                            underline,
+                            sp,
+                            ..plain
+                        };
+                        (style, underlined(underline, styled_back(sp)))
+                    })
+                    .collect()
+            })
+            .collect();
+        rows.push(
+            [
+                (
+                    Style {
+                        blink: true,
+                        ..plain
+                    },
+                    Flags::BLINK,
+                ),
+                (
+                    Style {
+                        conceal: true,
+                        ..plain
+                    },
+                    Flags::CONCEAL,
+                ),
+                (
+                    Style {
+                        strikethrough: true,
+                        ..plain
+                    },
+                    Flags::STRIKETHROUGH,
+                ),
+                (
+                    Style {
+                        altfont: true,
+                        ..plain
+                    },
+                    Flags::ALTFONT,
+                ),
+                (
+                    Style {
+                        overline: true,
+                        ..plain
+                    },
+                    Flags::OVERLINE,
+                ),
+            ]
+            .map(|(style, flag)| (style, flagged(&[flag])))
+            .to_vec(),
+        );
+        // Each styled cell with a plain one after it.
+        let (w, h) = (rows[0].len() * 2, rows.len());
+        let mut f = Frame::new(w, h, plain);
+        for (r, row) in rows.iter().enumerate() {
+            for (c, (style, _)) in row.iter().enumerate() {
                 let cell = &mut f.cells[r * w + c * 2];
                 cell.text = Text::Char('u');
-                cell.style = Style {
-                    underline: *underline,
-                    sp: *sp,
-                    ..Style::default()
-                };
+                cell.style = *style;
             }
         }
         let hidden = Shown {
@@ -2923,32 +3208,37 @@ mod tests {
         let mut s = Shadow::new(h as u16, w as u16);
         s.feed(&Client::new().draw(f, &hidden, false, &[]));
 
-        // Each cell's stroke; its colour through the palette if `shown`, as
-        // a painter that shades writes it.
-        let strokes = |s: &Shadow, shown: bool| -> Vec<Stroke> {
+        // What the twin holds of each cell, an underline's colour through
+        // the palette if `shown`, as a painter that shades writes it. `None`
+        // for a blank with no line on it, whose pen a painter is free with.
+        let held = |s: &Shadow, shown: bool| -> Vec<Option<Extra>> {
             (0..h as u16)
                 .flat_map(|row| (0..w as u16).map(move |col| (row, col)))
-                .map(|(row, col)| match stroke_at(s, row, col) {
-                    Stroke {
-                        style,
-                        colour: vt100::Color::Idx(n),
-                    } if shown => {
-                        let Rgb(r, g, b) = palette().index(n);
-                        stroke(style, vt100::Color::Rgb(r, g, b))
+                .map(|(row, col)| {
+                    let cell = s.screen().cell(row, col).expect("a cell");
+                    let extra = cell.extra();
+                    if cell.contents().trim().is_empty() && !extra.lined() {
+                        return None;
                     }
-                    stroke => stroke,
+                    Some(match extra.sp {
+                        vt100::Color::Idx(n) if shown => {
+                            let Rgb(r, g, b) = palette().index(n);
+                            Extra {
+                                sp: vt100::Color::Rgb(r, g, b),
+                                ..extra
+                            }
+                        }
+                        _ => extra,
+                    })
                 })
                 .collect()
         };
-        let drawn: Vec<Stroke> = sps
+        let drawn: Vec<Option<Extra>> = rows
             .iter()
-            .flat_map(|sp| {
-                styles
-                    .iter()
-                    .flat_map(|style| [stroke(*style, styled_back(*sp)), Stroke::NONE])
-            })
+            .flatten()
+            .flat_map(|(_, extra)| [Some(*extra), None])
             .collect();
-        assert_eq!(strokes(&s, false), drawn, "what the shadow holds");
+        assert_eq!(held(&s, false), drawn, "what the shadow holds");
 
         let over = Over {
             top: 0,
@@ -2981,8 +3271,8 @@ mod tests {
             let mut terminal = Shadow::new(h as u16, w as u16);
             terminal.feed(&bytes);
             assert_eq!(
-                strokes(&terminal, false),
-                strokes(&s, shown),
+                held(&terminal, false),
+                held(&s, shown),
                 "{name}: {:?}",
                 text(&bytes)
             );
@@ -3218,6 +3508,7 @@ mod tests {
             b"\x1b[1;1H\x1b[1;31mred bold\x1b[0m \x1b[3;4;38;5;208mitalic under\x1b[0m\
               \x1b[2;3H\x1b[7;48;2;10;20;30mreversed\x1b[0m \x1b[92;104mbright\x1b[0m\
               \x1b[3;1H\x1b[4m\x1b[4:3m\x1b[58:2::255:0:0mwavy\x1b[0m \x1b[4:2mtwice\x1b[0m\
+              \x1b[9m gone\x1b[0m \x1b[5;8;11;53mrest\x1b[0m\
               \x1b[4;1H\x1b[2mdim\x1b[0m \xe5\xad\x97\xe5\xad\x97 e\xcc\x81\
               \x1b[5;7H",
         );
@@ -3700,6 +3991,7 @@ mod tests {
             "c",
             Style::new().add_modifier(Modifier::DIM | Modifier::UNDERLINED),
         );
+        buf.set_string(3, 0, "d", Style::new().add_modifier(Modifier::CROSSED_OUT));
         let mut shadow = Shadow::new(1, 4);
         let frame = shadow.frame_under(
             &|_, _| Shade::Blank,
@@ -3710,6 +4002,7 @@ mod tests {
         let cells = screen_of(&frame);
         assert_eq!(cells[&(1, 1)], ("0;1;7;38;2;1;2;3".into(), "a".into()));
         assert_eq!(cells[&(1, 3)], ("0;2;4".into(), "c".into()));
+        assert_eq!(cells[&(1, 4)], ("0;9".into(), "d".into()));
     }
 
     /// A terminal drawing a VS16 sequence two columns wide, as kitty,

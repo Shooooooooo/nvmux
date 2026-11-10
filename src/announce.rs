@@ -16,7 +16,7 @@
 //!
 //! The box cross-fades ([`crate::fade`]) with the session's cells from
 //! [`crate::shadow`]. The repaint still runs, as the shadow lacks
-//! strikethrough; without a shadow the interior is blank until then. The
+//! hyperlinks; without a shadow the interior is blank until then. The
 //! relay cannot sleep between frames, so the popup holds a
 //! [`fade::Schedule`] and is asked for one clock-paced frame at a time. With
 //! [`fade::enabled`] false there is no fade phase.

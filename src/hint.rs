@@ -280,8 +280,8 @@ impl Bar {
     }
 }
 
-/// Restore the row from the shadow, a local erase (strikethrough comes back
-/// plain). Without a usable shadow or palette, blank the row and have the
+/// Restore the row from the shadow, a local erase (a hyperlink does not come
+/// back). Without a usable shadow or palette, blank the row and have the
 /// relay ask the server.
 fn erase(over: &Over, under: Option<&Shadow>, palette: Option<&Palette>) -> Act {
     match (under.filter(|s| s.is_usable()), palette) {
