@@ -646,18 +646,24 @@ pub fn sgr(out: &mut Vec<u8>, s: &Style) {
     colour(out, s.fg, 30, 90, 38);
     colour(out, s.bg, 40, 100, 48);
     out.push(b'm');
-    let style = match s.underline {
+    underline(out, s.underline, s.sp);
+}
+
+/// What a pen already underlined (SGR `4`) needs for its underline's style
+/// and colour `sp`, each in a sequence of its own (see [`sgr`]).
+pub fn underline(out: &mut Vec<u8>, style: Underline, sp: Color) {
+    let n = match style {
         Underline::Curl => Some(3),
         Underline::Double => Some(2),
         Underline::Dotted => Some(4),
         Underline::Dashed => Some(5),
         Underline::Line | Underline::None => None,
     };
-    if let Some(n) = style {
+    if let Some(n) = n {
         let _ = write!(out, "\x1b[4:{n}m");
     }
-    if s.underline != Underline::None {
-        match s.sp {
+    if style != Underline::None {
+        match sp {
             Color::Rgb(Rgb(r, g, b)) => {
                 let _ = write!(out, "\x1b[58:2::{r}:{g}:{b}m");
             }

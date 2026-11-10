@@ -119,9 +119,9 @@ pub struct ClientSettings {
     ///   a screen copy and its ssh forward; one that keeps redrawing keeps
     ///   sending it frames, over the link if remote.
     /// - No limit: one per session visited.
-    /// - The restored screen lacks undercurl, underline colour, strikethrough,
-    ///   blink, conceal and overline (see [`crate::shadow`]) until the
-    ///   server's repaint lands, a round trip or two later.
+    /// - The restored screen lacks strikethrough, blink, conceal and overline
+    ///   (see [`crate::shadow`]) until the server's repaint lands, a round
+    ///   trip or two later.
     pub per_session: bool,
     /// Start a session's client on its first visit instead of all at startup.
     ///

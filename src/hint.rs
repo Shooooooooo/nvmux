@@ -280,9 +280,9 @@ impl Bar {
     }
 }
 
-/// Restore the row from the shadow, a local erase (undercurl and strikethrough
-/// come back plain). Without a usable shadow or palette, blank the row and
-/// have the relay ask the server.
+/// Restore the row from the shadow, a local erase (strikethrough comes back
+/// plain). Without a usable shadow or palette, blank the row and have the
+/// relay ask the server.
 fn erase(over: &Over, under: Option<&Shadow>, palette: Option<&Palette>) -> Act {
     match (under.filter(|s| s.is_usable()), palette) {
         // At `t = 1.0` none of the bar is drawn, so its colour is moot.
