@@ -5211,6 +5211,11 @@ impl App {
             self.forget_unsure(now);
             return;
         };
+        // The agent resends its ack when the reach changes. Judged again, it
+        // would find no step for its key and drop those after it.
+        if p.base.as_ref().is_some_and(|b| b.seq == k && b.ack == ack) {
+            return;
+        }
         let made_out = p.made_out(k);
         let elsewhere = self
             .anim
@@ -11026,6 +11031,21 @@ mod tests {
         redraw(&mut a, cursor_to(0, 4), t1);
         assert_eq!(drawn(&a), (0, 4));
         assert!(a.anim.chain(2).is_none());
+    }
+
+    /// The agent resends its ack when the reach changes, after each ping.
+    #[test]
+    fn an_ack_sent_again_keeps_the_steps_after_it() {
+        let t1 = Instant::now() + Duration::from_secs(1);
+        let mut a = stepping(Duration::from_millis(200));
+        a.keys(b"llll", t1);
+        ack(&mut a, 1, "l", "n", (0, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(0, 1), t1);
+        ack(&mut a, 1, "l", "n", (0, 1, 1, 0), t1);
+        redraw(&mut a, cursor_to(0, 1), t1);
+        assert_eq!(drawn(&a), (0, 4));
+        let tally = a.predict.as_ref().map(|p| p.trust.tally);
+        assert_eq!(tally.map(|t| t.unjudged), Some(0), "dropped and remade");
     }
 
     #[test]
