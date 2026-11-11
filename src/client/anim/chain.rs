@@ -25,10 +25,10 @@
 //! also scroll the view ahead (`super::scroll`); [`Chain::top`] is the result.
 //! All steps and scrolls are dropped when a Neovim frame moves the view any
 //! other way, or changes the text of a row showing a visited line (an unseen
-//! edit, inline virtual text). A line scrolled into view must be drawn as the
-//! client laid it out, give or take what is drawn over its blanks
-//! ([`shows`]). Changes to other rows or to gutters, and a typed line drawn as
-//! a step typed it, keep the steps.
+//! edit, inline virtual text), give or take what is drawn over its blanks
+//! ([`Seen::agrees`]). A line scrolled into view must be drawn as the client
+//! laid it out. Changes to other rows or to gutters, and a typed line drawn
+//! as a step typed it, keep the steps.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -41,21 +41,31 @@ pub type Drawn = Option<Seen>;
 
 /// A visited line's text past the gutter: Neovim's whole row (`whole`), or,
 /// for a line a predicted scroll brings into view, the client's layout of its
-/// text only.
+/// text only. `blanks` are what `'list'` draws blanks as.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
     pub text: Vec<Text>,
     pub whole: bool,
+    pub blanks: Vec<char>,
 }
 
 impl Seen {
-    /// Whether Neovim's row `now` still matches: equal, or (not `whole`)
-    /// starting with the client's layout as [`shows`] reads it. `None` (out
-    /// of view) agrees.
+    /// Whether Neovim's row `now` still matches, give or take what is drawn
+    /// over blanks (see [`shows`]): the same length if `whole`, else starting
+    /// with the client's layout. A whole row's overlays may also go, as
+    /// snacks.nvim's scope guide does when the cursor leaves the scope.
+    /// `None` (out of view) agrees.
     pub fn agrees(&self, now: Option<&[Text]>) -> bool {
+        let blank = |t: &Text| matches!(t, Text::Char(c) if self.blanks.contains(c));
+        let shows = |laid: &Text, drawn: &Text| shows(laid, drawn) || blank(laid);
         now.is_none_or(|t| {
             if self.whole {
-                t == self.text.as_slice()
+                t.len() == self.text.len()
+                    && self
+                        .text
+                        .iter()
+                        .zip(t)
+                        .all(|(was, now)| shows(was, now) || shows(now, was))
             } else {
                 t.len() >= self.text.len()
                     && self
@@ -301,26 +311,27 @@ mod tests {
     #[test]
     fn a_line_still_agrees_with_what_neovim_draws_over_its_blanks() {
         let laid = Seen {
-            text: texts("  foo"),
+            text: texts("··foo"),
             whole: false,
+            blanks: vec!['·'],
         };
-        assert!(laid.agrees(Some(&texts("  foo  "))));
+        assert!(laid.agrees(Some(&texts("··foo  "))));
         assert!(
-            laid.agrees(Some(&texts("▏ foo x"))),
-            "a guide, text past the end"
+            laid.agrees(Some(&texts("▏·foo x"))),
+            "a guide over a listed blank, text past the end"
         );
-        assert!(!laid.agrees(Some(&texts("  fox  "))));
-        assert!(!laid.agrees(Some(&texts(" foo   "))), "moved");
-        assert!(!laid.agrees(Some(&texts("  fo"))), "cut short");
+        assert!(!laid.agrees(Some(&texts("··fox  "))));
+        assert!(!laid.agrees(Some(&texts("·foo   "))), "moved");
+        assert!(!laid.agrees(Some(&texts("··fo"))), "cut short");
         assert!(laid.agrees(None), "out of view");
         let whole = Seen {
-            text: texts("  foo  "),
+            text: texts("▏ foo  "),
             whole: true,
+            blanks: Vec::new(),
         };
-        assert!(
-            !whole.agrees(Some(&texts("▏ foo  "))),
-            "Neovim's own row, redrawn otherwise"
-        );
+        assert!(whole.agrees(Some(&texts("  foo ▏"))), "guides come and go");
+        assert!(!whole.agrees(Some(&texts("▏ fox  "))));
+        assert!(!whole.agrees(Some(&texts("▏ foo "))), "cut short");
     }
 
     #[test]

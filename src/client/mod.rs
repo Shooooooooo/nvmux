@@ -3882,7 +3882,11 @@ impl App {
     fn seen(&self, grid: u64, line: i64, text: Option<&str>) -> chain::Drawn {
         let shape = self.predict.as_ref()?.shape(*self.model.wins.get(&grid)?)?;
         if let Some(text) = anim::line_drawn(&self.model, grid, line, shape.textoff) {
-            return Some(chain::Seen { text, whole: true });
+            return Some(chain::Seen {
+                text,
+                whole: true,
+                blanks: shape.blanks(),
+            });
         }
         let (_, _, left, right) = anim::text_rect(&self.model, grid)?;
         let text = text?;
@@ -3894,6 +3898,7 @@ impl App {
         Some(chain::Seen {
             text: row[from..end].iter().map(|c| c.text.clone()).collect(),
             whole: false,
+            blanks: shape.blanks(),
         })
     }
 
@@ -11459,9 +11464,9 @@ mod tests {
         assert_eq!(drawn(&a), (1, 1));
     }
 
-    /// Changes on other lines (virtual text, diagnostics, timers) leave the
-    /// steps. A change to their line drops them: remade at once if only past
-    /// its end, else left to Neovim with the cursor snapped back.
+    /// Changes on other lines (virtual text, diagnostics, timers), or over
+    /// blanks on theirs, leave the steps. Any other change to their line
+    /// drops them, left to Neovim with the cursor snapped back.
     #[test]
     fn a_frame_lets_go_of_the_steps_only_where_it_draws_their_line_otherwise() {
         let t1 = Instant::now() + Duration::from_secs(1);
@@ -11473,8 +11478,8 @@ mod tests {
         assert_eq!(tally(&a).unjudged, 0, "another line");
         assert_eq!(drawn(&a), (0, 1));
         redraw(&mut a, vec![line(2, 0, "line 0  E")], t1);
-        assert_eq!(tally(&a).unjudged, 1);
-        assert_eq!(drawn(&a), (0, 1), "after its end: worked out again");
+        assert_eq!(tally(&a).unjudged, 0, "after its end");
+        assert_eq!(drawn(&a), (0, 1));
         a.keys(b"l", t1);
         assert_eq!(drawn(&a), (0, 2));
         redraw(&mut a, vec![line(2, 0, "li: ne 0")], t1);
