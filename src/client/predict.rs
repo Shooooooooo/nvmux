@@ -341,6 +341,17 @@ impl Shape {
         self.plain_gutter && (self.relativenumber || numbered)
     }
 
+    /// What `'list'` draws blanks as, tabs included.
+    pub fn blanks(&self) -> Vec<char> {
+        if !self.list {
+            return Vec::new();
+        }
+        let mut blanks: Vec<char> = self.lcs.blanks().chain(self.tab.iter().copied()).collect();
+        blanks.sort_unstable();
+        blanks.dedup();
+        blanks
+    }
+
     /// For a line sent cut short as `text`, whether the missing rest may
     /// change how `'listchars'` draws its blanks (`trail` if `text` ends
     /// blank, lead settings if it is all blank).
@@ -385,6 +396,16 @@ impl Listchars {
             precedes: one(8),
             leadtab: many(9),
         }
+    }
+
+    /// What blanks may be drawn as, besides spaces.
+    fn blanks(&self) -> impl Iterator<Item = char> + '_ {
+        [self.space, self.lead, self.trail]
+            .into_iter()
+            .flatten()
+            .chain(self.multispace.iter().copied())
+            .chain(self.leadmultispace.iter().copied())
+            .chain(self.leadtab.iter().copied())
     }
 
     /// Whether any lead setting depends on where a line's leading blanks end.
