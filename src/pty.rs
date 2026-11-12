@@ -3627,12 +3627,12 @@ fn pump(
                 Ok(0) => return Ok(Outcome::StdinClosed),
                 Err(e) => return Err(NvmuxError::Io(e)),
                 Ok(len) if leaving.is_some() => {
-                    let Some(mut leave) = leaving else {
+                    let Some(leave) = leaving.as_mut() else {
                         unreachable!("guarded");
                     };
                     // Answers read here are not passed on, but still count.
                     attachment.unanswered.read(&buf[..len]);
-                    match reply(&buf[..len], leave.detach) {
+                    match reply(&buf[..len], leave.detach, &mut leave.paste) {
                         Some(Reply::Detach) => return Ok(Outcome::Detached),
                         Some(Reply::Save) => {
                             let live = config::get();
@@ -3641,15 +3641,18 @@ fn pump(
                                     config::set_saved((*live).clone());
                                     return Ok(Outcome::Detached);
                                 }
-                                Err(e) => {
-                                    bar.ask(Some(leave.not_saved(&e)));
-                                    leaving = Some(leave);
-                                }
+                                Err(e) => bar.ask(Some(leave.not_saved(&e))),
                             }
                         }
                         Some(Reply::Stay) => {
+                            // A paste the read left open goes on to the
+                            // session as one, as past a panel; the client
+                            // was sent none of it.
+                            let (held, start) = after_panels(Held::default(), leave.paste);
                             leaving = None;
                             bar.ask(None);
+                            steps.extend(start);
+                            steps.extend(prefix.resume(held));
                         }
                         None => {}
                     }
@@ -3689,12 +3692,14 @@ fn pump(
                     let leave = Leaving {
                         detach: keys.bind.key(Action::Detach).unwrap_or(b'd'),
                         overwrite: false,
+                        paste,
                     };
                     bar.ask(Some(leave.question(unsaved)));
                     leaving = Some(leave);
                     // The steps after the `d` are dropped, and what the
                     // machine holds came from the same keys; the question
-                    // reads those that would settle it, a paste's end too.
+                    // reads those that would settle it, and takes over the
+                    // paste the input is in.
                     drop(prefix.take_held());
                     paste = None;
                     deadline = None;
@@ -3820,6 +3825,8 @@ struct Leaving {
     detach: u8,
     /// The file changed what is being saved, so `w` overwrites it.
     overwrite: bool,
+    /// Where the input is in a paste, as [`Prefix::paste`] puts it.
+    paste: Option<usize>,
 }
 
 impl Leaving {
@@ -3853,10 +3860,36 @@ enum Reply {
 }
 
 /// The first answer to [`Leaving`]'s question in a read of stdin: `w`, the
-/// detach key, `Esc`, or a click (stays). Anything else is swallowed. Keys
-/// may be kitty-protocol reports, whose releases (such as of the `d` that
-/// asked) and repeats are skipped; clicks are SGR or X10 mouse reports.
-fn reply(bytes: &[u8], detach: u8) -> Option<Reply> {
+/// detach key, `Esc`, or a click (stays). Anything else is swallowed, a
+/// bracketed paste through its end. `paste` is where the input is in one,
+/// as [`Prefix::paste`] puts it, and is followed to the end of the read,
+/// past the answer.
+fn reply(bytes: &[u8], detach: u8, paste: &mut Option<usize>) -> Option<Reply> {
+    let mut answer = None;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        if let Some(matched) = *paste {
+            *paste = keys::in_paste_after(matched, rest[0]);
+            rest = &rest[1..];
+            continue;
+        }
+        let (typed, after) = match memmem::find(rest, PASTE_START) {
+            Some(at) => {
+                *paste = Some(0);
+                (&rest[..at], &rest[at + PASTE_START.len()..])
+            }
+            None => (rest, &[][..]),
+        };
+        answer = answer.or_else(|| typed_reply(typed, detach));
+        rest = after;
+    }
+    answer
+}
+
+/// [`reply`] from input outside a paste. Keys may be kitty-protocol reports,
+/// whose releases (such as of the `d` that asked) and repeats are skipped;
+/// clicks are SGR or X10 mouse reports.
+fn typed_reply(bytes: &[u8], detach: u8) -> Option<Reply> {
     let key = |code: u32| match code {
         27 => Some(Reply::Stay),
         c if c == u32::from(b'w') => Some(Reply::Save),
@@ -4928,18 +4961,95 @@ mod tests {
             (b"\x1b[", None),
         ] {
             assert_eq!(
-                reply(bytes, d),
+                reply(bytes, d, &mut None),
                 want,
                 "{:?}",
                 String::from_utf8_lossy(bytes)
             );
         }
         assert_eq!(
-            reply(b"x", b'x'),
+            reply(b"x", b'x', &mut None),
             Some(Reply::Detach),
             "the detach key as moved"
         );
-        assert_eq!(reply(b"d", b'x'), None);
+        assert_eq!(reply(b"d", b'x', &mut None), None);
+    }
+
+    /// A `w` or the detach key in a paste saved the settings or detached.
+    #[test]
+    fn a_paste_answers_the_question_nothing() {
+        let d = b'd';
+        for bytes in [
+            &b"\x1b[200~word\x1b[201~"[..],
+            b"\x1b[200~d\x1b[201~",
+            b"\x1b[200~\x1b[27u\x1b[201~",
+            b"\x1b[200~\x1b[<0;10;5M\x1b[201~",
+            // A start in a paste is text.
+            b"\x1b[200~a\x1b[200~w\x1b[201~",
+        ] {
+            let mut paste = None;
+            let lossy = String::from_utf8_lossy(bytes);
+            assert_eq!(reply(bytes, d, &mut paste), None, "{lossy:?}");
+            assert_eq!(paste, None, "{lossy:?}");
+        }
+        let mut paste = Some(0);
+        assert_eq!(reply(b"cd\x1b[201~", d, &mut paste), None);
+        assert_eq!(paste, None);
+        assert_eq!(
+            reply(b"\x1b[200~w\x1b[201~d", d, &mut None),
+            Some(Reply::Detach),
+            "typed after the paste"
+        );
+    }
+
+    /// Each read was answered on its own, the rest of a paste as keys.
+    #[test]
+    fn a_paste_answers_nothing_across_reads_wherever_they_cut_its_end() {
+        let d = b'd';
+        let mut paste = None;
+        let mut read = |bytes: &[u8]| (reply(bytes, d, &mut paste), paste);
+        assert_eq!(read(b"\x1b[200~ab"), (None, Some(0)));
+        assert_eq!(read(b"wd"), (None, Some(0)));
+        assert_eq!(read(b"\x1b"), (None, Some(1)), "not Esc");
+        assert_eq!(read(b"[201~w"), (Some(Reply::Save), None));
+
+        for cut in 1..PASTE_END.len() {
+            let mut paste = Some(0);
+            let first = [&b"wd"[..], &PASTE_END[..cut]].concat();
+            assert_eq!(reply(&first, d, &mut paste), None, "cut at {cut}");
+            assert_eq!(paste, Some(cut));
+            let second = [&PASTE_END[cut..], b"d"].concat();
+            let answer = reply(&second, d, &mut paste);
+            assert_eq!(answer, Some(Reply::Detach), "cut at {cut}");
+            assert_eq!(paste, None);
+        }
+
+        // `ESC [ 2 0` then `0 ~`: a start in the paste, so text.
+        let mut paste = Some(0);
+        assert_eq!(reply(b"\x1b[20", d, &mut paste), None);
+        assert_eq!(reply(b"0~d", d, &mut paste), None);
+        assert_eq!(paste, Some(0));
+    }
+
+    /// Where a read leaves the input is what the relay goes on from once
+    /// the question is answered.
+    #[test]
+    fn a_paste_after_the_answer_is_followed_to_the_end_of_the_read() {
+        let d = b'd';
+        let (save, stay) = (Some(Reply::Save), Some(Reply::Stay));
+        for (bytes, want) in [
+            (&b"\x1b[27u\x1b[200~ab"[..], (stay, Some(0))),
+            (b"\x1b[<0;10;5M\x1b[200~ab", (stay, Some(0))),
+            (b"\x1b\x1b[200~ab", (stay, Some(0))),
+            (b"w\x1b[200~ab\x1b[201~d", (save, None)),
+            (b"w\x1b[200~a\x1b[201~d\x1b[200~b\x1b[20", (save, Some(4))),
+            // Past a sequence the scan cannot size.
+            (b"\x1bOA\x1b[200~wd", (None, Some(0))),
+        ] {
+            let mut paste = None;
+            let got = (reply(bytes, d, &mut paste), paste);
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(bytes));
+        }
     }
 
     #[test]
@@ -4947,6 +5057,7 @@ mod tests {
         let leave = Leaving {
             detach: b' ',
             overwrite: false,
+            paste: None,
         };
         assert_eq!(
             leave.question(2),
@@ -4955,6 +5066,7 @@ mod tests {
         let mut leave = Leaving {
             detach: b'd',
             overwrite: false,
+            paste: None,
         };
         let clash = crate::error::SaveError::Changed {
             path: "/x/config.toml".into(),
@@ -6902,6 +7014,10 @@ mod tests {
     /// the machine was left as they made it: in a paste whose end the
     /// question read, so the `<prefix> 1` after a stay went on as text, or
     /// armed, so the prefix timed out into a literal under the question.
+    /// The question also read a paste as keys: the `ESC` of an end marker a
+    /// read cut after it as `Esc`, the rest going to session 3 as typed. A
+    /// paste begun after an `Esc` in the same read was dropped, and the
+    /// `<prefix> 1` in the rest of it switched.
     #[test]
     fn what_is_read_with_a_detach_that_asks_goes_with_the_keys_after_it() {
         let p = keys::PREFIX;
@@ -6918,6 +7034,17 @@ mod tests {
         chunks.extend([&b""[..]; 13]);
         chunks.extend([&b"\x1b"[..], &prefix, b"1"]);
         let run = switching_with("pty-ask-prefix", &chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let chunks: &[&[u8]] = &[&asked, b"xyz\x1b", b"[201~", b"\x1b", &[p], b"1"];
+        let run = switching_with("pty-ask-cut-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        // kitty's `Esc`.
+        let want = landed(Some(1), ["", "", "\\u{1b}[200~c\\01d\\u{1b}[201~"]);
+        let rest = [&b"c"[..], &[p, b'1'], b"d\x1b[201~"].concat();
+        let chunks: &[&[u8]] = &[&[p, b'd'], b"\x1b[27u\x1b[200~ab", &rest, &[p], b"1"];
+        let run = switching_with("pty-ask-stay-paste", chunks, Duration::ZERO, also, &want);
         assert_eq!(run.landed, want, "{}", run.said);
     }
 

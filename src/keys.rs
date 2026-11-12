@@ -583,14 +583,7 @@ impl Prefix {
     fn byte(&mut self, b: u8, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
         if let Some(matched) = self.paste {
             pending.push(b);
-            // `ESC` is only the end marker's first byte, so a byte that
-            // breaks a match begins a new one only if it is `ESC`.
-            let matched = if b == PASTE_END[matched] {
-                matched + 1
-            } else {
-                usize::from(b == ESC)
-            };
-            self.paste = (matched < PASTE_END.len()).then_some(matched);
+            self.paste = in_paste_after(matched, b);
         } else if !self.seq.is_empty() {
             self.seq.push(b);
             match keyseq::classify(&self.seq, prefix_code(self.prefix)) {
@@ -760,6 +753,19 @@ impl Prefix {
         flush(&mut steps, &mut pending);
         steps
     }
+}
+
+/// How many bytes of a paste's end marker the input ends with after `b`,
+/// from `matched`; `None` once the marker is whole and the paste over.
+pub fn in_paste_after(matched: usize, b: u8) -> Option<usize> {
+    // `ESC` is only the end marker's first byte, so a byte that breaks a
+    // match begins a new one only if it is `ESC`.
+    let matched = if b == PASTE_END[matched] {
+        matched + 1
+    } else {
+        usize::from(b == ESC)
+    };
+    (matched < PASTE_END.len()).then_some(matched)
 }
 
 fn flush(steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
