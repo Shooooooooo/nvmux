@@ -10,12 +10,15 @@
 //! copy (see `pty::Attachment::paint_kept_screen`).
 //!
 //! `vt100` keeps one bit of a cell's underline, and nothing of its blink,
-//! conceal, strikethrough, alternate font or overline. So a twin parser is
-//! fed the same bytes with each SGR replaced by one whose colours stand for
-//! what the first drops (see `Extra`). Its grid holds that cell for cell
-//! through every scroll and erase: behind a floating screen a wavy underline
-//! stays wavy, and a line through a word stays through it. It costs a second
-//! parse and a second grid.
+//! conceal, strikethrough, alternate font or overline. While the session
+//! shows any of those, a twin parser is fed the same bytes with each SGR
+//! replaced by one whose colours stand for what the first drops (see `Held`).
+//! Its grid holds that cell for cell through every scroll and erase: behind
+//! a floating screen a wavy underline stays wavy, and a line through a word
+//! stays through it. A twin costs a second parse and a second grid, and a
+//! screen that changes colour at every cell is then fed at a third of the
+//! speed in a debug build. So it starts at the first SGR that needs one (see
+//! `Watch`) and goes once nothing on screen does (see `TWIN_CHECK`).
 //!
 //! # Painters
 //!
@@ -342,10 +345,13 @@ impl Painted {
 }
 
 pub struct Shadow {
-    parser: vt100::Parser,
-    /// `parser`'s twin (see the module docs): each cell's colours stand for
-    /// its [`Extra`], and its pen's for the session's.
-    twin: vt100::Parser,
+    parser: vt100::Parser<Watch>,
+    /// `parser`'s twin (see the module docs), while it has one: each cell's
+    /// colours stand for its [`Held`], and its pen's for the session's.
+    twin: Option<vt100::Parser>,
+    /// Bytes the twin has been fed since it was last looked over (see
+    /// [`TWIN_CHECK`]).
+    twin_fed: usize,
     /// Keeps the parsers' OSC buffers small: they ignore OSCs, and an
     /// `OSC 52` copy would otherwise stay buffered for the client's lifetime
     /// (see [`crate::ledger::OscCap`]).
@@ -379,10 +385,11 @@ impl Shadow {
     /// An empty screen of this size. No scrollback: only what is on screen can
     /// be faded.
     pub fn new(rows: u16, cols: u16) -> Self {
-        let parser = || vt100::Parser::new(rows.max(MIN_SIZE), cols.max(MIN_SIZE), 0);
+        let (rows, cols) = (rows.max(MIN_SIZE), cols.max(MIN_SIZE));
         Self {
-            parser: parser(),
-            twin: parser(),
+            parser: vt100::Parser::new_with_callbacks(rows, cols, 0, Watch::default()),
+            twin: None,
+            twin_fed: 0,
             osc: crate::ledger::OscCap::default(),
             cut: Vec::new(),
             painted: Vec::new(),
@@ -412,10 +419,9 @@ impl Shadow {
         let end = whole(bytes);
         self.cut.extend_from_slice(&bytes[end..]);
         let bytes = &bytes[..end];
-        self.guard(|parser, twin| {
-            parser.process(bytes);
-            follow(twin, bytes);
-        });
+        let mut fed = self.twin_fed;
+        self.guard(|parser, twin| track(parser, twin, &mut fed, bytes));
+        self.twin_fed = fed;
         self.invalidate();
     }
 
@@ -423,17 +429,17 @@ impl Shadow {
         if self.broken {
             return;
         }
+        let (rows, cols) = (rows.max(MIN_SIZE), cols.max(MIN_SIZE));
         self.guard(|parser, twin| {
-            for parser in [parser, twin] {
-                parser
-                    .screen_mut()
-                    .set_size(rows.max(MIN_SIZE), cols.max(MIN_SIZE));
+            parser.screen_mut().set_size(rows, cols);
+            if let Some(twin) = twin {
+                twin.screen_mut().set_size(rows, cols);
             }
         });
         self.invalidate();
     }
 
-    fn guard(&mut self, f: impl FnOnce(&mut vt100::Parser, &mut vt100::Parser)) {
+    fn guard(&mut self, f: impl FnOnce(&mut vt100::Parser<Watch>, &mut Option<vt100::Parser>)) {
         let (parser, twin) = (&mut self.parser, &mut self.twin);
         if crate::panics::caught(|| f(parser, twin)).is_err() {
             tracing::warn!("the shadow grid's parser panicked; the session will not dissolve");
@@ -1131,18 +1137,18 @@ impl Shadow {
     }
 }
 
-/// The session's screen as its two parsers hold it.
+/// The session's screen as its parser holds it, and the twin if there is one.
 #[derive(Clone, Copy)]
 struct Screen<'a> {
     cells: &'a vt100::Screen,
-    twin: &'a vt100::Screen,
+    twin: Option<&'a vt100::Screen>,
 }
 
 impl<'a> Screen<'a> {
-    fn of(parser: &'a vt100::Parser, twin: &'a vt100::Parser) -> Self {
+    fn of(parser: &'a vt100::Parser<Watch>, twin: &'a Option<vt100::Parser>) -> Self {
         Self {
             cells: parser.screen(),
-            twin: twin.screen(),
+            twin: twin.as_ref().map(vt100::Parser::screen),
         }
     }
 
@@ -1163,13 +1169,13 @@ impl std::ops::Deref for Screen<'_> {
     }
 }
 
-/// A cell of the parser's, and where the twin has its own, looked up only
-/// when asked for. `Deref` reaches `vt100`'s one bit of underline: ask
+/// A cell of the parser's, and where a twin has its own, looked up only when
+/// asked for. `Deref` reaches `vt100`'s one bit of underline: ask
 /// [`Cell::extra`].
 #[derive(Clone, Copy)]
 struct Cell<'a> {
     cell: &'a vt100::Cell,
-    twin: &'a vt100::Screen,
+    twin: Option<&'a vt100::Screen>,
     at: (u16, u16),
 }
 
@@ -1179,17 +1185,11 @@ impl<'a> Cell<'a> {
         self.cell.contents()
     }
 
-    /// An underline's colour is kept only with an underline to draw in it.
     fn extra(self) -> Extra {
         let (row, col) = self.at;
-        let Some(twin) = self.twin.cell(row, col) else {
-            return Extra::NONE;
-        };
-        let mut extra = Extra::read(twin.fgcolor(), twin.bgcolor());
-        if extra.underline == Underline::None {
-            extra.sp = vt100::Color::Default;
-        }
-        extra
+        let twin = self.twin.and_then(|twin| twin.cell(row, col));
+        let held = twin.map_or(Held::NONE, |c| Held::read(c.fgcolor(), c.bgcolor()));
+        held.over(self.cell.underline())
     }
 }
 
@@ -1201,16 +1201,39 @@ impl std::ops::Deref for Cell<'_> {
     }
 }
 
-/// What `vt100` drops of a pen, which the twin holds for a cell or for the
-/// session's pen: the underline's style and its colour (the default is the
-/// text's), and the [`Flags`].
-///
-/// The twin's foreground is the colour. Its background is an indexed colour,
-/// or the default for 0: the style as SGR `4:n` numbers it in the low three
-/// bits, the flags above them.
+/// What `vt100` drops of a pen: the underline's style and its colour (the
+/// default is the text's), and the [`Flags`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Extra {
     underline: Underline,
+    sp: vt100::Color,
+    flags: Flags,
+}
+
+impl Extra {
+    const NONE: Extra = Extra {
+        underline: Underline::None,
+        sp: vt100::Color::Default,
+        flags: Flags::NONE,
+    };
+
+    /// Whether a space shows it: a line under, through or over it.
+    fn lined(self) -> bool {
+        self.underline != Underline::None || self.flags.lined()
+    }
+}
+
+/// What a twin holds for a cell or for the session's pen: only what `vt100`
+/// cannot. So an underline's style is here only when a `4:n` set it, and
+/// with nothing held the twin's pen is the default one.
+///
+/// The twin's foreground is the underline's colour. Its background is an
+/// indexed colour, or the default for 0: in the low three bits the style as
+/// SGR `4:n` numbers it, plus one, and the flags above them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Held {
+    /// `None` leaves it to `vt100`'s bit: underlined by a plain `4`, or not.
+    underline: Option<Underline>,
     sp: vt100::Color,
     flags: Flags,
 }
@@ -1277,9 +1300,9 @@ const STYLES: [Underline; 6] = [
     Underline::Dashed,
 ];
 
-impl Extra {
-    const NONE: Extra = Extra {
-        underline: Underline::None,
+impl Held {
+    const NONE: Held = Held {
+        underline: None,
         sp: vt100::Color::Default,
         flags: Flags::NONE,
     };
@@ -1289,9 +1312,9 @@ impl Extra {
             vt100::Color::Idx(n) => n,
             _ => 0,
         };
-        let style = STYLES.get(usize::from(n & 7)).copied();
-        Extra {
-            underline: style.unwrap_or(Underline::None),
+        let style = usize::from(n & 7).checked_sub(1);
+        Held {
+            underline: style.and_then(|n| STYLES.get(n).copied()),
             sp: fg,
             flags: Flags(n >> 3),
         }
@@ -1301,17 +1324,35 @@ impl Extra {
         Self::read(twin.fgcolor(), twin.bgcolor())
     }
 
-    /// Whether a space shows it: a line under, through or over it.
-    fn lined(self) -> bool {
-        self.underline != Underline::None || self.flags.lined()
+    /// With `vt100`'s bit of underline, all it dropped. An underline's
+    /// colour is kept only with an underline to draw in it.
+    fn over(self, underlined: bool) -> Extra {
+        let plain = if underlined {
+            Underline::Line
+        } else {
+            Underline::None
+        };
+        let underline = self.underline.unwrap_or(plain);
+        Extra {
+            underline,
+            sp: if underline == Underline::None {
+                vt100::Color::Default
+            } else {
+                self.sp
+            },
+            flags: self.flags,
+        }
     }
 
     /// The SGR that makes the twin's pen stand for it.
     fn write(self, out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b[0");
         write_colour(out, self.sp, 30, 90, 38);
-        let style = STYLES.iter().position(|s| *s == self.underline);
-        let n = style.unwrap_or(0) as u8 | self.flags.0 << 3;
+        let style = self
+            .underline
+            .and_then(|style| STYLES.iter().position(|s| *s == style))
+            .map_or(0, |n| n as u8 + 1);
+        let n = style | self.flags.0 << 3;
         if n > 0 {
             write_colour(out, vt100::Color::Idx(n), 40, 100, 48);
         }
@@ -1327,12 +1368,13 @@ impl Extra {
             let mut subs = param.split(|&b| b == b':').map(number);
             let code = subs.next().unwrap_or(0);
             match (code, subs.next()) {
-                (0, None) => self = Extra::NONE,
-                (4, None) => self.underline = Underline::Line,
+                (0, None) => self = Held::NONE,
+                // `vt100`'s own to hold, from here.
+                (4 | 24, None) => self.underline = None,
                 (4, Some(n)) => {
-                    self.underline = STYLES.get(n as usize).copied().unwrap_or(Underline::Line);
+                    let style = STYLES.get(n as usize).copied();
+                    self.underline = Some(style.unwrap_or(Underline::Line));
                 }
-                (24, None) => self.underline = Underline::None,
                 (59, None) => self.sp = vt100::Color::Default,
                 (58, Some(kind)) => {
                     let mut arguments = [0; 4];
@@ -1422,15 +1464,167 @@ fn is_parameter(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9' | b';' | b':')
 }
 
+/// How much the twin is fed between looks at whether it still holds
+/// anything. A look reads every cell at most, a few hundredths of what
+/// feeding this much costs.
+const TWIN_CHECK: usize = 1 << 20;
+
+/// Watches the parser for the first SGR that sets what only a twin can hold,
+/// and keeps the screen as that SGR found it, for the twin to start from.
+#[derive(Default)]
+struct Watch {
+    /// Whether there is no twin.
+    armed: bool,
+    first: Option<First>,
+}
+
+/// The first SGR a twin is needed for.
+struct First {
+    /// The parser's screen, part way through the SGR.
+    screen: vt100::Screen,
+    /// Its parameters as [`canonical`] writes them.
+    params: Vec<u8>,
+}
+
+impl vt100::Callbacks for Watch {
+    /// Called for an SGR with a parameter `vt100` does not know, once for
+    /// each such parameter, with all of the SGR's.
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        private: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        if !self.armed || self.first.is_some() || c != 'm' || private.is_some() {
+            return;
+        }
+        let params: Vec<String> = params
+            .iter()
+            .map(|subs| {
+                let subs: Vec<String> = subs.iter().map(u16::to_string).collect();
+                subs.join(":")
+            })
+            .collect();
+        let params = params.join(";").into_bytes();
+        // One that only clears, such as `59`, needs no twin.
+        if Held::NONE.after(&params) != Held::NONE {
+            self.first = Some(First {
+                screen: screen.clone(),
+                params,
+            });
+        }
+    }
+}
+
+impl First {
+    /// The twin from this SGR on, given the feed that held it and the
+    /// parser's screen after that feed.
+    fn twin(self, bytes: &[u8], after: &vt100::Screen) -> vt100::Parser {
+        // No earlier SGR has these parameters, or it would have been first.
+        let found = sgrs(bytes).find(|&(start, m)| canonical(&bytes[start + 2..m]) == self.params);
+        let Some((start, _)) = found else {
+            // Longer than `SGR_MAX` and cut by a read, so its start is not
+            // in this feed. The twin starts after the feed with the pen it
+            // left, and what the feed drew stays without until drawn again.
+            let pen = sgrs(bytes).fold(Held::NONE.after(&self.params), |pen, (start, m)| {
+                pen.after(&bytes[start + 2..m])
+            });
+            let mut twin = blank_twin(after.clone());
+            let mut sgr = Vec::new();
+            pen.write(&mut sgr);
+            twin.process(&sgr);
+            return twin;
+        };
+        let mut twin = blank_twin(self.screen);
+        follow(&mut twin, &bytes[start..]);
+        twin
+    }
+}
+
+/// SGR parameters with each number as `vt100` reads it, to compare.
+fn canonical(params: &[u8]) -> Vec<u8> {
+    let params: Vec<String> = params
+        .split(|&b| b == b';')
+        .map(|param| {
+            let subs: Vec<String> = param
+                .split(|&b| b == b':')
+                .map(|sub| u16::try_from(number(sub)).unwrap_or(u16::MAX).to_string())
+                .collect();
+            subs.join(":")
+        })
+        .collect();
+    params.join(";").into_bytes()
+}
+
+/// A parser in `screen`'s state with every cell blank, as none has yet had
+/// what a twin holds.
+fn blank_twin(screen: vt100::Screen) -> vt100::Parser {
+    let (rows, cols) = screen.size();
+    let alternate = screen.alternate_screen();
+    let mut twin = vt100::Parser::new(rows, cols, 0);
+    *twin.screen_mut() = screen;
+    // Erased under a default pen: this screen, then the primary one behind
+    // an alternate. `?47` switches without moving either cursor.
+    twin.process(b"\x1b[0m\x1b[2J");
+    if alternate {
+        twin.process(b"\x1b[?47l\x1b[2J\x1b[?47h");
+    }
+    twin
+}
+
+/// Whether neither the twin's pen nor any cell with text holds anything.
+fn holds_nothing(twin: &vt100::Screen) -> bool {
+    let plain = |fg, bg| fg == vt100::Color::Default && bg == vt100::Color::Default;
+    let (rows, cols) = twin.size();
+    plain(twin.fgcolor(), twin.bgcolor())
+        && (0..rows).all(|row| {
+            (0..cols).all(|col| {
+                twin.cell(row, col)
+                    .is_none_or(|c| !c.has_contents() || plain(c.fgcolor(), c.bgcolor()))
+            })
+        })
+}
+
+/// Feed `bytes` to the parser, and to its twin while it needs one.
+fn track(
+    parser: &mut vt100::Parser<Watch>,
+    twin: &mut Option<vt100::Parser>,
+    fed: &mut usize,
+    bytes: &[u8],
+) {
+    parser.callbacks_mut().armed = twin.is_none();
+    parser.process(bytes);
+    let Some(there) = twin else {
+        if let Some(first) = parser.callbacks_mut().first.take() {
+            let born = first.twin(bytes, parser.screen());
+            // Neovim's client sets a wavy underline and draws nothing, to
+            // ask the terminal whether it can.
+            *twin = Some(born).filter(|twin| !holds_nothing(twin.screen()));
+            *fed = 0;
+        }
+        return;
+    };
+    follow(there, bytes);
+    *fed += bytes.len();
+    if *fed >= TWIN_CHECK {
+        *fed = 0;
+        if holds_nothing(there.screen()) {
+            *twin = None;
+        }
+    }
+}
+
 /// Feed the twin `bytes`, but for each SGR the one that makes its pen stand
-/// for what the session's pen has of [`Extra`] after it.
+/// for what the session's pen has of [`Held`] after it.
 fn follow(twin: &mut vt100::Parser, bytes: &[u8]) {
     let mut fed = 0;
     let mut sgr = Vec::new();
     for (start, m) in sgrs(bytes) {
         twin.process(&bytes[fed..start]);
         fed = m + 1;
-        let was = Extra::of_pen(twin.screen());
+        let was = Held::of_pen(twin.screen());
         let now = was.after(&bytes[start + 2..m]);
         // Only the twin's own SGRs set its pen, so it stands for `was`.
         if now != was {
@@ -1612,7 +1806,8 @@ impl Pen {
 
     /// The session's own, as its parsers have it.
     fn of_session(screen: Screen) -> Self {
-        let extra = Extra::of_pen(screen.twin);
+        let held = screen.twin.map_or(Held::NONE, Held::of_pen);
+        let extra = held.over(screen.underline());
         Pen {
             fg: screen.fgcolor(),
             bg: screen.bgcolor(),
@@ -2874,6 +3069,11 @@ mod tests {
             (&["4:2"], underlined(Double, Default)),
             (&["4:4"], underlined(Dotted, Default)),
             (&["4:5"], underlined(Dashed, Default)),
+            // A plain `4` is a straight one again.
+            (&["4:3", "4"], underlined(Line, Default)),
+            (&["4:3;4"], underlined(Line, Default)),
+            (&["4", "4:0"], Extra::NONE),
+            (&["4", "4:0", "4"], underlined(Line, Default)),
             (&["4:3", "4:0"], Extra::NONE),
             (&["4:3", "24"], Extra::NONE),
             (&["4:3", "0"], Extra::NONE),
@@ -3031,6 +3231,160 @@ mod tests {
         at(&s, [(2, 4), (2, 5)]);
         s.feed(b"\x1b[3;6H\x1b[K");
         assert_eq!(marked_and_lettered(&s), (vec![(2, 4)], vec![(2, 4)]));
+    }
+
+    /// Other drawing that leaves the first row alone, in reads of 8 KiB.
+    fn draw_elsewhere(s: &mut Shadow, bytes: usize) {
+        let drawn = b"\x1b[3;1H0123456789".repeat(bytes / 16 + 1);
+        for read in drawn.chunks(8192) {
+            s.feed(read);
+        }
+    }
+
+    /// With a twin from the start, a relay under a screen that changes colour
+    /// at every cell took ten times as long to pass a paste on.
+    #[test]
+    fn a_screen_with_nothing_for_a_twin_has_none() {
+        let mut s = Shadow::new(4, 20);
+        // As Neovim's client writes a cell, and as nvmux's own does.
+        s.feed(b"\x1b(B\x1b[m\x1b[38;5;167m\x1b[48;5;19m1");
+        s.feed(b"\x1b[0;1;3;4;7;38;5;9;48;2;5;8;53mu");
+        // Parameters that only clear what a twin would hold.
+        s.feed(b"\x1b[59m\x1b[25;28;29;10;55mx");
+        assert!(s.twin.is_none());
+        assert_eq!(
+            extra_at(&s, 0, 1),
+            underlined(Underline::Line, vt100::Color::Default),
+            "underlined by vt100's own bit"
+        );
+    }
+
+    /// The twin takes over from the screen as the SGR found it: what the
+    /// same read drew before it, the scroll region and the alternate screen.
+    #[test]
+    fn a_twin_starts_at_the_first_sgr_that_needs_one() {
+        let mut s = Shadow::new(5, 10);
+        s.feed(b"\x1b[?1049h\x1b[2;4r\x1b[1;1H\x1b[4mline\x1b[0m");
+        assert!(s.twin.is_none());
+        // Text, the SGR, text under it, and a line feed that scrolls rows 2
+        // to 4, all in one read.
+        s.feed(b"\x1b[3;1Hbefore\x1b[4;1H\x1b[9mstruck\x1b[0m\x1b[4;1H\n");
+        let twin = s.twin.as_ref().expect("a twin").screen();
+        assert!(twin.alternate_screen());
+        assert_eq!(twin.cursor_position(), s.parser.screen().cursor_position());
+        let row = |row: u16, cols: u16| -> (String, Vec<Extra>) {
+            let cells = (0..cols).map(|col| s.screen().cell(row, col).expect("a cell"));
+            (
+                cells.clone().map(|c| c.contents()).collect(),
+                cells.map(|c| c.extra()).collect(),
+            )
+        };
+        let line = underlined(Underline::Line, vt100::Color::Default);
+        assert_eq!(row(0, 4), ("line".into(), vec![line; 4]));
+        assert_eq!(row(1, 6), ("before".into(), vec![Extra::NONE; 6]));
+        assert_eq!(
+            row(2, 6),
+            ("struck".into(), vec![flagged(&[Flags::STRIKETHROUGH]); 6])
+        );
+    }
+
+    /// The twin starts as a copy of the parser's screen, whose cells' own
+    /// colours would read as what a twin holds: an indexed background as a
+    /// style of underline.
+    #[test]
+    fn what_was_drawn_before_a_twin_holds_nothing_in_it() {
+        let coloured = b"\x1b[38;5;9;48;5;3mab\x1b[0m";
+        let mut s = Shadow::new(2, 10);
+        s.feed(coloured);
+        s.feed(b"\x1b[?1049h");
+        s.feed(coloured);
+        s.feed(b"\x1b[2;1H\x1b[4:3mwavy\x1b[0m");
+        assert!(s.twin.is_some());
+        assert_eq!(extra_at(&s, 0, 0), Extra::NONE, "on the alternate screen");
+        s.feed(b"\x1b[?1049l");
+        assert_eq!(extra_at(&s, 0, 0), Extra::NONE, "and on the one behind it");
+    }
+
+    /// `vt100` reads `004:03` as 4:3, and the SGR is found again by that.
+    #[test]
+    fn the_sgr_a_twin_starts_at_is_found_as_vt100_read_it() {
+        let mut s = Shadow::new(1, 8);
+        s.feed(b"a\x1b[;004:03;01mb");
+        assert_eq!(extra_at(&s, 0, 0), Extra::NONE);
+        assert_eq!(
+            extra_at(&s, 0, 1),
+            underlined(Underline::Curl, vt100::Color::Default)
+        );
+    }
+
+    #[test]
+    fn a_twin_goes_once_nothing_on_screen_needs_it() {
+        let mut s = Shadow::new(4, 20);
+        s.feed(b"\x1b[1;1H\x1b[9mstruck\x1b[0m");
+        draw_elsewhere(&mut s, 2 * TWIN_CHECK);
+        assert!(s.twin.is_some(), "the word is still on screen");
+        assert_eq!(extra_at(&s, 0, 0), flagged(&[Flags::STRIKETHROUGH]));
+
+        s.feed(b"\x1b[1;1H\x1b[4mplain \x1b[0m");
+        draw_elsewhere(&mut s, TWIN_CHECK);
+        assert!(s.twin.is_none());
+        assert_eq!(
+            extra_at(&s, 0, 0),
+            underlined(Underline::Line, vt100::Color::Default)
+        );
+
+        s.feed(b"\x1b[2;1H\x1b[4:3mwavy\x1b[0m");
+        assert!(s.twin.is_some(), "and comes back");
+        assert_eq!(
+            extra_at(&s, 1, 0),
+            underlined(Underline::Curl, vt100::Color::Default)
+        );
+    }
+
+    /// A pen that holds something keeps the twin, for what it draws next.
+    #[test]
+    fn a_twin_stays_while_the_pen_needs_it() {
+        let mut s = Shadow::new(4, 20);
+        s.feed(b"\x1b[9m");
+        draw_elsewhere(&mut s, 2 * TWIN_CHECK);
+        s.feed(b"\x1b[1;1Hx");
+        assert_eq!(extra_at(&s, 0, 0), flagged(&[Flags::STRIKETHROUGH]));
+    }
+
+    /// Neovim's client asks whether the terminal can curl an underline by
+    /// setting one and a DECRQSS, and resets its pen before it draws.
+    #[test]
+    fn neovims_question_about_wavy_underlines_leaves_no_twin() {
+        let asked =
+            b"\x1b[?1049h\x1b[0m\x1b[4:3m\x1bP$qm\x1b\\\x1b[?u\x1b[c\x1b(B\x1b[m\x1b[H\x1b[2Jtext";
+        let mut s = Shadow::new(4, 20);
+        s.feed(asked);
+        assert!(s.twin.is_none());
+
+        // Read in two before the reset, the twin lasts until it is looked
+        // over.
+        let reset = asked.len() - b"\x1b(B\x1b[m\x1b[H\x1b[2Jtext".len();
+        let mut s = Shadow::new(4, 20);
+        s.feed(&asked[..reset]);
+        assert!(s.twin.is_some());
+        s.feed(&asked[reset..]);
+        draw_elsewhere(&mut s, TWIN_CHECK);
+        assert!(s.twin.is_none());
+        assert_eq!(extra_at(&s, 0, 0), Extra::NONE);
+    }
+
+    /// An SGR longer than [`SGR_MAX`] is not held back for its end.
+    #[test]
+    fn a_twin_starts_after_the_read_at_an_sgr_cut_too_long_to_hold() {
+        let sgr = format!("\x1b[{};4:3m", "0".repeat(SGR_MAX + 20));
+        let (head, tail) = sgr.as_bytes().split_at(SGR_MAX + 10);
+        let mut s = Shadow::new(1, 8);
+        s.feed(head);
+        s.feed(&[tail, b"ab"].concat());
+        s.feed(b"cd");
+        let wavy = underlined(Underline::Curl, vt100::Color::Default);
+        let held: Vec<Extra> = (0..4).map(|col| extra_at(&s, 0, col)).collect();
+        assert_eq!(held, [Extra::NONE, Extra::NONE, wavy, wavy]);
     }
 
     #[test]
