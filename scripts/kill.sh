@@ -41,10 +41,14 @@ is_zombie() {
   esac
 }
 
-# Exited, whether or not the process table has caught up.
+# Exited, whether or not the process table has caught up. `kill -0` also
+# fails on a live process of another user's, which no signal of ours reached.
 gone() {
-  kill -0 "$1" 2>/dev/null || return 0
-  is_zombie "$1"
+  if kill -0 "$1" 2>/dev/null; then
+    is_zombie "$1"
+  else
+    ! uid_of "$1" >/dev/null
+  fi
 }
 
 # Poll for up to $2 tenths of a second, every hundredth for the first tenth

@@ -21,7 +21,8 @@
 //! started ahead ([`Attachment::start_ahead`]) and, a frame at a time, under
 //! a floating panel ([`panel`]). **A held byte is never reordered or
 //! changed**; only synchronized-update ends are dropped, where held bytes go
-//! out in one update of nvmux's.
+//! out in one update of nvmux's, and a first paint still held when nvmux
+//! leaves for the shell is dropped whole.
 //!
 //! nvmux's own output (fade frames, the notice and hint bar, a kept client's
 //! repainted screen, floating panels) is never fed to the shadow. Overlays
@@ -45,6 +46,7 @@ use std::time::{Duration, Instant};
 use memchr::memmem;
 use pty_process::blocking::{Command, Pty};
 
+use crate::client::input::{PASTE_END, PASTE_START};
 use crate::error::{NvmuxError, Result};
 use crate::handoff::HandOff;
 use crate::keys::{self, Action, Held, Pending, Prefix, Step, Wait};
@@ -141,11 +143,12 @@ impl Outcome {
     }
 
     /// Whether keys typed after the one that ended the relay go on into the
-    /// next relay ([`Carry`]). A switch's go to the session it lands on;
-    /// settings that attach the session again send them back to it, as a
-    /// panel that closes does. Every other outcome leads to a screen of
-    /// nvmux's, out of it, or (a client gone) to a reconnect first, and drops
-    /// them: past a screen they could reach a session picked there.
+    /// next relay ([`Carry`]), with the answers the terminal still owes. A
+    /// switch's go to the session it lands on; settings that attach the
+    /// session again send them back to it, as a panel that closes does.
+    /// Every other outcome leads to a screen of nvmux's, out of it, or (a
+    /// client gone) to a reconnect first, and drops them: past a screen they
+    /// could reach a session picked there, and the screen reads the answers.
     fn carries_keys(self) -> bool {
         match self {
             Outcome::Switch(_) | Outcome::Resettle => true,
@@ -167,14 +170,15 @@ impl Outcome {
     /// machine holds predates a panel, as when one closes. Keys read with a
     /// panel's key never reached it: on into a session it switched to, they
     /// would land after whatever was done there, as past the full-screen
-    /// picker.
+    /// picker. The rest of a paste the input is left in goes on there as a
+    /// paste all the same, or the prefix in it would act.
     ///
     /// [`carries_keys`]: Outcome::carries_keys
     fn leaves(self, keyed: Outcome, floated: bool) -> Leaves {
         let by_a_panel = self != keyed;
         match self {
             _ if !self.carries_keys() => Leaves::Nothing,
-            Outcome::Switch(_) if by_a_panel => Leaves::Nothing,
+            Outcome::Switch(_) if by_a_panel => Leaves::Paste,
             _ if by_a_panel || floated => Leaves::Keys,
             _ => Leaves::KeysAndHeld,
         }
@@ -198,6 +202,24 @@ impl Outcome {
             | Outcome::StdinClosed => None,
         }
     }
+
+    /// Whether nvmux leaves for the shell, which then reads the terminal's
+    /// input: a held first paint is dropped, and the terminal is settled
+    /// first (see [`relay`]). A child that exited goes to a reconnect.
+    fn ends_at_the_shell(self) -> bool {
+        match self {
+            Outcome::Detached | Outcome::StdinClosed => true,
+            Outcome::ToPicker
+            | Outcome::CreateNew
+            | Outcome::CreateAfter(_)
+            | Outcome::Rename(_)
+            | Outcome::ShowHelp
+            | Outcome::ShowSettings
+            | Outcome::Resettle
+            | Outcome::Switch(_)
+            | Outcome::ChildExited => false,
+        }
+    }
 }
 
 /// Which session a `<prefix>` switch named: by number, the neighbour in the
@@ -214,7 +236,9 @@ pub enum Target {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leaves {
     Nothing,
-    /// The steps after it, not what the machine held.
+    /// Only a paste the input is still in (see [`after_panels`]).
+    Paste,
+    /// The steps after it, and of what the machine held only a paste.
     Keys,
     KeysAndHeld,
 }
@@ -223,20 +247,68 @@ enum Leaves {
 /// take as if typed there: the prefix machine's steps after the one that
 /// ended it, less replies, which go to the client they answer, then what it
 /// held, still due when it was. Only outcomes that relay again at once leave
-/// any (see [`Outcome::leaves`]).
+/// any (see [`Outcome::leaves`]), and with them what the terminal may still
+/// answer (see [`Owed`]).
 #[derive(Debug, Default)]
 pub struct Carry {
     steps: Vec<Step>,
     held: Held,
     due: Option<Instant>,
+    owed: Owed,
 }
 
 impl Carry {
-    /// Drop what the machine held, keeping the steps: for when the keys that
-    /// would end its wait were read elsewhere (the attaching screen).
+    /// What a relay leaves the next, as `leaves` says. `steps` are the keys
+    /// after the one that ended it; what `prefix` holds is due at `due`, and
+    /// panels read on from it to leave the input at `paste` (see
+    /// [`panel::float`]).
+    fn left(
+        leaves: Leaves,
+        mut steps: Vec<Step>,
+        prefix: &mut Prefix,
+        due: Option<Instant>,
+        paste: Option<usize>,
+    ) -> Self {
+        match leaves {
+            Leaves::Nothing => Self::default(),
+            // The next client was sent nothing of the paste.
+            Leaves::Paste => {
+                let (held, start) = after_panels(Held::default(), paste);
+                Self {
+                    steps: start.into_iter().collect(),
+                    held,
+                    ..Self::default()
+                }
+            }
+            Leaves::Keys => {
+                let (held, marker) = after_panels(prefix.take_held(), paste);
+                steps.extend(marker);
+                Self {
+                    steps,
+                    held,
+                    ..Self::default()
+                }
+            }
+            Leaves::KeysAndHeld => Self {
+                steps,
+                held: prefix.take_held(),
+                due,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// Drop what the machine held, for when the keys after it were read
+    /// elsewhere (the attaching screen). The steps are kept, and a paste
+    /// begun in them is ended from what of its end marker they hold: its own
+    /// end went with those keys. The answers owed go too: the attaching
+    /// screen read them.
     pub fn forget_held(&mut self) {
-        self.held = Held::default();
+        if let Some(sent) = std::mem::take(&mut self.held).paste() {
+            self.steps.push(Step::Forward(PASTE_END[sent..].to_vec()));
+        }
         self.due = None;
+        self.owed = Owed::default();
     }
 }
 
@@ -290,6 +362,8 @@ pub struct Attachment {
     /// without the answers, it would lack the keyboard protocol, synchronized
     /// updates and in-band sizes.
     startup_answered: bool,
+    /// What the terminal may still answer in this relay.
+    unanswered: Unanswered,
     /// After in-band size reports are re-enabled: the current size, and until
     /// when the terminal's matching report is swallowed.
     expecting_a_size_report: Option<(PtySize, Instant)>,
@@ -358,9 +432,10 @@ static EXITS_RELAYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// A session's first paint, held back so it can fade in finished.
 ///
 /// Released once something is drawn and the client has been quiet for
-/// [`HOLD_SETTLE`], or at [`HOLD_CAP`] or [`HOLD_MAX`]. The release writes the
-/// held bytes through the alternate-screen entry, fades the shadow in on that
-/// screen, then writes the rest in one synchronized update.
+/// [`HOLD_SETTLE`], or at [`HOLD_CAP`] or [`HOLD_MAX`]; never, if the relay
+/// ends at the shell first (see [`relay`]). The release writes the held bytes
+/// through the alternate-screen entry, fades the shadow in on that screen,
+/// then writes the rest in one synchronized update.
 #[derive(Debug)]
 struct Hold {
     bytes: Vec<u8>,
@@ -601,6 +676,302 @@ impl Write for ClientInput {
     }
 }
 
+/// How long the terminal gets to answer before nvmux leaves for the shell
+/// regardless, as Neovim's `tui_stop` waits for its DA1. A question asked
+/// longer ago is taken as answered.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// What the terminal may still answer, as one relay leaves it to the next
+/// (see [`Unanswered`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Owed {
+    /// DA1 answers.
+    answers: usize,
+    /// When something else that may draw an answer last reached the
+    /// terminal, if no DA1 request has followed it.
+    asked: Option<Instant>,
+}
+
+/// DA1 requests in client output sent to the terminal, less the answers
+/// read, and when it last asked something else. Terminals answer in order,
+/// so a DA1 of nvmux's sent after the rest is answered after everything sent
+/// before it, DA1 or not (see [`Attachment::settle_the_terminal`]).
+#[derive(Debug, Default)]
+struct Unanswered {
+    /// Owed to requests an earlier relay sent, so answered before this
+    /// relay's.
+    earlier: usize,
+    requests: usize,
+    /// As in [`Owed`].
+    asked: Option<Instant>,
+    asking: Asking,
+    /// The last bytes sent, for a request split between two reads.
+    sent_tail: Vec<u8>,
+    /// The start of an answer split between two reads.
+    read_tail: Vec<u8>,
+}
+
+impl Unanswered {
+    /// A relay's count, after one that left `owed`.
+    fn after(owed: Owed) -> Self {
+        Self {
+            earlier: owed.answers,
+            asked: owed.asked,
+            ..Self::default()
+        }
+    }
+
+    /// What is still to come, for the next relay.
+    fn owed(&self) -> Owed {
+        Owed {
+            answers: self.answers_due(),
+            asked: self.asked,
+        }
+    }
+
+    /// DA1 answers still to come, to this relay's requests and earlier ones'.
+    fn answers_due(&self) -> usize {
+        self.earlier + self.requests
+    }
+
+    /// Whether the terminal may still answer something at `now`.
+    fn awaited(&self, now: Instant) -> bool {
+        self.answers_due() > 0 || self.asked.is_some_and(|at| now < at + SETTLE_TIMEOUT)
+    }
+
+    /// Count the requests in client output on its way to the terminal, in
+    /// the order sent.
+    fn sent(&mut self, bytes: &[u8]) {
+        let keep = DA1_REQUEST.len() - 1;
+        let mut seam = std::mem::take(&mut self.sent_tail);
+        seam.extend_from_slice(&bytes[..bytes.len().min(keep)]);
+        // `seam` holds only requests across it, so none counts twice.
+        self.requests += memmem::find_iter(&seam, DA1_REQUEST).count()
+            + memmem::find_iter(bytes, DA1_REQUEST).count();
+        let last = if bytes.len() >= keep { bytes } else { &seam };
+        self.sent_tail = last[last.len().saturating_sub(keep)..].to_vec();
+        match self.asking.scan(bytes) {
+            // Answered after what came before it, and counted.
+            Some(Asked::Da1) => self.asked = None,
+            Some(Asked::Other) => self.asked = Some(Instant::now()),
+            None => {}
+        }
+    }
+
+    /// Count the answers in terminal input, in the order read: those owed to
+    /// earlier requests come first.
+    fn read(&mut self, bytes: &[u8]) {
+        let mut open = std::mem::take(&mut self.read_tail);
+        open.extend_from_slice(bytes);
+        let answers = device_attributes_answers(&open);
+        let earlier = answers.min(self.earlier);
+        self.earlier -= earlier;
+        self.requests = self.requests.saturating_sub(answers - earlier);
+        if let Some(at) = memchr::memrchr(keyseq::ESC, &open) {
+            if begins_device_attributes_answer(&open[at..]) {
+                self.read_tail = open.split_off(at);
+            }
+        }
+    }
+
+    /// Read and drop input from `fd` until every request is answered, or
+    /// until `deadline`. Returns whether they all were.
+    fn read_from(&mut self, fd: RawFd, deadline: Instant) -> bool {
+        let mut buf = [0u8; 1024];
+        while self.answers_due() > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let mut p = [pollfd(fd)];
+            let ms = left.as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
+            // SAFETY: one initialised pollfd, and `fd` outlives the call.
+            let n = unsafe { libc::poll(p.as_mut_ptr(), 1, ms) };
+            if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return false;
+            }
+            if n <= 0 {
+                continue;
+            }
+            match read_fd(fd, &mut buf) {
+                Ok(len) if len > 0 => self.read(&buf[..len]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// The parameter and intermediate bytes of a CSI that [`Asking`] reads; a
+/// longer one asks nothing it knows.
+const CSI_KEPT: usize = 32;
+
+/// Finds in client output what may draw an answer from the terminal: a DA1
+/// request, and the rest [`Unanswered`] does not count, from DECRQSS and
+/// XTGETTCAP to OSC queries and the focus mode Ghostty answers as it is set.
+/// Kept across reads, so a sequence cut by one is still found.
+#[derive(Debug, Default)]
+struct Asking {
+    state: AskingState,
+    /// The current CSI's bytes after `ESC [`, up to one past [`CSI_KEPT`].
+    csi: Vec<u8>,
+    /// The current OSC payload's last two bytes so far.
+    osc_tail: [u8; 2],
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AskingState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    Osc,
+    /// A DCS, SOS, PM or APC, until `ST`.
+    String,
+    /// `ESC` in an OSC or string: half of `ST`, or the next sequence.
+    StringEscape,
+}
+
+/// What [`Asking::scan`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    Da1,
+    /// Anything else that may draw an answer.
+    Other,
+}
+
+impl Asking {
+    /// Read `bytes`, the next client output to reach the terminal, and
+    /// return the last thing in them that asks.
+    fn scan(&mut self, bytes: &[u8]) -> Option<Asked> {
+        let mut found = None;
+        let mut rest = bytes;
+        while let Some(&byte) = rest.first() {
+            match self.state {
+                AskingState::Ground => {
+                    let Some(at) = memchr::memchr(keyseq::ESC, rest) else {
+                        break;
+                    };
+                    rest = &rest[at + 1..];
+                    self.state = AskingState::Escape;
+                }
+                AskingState::Escape => {
+                    rest = &rest[1..];
+                    self.state = match byte {
+                        b'[' => {
+                            self.csi.clear();
+                            AskingState::Csi
+                        }
+                        b']' => {
+                            self.osc_tail = [0; 2];
+                            AskingState::Osc
+                        }
+                        // DCS (DECRQSS, XTGETTCAP) and APC (kitty graphics).
+                        b'P' | b'_' => {
+                            found = Some(Asked::Other);
+                            AskingState::String
+                        }
+                        b'X' | b'^' => AskingState::String,
+                        // DECID.
+                        b'Z' => {
+                            found = Some(Asked::Other);
+                            AskingState::Ground
+                        }
+                        keyseq::ESC => AskingState::Escape,
+                        _ => AskingState::Ground,
+                    };
+                }
+                AskingState::Csi => {
+                    rest = &rest[1..];
+                    match byte {
+                        0x40..=0x7e => {
+                            found = csi_asks(&self.csi, byte).or(found);
+                            self.state = AskingState::Ground;
+                        }
+                        keyseq::ESC => self.state = AskingState::Escape,
+                        0x18 | 0x1a => self.state = AskingState::Ground,
+                        0x20..=0x3f if self.csi.len() <= CSI_KEPT => self.csi.push(byte),
+                        _ => {}
+                    }
+                }
+                AskingState::Osc | AskingState::String => {
+                    let osc = self.state == AskingState::Osc;
+                    let ends = rest
+                        .iter()
+                        .position(|b| matches!(b, 0x07 | 0x18 | 0x1a | 0x1b));
+                    if osc {
+                        self.osc_tail = match &rest[..ends.unwrap_or(rest.len())] {
+                            [] => self.osc_tail,
+                            [b] => [self.osc_tail[1], *b],
+                            [.., a, b] => [*a, *b],
+                        };
+                    }
+                    let Some(at) = ends else {
+                        break;
+                    };
+                    let end = rest[at];
+                    rest = &rest[at + 1..];
+                    // An OSC query's last field is `?`, as in `11;?`.
+                    if osc && matches!(end, 0x07 | 0x1b) && self.osc_tail == *b";?" {
+                        found = Some(Asked::Other);
+                    }
+                    self.state = match end {
+                        0x07 if osc => AskingState::Ground,
+                        // Part of a DCS.
+                        0x07 => AskingState::String,
+                        0x1b => AskingState::StringEscape,
+                        _ => AskingState::Ground,
+                    };
+                }
+                AskingState::StringEscape => {
+                    if byte == b'\\' {
+                        rest = &rest[1..];
+                        self.state = AskingState::Ground;
+                    } else {
+                        // The `ESC` starts the next sequence: read `byte` after it.
+                        self.state = AskingState::Escape;
+                    }
+                }
+            }
+        }
+        found
+    }
+}
+
+/// What a CSI asks, `body` being its bytes between `[` and `last`.
+fn csi_asks(body: &[u8], last: u8) -> Option<Asked> {
+    let marked = |mark: u8| body.first() == Some(&mark);
+    let first: Option<u16> = body
+        .split(|b| *b == b';')
+        .next()
+        .and_then(|p| std::str::from_utf8(p).ok()?.parse().ok());
+    let asks = match last {
+        _ if body.len() > CSI_KEPT => false,
+        b'c' if body.is_empty() => return Some(Asked::Da1),
+        // Device attributes and status.
+        b'c' | b'n' => true,
+        // DECRQM.
+        b'p' => body.last() == Some(&b'$'),
+        // kitty's keyboard query, XTVERSION, XTSMGRAPHICS.
+        b'u' => body == b"?",
+        b'q' => marked(b'>'),
+        b'S' => marked(b'?'),
+        // XTWINOPS reports.
+        b't' => matches!(first, Some(11 | 13 | 14 | 15 | 16 | 18 | 19 | 20 | 21)),
+        // Focus and in-band size reports, which some terminals send as soon as
+        // the mode is set.
+        b'h' => {
+            marked(b'?')
+                && body[1..]
+                    .split(|b| *b == b';')
+                    .any(|mode| mode == b"1004" || mode == b"2048")
+        }
+        _ => false,
+    };
+    asks.then_some(Asked::Other)
+}
+
 impl Attachment {
     /// Mark the notice to say the session is waiting for a key; otherwise it
     /// looks broken, drawing nothing until one arrives. Known only between the
@@ -697,19 +1068,21 @@ impl Attachment {
         }
     }
 
-    /// Watch terminal input. Neovim's client's first DA1 answer asks for the
-    /// flush its replies wait on (see [`flush_after_answers`]). For a kept
-    /// client, note when its startup queries are answered, and swallow the
-    /// size report a resume triggered. That report repeats the client's
-    /// current size; passed on, the server would resize to the same size,
-    /// which in `input()` or `getchar()` clears to the prompt row and wipes
-    /// the `:mode` repaint. Swallowing it loses nothing: a size changed while
-    /// parked was sent by [`Attachment::tell_its_size`]. Other sizes (a
-    /// resize since) go through.
+    /// Watch terminal input. DA1 answers are counted (see [`Unanswered`]),
+    /// and Neovim's client's first asks for the flush its replies wait on
+    /// (see [`flush_after_answers`]). For a kept client, note when its
+    /// startup queries are answered, and swallow the size report a resume
+    /// triggered. That report repeats the client's current size; passed on,
+    /// the server would resize to the same size, which in `input()` or
+    /// `getchar()` clears to the prompt row and wipes the `:mode` repaint.
+    /// Swallowing it loses nothing: a size changed while parked was sent by
+    /// [`Attachment::tell_its_size`]. Other sizes (a resize since) go
+    /// through.
     fn saw_input(&mut self, step: &mut Step) {
         let (Step::Forward(bytes) | Step::Reply(bytes)) = step else {
             return;
         };
+        self.unanswered.read(bytes);
         if self.flush_after_answers && answers_device_attributes(bytes) {
             self.flush_after_answers = false;
             flush_after_answers(&self.sock);
@@ -970,7 +1343,10 @@ impl Attachment {
         self.expecting_a_size_report = ledger
             .puts_back_in_band_reports(after_an_exit)
             .then(|| (size, Instant::now() + SIZE_REPORT_WAIT));
-        if let Err(e) = write_stdout(&ledger.put_back(after_an_exit)) {
+        let told = ledger.put_back(after_an_exit);
+        // Its focus and in-band size modes may draw answers.
+        self.unanswered.sent(&told);
+        if let Err(e) = write_stdout(&told) {
             tracing::debug!(error = %e, "could not put the client's settings back");
         }
     }
@@ -1131,6 +1507,7 @@ impl Attachment {
             }
             return Ok(());
         }
+        self.unanswered.sent(chunk);
         if let Some(boundary) = self.boundary.as_mut() {
             let ready = boundary.relay(chunk, now);
             // A read that was all tail: skip the write. Every shadow feed drops
@@ -1351,6 +1728,8 @@ impl Attachment {
         // stopped (see `replay`).
         let mut paint = bytes[split..].to_vec();
         paint.extend_from_slice(&later);
+        self.unanswered.sent(&bytes);
+        self.unanswered.sent(&later);
         let first = if lit { term::handover_in_span() } else { &[] };
         let mut out = std::io::stdout().lock();
         out.write_all(&replay(first, &paint))?;
@@ -1532,12 +1911,20 @@ impl Attachment {
     /// [`Attachment::reap`], the restore sequence is wanted. Bounded, or a
     /// client ignoring termination would hold the terminal in raw mode.
     ///
+    /// Not while its first paint is held: the terminal has seen nothing of
+    /// the client to restore, and the rest of its startup could still ask the
+    /// terminal something whose answer the shell would read. Its output is
+    /// left to [`Attachment::reap`], which discards it.
+    ///
     /// nvmux answers the DA1 request (else `<prefix> d` costs a second) and
     /// strips it from the output, an exception to the module's rule: the real
     /// terminal's answer would land in the shell as text after we exit.
     fn drain_until_eof(&mut self) {
         // Input still waiting is moot, and the DA1 answer goes in alone.
         self.input.discard();
+        if self.hold.is_some() {
+            return;
+        }
         let fd = self.master.as_raw_fd();
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         let mut buf = [0u8; 8192];
@@ -1552,12 +1939,40 @@ impl Attachment {
                 Ok(0) | Err(_) => return,
                 Ok(len) => {
                     owed |= asks_for_device_attributes(&buf[..len]);
-                    let _ = write_stdout(&without_device_attributes_request(&buf[..len]));
+                    let out = without_device_attributes_request(&buf[..len]);
+                    // One split between reads is not stripped, so is owed.
+                    self.unanswered.sent(&out);
+                    let _ = write_stdout(&out);
                     if owed {
                         owed = !self.answer_device_attributes();
                     }
                 }
             }
+        }
+    }
+
+    /// Before nvmux leaves for the shell, read and drop the answers the
+    /// terminal still owes, this client's and those an earlier relay left,
+    /// which the shell would read as typed (see [`Unanswered`]). Asked one
+    /// more DA1 after everything sent, it has answered the rest once it
+    /// answers that. Keys typed in that round trip go too. Only while a DA1
+    /// is unanswered, or something else was asked less than
+    /// [`SETTLE_TIMEOUT`] ago: clients ask both at startup, and a detach
+    /// otherwise waits for nothing.
+    fn settle_the_terminal(&mut self) {
+        if !self.unanswered.awaited(Instant::now()) || write_stdout(DA1_REQUEST).is_err() {
+            return;
+        }
+        self.unanswered.sent(DA1_REQUEST);
+        let stdin = std::io::stdin().as_raw_fd();
+        if !self
+            .unanswered
+            .read_from(stdin, Instant::now() + SETTLE_TIMEOUT)
+        {
+            tracing::debug!(
+                unanswered = self.unanswered.answers_due(),
+                "the terminal did not answer in time"
+            );
         }
     }
 }
@@ -2449,6 +2864,7 @@ fn spawn_client_with(
         // Only for a kept client, the only kind resumed from its output.
         ledger: kept.then(Ledger::new),
         startup_answered: false,
+        unanswered: Unanswered::default(),
         expecting_a_size_report: None,
         exits_seen: 0,
         unshown: None,
@@ -2620,6 +3036,10 @@ pub fn relay(
     others: &mut dyn Others,
 ) -> Result<(Outcome, Option<Attachment>)> {
     let master_fd = attachment.master.as_raw_fd();
+    // What the last relay left owed is answered first (see `Carry`); what
+    // this client asked in its own earlier relays went to whatever read the
+    // terminal since.
+    attachment.unanswered = Unanswered::after(std::mem::take(&mut carry.owed));
 
     let winch = winch::Winch::install()?;
     // A client that has not painted yet, whose first paint can be held.
@@ -2805,14 +3225,31 @@ pub fn relay(
         .and_then(|o| o.switch_target())
         .and_then(|target| others.begin_next(target));
 
-    // However the relay ended, nothing the client wrote may stay unshown.
+    // However the relay ended, what an overlay kept back goes out.
     if let Err(e) = attachment.stop_watching_the_terminal() {
         tracing::debug!(error = %e, "could not write out what the notice was keeping");
     }
-    // A relay cut short during the hold (a prefix typed at once, a child
-    // that exited) releases the paint as is, with no fade.
-    if let Err(e) = attachment.release_hold(false) {
+    let to_the_shell = match &outcome {
+        Ok(ended) => ended.ends_at_the_shell(),
+        Err(_) => true,
+    };
+    // A relay cut short during the hold by a key that opens a screen or
+    // switches, or by a child that exited, releases the paint as is, with no
+    // fade. One ending at the shell drops it and does not relay the client's
+    // way out (see `drain_until_eof`), so its startup questions are never
+    // asked: the terminal's answers would be the shell's input. The picker's
+    // name still comes down.
+    if to_the_shell {
+        if let Some(h) = attachment.hand_off.take() {
+            h.take_down();
+        }
+    } else if let Err(e) = attachment.release_hold(false) {
         tracing::debug!(error = %e, "could not release the held first paint");
+    }
+    // The next relay reads the answers still owed before any to its own
+    // client's requests.
+    if outcome.as_ref().is_ok_and(|ended| ended.carries_keys()) {
+        carry.owed = attachment.unanswered.owed();
     }
 
     match outcome {
@@ -2875,16 +3312,19 @@ pub fn relay(
             Ok((Outcome::ChildExited, None))
         }
         Ok(other @ (Outcome::Detached | Outcome::StdinClosed)) => {
-            // Let the child restore the terminal; a competing reset would
-            // corrupt its restore. A final reset covers a client that died
-            // first.
+            // Let the child restore the terminal, unless its first paint was
+            // held (see `drain_until_eof`); a competing reset would corrupt
+            // its restore. A final reset covers a client that died first.
             attachment.hang_up();
             attachment.drain_until_eof();
+            // While still raw: cooked, the tty would echo the answers and
+            // hold them for a line.
+            attachment.settle_the_terminal();
             raw.restore();
             attachment.reap();
             term::reset_screen();
             // After the reset: leaving the alternate screen puts the cursor
-            // back on the line with the client's hangup message.
+            // back on the line with the client's hangup message, if relayed.
             term::erase_hung_up_clients_line();
             Ok((other, None))
         }
@@ -2893,6 +3333,7 @@ pub fn relay(
             // case the client died mid-frame.
             attachment.hang_up();
             attachment.drain_until_eof();
+            attachment.settle_the_terminal();
             raw.restore();
             attachment.reap();
             term::reset_screen();
@@ -2961,14 +3402,28 @@ fn pump(
         let backlogged = attachment.input.backlogged();
 
         // Float pending settings or picker once the screen is back, before
-        // reading keys, so keys typed meanwhile go to them.
-        if let Some(outcome) = attachment.to_float.filter(|_| attachment.screen_is_back()) {
-            if let Some(outcome) = float_over(attachment, master_fd, winch, outcome, others)? {
-                return Ok(outcome);
+        // reading keys, so keys typed meanwhile go to them. Not inside a
+        // paste: the client has its start, so the rest is its too.
+        if let Some(outcome) = attachment
+            .to_float
+            .filter(|_| prefix.paste().is_none() && attachment.screen_is_back())
+        {
+            let mut paste = None;
+            let floating = float_over(attachment, master_fd, winch, outcome, others, &mut paste)?;
+            if let Some(ended) = floating {
+                // As past a panel a key opened, with no keys after it.
+                let leaves = ended.leaves(outcome, false);
+                *carry = Carry::left(leaves, Vec::new(), &mut prefix, None, paste);
+                return Ok(ended);
+            }
+            let (held, marker) = after_panels(prefix.take_held(), paste);
+            if let Some(marker) = marker {
+                take_step(attachment, marker)?;
             }
             // Re-read what they may have changed, as after `<prefix> ,` below.
             keys = crate::config::get().keys;
             prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
+            steps.extend(prefix.resume(held));
             prefix_timeout = Duration::from_millis(keys.timeout_ms);
             deadline = None;
             size = term::terminal_size();
@@ -3175,6 +3630,8 @@ fn pump(
                     let Some(mut leave) = leaving else {
                         unreachable!("guarded");
                     };
+                    // Answers read here are not passed on, but still count.
+                    attachment.unanswered.read(&buf[..len]);
                     match reply(&buf[..len], leave.detach) {
                         Some(Reply::Detach) => return Ok(Outcome::Detached),
                         Some(Reply::Save) => {
@@ -3210,6 +3667,9 @@ fn pump(
 
         // Whether a floating panel came and went (keys may change).
         let mut floated = false;
+        // Where the input is in a paste, as this read left it, then as each
+        // panel that read on from there did.
+        let mut paste = prefix.paste();
         let mut taking = std::mem::take(&mut steps).into_iter();
         while let Some(step) = taking.next() {
             let Some(keyed) = take_step(attachment, step)? else {
@@ -3217,7 +3677,8 @@ fn pump(
             };
             // `<prefix> ,`, `?`, `Space` or `c`: float the panel and return
             // here, unless it cannot float or leads to the session loop.
-            let Some(outcome) = float_over(attachment, master_fd, winch, keyed, others)? else {
+            let floating = float_over(attachment, master_fd, winch, keyed, others, &mut paste)?;
+            let Some(outcome) = floating else {
                 floated = true;
                 continue;
             };
@@ -3231,6 +3692,12 @@ fn pump(
                     };
                     bar.ask(Some(leave.question(unsaved)));
                     leaving = Some(leave);
+                    // The steps after the `d` are dropped, and what the
+                    // machine holds came from the same keys; the question
+                    // reads those that would settle it, a paste's end too.
+                    drop(prefix.take_held());
+                    paste = None;
+                    deadline = None;
                     break;
                 }
             }
@@ -3244,23 +3711,18 @@ fn pump(
                     after.push(step);
                 }
             }
-            *carry = match outcome.leaves(keyed, floated) {
-                Leaves::Nothing => Carry::default(),
-                Leaves::Keys => Carry {
-                    steps: after,
-                    ..Carry::default()
-                },
-                Leaves::KeysAndHeld => Carry {
-                    steps: after,
-                    held: prefix.take_held(),
-                    due: deadline,
-                },
-            };
+            let leaves = outcome.leaves(keyed, floated);
+            *carry = Carry::left(leaves, after, &mut prefix, deadline, paste);
             return Ok(outcome);
         }
         if floated {
+            let (held, marker) = after_panels(prefix.take_held(), paste);
+            if let Some(marker) = marker {
+                take_step(attachment, marker)?;
+            }
             keys = crate::config::get().keys;
             prefix = Prefix::with_keys(highest_session_num, keys.prefix, keys.bind);
+            steps.extend(prefix.resume(held));
             prefix_timeout = Duration::from_millis(keys.timeout_ms);
             deadline = None;
             // A resize while they floated was theirs.
@@ -3522,24 +3984,27 @@ fn take_carry(carry: &mut Carry, prefix: &mut Prefix) -> (Vec<Step>, Option<Inst
         mut steps,
         held,
         due,
+        ..
     } = std::mem::take(carry);
     steps.extend(prefix.resume(held));
     (steps, due.filter(|_| prefix.wait().is_some()))
 }
 
 /// Float `outcome`'s panel over the session if it floats and `[style] float`
-/// allows. `None` once it is taken down; else how the relay ends.
+/// allows. `None` once it is taken down; else how the relay ends. `paste` as
+/// [`panel::float`] takes it.
 fn float_over(
     attachment: &mut Attachment,
     master_fd: RawFd,
     winch: &winch::Winch,
     outcome: Outcome,
     others: &mut dyn Others,
+    paste: &mut Option<usize>,
 ) -> Result<Option<Outcome>> {
     attachment.to_float = None;
     match panel::What::of(outcome, config::get().style.float) {
         Some(what) => {
-            let floated = panel::float(attachment, master_fd, winch, what, others);
+            let floated = panel::float(attachment, master_fd, winch, what, others, paste);
             // However it went, drop what its frames were diffed against.
             if let Some(copy) = attachment.copy() {
                 copy.forget_under();
@@ -3548,6 +4013,33 @@ fn float_over(
         }
         None => Ok(Some(outcome)),
     }
+}
+
+/// What a machine holding `held` leaves once panels have read on from it to
+/// leave the input at `paste`: the paste the input is in, and nothing else,
+/// as they read the keys that would settle the rest. With it, the markers
+/// that take the client from where the machine left it to where the input
+/// is: the rest of the end of the client's paste, then the start of the
+/// input's and as much of its end as the input ends with. Where both are in
+/// a paste but differ in how far into its end, the panels may have read its
+/// end and another's start, so the client's paste is ended all the same.
+/// The panels may also have read one end and another start where both are
+/// as far into it: those two pastes reach the client as one.
+fn after_panels(held: Held, paste: Option<usize>) -> (Held, Option<Step>) {
+    let sent = held.paste();
+    let mut markers = Vec::new();
+    if sent != paste {
+        if let Some(sent) = sent {
+            markers.extend_from_slice(&PASTE_END[sent..]);
+        }
+        if let Some(read) = paste {
+            markers.extend_from_slice(PASTE_START);
+            markers.extend_from_slice(&PASTE_END[..read]);
+        }
+    }
+    let held = paste.map_or_else(Held::default, Held::in_paste);
+    let step = (!markers.is_empty()).then_some(Step::Forward(markers));
+    (held, step)
 }
 
 /// How long a sequence cut off by a read boundary waits for its rest.
@@ -3756,18 +4248,35 @@ fn find_size_report(bytes: &[u8]) -> Option<(std::ops::Range<usize>, u16, u16)> 
     Some((at..at + START.len() + len + 1, rows, cols))
 }
 
-/// Whether terminal input carries a DA1 answer, `CSI ? Ps ; … c`, the last
-/// reply to a client's startup queries.
+/// Whether terminal input carries a DA1 answer, the last reply to a client's
+/// startup queries.
 fn answers_device_attributes(bytes: &[u8]) -> bool {
+    device_attributes_answers(bytes) > 0
+}
+
+/// Whether `bytes` are a DA1 answer cut short, before its final `c`.
+fn begins_device_attributes_answer(bytes: &[u8]) -> bool {
     const START: &[u8] = b"\x1b[?";
-    memmem::find_iter(bytes, START).any(|at| {
-        let rest = &bytes[at + START.len()..];
-        let params = rest
+    let start = bytes.len().min(START.len());
+    bytes[..start] == START[..start]
+        && bytes[start..]
             .iter()
-            .take_while(|b| b.is_ascii_digit() || **b == b';')
-            .count();
-        params > 0 && rest.get(params) == Some(&b'c')
-    })
+            .all(|b| b.is_ascii_digit() || *b == b';')
+}
+
+/// How many DA1 answers, `CSI ? Ps ; … c`, terminal input carries.
+fn device_attributes_answers(bytes: &[u8]) -> usize {
+    const START: &[u8] = b"\x1b[?";
+    memmem::find_iter(bytes, START)
+        .filter(|&at| {
+            let rest = &bytes[at + START.len()..];
+            let params = rest
+                .iter()
+                .take_while(|b| b.is_ascii_digit() || **b == b';')
+                .count();
+            params > 0 && rest.get(params) == Some(&b'c')
+        })
+        .count()
 }
 
 /// The chunk with every DA1 request removed: exactly `ESC [ c`, which
@@ -4758,12 +5267,37 @@ mod tests {
         }
     }
 
+    /// Too wide drops the paint of a session nvmux stays in; too narrow lets
+    /// the shell read the terminal's answers. A child that exited goes to a
+    /// reconnect, and keeps its paint, which may say why.
+    #[test]
+    fn only_a_detach_or_a_closed_stdin_ends_at_the_shell() {
+        for leaving in [Outcome::Detached, Outcome::StdinClosed] {
+            assert!(leaving.ends_at_the_shell(), "{leaving:?}");
+        }
+        let id = crate::ids::Id::new("abcd2345").expect("an id");
+        for other in [
+            Outcome::ToPicker,
+            Outcome::CreateNew,
+            Outcome::CreateAfter(Some(id)),
+            Outcome::CreateAfter(None),
+            Outcome::Rename(id),
+            Outcome::ShowHelp,
+            Outcome::ShowSettings,
+            Outcome::Resettle,
+            Outcome::Switch(Target::Number(3)),
+            Outcome::ChildExited,
+        ] {
+            assert!(!other.ends_at_the_shell(), "{other:?}");
+        }
+    }
+
     /// Past a panel: the floating picker or prompt switching (`Enter`, or a
     /// session created), the settings resettling, and one closed back before
     /// a switch later in the same read.
     #[test]
     fn a_panel_that_switches_takes_no_keys_with_it() {
-        use Leaves::{Keys, KeysAndHeld, Nothing};
+        use Leaves::{Keys, KeysAndHeld, Nothing, Paste};
         use Outcome::{
             ChildExited, CreateNew, Detached, Resettle, ShowHelp, ShowSettings, ToPicker,
         };
@@ -4774,9 +5308,9 @@ mod tests {
             (number, number, false, KeysAndHeld),
             (number, number, true, Keys),
             (picked, picked, false, KeysAndHeld),
-            (picked, ToPicker, false, Nothing),
-            (picked, ToPicker, true, Nothing),
-            (picked, CreateNew, false, Nothing),
+            (picked, ToPicker, false, Paste),
+            (picked, ToPicker, true, Paste),
+            (picked, CreateNew, false, Paste),
             (Resettle, ShowSettings, false, Keys),
             (Resettle, ShowSettings, true, Keys),
             (Detached, ToPicker, false, Nothing),
@@ -4803,6 +5337,7 @@ mod tests {
             steps: steps[1..].to_vec(),
             held: p.take_held(),
             due: Some(due),
+            ..Carry::default()
         };
         let mut fewer = Prefix::new(9);
         assert_eq!(
@@ -4821,6 +5356,7 @@ mod tests {
             steps: vec![Step::Forward(b"x".to_vec())],
             held: p.take_held(),
             due: Some(due),
+            ..Carry::default()
         };
         let mut more = Prefix::new(12);
         assert_eq!(
@@ -4830,8 +5366,8 @@ mod tests {
         assert_eq!(more.pending(), Some(Pending::Number(1)));
     }
 
-    /// The attaching screen read the keys that would end the wait; the key
-    /// carried whole still goes.
+    /// The attaching screen read the keys that would end the wait, and the
+    /// answers owed; the key carried whole still goes.
     #[test]
     fn a_forgotten_wait_leaves_the_carried_keys() {
         let mut p = Prefix::new(12);
@@ -4840,14 +5376,110 @@ mod tests {
             steps: steps[1..].to_vec(),
             held: p.take_held(),
             due: Some(Instant::now()),
+            owed: Owed {
+                answers: 2,
+                asked: Some(Instant::now()),
+            },
         };
         carry.forget_held();
+        assert_eq!(
+            carry.owed,
+            Owed::default(),
+            "a detach would wait out its settle"
+        );
         let mut next = Prefix::new(12);
         assert_eq!(
             take_carry(&mut carry, &mut next),
             (vec![Step::Forward(b"x".to_vec())], None)
         );
         assert_eq!(next.wait(), None, "nothing held");
+    }
+
+    /// `Keys` is what a relay leaves where a panel read the keys after these:
+    /// the paste's end among them, or not yet, or the start of another.
+    /// `Paste` is past a panel's switch, whose session was sent none of them.
+    #[test]
+    fn a_paste_left_to_the_next_relay_goes_on_or_is_ended() {
+        let begun = [&[keys::PREFIX, b'1'][..], b"\x1b[200~abc"].concat();
+        let left = |typed: &[u8], leaves, paste| {
+            let mut p = Prefix::new(12);
+            let mut steps = p.feed(typed);
+            assert_eq!(steps.remove(0), Step::Act(Action::Switch(1)));
+            Carry::left(leaves, steps, &mut p, None, paste)
+        };
+        let paste = Step::Forward(begun[2..].to_vec());
+        let carry = left(&begun, Leaves::KeysAndHeld, Some(0));
+        assert_eq!(carry.steps, vec![paste.clone()]);
+        assert_eq!(carry.held, Held::in_paste(0));
+
+        let carry = left(&begun, Leaves::Keys, None);
+        let end = Step::Forward(PASTE_END.to_vec());
+        assert_eq!(carry.steps, [paste.clone(), end]);
+        assert_eq!(carry.held, Held::default());
+
+        let carry = left(&begun, Leaves::Keys, Some(0));
+        assert_eq!(carry.steps, [paste]);
+        assert_eq!(
+            carry.held,
+            Held::in_paste(0),
+            "the rest of the paste is text"
+        );
+
+        let carry = left(&[keys::PREFIX, b'1', b'x'], Leaves::Keys, Some(0));
+        let start = Step::Forward(PASTE_START.to_vec());
+        assert_eq!(carry.steps, [Step::Forward(b"x".to_vec()), start.clone()]);
+        assert_eq!(carry.held, Held::in_paste(0));
+
+        let carry = left(&begun, Leaves::Paste, Some(0));
+        assert_eq!(carry.steps, [start]);
+        assert_eq!(carry.held, Held::in_paste(0));
+        let carry = left(&begun, Leaves::Paste, None);
+        assert!(carry.steps.is_empty());
+        assert_eq!(carry.held, Held::default());
+
+        assert!(left(&begun, Leaves::Nothing, Some(0)).steps.is_empty());
+    }
+
+    /// Reads cut a paste's end marker anywhere, so the client may hold part
+    /// of one, and the input end with part of one, as panels leave it. Not
+    /// brought level, the client missed the end the relay saw, or saw one it
+    /// did not.
+    #[test]
+    fn panels_leave_the_client_as_far_into_a_paste_as_the_input() {
+        let held = |paste: Option<usize>| paste.map_or_else(Held::default, Held::in_paste);
+        for (sent, read, markers) in [
+            (None, None, &b""[..]),
+            (None, Some(0), b"\x1b[200~"),
+            (None, Some(4), b"\x1b[200~\x1b[20"),
+            (Some(0), None, b"\x1b[201~"),
+            (Some(4), None, b"1~"),
+            (Some(4), Some(4), b""),
+            (Some(4), Some(1), b"1~\x1b[200~\x1b"),
+            (Some(0), Some(2), b"\x1b[201~\x1b[200~\x1b["),
+        ] {
+            let (left, step) = after_panels(held(sent), read);
+            assert_eq!(left, held(read), "{sent:?} then {read:?}");
+            let want = (!markers.is_empty()).then(|| Step::Forward(markers.to_vec()));
+            assert_eq!(step, want, "{sent:?} then {read:?}");
+        }
+    }
+
+    /// The attaching screen read the rest of a paste whose carried keys end
+    /// in part of its end marker: a whole marker after that part left it
+    /// pasted as text.
+    #[test]
+    fn a_forgotten_paste_is_ended_from_what_of_its_end_was_carried() {
+        let mut p = Prefix::new(12);
+        let mut steps = p.feed(&[&[keys::PREFIX, b'1'][..], b"\x1b[200~abc\x1b[20"].concat());
+        assert_eq!(steps.remove(0), Step::Act(Action::Switch(1)));
+        let mut carry = Carry {
+            steps,
+            held: p.take_held(),
+            ..Carry::default()
+        };
+        carry.forget_held();
+        assert_eq!(carry.steps.last(), Some(&Step::Forward(b"1~".to_vec())));
+        assert_eq!(carry.held, Held::default());
     }
 
     /// Too narrow leaves the old session on screen through the spawn; too wide
@@ -5563,6 +6195,127 @@ mod tests {
         );
     }
 
+    /// Set to `held` or `shown` on the test binary rerun by
+    /// [`a_client_whose_first_paint_is_held_goes_without_a_word`].
+    const WAY_OUT_CHILD: &str = "NVMUX_TEST_WAY_OUT_CHILD";
+
+    /// The stand-in's question on its way out, as a client cut off in its
+    /// startup asks it.
+    const ASKED_ON_THE_WAY_OUT: &[u8] = b"\x1b[?u";
+
+    /// After a detach, the terminal's answer would be the shell's input. A
+    /// client the terminal has seen is relayed, so its restore lands.
+    #[test]
+    fn a_client_whose_first_paint_is_held_goes_without_a_word() {
+        let written = |mode: &str| {
+            std::process::Command::new(std::env::current_exe().expect("the tests"))
+                .args([
+                    "--exact",
+                    "pty::tests::draining_a_client_on_its_way_out",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(WAY_OUT_CHILD, mode)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .expect("run the child")
+                .stdout
+        };
+        let shown = written("shown");
+        assert!(
+            crate::test_support::contains(&shown, ASKED_ON_THE_WAY_OUT),
+            "a client the terminal has seen was not relayed on its way out: {}",
+            String::from_utf8_lossy(&shown).escape_debug()
+        );
+        let held = written("held");
+        assert!(
+            !crate::test_support::contains(&held, ASKED_ON_THE_WAY_OUT),
+            "a client whose first paint was held asked the terminal on its way out: {}",
+            String::from_utf8_lossy(&held).escape_debug()
+        );
+    }
+
+    /// The child half of the test above; does nothing without
+    /// [`WAY_OUT_CHILD`]. Its stdout is the terminal.
+    #[test]
+    #[ignore = "the child half of a test; run by it, not by hand"]
+    fn draining_a_client_on_its_way_out() {
+        let Ok(mode) = std::env::var(WAY_OUT_CHILD) else {
+            return;
+        };
+        let mut a = attached_to(
+            r#"trap 'printf "\033[?u"; exit 0' HUP; printf r; while :; do sleep 0.05; done"#,
+        );
+        wait_until_ready(&a);
+        if mode == "held" {
+            a.hold = Some(Hold::new(Instant::now()));
+        }
+        a.hang_up();
+        a.drain_until_eof();
+    }
+
+    /// Set on the test binary rerun by
+    /// [`a_request_is_unanswered_from_reaching_the_terminal_to_its_answer`].
+    const ASKING_CHILD: &str = "NVMUX_TEST_ASKING_CHILD";
+
+    /// Counted while held, a detach would wait out [`SETTLE_TIMEOUT`] for
+    /// answers to questions never asked; uncounted once relayed, the shell
+    /// would read them.
+    #[test]
+    fn a_request_is_unanswered_from_reaching_the_terminal_to_its_answer() {
+        let child = std::process::Command::new(std::env::current_exe().expect("the tests"))
+            .args([
+                "--exact",
+                "pty::tests::asking_the_terminal",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ASKING_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child");
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    /// The child half of the test above; does nothing without
+    /// [`ASKING_CHILD`]. Its stdout, which relayed requests reach, is a pipe.
+    #[test]
+    #[ignore = "the child half of a test; run by it, not by hand"]
+    fn asking_the_terminal() {
+        if std::env::var_os(ASKING_CHILD).is_none() {
+            return;
+        }
+        let mut a = attached_to("exec sleep 30");
+        a.hold = Some(Hold::new(Instant::now()));
+        a.relay_output(b"\x1b[?u\x1b[c\x1b[?1004h", Instant::now())
+            .expect("hold");
+        assert_eq!(a.unanswered.requests, 0, "asked while held");
+        assert_eq!(a.unanswered.asked, None, "asked while held");
+        a.release_hold(false).expect("release");
+        assert_eq!(a.unanswered.requests, 1, "not asked once released");
+        assert!(a.unanswered.asked.is_some(), "not asked once released");
+        a.relay_output(b"\x1b[c", Instant::now()).expect("relay");
+        assert_eq!(a.unanswered.requests, 2, "not asked once relayed");
+        passed_on(&mut a, b"\x1b[?62;22c\x1b[?62;22c");
+        assert_eq!(a.unanswered.requests, 0, "answers passed on paid nothing");
+
+        // Put back after another session's exit, as a kept client returns.
+        let mut k = kept("exec sleep 30");
+        if let Some(ledger) = k.ledger.as_mut() {
+            ledger.saw(b"\x1b[?1004h");
+        }
+        k.exits_seen = u64::MAX;
+        k.put_back_what_it_told(PtySize::default());
+        assert!(k.unanswered.asked.is_some(), "its focus mode asked nothing");
+    }
+
     /// Set on the test binary rerun by
     /// [`a_client_taking_no_input_is_still_read_until_it_exits`].
     const DEAF_CHILD: &str = "NVMUX_TEST_DEAF_CLIENT_CHILD";
@@ -5746,6 +6499,31 @@ mod tests {
     /// listened.
     const SWITCH_LISTENS: &str = "NVMUX_TEST_SWITCH_LISTENS";
 
+    /// Set for that child to have a setting unsaved, so `<prefix> d` asks.
+    const SWITCH_UNSAVED: &str = "NVMUX_TEST_SWITCH_UNSAVED";
+
+    /// Set for that child to float panels over a screen copy of each client,
+    /// whose screen comes back as it reads its first byte. To `settings`, the
+    /// settings are also due to float over session 3 once it is back.
+    const SWITCH_FLOATS: &str = "NVMUX_TEST_SWITCH_FLOATS";
+
+    /// What the child of [`switching`] does besides relaying.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Also {
+        Nothing,
+        /// [`SWITCH_LISTENS`].
+        Listens,
+        /// [`SWITCH_UNSAVED`]; the detach that ends a run answers `d`.
+        Unsaved,
+        /// [`SWITCH_FLOATS`].
+        Floats,
+        /// [`SWITCH_FLOATS`], with the settings due.
+        FloatsSettings,
+        /// As [`Also::FloatsSettings`], for keys that change `client` there:
+        /// the relay resettles, and the detach that ends a run answers `d`.
+        Resettles,
+    }
+
     /// The session a run of [`switching`] detached from, and what sessions 1,
     /// 2 and 3 were sent, escaped.
     type Landed = (Option<u32>, [String; 3]);
@@ -5774,21 +6552,42 @@ mod tests {
     /// `chunks` into it, one read each. Once it has landed as `want` says, or
     /// failed to, detach.
     fn switching(tag: &str, chunks: &[&[u8]], slow: Duration, want: &Landed) -> Run {
-        switching_with(tag, chunks, slow, false, want)
+        switching_with(tag, chunks, slow, Also::Nothing, want)
     }
 
-    /// [`switching`], with [`SWITCH_LISTENS`] if `listens`.
+    /// [`switching`], with a child that does `also`.
     fn switching_with(
         tag: &str,
         chunks: &[&[u8]],
         slow: Duration,
-        listens: bool,
+        also: Also,
         want: &Landed,
     ) -> Run {
         let dir = crate::test_support::scratch_dir(tag);
         let mut command = std::process::Command::new(std::env::current_exe().expect("the tests"));
-        if listens {
-            command.env(SWITCH_LISTENS, "1");
+        let set = match also {
+            Also::Nothing => None,
+            Also::Listens => Some((SWITCH_LISTENS, "1")),
+            Also::Unsaved => Some((SWITCH_UNSAVED, "1")),
+            Also::Floats => Some((SWITCH_FLOATS, "1")),
+            Also::FloatsSettings | Also::Resettles => Some((SWITCH_FLOATS, "settings")),
+        };
+        if let Some((name, value)) = set {
+            command.env(name, value);
+        }
+        if matches!(also, Also::Floats | Also::FloatsSettings | Also::Resettles) {
+            // With no controlling terminal, a panel measures crossterm's
+            // fallbacks (`tput`, which reads these), not the terminal the
+            // tests run in: it fits in 80x24.
+            command.env("COLUMNS", "80").env("LINES", "24");
+            // SAFETY: `setsid(2)` neither allocates nor locks, as a pre-exec
+            // hook requires, and cannot fail in a fresh child.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
         }
         let mut child = command
             .args([
@@ -5860,6 +6659,9 @@ mod tests {
             .then(|| relayed.elapsed());
         typing(&[keys::PREFIX]);
         typing(b"d");
+        if matches!(also, Also::Unsaved | Also::Resettles) {
+            typing(b"d");
+        }
         let ended = crate::test_support::wait_until(Duration::from_secs(10), || {
             child.try_wait().is_ok_and(|status| status.is_some())
         });
@@ -5898,14 +6700,34 @@ mod tests {
             .and_then(|ms| ms.parse().ok())
             .map_or(Duration::ZERO, Duration::from_millis);
         let listens = std::env::var_os(SWITCH_LISTENS).is_some();
-        // The picker full screen, so it ends the relay without a panel.
+        let floats = std::env::var(SWITCH_FLOATS).ok();
+        // Unless floating, the picker full screen, so it ends the relay
+        // without a panel.
         let mut settings = config::Settings::default();
-        settings.style.float = false;
+        settings.style.float = floats.is_some();
         config::init(settings);
+        if std::env::var_os(SWITCH_UNSAVED).is_some() {
+            config::set_saved(config::Settings::default());
+        }
         let winch = winch::Winch::install().expect("the SIGWINCH pipe");
         let mut others = |_: Target| None::<card::Card>;
-        let client = |n: u32| attached_to(&format!("exec cat > '{}/{n}'", dir.display()));
+        let client = |n: u32| {
+            let file = dir.join(n.to_string());
+            if floats.is_none() {
+                return attached_to(&format!("exec cat > '{}'", file.display()));
+            }
+            // `dd` reads no more than the byte it keeps.
+            let mut a = attached_to(&format!(
+                "dd bs=1 count=1 of='{0}' 2>/dev/null; printf x; exec cat >> '{0}'",
+                file.display()
+            ));
+            a.screen = Some(shadow::Shadow::new(24, 80));
+            a
+        };
         let mut clients = vec![(3, client(3))];
+        if floats.as_deref() == Some("settings") {
+            clients[0].1.float_the_settings();
+        }
         let mut on = 3;
         let mut carry = Carry::default();
         loop {
@@ -5933,6 +6755,11 @@ mod tests {
                 Ok(Outcome::Switch(Target::Step(Direction::Prev))) => (on + 1) % 3 + 1,
                 Ok(Outcome::Switch(_)) => on,
                 Ok(Outcome::ToPicker) => 2,
+                // As `main` attaches again after a change to `client`.
+                Ok(Outcome::Resettle) => {
+                    eprintln!("resettled on {on}");
+                    on
+                }
                 other => {
                     eprintln!("ended {other:?} on {on}");
                     break;
@@ -6042,12 +6869,189 @@ mod tests {
         let slow = Duration::from_millis(1500);
         let want = landed(Some(1), ["", "", ""]);
         let chunks: &[&[u8]] = &[&[keys::PREFIX], b"1", &[keys::PREFIX], b"2"];
-        let run = switching_with("pty-switch-listened", chunks, slow, true, &want);
+        let run = switching_with("pty-switch-listened", chunks, slow, Also::Listens, &want);
         assert_eq!(run.landed, want, "{}", run.said);
 
         let want = landed(Some(1), ["j", "", ""]);
         let chunks: &[&[u8]] = &[&[keys::PREFIX, b'1', b'j']];
-        let run = switching_with("pty-switch-listened-j", chunks, slow, true, &want);
+        let run = switching_with("pty-switch-listened-j", chunks, slow, Also::Listens, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The prefix and a digit in a paste's second read switched mid-paste,
+    /// leaving the session without the paste's end: in one relay, and in
+    /// the relay a switch read with the paste's start leads to.
+    #[test]
+    fn a_paste_over_two_reads_reaches_one_session_whole() {
+        let p = keys::PREFIX;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~a\\01b\\u{1b}[201~"]);
+        let end = [&[p, b'1', b'b'][..], b"\x1b[201~"].concat();
+        let chunks: &[&[u8]] = &[b"\x1b[200~a", &end];
+        let run = switching("pty-paste", chunks, Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let want = landed(Some(1), ["\\u{1b}[200~a\\02b\\u{1b}[201~", "", ""]);
+        let start = [&[p, b'1'][..], b"\x1b[200~a"].concat();
+        let end = [&[p, b'2', b'b'][..], b"\x1b[201~"].concat();
+        let chunks: &[&[u8]] = &[&start, &end];
+        let run = switching("pty-switch-paste", chunks, Duration::ZERO, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The question unsaved settings ask reads the keys after the `d`, but
+    /// the machine was left as they made it: in a paste whose end the
+    /// question read, so the `<prefix> 1` after a stay went on as text, or
+    /// armed, so the prefix timed out into a literal under the question.
+    #[test]
+    fn what_is_read_with_a_detach_that_asks_goes_with_the_keys_after_it() {
+        let p = keys::PREFIX;
+        let also = Also::Unsaved;
+        let want = landed(Some(1), ["", "", ""]);
+        let asked = [&[p, b'd'][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&asked, b"xyz\x1b[201~", b"\x1b", &[p], b"1"];
+        let run = switching_with("pty-ask-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        // The stay comes past the prefix's timeout.
+        let (armed, prefix) = ([p, b'd', p], [p]);
+        let mut chunks = vec![&armed[..]];
+        chunks.extend([&b""[..]; 13]);
+        chunks.extend([&b"\x1b"[..], &prefix, b"1"]);
+        let run = switching_with("pty-ask-prefix", &chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The attaching screen read the rest of a paste begun with the switch:
+    /// the session was sent its start and left waiting for its end.
+    #[test]
+    fn a_paste_an_attaching_screen_read_the_end_of_is_ended() {
+        let want = landed(Some(1), ["\\u{1b}[200~abc\\u{1b}[201~", "", ""]);
+        let start = [&[keys::PREFIX, b'1'][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"def\x1b[201~"];
+        let slow = Duration::from_millis(1500);
+        let run = switching_with("pty-listened-paste", chunks, slow, Also::Listens, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// A settings panel read the end of a paste begun with its key: the
+    /// steps after the key took the paste's start to the session once the
+    /// panel closed, here or past a switch read with it.
+    #[test]
+    fn a_paste_a_panel_read_the_end_of_is_ended() {
+        let p = keys::PREFIX;
+        let also = Also::Floats;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~abc\\u{1b}[201~"]);
+        let start = [&[p, b','][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"\x1b[201~", b"\x1b"];
+        let run = switching_with("pty-panel-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let want = landed(Some(1), ["\\u{1b}[200~abc\\u{1b}[201~", "", ""]);
+        let start = [&[p, b',', p, b'1'][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"\x1b[201~", b"\x1b"];
+        let tag = "pty-panel-switch-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// A panel whose key came with a paste's start read the paste as keys: a
+    /// `q` in it closed the settings, the relay took the rest as typed, and
+    /// the prefix in it switched to session 1 mid-paste. The second run
+    /// opens the help and the settings with one read: the help reads the
+    /// paste's end, and the settings, opened after it, read keys again.
+    #[test]
+    fn a_panel_opened_with_a_paste_drops_the_paste_through_its_end() {
+        let p = keys::PREFIX;
+        let also = Also::Floats;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~abc\\u{1b}[201~"]);
+        let end = [&b"def"[..], &[p, b'1'], b"g\x1b[201~"].concat();
+        let start = [&[p, b','][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"q", &end, b"\x1b"];
+        let run = switching_with("pty-panel-in-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let start = [&[p, b'?', p, b','][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"q", &end, b"q", b"\x1b"];
+        let tag = "pty-panels-in-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// A paste begun as a panel closed: the panel read its start, and the
+    /// relay took the rest as typed, the prefix in it switching to session
+    /// 1, where the rest goes to the session as a paste. In the second run
+    /// the panel also read the start of the end marker, which the session
+    /// never got: it took everything after as pasted, the detach included.
+    #[test]
+    fn a_paste_a_panel_read_the_start_of_goes_on_as_a_paste() {
+        let p = keys::PREFIX;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~def\\01g\\u{1b}[201~"]);
+        let end = [&b"def"[..], &[p, b'1'], b"g\x1b[201~"].concat();
+        let chunks: &[&[u8]] = &[&[p, b','], b"q\x1b[200~abc", &end];
+        let tag = "pty-panel-closed-in-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, Also::Floats, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let want = landed(Some(1), ["g", "", "\\u{1b}[200~\\u{1b}[201~def"]);
+        let rest = [&b"1~def"[..], &[p, b'1'], b"g"].concat();
+        let chunks: &[&[u8]] = &[&[p, b','], b"q\x1b[200~abc\x1b[20", &rest];
+        let tag = "pty-panel-closed-in-paste-end";
+        let run = switching_with(tag, chunks, Duration::ZERO, Also::Floats, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// A panel took over with the relay having read the start of a paste's
+    /// end marker, and never saw it: the settings took the rest of the input
+    /// as pasted, their `q` included, and stayed up. In the second run a
+    /// pause after the marker's start timed it out in the panel, with the
+    /// same result.
+    #[test]
+    fn a_paste_ends_across_a_panel_wherever_reads_cut_its_end() {
+        let p = keys::PREFIX;
+        let also = Also::Floats;
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~abc\\u{1b}[201~"]);
+        let start = [&[p, b','][..], b"\x1b[200~abc\x1b[20"].concat();
+        let chunks: &[&[u8]] = &[&start, b"1~", b"q"];
+        let run = switching_with("pty-panel-cut-end", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        let start = [&[p, b','][..], b"\x1b[200~abc"].concat();
+        let chunks: &[&[u8]] = &[&start, b"def\x1b[20", b"1~", b"q"];
+        let run = switching_with("pty-panel-paused-end", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// The session's screen came back mid-paste, and the settings due to
+    /// float over it came up to read the paste's end.
+    #[test]
+    fn settings_due_to_float_wait_for_a_paste_to_end() {
+        let want = landed(Some(3), ["", "", "\\u{1b}[200~abc\\u{1b}[201~"]);
+        let chunks: &[&[u8]] = &[b"\x1b[200~abc", b"\x1b[201~", b"\x1b"];
+        let also = Also::FloatsSettings;
+        let run = switching_with("pty-float-paste", chunks, Duration::ZERO, also, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+    }
+
+    /// Settings due to float over the session read a paste's start as they
+    /// closed, and the rest must reach the session as a paste. Resettling
+    /// after a change, they left the next relay nothing: it took the rest as
+    /// typed, and the prefix in it switched to session 1.
+    #[test]
+    fn settings_due_to_float_pass_on_a_paste_they_read_the_start_of() {
+        let p = keys::PREFIX;
+        let want = landed(Some(3), ["", "", "z\\u{1b}[200~def\\01g\\u{1b}[201~"]);
+        let end = [&b"def"[..], &[p, b'1'], b"g\x1b[201~"].concat();
+        // The `z` brings the session's screen back.
+        let chunks: &[&[u8]] = &[b"z", b"q\x1b[200~abc", &end];
+        let tag = "pty-float-closed-in-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, Also::FloatsSettings, &want);
+        assert_eq!(run.landed, want, "{}", run.said);
+
+        // Turns `client.per_session`, on the third tab, second row.
+        let chunks: &[&[u8]] = &[b"z", b"\t", b"\t", b"j", b"l", b"q\x1b[200~abc", &end];
+        let tag = "pty-float-resettled-in-paste";
+        let run = switching_with(tag, chunks, Duration::ZERO, Also::Resettles, &want);
+        assert!(run.said.contains("resettled on 3"), "{}", run.said);
         assert_eq!(run.landed, want, "{}", run.said);
     }
 
@@ -6578,8 +7582,8 @@ mod tests {
         );
     }
 
-    /// Neither an fd nvmux made without close-on-exec (like the SIGWINCH
-    /// self-pipe) nor one nvmux inherited (see `before_exec`).
+    /// Not even one without close-on-exec, as nvmux may have inherited (see
+    /// `before_exec`).
     #[test]
     fn a_client_inherits_no_descriptor_but_its_terminal() {
         let (read, write) = nix::unistd::pipe().expect("a pipe without close-on-exec");
@@ -6739,6 +7743,191 @@ mod tests {
         assert!(!asks_for_device_attributes(b"\x1b[?1049l"));
         // A reply is not a request; answering one with another is a loop.
         assert!(!asks_for_device_attributes(DA1_REPLY));
+    }
+
+    /// Miscounted, the terminal is given back with answers still to come,
+    /// or waited on for answers that never will.
+    #[test]
+    fn a_request_or_an_answer_split_between_reads_counts_once() {
+        let mut u = Unanswered::default();
+        for sent in [
+            &b"\x1b[?u\x1b[c\x1b"[..],
+            b"[",
+            b"c\x1b[>c\x1b[",
+            b"c",
+            b"x",
+        ] {
+            u.sent(sent);
+        }
+        assert_eq!(u.requests, 3, "a DA2 is no DA1");
+        for read in [
+            &b"\x1b[I\x1b[?0u\x1b[?62;22c\x1b"[..],
+            b"[?6",
+            b"2;",
+            b"22c\x1bi",
+        ] {
+            u.read(read);
+        }
+        assert_eq!(u.requests, 1);
+        // Two answers for one request: the next request is still owed one.
+        u.read(b"\x1b[?62;22c\x1b[?62;22c");
+        u.sent(b"\x1b[c");
+        assert_eq!(u.requests, 1);
+    }
+
+    /// Ends with the last answer due, not at the deadline; one that never
+    /// comes ends it at the deadline, and a closed input at once.
+    #[test]
+    fn the_terminal_is_heard_out_until_nothing_is_unanswered() {
+        let (mut terminal, nvmux) = UnixStream::pair().expect("a socket pair");
+        let fd = nvmux.as_raw_fd();
+        let mut u = Unanswered::default();
+        u.sent(b"\x1b[?u\x1b[c\x1b[c");
+        terminal
+            .write_all(b"\x1b[?0u\x1b[?62;22c\x1b[?62;22c")
+            .expect("answer");
+        let started = Instant::now();
+        assert!(u.read_from(fd, started + Duration::from_secs(10)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited past the answers"
+        );
+
+        u.sent(b"\x1b[c\x1b[c");
+        terminal.write_all(b"\x1b[?62;22c").expect("answer");
+        let started = Instant::now();
+        assert!(!u.read_from(fd, started + Duration::from_millis(100)));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(u.requests, 1);
+
+        drop(terminal);
+        let started = Instant::now();
+        assert!(!u.read_from(fd, started + Duration::from_secs(10)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited on a closed input"
+        );
+    }
+
+    /// Answers owed to an earlier relay's requests come first: taken for this
+    /// relay's, they leave its own to the shell.
+    #[test]
+    fn answers_owed_to_an_earlier_relay_pay_off_none_of_this_ones() {
+        let (mut terminal, nvmux) = UnixStream::pair().expect("a socket pair");
+        let fd = nvmux.as_raw_fd();
+        let owed = |answers| Owed {
+            answers,
+            asked: None,
+        };
+        let mut u = Unanswered::after(owed(2));
+        u.sent(b"\x1b[c\x1b[c");
+        u.read(b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c");
+        assert_eq!((u.earlier, u.requests), (0, 1));
+
+        let mut u = Unanswered::after(owed(1));
+        terminal.write_all(b"\x1b[?62;22c").expect("answer");
+        assert!(u.read_from(fd, Instant::now() + Duration::from_secs(10)));
+        assert_eq!(
+            u.answers_due(),
+            0,
+            "gave up the terminal before the answer owed"
+        );
+    }
+
+    /// Clients ask more than DA1, some of it after their last: Neovim
+    /// 0.12.6's XTGETTCAP once its DA1 is answered, its TUI's focus mode
+    /// 100 ms in. Each is found whole or cut anywhere by reads; what only
+    /// draws is not, or every detach would wait a round trip.
+    #[test]
+    fn what_may_draw_an_answer_is_found_wherever_reads_cut_it() {
+        let found = |bytes: &[u8]| {
+            let whole = Asking::default().scan(bytes);
+            for cut in 1..bytes.len() {
+                let mut a = Asking::default();
+                let first = a.scan(&bytes[..cut]);
+                let second = a.scan(&bytes[cut..]);
+                assert_eq!(
+                    second.or(first),
+                    whole,
+                    "{} cut at {cut}",
+                    bytes.escape_ascii()
+                );
+            }
+            whole
+        };
+        for asks in [
+            &b"\x1b[?2026$p"[..],
+            b"\x1b[12$p",
+            b"\x1bP$qm\x1b\\",
+            b"\x1bP+q4D73\x1b\\",
+            b"\x1b[?u",
+            b"\x1b]11;?\x07",
+            b"\x1b]4;1;?\x1b\\",
+            b"\x1b]52;c;?\x1b\\",
+            b"\x1b[5n",
+            b"\x1b[?996n",
+            b"\x1b[>c",
+            b"\x1b[0c",
+            b"\x1b[>q",
+            b"\x1b[16t",
+            b"\x1b[?2;1;0S",
+            b"\x1b[?1004h",
+            b"\x1b[?2004;2048h",
+            b"\x1b_Gi=1,a=q;\x1b\\",
+            b"\x1bZ",
+        ] {
+            assert_eq!(found(asks), Some(Asked::Other), "{}", asks.escape_ascii());
+        }
+        assert_eq!(found(b"\x1b[c"), Some(Asked::Da1));
+        assert_eq!(found(b"\x1b[c\x1b[?1004h"), Some(Asked::Other));
+        assert_eq!(found(b"\x1b[?1004h\x1b[c"), Some(Asked::Da1));
+        for drawn in [
+            &b"\x1b[?1049h\x1b[22;0;0t\x1b[?1h\x1b=\x1b[H\x1b[2J\x1b[?2004h"[..],
+            b"\x1b[0m\x1b[4:3m\x1b[38;2;1;2;3mwhat?\x1b[K\x07",
+            b"\x1b]0;what;?\x18\x1b]112\x07\x1b]2;title?\x1b\\",
+            b"\x1b[?1004l\x1b[23;0;0t\x1b[?1049l\x1b[>4;2m\x1b[>1u\x1b[<u\x1b[2 q",
+        ] {
+            assert_eq!(found(drawn), None, "{}", drawn.escape_ascii());
+        }
+    }
+
+    /// Something else asked waits for a settle until [`SETTLE_TIMEOUT`] has
+    /// passed, and a DA1 after it, counted, takes over.
+    #[test]
+    fn what_was_asked_lately_is_awaited() {
+        let mut u = Unanswered::default();
+        let now = Instant::now();
+        assert!(!u.awaited(now));
+        u.sent(b"\x1bP+q4D73");
+        u.sent(b"\x1b\\");
+        let asked = u.asked.expect("asked");
+        assert!(u.awaited(asked + SETTLE_TIMEOUT / 2));
+        assert!(!u.awaited(asked + SETTLE_TIMEOUT));
+        u.sent(b"\x1b[c");
+        assert_eq!(u.asked, None);
+        u.read(b"\x1b[?62;22c");
+        assert!(!u.awaited(asked));
+
+        let carried = Unanswered::after(Owed {
+            answers: 0,
+            asked: Some(asked),
+        });
+        assert!(carried.awaited(asked), "lost with the relay that asked");
+    }
+
+    /// Two switches can come before the first client's answers: the relay in
+    /// between passes on what it was left, not only what its client asked.
+    #[test]
+    fn what_is_owed_goes_on_through_a_relay_in_between() {
+        let mut first = Unanswered::default();
+        first.sent(b"\x1b[c\x1bP+q4D73\x1b\\");
+        let asked = first.asked.expect("asked");
+        let between = Unanswered::after(first.owed());
+        let mut last = Unanswered::after(between.owed());
+        assert_eq!(last.answers_due(), 1);
+        last.read(b"\x1b[?62;22c");
+        assert!(last.awaited(asked), "lost what was asked two relays back");
+        assert!(!last.awaited(asked + SETTLE_TIMEOUT));
     }
 
     /// SIGHUP is not delivered to a stopped process, so without SIGCONT this

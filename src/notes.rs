@@ -40,9 +40,12 @@ use rmpv::Value;
 use crate::error::RpcError;
 use crate::rpc;
 
-/// Watcher version. A session with any other version gets this watcher,
-/// keeping its record.
-pub const VERSION: i64 = 9;
+/// Watcher version. A session with an older watcher, or none, gets this one,
+/// keeping its record. An older nvmux reads a newer watcher with its own
+/// [`READ`] and [`SEEN`], and waits for [`NEWS`] on the channel its READ
+/// registers, so a new version may add to what those use and to the record,
+/// but must not change any of them.
+pub const VERSION: i64 = 11;
 
 /// Picker read interval.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -55,9 +58,10 @@ const BUDGET: Duration = Duration::from_secs(1);
 const SETTLE: Duration = Duration::from_millis(30);
 
 /// The watcher, run with `nvim_exec_lua` (args: version, optional listener
-/// channel); returns the record as [`READ`] does. Reinstalling replaces the
-/// autocommands and keeps the record, except LSP work, which restarts since
-/// another version's watcher may have missed its end.
+/// channel) where [`READ`] found none or an older one; returns the record as
+/// [`READ`] does. One at least as new installed since, by another read, is
+/// kept. Replacing keeps the record, except LSP work, which restarts since
+/// the older watcher may have missed its end.
 ///
 /// It records:
 /// - running progress by source and id (title, text, start time, percent;
@@ -90,13 +94,19 @@ const SETTLE: Duration = Duration::from_millis(30);
 /// registered ([`READ`], [`listen`]). Failing channels are dropped (channel ids
 /// are never reused); listeners survive reinstalling. A listener passed here
 /// is registered, but the record does not report it as `listening`, since the
-/// replaced watcher may not have told it.
+/// watcher this one replaces, or one another read installed since, may not
+/// have told it.
 const WATCHER: &str = r#"local version, listener = ...
 local api = vim.api
 local N = package.loaded['nvmux.notes']
 if type(N) ~= 'table' then
   N = { progress = {} }
   package.loaded['nvmux.notes'] = N
+elseif type(N.version) == 'number' and N.version >= version and type(N.snapshot) == 'function' then
+  if listener then
+    N.listeners[listener] = true
+  end
+  return N.snapshot()
 end
 N.version = version
 N.progress = type(N.progress) == 'table' and N.progress or {}
@@ -109,7 +119,10 @@ N.lsp = {}
 N.seq = type(N.seq) == 'number' and N.seq or 0
 N.listeners = type(N.listeners) == 'table' and N.listeners or {}
 local group = api.nvim_create_augroup('nvmux_notes', { clear = true })
-local function clean(s)
+-- `open` is for a kitty part, which later parts extend, perhaps mid-character:
+-- its trailing blanks stay, and it is cut by bytes, at 1200 for 200 characters
+-- of up to 6 bytes as strcharpart counts them.
+local function clean(s, open)
   if type(s) == 'table' then
     local parts = {}
     for _, c in ipairs(s) do
@@ -121,6 +134,9 @@ local function clean(s)
     return ''
   end
   s = s:gsub('[%z\1-\31\127]', ' '):gsub('\194[\128-\159]', ' ')
+  if open then
+    return (s:gsub('^%s+', '')):sub(1, 1200)
+  end
   return vim.fn.strcharpart(vim.trim(s), 0, 200)
 end
 local function shown(buf)
@@ -219,7 +235,7 @@ api.nvim_create_autocmd('LspProgress', {
   end,
 })
 local function program(buf)
-  local name = api.nvim_buf_is_valid(buf) and api.nvim_buf_get_name(buf) or ''
+  local name = buf and api.nvim_buf_is_valid(buf) and api.nvim_buf_get_name(buf) or ''
   local command = name:match('^term://.-//%d+:(.*)$') or name
   return (command:gsub('^%S*/', ''))
 end
@@ -235,26 +251,33 @@ api.nvim_create_autocmd('TermRequest', {
     if type(seq) ~= 'string' or seq:sub(1, 2) ~= '\27]' then
       return
     end
+    -- Nil for a buffer an earlier TermRequest autocommand wiped, which keeps
+    -- nothing here; 0.11 sends the terminal's later requests for buffer 0.
+    local buf = ev.buf > 0 and api.nvim_buf_is_valid(ev.buf) and ev.buf or nil
     local osc = seq:sub(3)
     local title, body = osc:match('^777;notify;([^;]*);?(.*)$')
     if title then
-      return note('notify', title, body, ev.buf)
+      return note('notify', title, body, buf)
     end
     local mark, args = osc:match('^133;(%a)(.*)$')
     if mark == 'C' then
       local url = args:match(';cmdline_url=([^;]*)')
-      commands[ev.buf] = url and vim.uri_decode(url) or false
+      if buf then
+        commands[buf] = url and vim.uri_decode(url) or false
+      end
       return
     elseif mark == 'D' then
       local status = tonumber(args:match('^;(%d+)'))
-      local command = commands[ev.buf]
-      commands[ev.buf] = nil
+      local command = buf and commands[buf]
+      if buf then
+        commands[buf] = nil
+      end
       if status and (status > 0 or command ~= nil) then
         local kind = status > 0 and 'failed' or 'finished'
         if command then
-          note(kind, command, 'exited with code ' .. status, ev.buf)
+          note(kind, command, 'exited with code ' .. status, buf)
         else
-          note(kind, program(ev.buf), 'a command exited with code ' .. status, ev.buf)
+          note(kind, program(buf), 'a command exited with code ' .. status, buf)
         end
       end
       return
@@ -262,7 +285,7 @@ api.nvim_create_autocmd('TermRequest', {
     local text = osc:match('^9;(.*)$')
     if text then
       if not text:match('^%d+;') and not text:match('^%d+$') then
-        note('notify', '', text, ev.buf)
+        note('notify', '', text, buf)
       end
       return
     end
@@ -276,20 +299,37 @@ api.nvim_create_autocmd('TermRequest', {
         local ok, decoded = pcall(vim.base64.decode, payload)
         payload = ok and decoded or ''
       end
+      -- One unfinished notification per terminal, as kitty keeps one per
+      -- window; a part with another id starts a new one, as does one on another
+      -- channel: a terminal a TermClose autocommand starts fires no TermOpen
+      -- unless the autocommand is nested.
       local id = m.i or ''
-      local p = parts[id] or { title = '', body = '' }
-      if (m.p or 'title') == 'title' then
-        p.title = p.title .. payload
-      elseif m.p == 'body' then
-        p.body = p.body .. payload
+      local chan = buf and vim.bo[buf].channel or 0
+      local p = buf and parts[buf]
+      if not p or p.id ~= id or p.chan ~= chan then
+        p = { id = id, chan = chan, title = '', body = '' }
       end
-      if m.d == '0' then
-        parts[id] = p
-      else
-        parts[id] = nil
-        note('notify', p.title, p.body, ev.buf)
+      local field = m.p or 'title'
+      if field == 'title' or field == 'body' then
+        p[field] = clean(p[field] .. payload, true)
+      end
+      if buf then
+        parts[buf] = m.d == '0' and p or nil
+      end
+      if m.d ~= '0' then
+        note('notify', p.title, p.body, buf)
       end
     end
+  end,
+})
+-- Neovim holds back a terminal's sequences while lines it scrolled are pending,
+-- so they can come after its TermClose: its parts and command go when its
+-- buffer is wiped or another terminal opens in it, and sequences held back
+-- past that are taken as the new terminal's.
+api.nvim_create_autocmd({ 'TermOpen', 'BufWipeout' }, {
+  group = group,
+  callback = function(ev)
+    parts[ev.buf], commands[ev.buf] = nil, nil
   end,
 })
 api.nvim_create_autocmd('TermClose', {
@@ -329,7 +369,7 @@ function N.snapshot()
       busy = p
     end
   end
-  local out = { v = N.version }
+  local out = { v = N.version, seq = N.seq }
   if busy then
     out.busy = { title = busy.title, text = busy.text, percent = busy.percent, age = now - busy.at }
   end
@@ -365,17 +405,18 @@ end
 return N.snapshot()
 "#;
 
-/// Returns the record map, or `false` if the watcher is missing or another
-/// version. Keys, each present only when set: `busy` (latest-started progress
-/// or LSP work: `title`, `text`, `percent`, `age` in seconds); `note` (`kind`
-/// `notify` or `failed`) and `finished`, both with `title`, `body`, `age`,
-/// `seq`, `shown`, `buf`, `tab`.
+/// Returns the record map, or `false` if the watcher is missing or older.
+/// Keys: `seq`, the last number given; and, each present only when set,
+/// `busy` (latest-started progress or LSP work: `title`, `text`, `percent`,
+/// `age` in seconds), `note` (`kind` `notify` or `failed`) and `finished`,
+/// both with `title`, `body`, `age`, `seq`, `shown`, `buf`, `tab`.
 ///
 /// With a listener channel ([`listen`]) it registers it and reports whether it
 /// already was (`listening`).
 const READ: &str = r#"local version, listener = ...
 local N = package.loaded['nvmux.notes']
-if type(N) ~= 'table' or N.version ~= version or type(N.snapshot) ~= 'function' then
+local v = type(N) == 'table' and N.version
+if type(v) ~= 'number' or v < version or type(N.snapshot) ~= 'function' then
   return false
 end
 local out = N.snapshot()
@@ -441,8 +482,7 @@ pub enum Reading {
     Gone,
 }
 
-/// Read the session on `sock`, installing the watcher if missing or another
-/// version.
+/// Read the session on `sock`, installing the watcher if missing or older.
 pub fn read(sock: &Path) -> Reading {
     let mut client = match rpc::Client::connect(sock, BUDGET) {
         Ok(c) => c,
@@ -484,9 +524,13 @@ pub struct News {
 /// Result of [`hear`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Heard {
-    /// Kept news, oldest first (up to two), and whether the named listener
-    /// was already registered (it is now).
-    Said { news: Vec<News>, listening: bool },
+    /// Kept news, oldest first (up to two), whether the named listener was
+    /// already registered (it is now), and the last number the watcher gave.
+    Said {
+        news: Vec<News>,
+        listening: bool,
+        numbered: u64,
+    },
     /// No answer now; nothing was left queued in the session.
     Unknown,
     /// Refused or reset: nothing listens on its socket, or on macOS its
@@ -510,6 +554,7 @@ pub fn hear(sock: &Path, listener: Option<u64>) -> Heard {
             news: news_of(&v),
             listening: listener.is_some()
                 && field(&v, "listening").and_then(Value::as_bool) == Some(true),
+            numbered: field(&v, "seq").and_then(number).unwrap_or(0),
         },
         Ok(None) => Heard::Unknown,
         Err(e) if e.is_definitely_dead() => Heard::Gone,
@@ -633,8 +678,8 @@ impl Seeing {
     }
 }
 
-/// The record, installing the watcher if missing or another version; `None`
-/// while the editor is blocked on a key (deferred calls go unanswered).
+/// The record, installing the watcher if missing or older; `None` while the
+/// editor is blocked on a key (deferred calls go unanswered).
 ///
 /// The read is pipelined with the mode: one round trip. If blocked, it runs
 /// harmlessly once the key comes (it only drops LSP work of dead servers); the
@@ -747,9 +792,9 @@ fn field<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
 
 /// A record string, safe to draw. The watcher already strips control
 /// characters, but the text comes from whoever sent the notification, so it is
-/// not trusted.
+/// not trusted, nor even UTF-8: a Latin-1 program's `é` comes as one byte.
 fn text(v: Option<&Value>) -> String {
-    let s = v.and_then(Value::as_str).unwrap_or_default();
+    let s = String::from_utf8_lossy(v.and_then(Value::as_slice).unwrap_or_default());
     let clean: String = s
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -1106,6 +1151,36 @@ mod tests {
         );
         assert_eq!(note.text, "a b c d");
         assert_eq!(note.age, Duration::ZERO, "a clock that went back");
+    }
+
+    /// A Latin-1 program's `é` is one byte that is not UTF-8; it must not
+    /// blank the whole title or body.
+    #[test]
+    fn text_that_is_not_utf8_still_shows() {
+        // A msgpack str, as Neovim sends any Lua string, whatever its bytes.
+        let raw = |bytes: &[u8]| {
+            assert!(bytes.len() < 32, "a fixstr");
+            let packed = [&[0xa0 | bytes.len() as u8][..], bytes].concat();
+            rmpv::decode::read_value(&mut &packed[..]).expect("a str")
+        };
+        let record = map(vec![(
+            "note",
+            map(vec![
+                ("kind", Value::from("notify")),
+                ("title", raw(b"Build \xe9")),
+                ("body", raw(b"caf\xe9 failed")),
+            ]),
+        )]);
+        let note = note_of(&record, Instant::now()).expect("a note");
+        assert_eq!(
+            (note.title.as_str(), note.text.as_str()),
+            ("Build \u{fffd}", "caf\u{fffd} failed")
+        );
+        let news = news_of(&record);
+        assert_eq!(
+            (news[0].title.as_str(), news[0].text.as_str()),
+            ("Build \u{fffd}", "caf\u{fffd} failed")
+        );
     }
 
     #[test]

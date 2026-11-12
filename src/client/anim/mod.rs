@@ -221,7 +221,8 @@ pub struct Animator {
     blink: Blink,
     /// See [`Animator::hold_blink`].
     blink_held: bool,
-    /// When animations last advanced.
+    /// When animations last advanced; set to now by whatever starts one from
+    /// rest, whose first step would otherwise take in the whole quiet spell.
     last: Option<Instant>,
     /// The cell the cursor was last in, which particles fly from.
     cell: Option<(i64, i64)>,
@@ -649,6 +650,10 @@ impl Animator {
 
     /// Move the cursor to its new place, animated only if `allowed`.
     fn cursor_moved(&mut self, model: &Model, allowed: bool, now: Instant) {
+        // Step from now, not from the last frame.
+        if !self.moving() {
+            self.last = Some(now);
+        }
         let (row, col) = self.cursor_at(model);
         let Some(target) = cursor_rect(self.mode_info(model), (row, col)) else {
             return;
@@ -855,15 +860,15 @@ impl Animator {
         (fill, land): (&mut Fill, &mut Lander),
         now: Instant,
     ) {
+        if !self.moving() {
+            self.last = Some(now);
+        }
         let Some(s) = self.scrolls.get_mut(&grid) else {
             return;
         };
         let more = s.fill_in(fill, land);
         self.gather();
         if more {
-            if !self.moving() {
-                self.last = Some(now);
-            }
             self.cursor_moved(model, true, now);
         }
     }
@@ -892,7 +897,10 @@ impl Animator {
 
     /// Stop scrolling `grid` ahead; returns the client numbers of the inputs
     /// behind the dropped scrolls.
-    pub fn give_up(&mut self, grid: u64) -> Vec<u64> {
+    pub fn give_up(&mut self, grid: u64, now: Instant) -> Vec<u64> {
+        if !self.moving() {
+            self.last = Some(now);
+        }
         let Some(s) = self.scrolls.get_mut(&grid) else {
             return Vec::new();
         };
@@ -1244,6 +1252,11 @@ impl Animator {
     }
 
     pub fn advance(&mut self, now: Instant) {
+        // A scroll ahead expiring below may be the first thing to move since
+        // a quiet spell.
+        if !self.moving() {
+            self.last = Some(now);
+        }
         let dt = self.last.map_or(0.0, |last| {
             now.saturating_duration_since(last).as_secs_f32()
         });
@@ -1960,6 +1973,191 @@ mod tests {
         assert_eq!(a.ahead(2), (0, 0), "never confirmed");
         assert_eq!(top(&a, &m), Some(Text::Char('3')), "Neovim's view again");
         assert_eq!(a.next_frame(&m, until), None);
+    }
+
+    /// Frames drawn as the client draws them, one at once and then each as it
+    /// falls due, until `moving` no longer holds; returns how many it held
+    /// for, and the time of the frame that found it over.
+    fn frames_while(
+        a: &mut Animator,
+        m: &Model,
+        from: Instant,
+        moving: impl Fn(&Animator) -> bool,
+    ) -> (usize, Instant) {
+        let mut t = from;
+        for n in 0..100 {
+            a.advance(t);
+            if !moving(a) {
+                return (n, t);
+            }
+            t = a.next_frame(m, t).expect("a frame while moving").max(t);
+        }
+        panic!("still moving");
+    }
+
+    /// A step to the start of line `line` in grid 2's window, its view at the
+    /// buffer's top.
+    fn step_to(line: i64, until: Instant) -> Step {
+        Step {
+            seq: 1,
+            pos: crate::client::predict::Pos {
+                win: 1002,
+                line,
+                byte: 0,
+                want: crate::client::predict::Want::Col(0),
+                top: 0,
+                left: 0,
+                rest: Rest::Normal,
+            },
+            vcol: 0,
+            proof: Proof::Move,
+            credited: true,
+            tick: 1,
+            line_count: 100,
+            echo: None,
+            insstart: None,
+            hidden: false,
+            until,
+        }
+    }
+
+    /// Its sparks outlive the trip. Timed from the last frame instead, both
+    /// would be over in the first frame.
+    #[test]
+    fn a_step_after_a_quiet_spell_travels_as_neovims_move_does() {
+        let fx = Effects {
+            vfx: Some(PARTICLES),
+            ..effects()
+        };
+        let travels = |ahead: bool| {
+            let (mut a, mut m, t0) = (Animator::new(fx), model(), Instant::now());
+            setup(&mut a, &mut m, t0);
+            batch(&mut a, &mut m, vec![viewport(0, 0, 0)], true, t0);
+            let t1 = t0 + Duration::from_secs(2);
+            if ahead {
+                let step = step_to(5, t1 + Duration::from_secs(1));
+                a.step(&m, 2, ((1002, 0, 0), true), (step, || None), t1);
+            } else {
+                let to = Event::GridCursor {
+                    grid: 2,
+                    row: 5,
+                    col: 0,
+                };
+                batch(&mut a, &mut m, vec![to], true, t1);
+            }
+            assert_eq!(a.cursor_at(&m), (5, 0));
+            let (frames, _) = frames_while(&mut a, &m, t1, |a| a.smear.moving());
+            (frames, a.vfx.moving())
+        };
+        let (frames, sparks) = travels(false);
+        assert!(frames > 3 && sparks, "{frames} frames, sparks {sparks}");
+        assert_eq!(travels(true), (frames, true));
+    }
+
+    /// A scroll ahead is held for lines not sent yet. Once they come it
+    /// slides, the cursor with it, as one drawn at once does; timed from the
+    /// last frame instead, both would land in the first frame.
+    #[test]
+    fn a_held_scroll_slides_from_when_its_lines_come() {
+        // Rows for the lines sent: those before `sent`.
+        let fill = |sent: i64| {
+            move |i: i64| {
+                let digit = char::from_digit((i % 10) as u32, 10).filter(|_| i < sent)?;
+                let mut row = vec![Cell::default(); 10];
+                row[0].text = Text::Char(digit);
+                Some(row)
+            }
+        };
+        let slides = |held: bool| {
+            let (mut a, mut m, t0) = (Animator::new(effects()), model(), Instant::now());
+            setup(&mut a, &mut m, t0);
+            batch(&mut a, &mut m, vec![viewport(0, 0, 0)], true, t0);
+            let go = Ahead {
+                rows: 3,
+                cursor: 0,
+                col: None,
+                land: None,
+                until: t0 + Duration::from_secs(9),
+                scrolloff: 2,
+                seq: None,
+            };
+            let t1 = t0 + Duration::from_secs(2);
+            let mut land = |_, _| None;
+            if held {
+                assert!(a.predict(&m, 2, go, (&mut fill(10), &mut land), t0));
+                assert_eq!(a.held(), [2]);
+                a.fill_in(&m, 2, (&mut fill(13), &mut land), t1);
+                assert!(a.held().is_empty());
+            } else {
+                assert!(a.predict(&m, 2, go, (&mut fill(13), &mut land), t1));
+            }
+            assert_eq!(a.cursor_at(&m), (2, 0));
+            frames_while(&mut a, &m, t1, Animator::moving).0
+        };
+        let frames = slides(false);
+        assert!(frames > 3, "slides over {frames} frames");
+        assert_eq!(slides(true), frames);
+    }
+
+    /// Four ways: given up alone, then with its steps dropped, after they
+    /// lapse, and at its deadline. Timed from the last frame instead, the view
+    /// would be back in the first frame.
+    #[test]
+    fn a_scroll_ahead_given_up_after_a_quiet_spell_slides_back() {
+        type GiveUp = fn(&mut Animator, &Model, Instant);
+        let ways: [GiveUp; 4] = [
+            |a, _, now| {
+                a.give_up(2, now);
+            },
+            |a, m, now| {
+                a.give_up(2, now);
+                a.drop_chain(m, 2, now);
+            },
+            |a, m, now| {
+                a.idle(2);
+                assert_eq!(a.lapsed(m, now).len(), 1);
+                a.give_up(2, now);
+            },
+            |_, _, _| {},
+        ];
+        // A 3-line scroll ahead for key 1 and a step onto its cursor line for
+        // key 2, given up at their deadline, long after the scroll settled, or
+        // if not `quiet` on the frame it settled.
+        let back = |way: GiveUp, quiet: bool| {
+            let (mut a, mut m, t0) = (Animator::new(effects()), model(), Instant::now());
+            setup(&mut a, &mut m, t0);
+            batch(&mut a, &mut m, vec![viewport(0, 0, 0)], true, t0);
+            let until = t0 + Duration::from_secs(2);
+            let go = Ahead {
+                rows: 3,
+                cursor: 3,
+                col: None,
+                land: None,
+                until,
+                scrolloff: 2,
+                seq: Some(1),
+            };
+            let mut fill = |i: i64| {
+                let digit = char::from_digit((i % 10) as u32, 10)?;
+                let mut row = vec![Cell::default(); 10];
+                row[0].text = Text::Char(digit);
+                Some(row)
+            };
+            assert!(a.predict(&m, 2, go, (&mut fill, &mut |_, _| None), t0));
+            let mut step = step_to(5, until);
+            (step.seq, step.pos.top) = (2, 3);
+            a.step(&m, 2, ((1002, 0, 0), true), (step, || None), t0);
+            a.idle(1);
+            let (_, still) = frames_while(&mut a, &m, t0, Animator::moving);
+            let at = if quiet { until } else { still };
+            way(&mut a, &m, at);
+            frames_while(&mut a, &m, at, Animator::moving).0
+        };
+        let frames = back(ways[0], false);
+        assert!(frames > 3, "slides back over {frames} frames");
+        for (n, way) in ways.into_iter().enumerate() {
+            assert_eq!(back(way, true), frames, "way {n}");
+        }
     }
 
     #[test]

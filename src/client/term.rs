@@ -141,7 +141,9 @@ pub struct Hangup {
 
 impl Hangup {
     pub fn install() -> std::io::Result<Self> {
-        let (read, write) = nix::unistd::pipe().map_err(std::io::Error::from)?;
+        // std's, which is close-on-exec, as `crate::winch`'s must be.
+        let (read, write) = std::io::pipe()?;
+        let (read, write) = (OwnedFd::from(read), OwnedFd::from(write));
         for fd in [&read, &write] {
             let flags = nix::fcntl::OFlag::from_bits_truncate(
                 nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(std::io::Error::from)?,
@@ -227,5 +229,19 @@ mod tests {
     #[test]
     fn a_title_cannot_carry_a_sequence() {
         assert_eq!(title("a\x1b]0;b\x07c"), b"\x1b]2;a]0;bc\x07");
+    }
+
+    #[test]
+    fn the_hangup_pipe_is_closed_on_exec() {
+        let hangup = Hangup::install().expect("install");
+        for end in [&hangup.read, &hangup._write] {
+            let flags = nix::fcntl::fcntl(end, nix::fcntl::F_GETFD).expect("its flags");
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "fd {} outlives an exec",
+                end.as_raw_fd()
+            );
+        }
     }
 }

@@ -5,8 +5,7 @@
 //! drops every chord it does not bind. Chords are validated by
 //! [`crate::keys::parse_prefix`], as in the config file.
 //!
-//! `Enter` keeps what is shown; `Esc` and `Ctrl-c` skip, so `C-c` can be the
-//! prefix only by editing the config.
+//! `Enter` keeps what is shown; `Esc` and `Ctrl-c` skip.
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;

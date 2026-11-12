@@ -1493,7 +1493,7 @@ pub enum Mouse {
 mod tests {
     use super::*;
     use crate::ui::swap;
-    use crate::ui::test_support::{filtering, picker as app};
+    use crate::ui::test_support::{filtering, picker as app, prefix_chords};
 
     fn names(app: &App) -> Vec<String> {
         app.visible().iter().map(|s| s.name.clone()).collect()
@@ -1601,6 +1601,30 @@ mod tests {
         assert_eq!(a.mode(), &Mode::Normal, "esc stays");
         assert_eq!(a.on_key(Key::Char('q')), Request::None, "and asks again");
         assert_eq!(a.on_key(Key::CtrlC), Request::Quit, "Ctrl-c quits anyway");
+    }
+
+    /// In every mode, browsing, filtering, moving a row or at `[y/N]`.
+    #[test]
+    fn no_prefix_quits_or_asks_to() {
+        for (byte, chord) in prefix_chords() {
+            let label = crate::keys::prefix_label(byte);
+            for opens in [None, Some('/'), Some(' '), Some('x')] {
+                for unsaved in [0, 1] {
+                    let mut a = app(&["one", "two"]);
+                    a.set_unsaved(unsaved);
+                    if let Some(c) = opens {
+                        a.on_key(Key::Char(c));
+                    }
+                    let request = a.on_key(crate::ui::translate(chord));
+                    assert!(
+                        !matches!(request, Request::Quit | Request::SaveAndQuit { .. })
+                            && !matches!(a.mode(), Mode::Leave { .. }),
+                        "{label} after {opens:?}, {unsaved} unsaved: {request:?}, {:?}",
+                        a.mode()
+                    );
+                }
+            }
+        }
     }
 
     /// A clash keeps the question up for a second `w`; other failures return

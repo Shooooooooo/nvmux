@@ -10,7 +10,8 @@
 //! another window, which would leave the shell with no echo or line editing.
 //! So the saved termios also lives in a static; a signal handler restores it
 //! and re-raises the signal with the default disposition, keeping the exit
-//! status honest.
+//! status honest. A panic that ends nvmux restores the same copy, before any
+//! guard unwinds ([`restore_and_reset`]).
 
 use std::os::fd::BorrowedFd;
 use std::sync::OnceLock;
@@ -46,15 +47,22 @@ fn stdin_fd() -> BorrowedFd<'static> {
     unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) }
 }
 
-/// Restore the terminal, then re-raise under the default disposition (not
-/// `_exit`) so the shell reports the signal. `tcsetattr`, `write`, `signal`
-/// and `raise` are all async-signal-safe.
-extern "C" fn restore_and_reraise(sig: libc::c_int) {
+/// Put the shell's termios back, if it was saved.
+fn restore_saved_termios() {
     if let Some(saved) = SAVED.get() {
+        // SAFETY: `saved.0` is a termios that `tcgetattr` filled in; a bad fd
+        // only fails the call.
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved.0);
         }
     }
+}
+
+/// Restore the terminal, then re-raise under the default disposition (not
+/// `_exit`) so the shell reports the signal. `tcsetattr`, `write`, `signal`
+/// and `raise` are all async-signal-safe.
+extern "C" fn restore_and_reraise(sig: libc::c_int) {
+    restore_saved_termios();
     // Undo screen state (alternate screen, hidden cursor); harmless if none.
     unsafe {
         libc::write(libc::STDOUT_FILENO, RESET.as_ptr().cast(), RESET.len());
@@ -74,10 +82,10 @@ const INHERITED: &[u8] = b"\x1b[?2026l\x1b[0m";
 /// [`INHERITED`], plus leave the alternate screen (no-op if not in it), show
 /// the cursor, and turn off focus reports, bracketed paste, modifyOtherKeys and
 /// mouse reporting ([`MOUSE_OFF`]). One fixed string so the signal handler can
-/// write it, and error paths match a signal's reset. The modes are included
-/// because every path here ends at a shell prompt, and a client killed with
-/// nvmux never turns its own off. The kitty keyboard stack is per screen, so
-/// leaving the alternate screen is its reset.
+/// write it, and error paths and a panic match a signal's reset. The modes are
+/// included because every path here ends at a shell prompt, and a client
+/// killed with nvmux never turns its own off. The kitty keyboard stack is per
+/// screen, so leaving the alternate screen is its reset.
 const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1004l\x1b[?2004l\x1b[>4;0m\
 \x1b[?1003l\x1b[?1006l\x1b[?1002l";
 
@@ -152,6 +160,13 @@ pub fn reset_screen() {
     let _ = write_stdout(RESET);
 }
 
+/// What [`restore_and_reraise`] does before it re-raises, for a panic that
+/// ends nvmux (see [`crate::panics`]).
+pub(crate) fn restore_and_reset() {
+    restore_saved_termios();
+    reset_screen();
+}
+
 /// Home the cursor and erase its line. Only for the two paths that hang up
 /// on a client and end at a shell, so not part of [`RESET`].
 const ERASE_LINE: &[u8] = b"\r\x1b[2K";
@@ -159,9 +174,9 @@ const ERASE_LINE: &[u8] = b"\r\x1b[2K";
 /// Erase the `Nvim: Caught deadly signal 'SIGHUP'` line a retired client
 /// prints. Neovim restores the terminal (leaving the alternate screen) before
 /// printing it, so it lands on the user's screen. The detach path relays that
-/// restore on purpose (see [`crate::pty::Attachment::drain_until_eof`]): it
-/// carries the kitty keyboard pop and the title restore, which nvmux does not
-/// send.
+/// restore on purpose, unless the client's first paint was held (see
+/// [`crate::pty::Attachment::drain_until_eof`]): it carries the kitty keyboard
+/// pop and the title restore, which nvmux does not send.
 ///
 /// Called after the client is gone and [`RESET`] has left the alternate
 /// screen, which puts the cursor back on that line. The client's output is not

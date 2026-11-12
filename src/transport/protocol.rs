@@ -95,8 +95,8 @@ pub fn parse_listing(stdout: &str) -> Result<Vec<Listed>> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Spawned {
-    /// The new nvim's pid, validated against its socket. `None` is not fatal,
-    /// but never signal an unvalidated pid: pids are reused.
+    /// The pid spawn.sh matched to the socket (see [`Session::pid`]). `None`
+    /// is not fatal, but never signal an unvalidated pid: pids are reused.
     pub pid: Option<u32>,
     /// Whether the socket appeared before the script stopped waiting.
     pub socket_appeared: bool,

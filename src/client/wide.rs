@@ -238,6 +238,11 @@ if chan then
     },
     callback = soon,
   })
+  -- Settings made as Neovim starts fire no OptionSet; a check queued then
+  -- may run before the last of them.
+  if vim.v.vim_did_enter == 0 then
+    api.nvim_create_autocmd('VimEnter', { group = group, once = true, callback = soon })
+  end
   api.nvim_create_autocmd('UILeave', {
     group = group,
     callback = function()

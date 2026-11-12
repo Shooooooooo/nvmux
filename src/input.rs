@@ -13,6 +13,8 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 
+use crate::client::input::PASTE_END;
+
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 
@@ -30,6 +32,8 @@ pub enum Input {
 /// Buffers a sequence split across reads.
 #[derive(Debug, Default)]
 pub struct Decoder {
+    /// An incomplete sequence; inside a paste, as much of its end marker as
+    /// the input so far ends with.
     pending: Vec<u8>,
     /// Inside a bracketed paste, which is dropped.
     pasting: bool,
@@ -52,6 +56,21 @@ enum Piece {
 impl Decoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// One taking up inside a paste whose start was read elsewhere, the
+    /// input so far ending with `matched` bytes of its end marker.
+    pub fn in_paste(matched: usize) -> Self {
+        Self {
+            pending: PASTE_END[..matched].to_vec(),
+            pasting: true,
+        }
+    }
+
+    /// Inside a paste, how many bytes of its end marker the input so far
+    /// ends with; `None` outside one.
+    pub fn paste(&self) -> Option<usize> {
+        self.pasting.then_some(self.pending.len())
     }
 
     /// Decode `bytes` after any pending ones; an incomplete tail stays
@@ -85,14 +104,20 @@ impl Decoder {
         out
     }
 
-    /// Whether an incomplete sequence is pending.
+    /// Whether an incomplete sequence is pending, for [`flush`](Self::flush)
+    /// to settle if nothing completes it. Never a paste's end, which always
+    /// comes.
     pub fn waiting(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pasting && !self.pending.is_empty()
     }
 
     /// Stop waiting: a lone `ESC` is Escape; anything else pending is dropped.
+    /// Inside a paste nothing is: part of its end marker waits for the rest.
     pub fn flush(&mut self) -> Vec<Input> {
-        let lone_esc = self.pending == [ESC] && !self.pasting;
+        if self.pasting {
+            return Vec::new();
+        }
+        let lone_esc = self.pending == [ESC];
         self.pending.clear();
         if lone_esc {
             vec![key(KeyCode::Esc, KeyModifiers::NONE)]
@@ -121,14 +146,13 @@ fn done(len: usize, input: Input) -> Parsed {
 
 /// Inside a paste: consume everything up to and including its end.
 fn pasted(bytes: &[u8]) -> Parsed {
-    const END: &[u8] = b"\x1b[201~";
-    if let Some(at) = bytes.windows(END.len()).position(|w| w == END) {
-        return Parsed::Done(at + END.len(), Piece::PasteEnd);
+    if let Some(at) = bytes.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+        return Parsed::Done(at + PASTE_END.len(), Piece::PasteEnd);
     }
     // Hold back a possible prefix of the end marker.
-    let keep = (1..END.len())
+    let keep = (1..PASTE_END.len())
         .rev()
-        .find(|&n| bytes.len() >= n && bytes.ends_with(&END[..n]))
+        .find(|&n| bytes.len() >= n && bytes.ends_with(&PASTE_END[..n]))
         .unwrap_or(0);
     match bytes.len() - keep {
         0 => Parsed::Need,
@@ -564,6 +588,39 @@ mod tests {
         assert!(d.feed(b"\x1b[200~w").is_empty());
         assert!(d.feed(b"q\x1b[20").is_empty());
         assert_eq!(d.feed(b"1~k"), vec![pressed(KeyCode::Char('k'), NONE)]);
+    }
+
+    /// The relay read the start; a `q` or `Enter` in the rest would close a
+    /// panel.
+    #[test]
+    fn a_paste_begun_elsewhere_goes_nowhere_through_its_end() {
+        let mut d = Decoder::in_paste(0);
+        assert!(d.feed(b"q\r\x1b").is_empty());
+        assert_eq!(d.paste(), Some(1));
+        assert_eq!(d.feed(b"[201~q"), vec![pressed(KeyCode::Char('q'), NONE)]);
+        assert_eq!(d.paste(), None);
+        assert!(d.feed(b"\x1b[200~abc\x1b[20").is_empty());
+        assert_eq!(d.paste(), Some(4), "left in a paste, its end begun");
+    }
+
+    /// The relay read `ESC [ 2 0` too: begun empty, the panel never saw the
+    /// end, and took everything after as pasted.
+    #[test]
+    fn a_paste_begun_elsewhere_ends_where_the_relay_left_its_end() {
+        let mut d = Decoder::in_paste(4);
+        assert_eq!(d.feed(b"1~q"), vec![pressed(KeyCode::Char('q'), NONE)]);
+        assert_eq!(d.paste(), None);
+    }
+
+    /// Flushed, part of a paste's end was dropped and the rest taken as
+    /// pasted: a panel read no key until another paste ended.
+    #[test]
+    fn a_pause_in_a_pastes_end_is_not_timed_out() {
+        let mut d = Decoder::new();
+        assert!(d.feed(b"\x1b[200~abc\x1b[20").is_empty());
+        assert!(!d.waiting(), "a paste's end is timed");
+        assert!(d.flush().is_empty());
+        assert_eq!(d.feed(b"1~q"), vec![pressed(KeyCode::Char('q'), NONE)]);
     }
 
     #[test]

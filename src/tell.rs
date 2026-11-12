@@ -136,6 +136,13 @@ fn to_tell(heard: Option<u64>, news: &[News], here: bool) -> Vec<&News> {
         .collect()
 }
 
+/// Whether the watcher's last number, `numbered`, is below what was `heard`
+/// of the session: a new server numbering afresh, as `:restart` leaves at
+/// the same socket, all of whose news is news.
+fn renumbered(heard: Option<u64>, numbered: u64) -> bool {
+    heard.is_some_and(|h| numbered < h)
+}
+
 /// Messages to the notifier thread.
 enum Command {
     Watch {
@@ -454,7 +461,16 @@ fn round(watched: &mut Vec<Watched>, front: &str, settings: KeySettings, now: In
         w.last = Some(read_at);
         let pushed = std::mem::take(&mut w.pushed);
         let (news, listening) = match heard {
-            Heard::Said { news, listening } => (news, listening),
+            Heard::Said {
+                news,
+                listening,
+                numbered,
+            } => {
+                if renumbered(w.heard, numbered) {
+                    w.heard = Some(0);
+                }
+                (news, listening)
+            }
             Heard::Gone => {
                 w.told = false;
                 w.next = read_at + notes::POLL;
@@ -683,6 +699,17 @@ mod tests {
             .collect();
         assert_eq!(told, [7]);
         assert!(to_tell(Some(7), &said, false).is_empty(), "told already");
+    }
+
+    /// The same number again is the same server with nothing new: taking it
+    /// for a new one would tell every kept entry again at each read.
+    #[test]
+    fn only_numbers_below_those_heard_are_a_new_servers() {
+        assert!(renumbered(Some(5), 2));
+        assert!(!renumbered(Some(5), 5));
+        assert!(!renumbered(Some(5), 7));
+        assert!(!renumbered(None, 0));
+        assert!(!renumbered(Some(0), 0));
     }
 
     /// Not news from a terminal on screen, nor a progress message, which the

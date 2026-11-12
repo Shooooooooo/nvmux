@@ -62,6 +62,7 @@ require_private_dir() {
 # a `grep` would put the flag and path on a command line `serving_pid` reads.
 # Quoted: the path is data, not a pattern.
 owns_socket() {
+  ours "$1" || return 1
   case " $(cmdline "$1") " in
     *" --listen $2 "*) return 0 ;;
   esac
@@ -95,17 +96,44 @@ cmdline() {
   fi
 }
 
+# The effective uid of a pid, unsigned as `id -u` prints it; fails if there is
+# no such process. Linux owns /proc/<pid> by it, unlike the files inside, which
+# a process that is not dumpable gives to root. macOS's `ps` prints a uid past
+# 2^31-1 negative (`%d`).
+uid_of() {
+  if [ -r /proc/self/cmdline ]; then
+    [ -d "/proc/$1" ] || return 1
+    set -- $(ls -ldn "/proc/$1" 2>/dev/null)
+    [ -n "${3:-}" ] && printf '%s\n' "$3"
+  else
+    # Parenthesized: BWK awk, macOS's, takes no bare `<` in printf's arguments.
+    set -- $(ps -o uid= -p "$1" 2>/dev/null |
+      awk '{ printf "%.0f\n", ($1 < 0 ? $1 + 4294967296 : $1) }')
+    [ -n "${1:-}" ] && printf '%s\n' "$1"
+  fi
+}
+
+# Is this pid ours? Only our processes can be sessions. Anyone's can name our
+# socket: session ids show in `ps`.
+ours() {
+  nvmux_owner=$(uid_of "$1") && [ "$nvmux_owner" = "$(id -u)" ]
+}
+
 # The pid serving this socket, or nothing.
 #
-# The first process whose command line has `--listen`, this path, then a space
-# or its end: `a.sock` is not `a.sock2`. The socket is a session's identity:
-# pids are reused, paths are not.
+# The first process of ours whose command line has `--listen`, this path, then
+# a space or its end: `a.sock` is not `a.sock2`. The socket is a session's
+# identity: pids are reused, paths are not.
 #
 # `ps` first: one call reads every command line, where a `/proc` loop forks
 # per process (seconds on a host with a thousand). `/proc` is the fallback for
 # minimal containers without `ps`. `-A`, not `-e`, which on macOS shows the
-# environment. Callers test for empty output: the `awk` succeeds whether or
-# not it matched.
+# environment. One `-o` per keyword: FreeBSD and NetBSD read all of an `-o`
+# argument after its first `=` as that column's header. The uid is matched in
+# the `awk`: procps lists the union of `-A` and `-u`, every process. It is
+# compared modulo 2^32, as procps and macOS print one past 2^31-1 negative
+# (`%d`) and `id -u` unsigned. Callers test for empty output: the `awk`
+# succeeds whether or not it matched.
 #
 # The flag is split, so the `awk`'s own command line, which `ps` may catch,
 # cannot match. Nor can the shell's: nvmux runs `sh -s`, arguments on stdin.
@@ -119,10 +147,11 @@ cmdline() {
 # mawk 1.3.3 when a line splits into more than 32767 fields.
 serving_pid() {
   if command -v ps >/dev/null 2>&1; then
-    ps -ww -A -u "$(id -u)" -o pid=,args= 2>/dev/null \
-      | nvmux_sock=$1 awk '
+    ps -ww -A -o uid= -o pid= -o args= 2>/dev/null \
+      | nvmux_sock=$1 awk -v uid="$(id -u)" '
           BEGIN { want = " --lis" "ten " ENVIRON["nvmux_sock"] " " }
-          index($0 " ", want) && $2 !~ /(^|\/)[efp]?grep$/ { print $1; exit }'
+          !index($0 " ", want) || ($1 < 0 ? $1 + 4294967296 : $1) != uid { next }
+          $3 !~ /(^|\/)[efp]?grep$/ { print $2; exit }'
     return
   fi
 
@@ -135,7 +164,9 @@ serving_pid() {
       case " $nvmux_args " in
         *" --listen $1 "*)
           c=${c#/proc/}
-          printf '%s\n' "${c%/cmdline}"
+          c=${c%/cmdline}
+          ours "$c" || continue
+          printf '%s\n' "$c"
           return 0
           ;;
       esac
@@ -155,15 +186,12 @@ take_listening() {
   [ -z "$NVMUX_LISTENING_TAKEN" ] || return 0
   NVMUX_LISTENING_TAKEN=1
 
-  # `ps` first, as in `serving_pid`. `tr` gives `/proc` entries the
-  # space-joined shape of `ps -o args=`, so one extractor reads both.
+  # `ps` first, as in `serving_pid`; `proc_listening` gives `/proc` the shape
+  # of its lines, so one extractor reads both.
   if command -v ps >/dev/null 2>&1; then
-    NVMUX_LISTENING=$(ps -ww -A -u "$(id -u)" -o args= 2>/dev/null | listen_args)
+    NVMUX_LISTENING=$(ps -ww -A -o uid= -o args= 2>/dev/null | listen_args)
   elif [ -r /proc/self/cmdline ]; then
-    NVMUX_LISTENING=$(for c in /proc/[0-9]*/cmdline; do
-      tr '\0' ' ' < "$c" 2>/dev/null
-      printf '\n'
-    done | listen_args)
+    NVMUX_LISTENING=$(proc_listening | listen_args)
   fi
 
   NVMUX_LISTENING="
@@ -171,22 +199,40 @@ $NVMUX_LISTENING
 "
 }
 
-# The `--listen` argument of every command line on stdin, one per line.
+# Each /proc command line that names a `--listen`, as a `ps -o uid= -o args=`
+# line: the uid, then the command line joined by `tr`, newlines included, or
+# an argument holding one could start a line with our uid. Not inline in a
+# `$( )`: bash 3.2, macOS's sh, ends that at a `case` pattern's `)`.
+proc_listening() {
+  for c in /proc/[0-9]*/cmdline; do
+    nvmux_args=$(tr '\0\n' '  ' 2>/dev/null < "$c")
+    case $nvmux_args in
+      *" --listen "*)
+        c=${c#/proc/}
+        nvmux_owner=$(uid_of "${c%/cmdline}") &&
+          printf '%s %s\n' "$nvmux_owner" "$nvmux_args"
+        ;;
+    esac
+  done
+}
+
+# The `--listen` argument of each command line of ours on stdin, where every
+# line is a uid and then a command line. The uid is compared as in
+# `serving_pid`.
 #
 # Taken to end of line, not the next space: `spawn.sh` puts the socket last
 # and a runtime directory may contain a space. The trailing trim is for
 # `/proc`, whose command lines end in a separator. The flag is split in two
 # so this `awk`'s own command line, which `ps` may catch, cannot match itself.
 listen_args() {
-  awk '
+  awk -v uid="$(id -u)" '
     BEGIN { flag = " --lis" "ten " }
     {
       at = index($0, flag)
-      if (at > 0) {
-        path = substr($0, at + length(flag))
-        sub(/[ 	]*$/, "", path)
-        if (path != "") print path
-      }
+      if (!at || ($1 < 0 ? $1 + 4294967296 : $1) != uid) next
+      path = substr($0, at + length(flag))
+      sub(/[ 	]*$/, "", path)
+      if (path != "") print path
     }'
 }
 

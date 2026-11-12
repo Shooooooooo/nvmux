@@ -509,6 +509,14 @@ fn ss3(bytes: &[u8], final_: bool) -> Step {
 
 /// A `CSI` sequence: a key, a mouse report, a focus report, or a reply.
 fn csi(bytes: &[u8], final_: bool) -> Step {
+    // Alt-[: `ESC [` alone once the wait is over, as termkey reads it, or
+    // before a byte that cannot continue it, which starts the next key. DEL
+    // is Backspace here, not a final byte as in termkey.
+    match bytes.get(2) {
+        None if !final_ => return Step::More,
+        Some(0x20..=0x7e) => {}
+        _ => return Step::Took(2, Some(Input::Keys("<M-[>".into()))),
+    }
     // The legacy X10 mouse report: `CSI M` and three bytes, any bytes.
     if bytes.get(2) == Some(&b'M') {
         if bytes.len() < 6 {
@@ -902,6 +910,7 @@ mod tests {
     #[test]
     fn two_escapes_are_two_escapes() {
         assert_eq!(keys(b"\x1b\x1b"), "<Esc><Esc>");
+        assert_eq!(keys(b"\x1b\x1b["), "<Esc><M-[>");
         let mut p = Parser::default();
         let mut out = Vec::new();
         p.feed(b"\x1b\x1b[", &mut out);
@@ -917,8 +926,13 @@ mod tests {
         assert_eq!(keys(b"\x1bP"), "<M-P>");
         assert_eq!(keys(b"\x1b]"), "<M-]>");
         assert_eq!(keys(b"\x1b_"), "<M-_>");
+        assert_eq!(keys(b"\x1b["), "<M-[>");
         assert_eq!(keys(b"\x1b^"), "<M-^>");
         assert_eq!(keys(b"\x1bPx"), "<M-P>x");
+        assert_eq!(keys(b"\x1b[\r"), "<M-[><CR>");
+        assert_eq!(keys(b"\x1b[\x7f"), "<M-[><BS>");
+        assert_eq!(keys("\x1b[é".as_bytes()), "<M-[>é");
+        assert_eq!(keys(b"\x1b[\x1b[A"), "<M-[><Up>");
         assert_eq!(keys(b"\x1b<"), "<M-lt>");
         assert_eq!(keys(b"\x1b "), "<M-Space>");
         assert_eq!(keys(b"\x1b\x01"), "<M-C-a>");
@@ -1004,6 +1018,12 @@ mod tests {
         assert_eq!(out, vec![Input::Keys("a".into())]);
         p.feed(b"5A", &mut out);
         assert_eq!(out[1], Input::Keys("<C-Up>".into()));
+        // Cut after `ESC [`, which is Alt-[ only once the wait is over.
+        let mut out = Vec::new();
+        p.feed(b"\x1b[", &mut out);
+        assert!(out.is_empty() && p.waiting());
+        p.feed(b"A", &mut out);
+        assert_eq!(out, vec![Input::Keys("<Up>".into())]);
         // A character split the same way.
         let bytes = "中".as_bytes();
         let mut out = Vec::new();

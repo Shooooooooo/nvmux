@@ -2009,6 +2009,21 @@ mod tests {
         assert_eq!(key(&mut s, KeyCode::Char('S')), Step::Close);
     }
 
+    /// Then `<prefix> d` neither closes it nor changes a setting.
+    #[test]
+    fn every_prefix_arms_the_screen() {
+        for (byte, chord) in test_support::prefix_chords() {
+            let label = keys::prefix_label(byte);
+            let mut s = state();
+            s.live.keys.prefix = byte;
+            let before = s.live.clone();
+            assert_eq!(s.on_key(press(chord)), Step::Stay, "{label}");
+            assert!(s.armed, "{label}");
+            assert_eq!(key(&mut s, KeyCode::Char('d')), Step::Stay, "{label} d");
+            assert_eq!(s.live, before, "{label} d changed a setting");
+        }
+    }
+
     /// While the prefix is being changed, its chord is a choice, not the
     /// prefix.
     #[test]

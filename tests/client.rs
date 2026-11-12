@@ -37,6 +37,10 @@ const DA1_REPLY_OSC52: &[u8] = b"\x1b[?62;22;52c";
 /// The kitty keyboard query and "supported, no flags set".
 const KITTY_QUERY: &[u8] = b"\x1b[?u";
 const KITTY_REPLY: &[u8] = b"\x1b[?0u";
+/// A status report request and "OK". Neovim 0.12 starting with a UI attached
+/// waits 100 ms for it, then warns (E1568).
+const DSR: &[u8] = b"\x1b[5n";
+const DSR_REPLY: &[u8] = b"\x1b[0n";
 
 struct Terminal {
     child: std::process::Child,
@@ -298,6 +302,16 @@ impl Terminal {
         cells
     }
 
+    /// Whether the client has not exited; reaps it if it has.
+    fn running(&mut self) -> bool {
+        if self.exited.is_none() {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exited = Some(common::exit_code(status));
+            }
+        }
+        self.exited.is_none()
+    }
+
     /// SIGHUP the client, as nvmux retires one; returns its exit code.
     fn hang_up(&mut self) -> Option<u32> {
         self.signal(Signal::SIGHUP)
@@ -393,9 +407,22 @@ fn session(
     nvmux::rpc::Client<std::os::unix::net::UnixStream>,
     PathBuf,
 ) {
+    session_launched(scratch, tag, &common::launch())
+}
+
+/// [`session`], started with `launch`.
+fn session_launched(
+    scratch: &Scratch,
+    tag: &str,
+    launch: &nvmux::launch::Launch,
+) -> (
+    PathBuf,
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    PathBuf,
+) {
     let t = scratch.transport();
     let session = t
-        .create_session(&common::unique(tag), &common::launch(), common::anywhere())
+        .create_session(&common::unique(tag), launch, common::anywhere())
         .expect("create");
     let sock = t.local_socket_for(&session).expect("socket path");
     let rpc = nvmux::rpc::Client::connect(&sock, Duration::from_secs(5)).expect("connect");
@@ -594,6 +621,334 @@ fn an_undone_restart_leaves_the_client_where_it_was() {
         Vec::<bool>::new(),
         "no UI came back"
     );
+}
+
+/// The write fails as it does once a quitting server has gone, but before
+/// the client has read its `restart`. A stand-in server, as Neovim makes
+/// that order rare.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_key_that_cannot_be_sent_leaves_the_restart_to_be_followed() {
+    let scratch = Scratch::new("client-unsent");
+    let (mut term, listener, mut server) = unsent(&scratch);
+    let restart = Value::Array(vec![
+        2.into(),
+        "redraw".into(),
+        Value::Array(vec![
+            Value::Array(vec!["restart".into(), Value::Array(vec!["x".into()])]),
+            Value::Array(vec!["flush".into(), Value::Array(Vec::new())]),
+        ]),
+    ]);
+    let mut frame = Vec::new();
+    rmpv::encode::write_value(&mut frame, &restart).expect("encode the restart");
+    server.write_all(&frame).expect("send the restart");
+    drop(server);
+    // Held: the client ends once a connection closes under it.
+    let next = connection(&mut term, &listener);
+    assert!(
+        next.is_some(),
+        "the client did not connect again; exit {:?}",
+        term.exited
+    );
+    assert!(term.running(), "the client ended: {:?}", term.exited);
+}
+
+/// With no `restart` sent, the write's error is the client's exit.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_key_that_cannot_be_sent_ends_the_client_with_its_server() {
+    let scratch = Scratch::new("client-unsent-end");
+    let (mut term, _listener, server) = unsent(&scratch);
+    drop(server);
+    assert_eq!(term.exit_within(Duration::from_secs(5)), Some(1));
+}
+
+/// A client whose stand-in server has stopped reading, failing the key
+/// typed next; checks it then waits rather than spins, as its socket still
+/// polls writable. macOS would drop the write instead of failing it.
+#[cfg(target_os = "linux")]
+fn unsent(
+    scratch: &Scratch,
+) -> (
+    Terminal,
+    std::os::unix::net::UnixListener,
+    std::os::unix::net::UnixStream,
+) {
+    std::fs::create_dir_all(&scratch.0).expect("create the scratch");
+    let sock = scratch.0.join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the socket");
+    listener
+        .set_nonblocking(true)
+        .expect("a non-blocking listener");
+    let config = scratch.0.join("config.toml");
+    std::fs::write(&config, "").expect("write the config");
+    let mut term = Terminal::spawn(&sock, &config);
+    let Some(mut server) = connection(&mut term, &listener) else {
+        panic!("the client never connected; exit {:?}", term.exited);
+    };
+    // Read the client's start, which it sends in one write: left unread, it
+    // would have the close reset the connection, and the client end on that
+    // read rather than on the failed write.
+    server
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("a read timeout");
+    let mut buf = vec![0u8; 64 * 1024];
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && matches!(server.read(&mut buf), Ok(1..)) {}
+    server
+        .shutdown(std::net::Shutdown::Read)
+        .expect("stop reading");
+    let before = cpu_time(term.child.id());
+    term.type_bytes(b"j");
+    term.pump_until(Duration::from_secs(1), |_| false);
+    assert!(
+        term.running(),
+        "the write ended the client: {:?}",
+        term.exited
+    );
+    let spent = cpu_time(term.child.id()) - before;
+    assert!(
+        spent < Duration::from_millis(250),
+        "the client spun for {spent:?} of the second after the failed write"
+    );
+    (term, listener, server)
+}
+
+/// The client's next connection to `listener`, a non-blocking one, unless it
+/// exits first or 5 s pass.
+#[cfg(target_os = "linux")]
+fn connection(
+    term: &mut Terminal,
+    listener: &std::os::unix::net::UnixListener,
+) -> Option<std::os::unix::net::UnixStream> {
+    let mut conn = None;
+    common::wait_until(Duration::from_secs(5), || {
+        term.pump_until(Duration::from_millis(20), |_| false);
+        conn = listener.accept().ok().map(|(conn, _)| conn);
+        conn.is_some() || !term.running()
+    });
+    conn
+}
+
+/// The user and system CPU time process `pid` has used.
+#[cfg(target_os = "linux")]
+fn cpu_time(pid: u32) -> Duration {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read the stat");
+    // utime and stime, fields 14 and 15; the name before them, field 2, is
+    // in parentheses and may hold spaces.
+    let (_, rest) = stat.rsplit_once(')').expect("a stat line");
+    let ticks: u64 = rest
+        .split_whitespace()
+        .skip(11)
+        .take(2)
+        .map(|n| n.parse::<u64>().expect("a tick count"))
+        .sum();
+    // SAFETY: sysconf takes no pointers.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    Duration::from_millis(ticks * 1000 / hz as u64)
+}
+
+/// [`session`] without ShaDa, which the restart's `:qall` would write the
+/// command line to, and with `init` as its config if given. A restarted
+/// server keeps both arguments.
+fn restartable(
+    scratch: &Scratch,
+    tag: &str,
+    init: Option<&str>,
+) -> (
+    PathBuf,
+    nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    PathBuf,
+) {
+    let launch = match init {
+        Some(lua) => {
+            let path = scratch.0.join("init.lua");
+            // Makes the directory private, as the transport requires.
+            scratch.transport();
+            std::fs::write(&path, lua).expect("write the init file");
+            common::launch_with(&format!("-u {} -i NONE", path.display()))
+        }
+        None => common::launch_with("-i NONE"),
+    };
+    session_launched(scratch, tag, &launch)
+}
+
+/// Whether the screen's first line is `line`, wherever it is centred.
+fn first(screen: &str, line: &str) -> bool {
+    screen.lines().next().map(str::trim) == Some(line)
+}
+
+/// A client drawing the session, restarted by typing `restart` (`:restart`
+/// or `:restart!`), and a connection to the new server once the client draws
+/// it. The new server puts "after the restart" on its first line.
+fn restarted(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    sock: &Path,
+    config: &Path,
+    restart: &str,
+) -> (Terminal, nvmux::rpc::Client<std::os::unix::net::UnixStream>) {
+    let old = server_pid(sock).expect("the server's pid");
+    // Unmodified, or the restart's `:qall` refuses to quit.
+    rpc.command(
+        "setlocal noswapfile | call setline(1, 'before the restart') | setlocal nomodified",
+    )
+    .expect("setline");
+    let mut term = Terminal::spawn(sock, config).answering(DSR, DSR_REPLY);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| first(s, "before the restart")),
+        "the session was never drawn:\n{}",
+        term.text()
+    );
+    term.type_bytes(
+        format!(":{restart} setlocal noswapfile | call setline(1, 'after the restart')\r")
+            .as_bytes(),
+    );
+    let mut new = None;
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            // So the new server's `DSR` is answered in time.
+            term.pump_until(Duration::from_millis(20), |_| false);
+            new = server_pid(sock).filter(|pid| *pid != old);
+            new.is_some()
+        }),
+        "no new server took the socket:\n{}",
+        term.text()
+    );
+    // The scratch stops sessions by their recorded pid.
+    let json = sock.with_extension("json");
+    let mut meta = common::read_meta(&json);
+    meta["pid"] = serde_json::json!(new);
+    common::write_meta(&json, &meta);
+
+    let rpc = nvmux::rpc::Client::connect(sock, Duration::from_secs(5)).expect("connect");
+    let shown = term.pump_until(Duration::from_secs(15), |s| first(s, "after the restart"));
+    assert!(term.running(), "the client left with the old server");
+    assert!(
+        shown,
+        "the restarted session was never drawn:\n{}",
+        term.text()
+    );
+    (term, rpc)
+}
+
+/// Hangs up `term`'s client once it settles, and checks that a fresh one
+/// draws the same screen.
+fn drawn_as_afresh(
+    mut term: Terminal,
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    sock: &Path,
+    config: &Path,
+) {
+    assert!(settle(
+        &mut term,
+        Duration::from_millis(400),
+        Duration::from_secs(10)
+    ));
+    let (drawn, text) = (term.cells(), term.text());
+    assert_eq!(term.hang_up(), Some(0));
+    assert!(
+        common::wait_until(Duration::from_secs(5), || rpc.list_uis().ok() == Some(0)),
+        "the client stayed attached"
+    );
+
+    let mut fresh = Terminal::spawn(sock, config);
+    assert!(
+        fresh.pump_until(Duration::from_secs(15), |s| first(s, "after the restart")),
+        "never drawn afresh:\n{}",
+        fresh.text()
+    );
+    assert!(settle(
+        &mut fresh,
+        Duration::from_millis(400),
+        Duration::from_secs(10)
+    ));
+    assert!(
+        drawn == fresh.cells(),
+        "the client's screen:\n{text}\nis not a fresh one's:\n{}",
+        fresh.text()
+    );
+}
+
+/// The row of the screen that is all `'laststatus'` 3's divider between
+/// windows one above another, if any.
+fn divider(screen: &vt100::Screen) -> Option<u16> {
+    (0..ROWS).find(|r| (0..COLS).all(|c| screen.cell(*r, c).is_some_and(|x| x.contents() == "─")))
+}
+
+/// A server `:restart` starts (0.12.1 on) takes the client's requests before
+/// running the user's config, whose settings fire no OptionSet as Neovim
+/// starts. With the config's `'laststatus'` 3, a window closed flies out
+/// behind the divider Neovim draws, not a blank status line.
+#[test]
+fn options_set_as_a_restarted_session_starts_reach_the_client() {
+    require_nvim!();
+    let scratch = Scratch::new("client-restart-ls");
+    let init = "vim.o.laststatus = 3";
+    let (sock, mut rpc, config) = restartable(&scratch, "client-restart-ls", Some(init));
+    if !restarts(&mut rpc) {
+        eprintln!("skipping: :restart needs Neovim 0.12");
+        return;
+    }
+    let (mut term, mut rpc) = restarted(&mut rpc, &sock, &config, "restart");
+    rpc.command("split").expect("split");
+    let row = rpc.eval("winheight(0)").expect("the height").as_u64();
+    let row = u16::try_from(row.expect("a number")).expect("on the screen");
+    assert!(
+        term.pump(Duration::from_secs(5), |t| divider(t.parser.screen())
+            == Some(row)),
+        "never split:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+
+    let from = term.output.len();
+    rpc.command("close").expect("close");
+    assert!(
+        term.pump(Duration::from_secs(5), |t| divider(t.parser.screen())
+            .is_none()),
+        "never closed:\n{}",
+        term.text()
+    );
+    term.pump_until(Duration::from_millis(300), |_| false);
+    let mut replay = vt100::Parser::new(ROWS, COLS, 0);
+    replay.process(&term.output[..from]);
+    let mut seen = Vec::new();
+    let mut at = from;
+    while let Some(i) = find(&term.output[at..], SYNC_END) {
+        replay.process(&term.output[at..at + i + SYNC_END.len()]);
+        at += i + SYNC_END.len();
+        seen.push(divider(replay.screen()));
+    }
+    assert!(
+        seen.iter().flatten().any(|r| *r < row),
+        "the divider did not fly out with the window: {seen:?}"
+    );
+}
+
+/// As [`options_set_as_a_restarted_session_starts_reach_the_client`], for a
+/// centring client's measure, which checks again after any window or buffer
+/// event. Here the config's buffer fires BufWinEnter, its wait runs that
+/// check, and Neovim, finding the buffer loaded, enters none as it starts:
+/// measured with `'laststatus'` 2, the global status line would be drawn as
+/// the centred window's own, narrowed with it.
+#[test]
+fn a_restarted_session_is_measured_once_it_has_started() {
+    require_nvim!();
+    let scratch = Scratch::new("client-restart-mid");
+    let init = "vim.cmd.enew()\nvim.wait(20)\nvim.o.laststatus = 3\n";
+    let (sock, mut rpc, config) = restartable(&scratch, "client-restart-mid", Some(init));
+    if !restarts(&mut rpc) {
+        eprintln!("skipping: :restart needs Neovim 0.12");
+        return;
+    }
+    std::fs::write(&config, "[client]\ncentre = \"fixed\"\nwindow_width = 40\n")
+        .expect("write the config");
+    // From 0.12.5 a restart without the bang restores a session, whose
+    // windows are measured anew.
+    let bang = rpc.eval("has('nvim-0.12.5')").ok().and_then(|v| v.as_i64()) == Some(1);
+    let restart = if bang { "restart!" } else { "restart" };
+    let (term, mut rpc) = restarted(&mut rpc, &sock, &config, restart);
+    drawn_as_afresh(term, &mut rpc, &sock, &config);
 }
 
 /// A card (`nvmux::card`), sent in the client's input, is drawn in the margin
@@ -1131,6 +1486,77 @@ fn a_ui_without_windows_of_its_own_is_made_room_for() {
         }),
         "not drawn whole after:\n{}",
         term.text()
+    );
+}
+
+/// Both settings cards reach the client before Neovim answers its detach.
+#[test]
+fn effects_turned_off_and_on_while_neovim_is_busy_keep_windows_of_their_own() {
+    require_nvim!();
+    let scratch = Scratch::new("client-toggled");
+    let (sock, mut rpc, config) = session(&scratch, "client-toggled");
+    rpc.command("setlocal noswapfile | call setline(1, 'toggled')")
+        .expect("setline");
+    rpc.command(
+        "lua _G.left = 0 vim.api.nvim_create_autocmd('UILeave', \
+         { callback = function() _G.left = _G.left + 1 end })",
+    )
+    .expect("count detaches");
+    let on = nvmux::config::Drawing::default();
+    let mut term = Terminal::spawn_told(&sock, &config, &on);
+    assert!(
+        term.pump_until(Duration::from_secs(15), |s| s.starts_with("toggled")),
+        "never drawn:\n{}",
+        term.text()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(5), || multigrid_uis(&mut rpc)
+            == vec![true]),
+        "attached without ext_multigrid: {:?}",
+        multigrid_uis(&mut rpc)
+    );
+
+    // Neovim reads nothing until `go` exists; capped in case the test dies.
+    let busy = scratch.0.join("busy");
+    let go = scratch.0.join("go");
+    let mut other = nvmux::rpc::Client::connect(&sock, Duration::from_secs(30)).expect("connect");
+    let held = other
+        .ask(
+            "nvim_exec_lua",
+            vec![
+                Value::from(
+                    "local busy, go = ... io.open(busy, 'w'):close() local t = vim.uv.hrtime() \
+                     while not vim.uv.fs_stat(go) and vim.uv.hrtime() - t < 2e10 do \
+                     vim.uv.sleep(5) end",
+                ),
+                Value::Array(vec![
+                    Value::from(busy.to_str().expect("a UTF-8 path")),
+                    Value::from(go.to_str().expect("a UTF-8 path")),
+                ]),
+            ],
+        )
+        .expect("keep Neovim busy");
+    assert!(
+        common::wait_until(Duration::from_secs(5), || busy.exists()),
+        "Neovim never got busy"
+    );
+    let mut off = on;
+    off.effects.enabled = false;
+    term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Settings(off)));
+    term.type_bytes(&nvmux::card::encode(&nvmux::card::Command::Settings(on)));
+    // Time for the client to read both.
+    term.pump_until(Duration::from_millis(500), |_| false);
+    std::fs::write(&go, "").expect("let Neovim go");
+    other.reply_to(held).expect("Neovim let go");
+
+    // Until a UI has left, the list is the first attach's.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            let left = rpc.eval("luaeval('_G.left')").expect("the count");
+            left.as_i64().is_some_and(|n| n >= 1) && multigrid_uis(&mut rpc) == vec![true]
+        }),
+        "the client attached again without ext_multigrid: {:?}",
+        multigrid_uis(&mut rpc)
     );
 }
 
@@ -5875,6 +6301,231 @@ fn auto_predicts_over_ssh_and_on_here_as_well() {
         assert_eq!(agent_autocmds(&mut rpc).1 > 0, predicting, "{tag}");
         assert_eq!(term.hang_up(), Some(0), "{tag}: the client's exit");
     }
+}
+
+/// The number of open uv timers, and of `changedtree` callbacks on the tree
+/// of the buffer given.
+const HELD_LUA: &str = "local timers = 0
+  vim.uv.walk(function(h)
+    if h:get_type() == 'timer' and not h:is_closing() then
+      timers = timers + 1
+    end
+  end)
+  local buf = ...
+  return { timers, #vim.treesitter.highlighter.active[buf].tree._callbacks_rec.changedtree }";
+
+/// Holds weakly, in `_G.nvmux_probe`, every function the newest
+/// `changedtree` callback on the given buffer's tree reaches through
+/// upvalues, and the trees of the other highlighted buffers; returns how
+/// many functions.
+const PROBE_LUA: &str = "local buf = ...
+  local cbs = vim.treesitter.highlighter.active[buf].tree._callbacks_rec.changedtree
+  local fns, trees, n = setmetatable({}, { __mode = 'k' }), setmetatable({}, { __mode = 'k' }), 0
+  local function walk(f)
+    if type(f) == 'function' and not fns[f] then
+      fns[f], n = true, n + 1
+      local i, name, v = 1, debug.getupvalue(f, 1)
+      while name do
+        walk(v)
+        i = i + 1
+        name, v = debug.getupvalue(f, i)
+      end
+    end
+  end
+  walk(cbs[#cbs])
+  for b, hl in pairs(vim.treesitter.highlighter.active) do
+    if b ~= buf then
+      trees[hl.tree] = true
+    end
+  end
+  _G.nvmux_probe = { fns, trees }
+  return n";
+
+/// How many of the functions, and of the trees, in `_G.nvmux_probe` are
+/// alive. JIT traces hold what they were compiled from, so they go first.
+const PROBED_LUA: &str = "if jit then
+    jit.flush()
+  end
+  collectgarbage('collect')
+  collectgarbage('collect')
+  local alive = {}
+  for i, held in ipairs(_G.nvmux_probe) do
+    alive[i] = 0
+    for _ in pairs(held) do
+      alive[i] = alive[i] + 1
+    end
+  end
+  return alive";
+
+/// Runs `lua` with `args` in the editor; its result.
+fn exec_lua(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    lua: &str,
+    args: Vec<Value>,
+) -> Value {
+    rpc.call("nvim_exec_lua", vec![lua.into(), Value::Array(args)])
+        .expect("ask the editor")
+}
+
+/// The `i`th count in `v`, an array of them.
+fn count(v: &Value, i: usize) -> i64 {
+    v.as_array()
+        .and_then(|a| a.get(i))
+        .and_then(Value::as_i64)
+        .expect("a count")
+}
+
+/// See [`HELD_LUA`].
+fn held(rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>, buf: &Value) -> (i64, i64) {
+    let v = exec_lua(rpc, HELD_LUA, vec![buf.clone()]);
+    (count(&v, 0), count(&v, 1))
+}
+
+/// Two buffers of Lua highlighted by tree-sitter, `local v1 = 1` to `local
+/// v300 = 300` and the same with `w`, the second current in a window split
+/// above the first's.
+fn highlighted_pair(
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+) -> (Value, Value) {
+    let lua = |name: &str| {
+        format!(
+            "setlocal noswapfile | \
+             call setline(1, map(range(1, 300), '\"local {name}\" . v:val . \" = \" . v:val')) | \
+             lua vim.treesitter.start(0, 'lua')"
+        )
+    };
+    rpc.command(&lua("v")).expect("a highlighted buffer");
+    let one = rpc.eval("bufnr()").expect("its number");
+    rpc.command(&format!("new | {}", lua("w")))
+        .expect("another, split");
+    let two = rpc.eval("bufnr()").expect("its number");
+    (one, two)
+}
+
+/// A predicting client of the session at `sock`, once its agent follows the
+/// trees of `bufs` ([`highlighted_pair`]). `what` names it in failures.
+fn following(
+    sock: &Path,
+    config: &Path,
+    rpc: &mut nvmux::rpc::Client<std::os::unix::net::UnixStream>,
+    bufs: [&Value; 2],
+    what: &str,
+) -> Terminal {
+    let callbacks = bufs.map(|buf| held(rpc, buf).1);
+    let mut term = Terminal::spawn_told(sock, config, &over_ssh(""));
+    assert!(
+        term.pump_until(Duration::from_secs(20), |s| s.contains("local v1 = 1")),
+        "{what}: never drawn:\n{}",
+        term.text()
+    );
+    // The push that sends a window's lines follows its buffer's tree.
+    assert!(
+        common::wait_until(Duration::from_secs(5), || {
+            term.pump_until(Duration::from_millis(20), |_| false);
+            bufs.iter()
+                .zip(callbacks)
+                .all(|(buf, n)| held(rpc, buf).1 > n)
+        }),
+        "{what}: the agent never followed both trees"
+    );
+    term
+}
+
+/// Guards against the agent's timer left open (deleting its group skips its
+/// later UILeave handlers), and against a tree's callbacks, which Neovim
+/// keeps for good, holding on to the agent or to another buffer's tree. The
+/// departed agents' buffer callbacks go at the last edit and the wipe, before
+/// anything is counted.
+#[test]
+fn the_agent_lets_go_of_its_timer_and_state_when_its_client_leaves() {
+    require_nvim!();
+    let tag = "client-gone";
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    let (one, two) = highlighted_pair(&mut rpc);
+    let timers = held(&mut rpc, &one).0;
+    let mut probed = 0;
+    for round in 0..3 {
+        let what = format!("round {round}");
+        let mut term = following(&sock, &config, &mut rpc, [&one, &two], &what);
+        if round == 0 {
+            probed = exec_lua(&mut rpc, PROBE_LUA, vec![one.clone()])
+                .as_i64()
+                .expect("a count");
+            // Gives the agent's timer a callback, which holds the agent.
+            rpc.command("call setline(1, 'local w1 = 0')")
+                .expect("an edit");
+        }
+        assert_eq!(term.hang_up(), Some(0), "{what}: the client's exit");
+        assert!(
+            common::wait_until(Duration::from_secs(5), || agent_autocmds(&mut rpc).0 == 0),
+            "{what}: the agent never left"
+        );
+    }
+    rpc.command(&format!(
+        "call setbufline({one}, 300, 'local x = 0') | bwipeout! {two}"
+    ))
+    .expect("an edit and a wipe");
+    // The agents' `vim.defer_fn` timers close as they run, within a second.
+    common::wait_until(Duration::from_secs(5), || held(&mut rpc, &one).0 == timers);
+    let open = held(&mut rpc, &one).0;
+    let alive = exec_lua(&mut rpc, PROBED_LUA, vec![]);
+    let (functions, trees) = (count(&alive, 0), count(&alive, 1));
+    assert_eq!(open, timers, "uv timers open after, and before");
+    // Neovim keeps the first agent's tree callback, and the little it names.
+    assert!(
+        functions * 4 <= probed,
+        "{functions} of the {probed} functions its tree callback reached are alive"
+    );
+    assert_eq!(trees, 0, "the wiped buffer's tree is alive");
+}
+
+/// Counts `nvim_buf_attach` calls in `_G.nvmux_attaches`.
+const COUNT_ATTACHES_LUA: &str = "_G.nvmux_attaches = 0
+  local attach = vim.api.nvim_buf_attach
+  vim.api.nvim_buf_attach = function(...)
+    _G.nvmux_attaches = _G.nvmux_attaches + 1
+    return attach(...)
+  end";
+
+/// Makes `vim.rpcnotify` fail for the client's channel, as for a closed one,
+/// and changes the shape of the current window, the first one pushed.
+const REFUSE_LUA: &str = "local chan = vim.api.nvim_list_uis()[1].chan
+  _G.nvmux_rpcnotify = vim.rpcnotify
+  vim.rpcnotify = function(c, ...)
+    if c == chan then
+      error('refused')
+    end
+    return _G.nvmux_rpcnotify(c, ...)
+  end
+  vim.cmd('set number!')";
+
+/// A send that fails midway through a push calls leave(), which empties the
+/// tables of trees followed and buffers attached to. Were the rest of the push
+/// to follow and attach anew, a tree would keep for good a callback holding
+/// the other buffer's tree. The send fails at the first window; the second is
+/// then pushed as new, and attaches.
+#[test]
+fn a_send_failing_midway_through_a_push_leaves_no_new_callbacks() {
+    require_nvim!();
+    let tag = "client-refused";
+    let scratch = Scratch::new(tag);
+    let (sock, mut rpc, config) = session(&scratch, tag);
+    let (one, two) = highlighted_pair(&mut rpc);
+    exec_lua(&mut rpc, COUNT_ATTACHES_LUA, vec![]);
+    let mut term = following(&sock, &config, &mut rpc, [&one, &two], tag);
+    let callbacks = [held(&mut rpc, &one).1, held(&mut rpc, &two).1];
+    let attaches = exec_lua(&mut rpc, "return _G.nvmux_attaches", vec![]);
+    assert_eq!(attaches.as_i64(), Some(2), "the agent's buffer attaches");
+    exec_lua(&mut rpc, REFUSE_LUA, vec![]);
+    let left = common::wait_until(Duration::from_secs(5), || agent_autocmds(&mut rpc).0 == 0);
+    exec_lua(&mut rpc, "vim.rpcnotify = _G.nvmux_rpcnotify", vec![]);
+    let after = [held(&mut rpc, &one).1, held(&mut rpc, &two).1];
+    let attached = exec_lua(&mut rpc, "return _G.nvmux_attaches", vec![]);
+    assert!(left, "the agent never left");
+    assert_eq!(after, callbacks, "changedtree callbacks after, and before");
+    assert_eq!(attached, attaches, "buffer attaches after, and before");
+    assert_eq!(term.hang_up(), Some(0), "the client's exit");
 }
 
 /// A remote client, or a local one on `"on"`, scrolls at once on a wheel turn

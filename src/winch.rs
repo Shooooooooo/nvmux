@@ -34,7 +34,10 @@ pub struct Winch {
 
 impl Winch {
     pub fn install() -> Result<Self> {
-        let (read, write) = nix::unistd::pipe()?;
+        // std's, which is close-on-exec: a local shell started during a relay
+        // would pass the pipe on to every session it launches.
+        let (read, write) = std::io::pipe()?;
+        let (read, write) = (OwnedFd::from(read), OwnedFd::from(write));
 
         // Non-blocking: the handler must never block, and `drain` reads until
         // `EAGAIN`, which a blocking read end would turn into a hang.
@@ -182,5 +185,23 @@ mod tests {
             libc::raise(libc::SIGWINCH);
         }
         assert_eq!(WRITE_FD.load(Ordering::Relaxed), -1);
+    }
+
+    /// The local shell skips `pty::before_exec`'s sweep, and would pass the
+    /// pipe on to every session it launches.
+    #[test]
+    fn a_shell_started_while_subscribed_inherits_neither_end() {
+        let _guard = serial();
+        let winch = Winch::install().expect("install");
+        let ends = [winch.fd(), winch._write.as_raw_fd()].map(|fd| fd.to_string());
+        let mut shell = crate::proc::Shell::local().expect("a shell");
+        let held = shell
+            .run(
+                r#"for fd in "$@"; do [ -e "/dev/fd/$fd" ] && printf '%s ' "$fd"; done; :"#,
+                &[&ends[0], &ends[1]],
+            )
+            .expect("the shell is alive")
+            .stdout;
+        assert_eq!(held, "", "the shell holds the pipe's fds {ends:?}");
     }
 }

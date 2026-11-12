@@ -289,14 +289,18 @@ return out";
 const AGENT_LUA: &str = "local chan, predict, keys, ikeys, reach, acks, typing = ...
 local api = vim.api
 local group = api.nvim_create_augroup('nvmux_client_' .. chan, { clear = true })
--- `gone` stops the agent once the client is gone; `unkey` drops its key count.
-local gone, unkey = false, nil
+-- `gone` stops the agent once the client is gone. leave() runs `cleanups`
+-- for what deleting the augroup does not free: a later UILeave handler
+-- would not run, as Neovim skips the rest of a group deleted while it runs.
+local gone, cleanups = false, {}
 local function leave()
   gone = true
-  if unkey then
-    unkey()
-  end
   pcall(api.nvim_del_augroup_by_id, group)
+  local undo = cleanups
+  cleanups = {}
+  for _, f in ipairs(undo) do
+    pcall(f)
+  end
 end
 local function send(...)
   if not pcall(vim.rpcnotify, chan, 'nvmux_client', ...) then
@@ -317,9 +321,15 @@ end)
 au('WinClosed', {}, function(ev)
   send('closed', tonumber(ev.match))
 end)
-au('OptionSet', { pattern = { 'laststatus', 'splitright', 'splitbelow' } }, function()
+local function options()
   send('options', vim.o.laststatus, vim.o.splitright, vim.o.splitbelow)
-end)
+end
+au('OptionSet', { pattern = { 'laststatus', 'splitright', 'splitbelow' } }, options)
+-- Settings made as Neovim starts fire no OptionSet, and a server :restart
+-- started takes the client's requests before the user's config.
+if vim.v.vim_did_enter == 0 then
+  au('VimEnter', { once = true }, options)
+end
 au('UILeave', {}, function()
   if vim.v.event.chan == chan then
     leave()
@@ -372,7 +382,7 @@ if predict then
     local keyns = api.nvim_create_namespace('nvmux_client_keys_' .. chan)
     _G.nvmux_taken = _G.nvmux_taken or {}
     _G.nvmux_taken[chan] = 0
-    unkey = function()
+    cleanups[#cleanups + 1] = function()
       vim.on_key(nil, keyns)
       _G.nvmux_taken[chan] = nil
     end
@@ -752,7 +762,7 @@ if predict then
   end
   local function follow(buf)
     local hl = vim.treesitter.highlighter.active[buf]
-    if not hl or followed[buf] == hl.tree then
+    if gone or not hl or followed[buf] == hl.tree then
       return
     end
     local tree = hl.tree
@@ -839,7 +849,7 @@ if predict then
     e.over = e.size > 2000 or #e.list > 100
   end
   local function attach(buf)
-    if attached[buf] then
+    if gone or attached[buf] then
       return
     end
     attached[buf] = api.nvim_buf_attach(buf, false, {
@@ -1056,6 +1066,15 @@ if predict then
     end
   end
   local timer = vim.uv.new_timer()
+  -- Neovim keeps a tree's callbacks for good and a buffer's until its next
+  -- change (see edited): once gone they reach empty tables and a `soon` that
+  -- does nothing, not the rest of the agent. A push whose send fails goes on
+  -- after this, so follow() and attach() check `gone`.
+  cleanups[#cleanups + 1] = function()
+    timer:close()
+    soon = function() end
+    have, edits, attached, ticks, stale, followed = {}, {}, {}, {}, {}, {}
+  end
   au({ 'WinResized', 'BufWinEnter', 'WinNew', 'TabEnter', 'VimResized', 'CursorHold',
     'CursorHoldI' }, {}, function()
     soon()
@@ -1269,11 +1288,6 @@ if predict then
     reach = tonumber(ev.data) or reach
     said, fixed, decorated = nil, nil, nil
     soon()
-  end)
-  au('UILeave', {}, function()
-    if vim.v.event.chan == chan then
-      timer:close()
-    end
   end)
   -- With typing prediction, what would make an Insert-mode key differ from
   -- plain typing (typing::Facts). Sent after InsertEnter has run its course
@@ -2542,6 +2556,7 @@ impl App {
                 self.leave(wanted, now);
                 true
             }
+            // Not turned back on here: the UIs decide after the re-attach.
             Attach::Leaving { multigrid } => {
                 self.attach = Attach::Leaving {
                     multigrid: multigrid && wanted,
@@ -2712,6 +2727,12 @@ impl App {
                         if let Attach::Leaving { multigrid } = self.attach {
                             self.reset();
                             self.attach_as(multigrid);
+                            // The UIs decide again: multigrid may be wanted
+                            // back since the detach, or the UI that kept it
+                            // away gone unseen while leaving.
+                            if !multigrid {
+                                self.uis_changed(now);
+                            }
                         }
                     }
                     Some(Ask::Fence { sent, fenced }) => {
@@ -4782,7 +4803,7 @@ impl App {
             );
             let until = p.deadline(cause.at);
             let Some(rows) = self.side_rows(grid, left) else {
-                self.give_up(grid);
+                self.give_up(grid, now);
                 return false;
             };
             // Rows moved sideways do not also slide.
@@ -4970,7 +4991,7 @@ impl App {
     fn fill_in(&mut self, now: Instant) {
         for grid in self.anim.held() {
             if !self.fill_in_grid(grid, now) {
-                self.give_up(grid);
+                self.give_up(grid, now);
                 if let Some(p) = self.predict.as_mut() {
                     p.typed.missed();
                 }
@@ -4981,8 +5002,8 @@ impl App {
 
     /// Stops scrolling `grid` ahead: it shows Neovim's view again, and the
     /// scrolls' inputs are replayed from the next ack ([`App::replay`]).
-    fn give_up(&mut self, grid: u64) {
-        let seqs = self.anim.give_up(grid);
+    fn give_up(&mut self, grid: u64, now: Instant) {
+        let seqs = self.anim.give_up(grid, now);
         if let Some(p) = self.predict.as_mut() {
             p.given_up(&seqs);
         }
@@ -5270,7 +5291,7 @@ impl App {
                 k,
                 "client: a scroll ahead its key's frame did not make, given up"
             );
-            self.give_up(grid);
+            self.give_up(grid, now);
             self.dirty = true;
         }
         // Whether the screen is this ack's frame (not one drawn after more
@@ -5423,7 +5444,7 @@ impl App {
                     }
                     // Drop their scrolls ahead too (a hidden step made none,
                     // nor any after it).
-                    self.give_up(grid);
+                    self.give_up(grid, now);
                     let seqs = self.anim.drop_chain(&self.model, grid, now);
                     let rest: Vec<u64> = seqs.into_iter().filter(|&q| q != k).collect();
                     self.forget(&rest);
@@ -5508,7 +5529,7 @@ impl App {
     /// ([`predict::Typed::blinded`]).
     fn drop_steps(&mut self, grid: u64, now: Instant) {
         if self.anim.chain(grid).is_some() {
-            self.give_up(grid);
+            self.give_up(grid, now);
         }
         let seqs = self.anim.drop_chain(&self.model, grid, now);
         self.forget(&seqs);
@@ -5943,7 +5964,7 @@ impl App {
         // Steps not acked in time are dropped like scrolls ahead, blind
         // until the next ack.
         for (grid, seqs) in self.anim.lapsed(&self.model, now) {
-            self.give_up(grid);
+            self.give_up(grid, now);
             self.forget(&seqs);
         }
         self.anim.advance(now);
@@ -6119,14 +6140,12 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut buf = vec![0u8; 64 * 1024];
 
-    let outcome = 'session: loop {
+    let outcome = loop {
         app.tick(Instant::now());
         if app.take_refresh() {
             refresh(sock, app.size());
         }
-        if let Err(e) = app.outbox.send(&mut stream) {
-            break Err(anyhow::Error::from(e).context("writing to the session"));
-        }
+        let unsent = send(&mut app, &mut stream);
         let said = app.take_said();
         if !said.is_empty() {
             if let Err(e) = crate::term::write_stdout(&said) {
@@ -6137,7 +6156,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         let timeout = app.wake_at(now).map_or(-1, |at| {
             at.saturating_duration_since(now).as_micros().div_ceil(1000) as libc::c_int
         });
-        let sock_events = if app.outbox.is_empty() {
+        // After a failed write the socket can poll writable yet take nothing,
+        // so the next write waits for something else to wake the loop.
+        let sock_events = if app.outbox.is_empty() || unsent.is_some() {
             libc::POLLIN
         } else {
             libc::POLLIN | libc::POLLOUT
@@ -6170,46 +6191,25 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
             app.resized(term::size());
         }
         if n > 0 && fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            match inbox.fill(&mut stream) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Frames read with the end would be dropped, and a
-                    // `restart` may be among them.
-                    while let Ok(Some(frame)) = inbox.take_frame() {
-                        app.message(frame, now);
+            match read(&mut app, &mut inbox, &mut stream, unsent, now) {
+                None => {}
+                Some(Ended::Leave(outcome)) => break outcome,
+                // Neovim gives the new server the old one's `--listen`
+                // address and has it listening before the old one quits, so
+                // the same socket (or ssh forward) reaches it.
+                Some(Ended::Restart) => match connect(sock) {
+                    Ok(next) => {
+                        tracing::info!("client: attaching to the restarted server");
+                        stream = next;
+                        inbox = Inbox::default();
+                        app.restarted();
+                        continue;
                     }
-                    if !app.restarting() {
+                    Err(e) => {
+                        tracing::info!(error = %e, "client: no server after the restart");
                         break Ok(());
                     }
-                    // Neovim gives the new server the old one's `--listen`
-                    // address and has it listening before the old one quits,
-                    // so the same socket (or ssh forward) reaches it.
-                    match connect(sock) {
-                        Ok(next) => {
-                            tracing::info!("client: attaching to the restarted server");
-                            stream = next;
-                            inbox = Inbox::default();
-                            app.restarted();
-                            continue 'session;
-                        }
-                        Err(e) => {
-                            tracing::info!(error = %e, "client: no server after the restart");
-                            break Ok(());
-                        }
-                    }
-                }
-                Err(e) => break Err(anyhow::Error::from(e).context("reading from the session")),
-            }
-            loop {
-                match inbox.take_frame() {
-                    Ok(Some(frame)) => app.message(frame, now),
-                    Ok(None) => break,
-                    Err(e) => {
-                        break 'session Err(
-                            anyhow::Error::from(e).context("reading from the session")
-                        );
-                    }
-                }
+                },
             }
         }
         if n > 0 && crate::pty::ready(&fds[0]) {
@@ -6226,10 +6226,9 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
         }
         // Send keys before composing the frame they may have predicted,
         // which would otherwise delay them about a millisecond each on an
-        // already slow link.
-        if let Err(e) = app.outbox.send(&mut stream) {
-            break Err(anyhow::Error::from(e).context("writing to the session"));
-        }
+        // already slow link. A failed write is tried again, and kept, at the
+        // top of the loop.
+        let _ = send(&mut app, &mut stream);
         if app.due(now) {
             // Empty when nothing changed and nothing was queued (see
             // `Screen::draw_into`).
@@ -6257,6 +6256,63 @@ pub fn run(sock: &Path) -> anyhow::Result<()> {
     }
     let _ = crate::term::write_stdout(term::CLOSING);
     outcome
+}
+
+/// What follows the end of the connection to the server.
+#[derive(Debug)]
+enum Ended {
+    /// Attach to the server a `:restart` started.
+    Restart,
+    /// End the client with this.
+    Leave(anyhow::Result<()>),
+}
+
+/// Sends what `app` queued; the error if a write failed. A failed write does
+/// not end the client: the server has gone or is going, and the `restart` it
+/// sent first may still be unread, so the read of the end decides ([`read`]).
+fn send(app: &mut App, stream: &mut UnixStream) -> Option<anyhow::Error> {
+    let e = app.outbox.send(stream).err()?;
+    Some(anyhow::Error::from(e).context("writing to the session"))
+}
+
+/// Reads what the server sent into `app`: `None` while the connection lasts,
+/// else what follows its end. A failed read is an end as EOF is, since Linux
+/// resets the connection of a server that quits with keys unread. Frames
+/// read with the end count: the `restart` may be among them. Without one,
+/// `unsent`, a write that failed first, is the client's outcome.
+fn read(
+    app: &mut App,
+    inbox: &mut Inbox,
+    stream: &mut impl Read,
+    unsent: Option<anyhow::Error>,
+    now: Instant,
+) -> Option<Ended> {
+    let end = match inbox.fill(stream) {
+        Ok(true) => None,
+        Ok(false) => Some(Ok(())),
+        Err(e) => Some(Err(
+            anyhow::Error::from(e).context("reading from the session")
+        )),
+    };
+    loop {
+        match inbox.take_frame() {
+            Ok(Some(frame)) => app.message(frame, now),
+            Ok(None) => break,
+            // At the end, the frames before a bad one still decide.
+            Err(_) if end.is_some() => break,
+            Err(e) => {
+                return Some(Ended::Leave(Err(
+                    anyhow::Error::from(e).context("reading from the session")
+                )));
+            }
+        }
+    }
+    let end = end?;
+    Some(if app.restarting() {
+        Ended::Restart
+    } else {
+        Ended::Leave(unsent.map_or(end, Err))
+    })
 }
 
 fn connect(sock: &Path) -> std::io::Result<UnixStream> {
@@ -6506,12 +6562,20 @@ mod tests {
     /// One `redraw` notification of the events given alone, as Neovim sends
     /// `error_exit`, and 0.12.0 `restart`.
     fn unflushed(app: &mut App, events: Vec<(&str, Vec<Value>)>, now: Instant) {
+        app.message(&redraws(events), now);
+    }
+
+    /// The bytes of one `redraw` notification of `events`.
+    fn redraws(events: Vec<(&str, Vec<Value>)>) -> Vec<u8> {
         let batches = events
             .into_iter()
             .map(|(name, args)| Value::Array(vec![name.into(), Value::Array(args)]))
             .collect();
-        let v = Value::Array(vec![2.into(), "redraw".into(), Value::Array(batches)]);
-        app.message(&encoded(v), now);
+        encoded(Value::Array(vec![
+            2.into(),
+            "redraw".into(),
+            Value::Array(batches),
+        ]))
     }
 
     /// Calls sent since last asked, as `(id, method, args)`; notifications
@@ -6719,6 +6783,26 @@ mod tests {
         answer(&mut a, asks_uis(&sent), uis(false, false), t0);
         let sent = calls(&mut a);
         let detach = request(&sent, "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t0);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
+    }
+
+    /// Settings toggled twice within a round trip do this, or twice while
+    /// Neovim is busy.
+    #[test]
+    fn a_client_told_off_and_on_again_while_leaving_takes_its_windows_back() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut off = drawing();
+        off.effects.enabled = false;
+        a.reconfigure(&off, t0);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
+        a.reconfigure(&drawing(), t0);
+        answer(&mut a, detach, Value::Nil, t0);
+        let sent = calls(&mut a);
+        assert_eq!(attached_with_multigrid(&sent), Some(false));
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
         answer(&mut a, detach, Value::Nil, t0);
         assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
     }
@@ -7978,6 +8062,105 @@ mod tests {
         assert_eq!(chan, Some(9), "the agent installed for the new channel");
     }
 
+    /// The old server's last redraw, with a `restart` if `due`.
+    fn last_redraw(due: bool) -> Vec<u8> {
+        let mut events = vec![("flush", vec![])];
+        if due {
+            events.insert(0, restart());
+        }
+        redraws(events)
+    }
+
+    fn io_kind(e: &anyhow::Error) -> Option<std::io::ErrorKind> {
+        e.downcast_ref::<std::io::Error>().map(std::io::Error::kind)
+    }
+
+    /// Keys come as a `:restart` runs, and the old server quits with them
+    /// unread: Linux then fails the read after its last redraw with
+    /// ECONNRESET, before EOF.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reset_connection_follows_a_restart_or_ends_the_client() {
+        use std::io::Write;
+        for due in [true, false] {
+            let t0 = Instant::now();
+            let mut a = attached(false, t0);
+            let (mut near, mut far) = UnixStream::pair().expect("a socket pair");
+            near.write_all(b"j")
+                .expect("a key the server leaves unread");
+            far.write_all(&last_redraw(due)).expect("the last redraw");
+            drop(far);
+            near.set_nonblocking(true).expect("non-blocking");
+            let mut inbox = Inbox::default();
+            assert!(read(&mut a, &mut inbox, &mut near, None, t0).is_none());
+            match read(&mut a, &mut inbox, &mut near, None, t0) {
+                Some(Ended::Restart) => assert!(due, "followed a restart never sent"),
+                Some(Ended::Leave(Err(e))) => {
+                    assert!(!due, "the restart was not followed: {e:#}");
+                    assert_eq!(io_kind(&e), Some(std::io::ErrorKind::ConnectionReset));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A first read that fills the buffer it is given with `frames`, padded
+    /// with fixints (frames of a byte, which the client ignores), and a
+    /// second that fails.
+    struct Reset(Option<Vec<u8>>);
+
+    impl Read for Reset {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let frames = self.0.take().ok_or(std::io::ErrorKind::ConnectionReset)?;
+            buf.fill(0);
+            buf[..frames.len()].copy_from_slice(&frames);
+            Ok(buf.len())
+        }
+    }
+
+    /// The inbox reads on after a full read, so a fill that ends in a failed
+    /// read can bring the `restart` with it.
+    #[test]
+    fn a_restart_read_with_the_end_is_followed() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        let mut inbox = Inbox::default();
+        let mut conn = Reset(Some(last_redraw(true)));
+        assert!(matches!(
+            read(&mut a, &mut inbox, &mut conn, None, t0),
+            Some(Ended::Restart)
+        ));
+    }
+
+    /// A key typed as the old server goes fails its write, maybe before the
+    /// client has read the `restart`.
+    #[test]
+    fn a_failed_write_leaves_the_end_to_the_read() {
+        use std::io::Write;
+        for due in [true, false] {
+            let t0 = Instant::now();
+            let mut a = attached(false, t0);
+            let (mut near, mut far) = UnixStream::pair().expect("a socket pair");
+            far.write_all(&last_redraw(due)).expect("the last redraw");
+            drop(far);
+            near.set_nonblocking(true).expect("non-blocking");
+            a.keys(b"j", t0);
+            let unsent = send(&mut a, &mut near);
+            assert!(unsent.is_some(), "the key was written");
+            let mut inbox = Inbox::default();
+            assert!(read(&mut a, &mut inbox, &mut near, unsent, t0).is_none());
+            let unsent = send(&mut a, &mut near);
+            match read(&mut a, &mut inbox, &mut near, unsent, t0) {
+                Some(Ended::Restart) => assert!(due, "followed a restart never sent"),
+                Some(Ended::Leave(Err(e))) => {
+                    assert!(!due, "the restart was not followed: {e:#}");
+                    assert_eq!(io_kind(&e), Some(std::io::ErrorKind::BrokenPipe));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     /// Only cells changed since the other UI saw them arrive; refreshed like
     /// an empty window.
     #[test]
@@ -8165,7 +8348,13 @@ mod tests {
         redraw(&mut a, vec![resize(9, 3, 3)], t0);
         assert!(!a.model.grids.contains_key(&9), "the old attach's");
         answer(&mut a, detach, Value::Nil, t0);
-        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(false));
+        let sent = calls(&mut a);
+        assert_eq!(attached_with_multigrid(&sent), Some(false));
+        answer(&mut a, asks_uis(&sent), uis(true, false), t0);
+        assert!(
+            calls(&mut a).iter().all(|(_, m, _)| m != "nvim_ui_detach"),
+            "the foreign UI is still there"
+        );
         assert!(!a.due(t0), "not drawn before the new attach's first flush");
         redraw(&mut a, vec![resize(1, 20, 6)], t0);
         assert!(a.due(t0), "on grid 1, nothing to wait for");
@@ -8173,6 +8362,26 @@ mod tests {
         redraw(&mut a, vec![ui_change()], t0);
         let uis_id = asks_uis(&calls(&mut a));
         answer(&mut a, uis_id, uis(false, false), t0);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
+        answer(&mut a, detach, Value::Nil, t0);
+        assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));
+    }
+
+    /// The redraw telling of it came while leaving, dropped with the old
+    /// attach's.
+    #[test]
+    fn a_foreign_ui_gone_while_the_client_leaves_for_it_keeps_it_off_grid_1() {
+        let t0 = Instant::now();
+        let mut a = attached(false, t0);
+        redraw(&mut a, vec![ui_change()], t0);
+        let uis_id = asks_uis(&calls(&mut a));
+        answer(&mut a, uis_id, uis(true, false), t0);
+        let detach = request(&calls(&mut a), "nvim_ui_detach", "");
+        redraw(&mut a, vec![ui_change()], t0);
+        answer(&mut a, detach, Value::Nil, t0);
+        let sent = calls(&mut a);
+        assert_eq!(attached_with_multigrid(&sent), Some(false));
+        answer(&mut a, asks_uis(&sent), uis(false, false), t0);
         let detach = request(&calls(&mut a), "nvim_ui_detach", "");
         answer(&mut a, detach, Value::Nil, t0);
         assert_eq!(attached_with_multigrid(&calls(&mut a)), Some(true));

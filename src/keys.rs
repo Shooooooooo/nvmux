@@ -32,6 +32,10 @@
 //! which shares the press's fate. Neovim sees input in its original order,
 //! minus what the machine consumed.
 //!
+//! A bracketed paste is text. Its start ends a pending `<prefix>` or number
+//! as any other key does; from there through its end, every byte is
+//! forwarded as it comes, the prefix in any spelling included.
+//!
 //! # Digits
 //!
 //! `<prefix> 1`-`9` select a session by number, possibly multi-digit, so a
@@ -41,6 +45,7 @@
 //! digit happens only when it could change the answer (never with nine or
 //! fewer sessions). Whether the session exists is the caller's concern.
 
+use crate::client::input::{PASTE_END, PASTE_START};
 use crate::keyseq::{self, Sequence, ESC};
 
 /// The byte `Ctrl-Space` sends: `NUL`. The only prefix chord that is not
@@ -253,8 +258,9 @@ impl Keymap {
 /// Only `Ctrl-<letter>` or `Ctrl-Space` (`NUL`): a single raw-mode byte that
 /// is typable and never ordinary text. `C-h`, `C-i`, `C-j` are refused (they
 /// mean something else on the wire), and `C-m` would clash with `ENTER`, which
-/// ends a number. `C-c` and `C-z` are allowed, as in tmux; that byte just stops
-/// reaching Neovim.
+/// ends a number. `C-c` is refused too: every nvmux screen quits, closes or
+/// cancels on it, so a `<prefix>` typed on one would end it. `C-z` is allowed,
+/// as in tmux; that byte just stops reaching Neovim.
 pub fn parse_prefix(s: &str) -> Result<u8, String> {
     let lower = s.trim().to_ascii_lowercase();
     let key = lower
@@ -277,6 +283,10 @@ pub fn parse_prefix(s: &str) -> Result<u8, String> {
     // 'a' (0x61) -> 0x01 ... 't' (0x74) -> 0x14 ... 'z' (0x7a) -> 0x1a.
     let byte = b & 0x1f;
     match byte {
+        0x03 => Err(
+            "C-c quits the picker and closes nvmux's other screens, so it cannot also be the prefix"
+                .into(),
+        ),
         0x08 => Err("C-h is Backspace and would never reach the prefix machine".into()),
         0x09 => Err("C-i is Tab and would never reach the prefix machine".into()),
         0x0a => Err("C-j is a line feed and would never reach the prefix machine".into()),
@@ -410,14 +420,32 @@ pub enum Pending {
     Number(u32),
 }
 
-/// What a machine has half-typed (a `<prefix>`, digits, a sequence cut off),
-/// for another machine to go on from: the next relay's, after a switch (see
-/// [`Prefix::take_held`]).
+/// What a machine has half-typed (a `<prefix>`, digits, a sequence cut off)
+/// or is halfway through (a paste), for another machine to go on from: the
+/// next relay's, after a switch (see [`Prefix::take_held`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Held {
     state: State,
     armed: Vec<u8>,
     seq: Vec<u8>,
+    paste: Option<usize>,
+}
+
+impl Held {
+    /// Inside a paste whose start was read elsewhere, the input so far
+    /// ending with `matched` bytes of its end marker.
+    pub fn in_paste(matched: usize) -> Self {
+        Self {
+            paste: Some(matched),
+            ..Self::default()
+        }
+    }
+
+    /// Halfway through a paste, how many bytes of its end marker the input
+    /// so far ends with.
+    pub fn paste(&self) -> Option<usize> {
+        self.paste
+    }
 }
 
 /// The prefix state machine. The prefix byte and keymap come in through the
@@ -438,6 +466,9 @@ pub struct Prefix {
     /// An escape sequence still being read, held back since it could spell
     /// the prefix. Empty between sequences.
     seq: Vec<u8>,
+    /// Inside a bracketed paste: how many bytes of its end marker the input
+    /// so far ends with. `None` outside one.
+    paste: Option<usize>,
 }
 
 /// The derive would zero `prefix`; the default machine must arm on [`PREFIX`].
@@ -465,6 +496,7 @@ impl Prefix {
             keymap,
             armed: Vec::new(),
             seq: Vec::new(),
+            paste: None,
         }
     }
 
@@ -497,13 +529,20 @@ impl Prefix {
         }
     }
 
-    /// What is half-typed, taken out for another machine to
+    /// Inside a bracketed paste, past its start, how many bytes of its end
+    /// marker the input so far ends with.
+    pub fn paste(&self) -> Option<usize> {
+        self.paste
+    }
+
+    /// What is half-typed or half-pasted, taken out for another machine to
     /// [`resume`](Self::resume), leaving this one idle.
     pub fn take_held(&mut self) -> Held {
         Held {
             state: std::mem::take(&mut self.state),
             armed: std::mem::take(&mut self.armed),
             seq: std::mem::take(&mut self.seq),
+            paste: self.paste.take(),
         }
     }
 
@@ -515,6 +554,7 @@ impl Prefix {
         let mut steps = Vec::new();
         self.armed = held.armed;
         self.seq = held.seq;
+        self.paste = held.paste;
         match held.state {
             State::Number(n) => self.start_number(n, &mut steps, &mut Vec::new()),
             state => self.state = state,
@@ -541,7 +581,17 @@ impl Prefix {
     }
 
     fn byte(&mut self, b: u8, steps: &mut Vec<Step>, pending: &mut Vec<u8>) {
-        if !self.seq.is_empty() {
+        if let Some(matched) = self.paste {
+            pending.push(b);
+            // `ESC` is only the end marker's first byte, so a byte that
+            // breaks a match begins a new one only if it is `ESC`.
+            let matched = if b == PASTE_END[matched] {
+                matched + 1
+            } else {
+                usize::from(b == ESC)
+            };
+            self.paste = (matched < PASTE_END.len()).then_some(matched);
+        } else if !self.seq.is_empty() {
             self.seq.push(b);
             match keyseq::classify(&self.seq, prefix_code(self.prefix)) {
                 Sequence::Partial => {}
@@ -569,7 +619,11 @@ impl Prefix {
                 Sequence::Other(n) => {
                     let mut key = std::mem::take(&mut self.seq);
                     let rest = key.split_off(n);
+                    let pasting = key == PASTE_START;
                     self.other_key(key, steps, pending);
+                    if pasting {
+                        self.paste = Some(0);
+                    }
                     // The rest is new input; it may be the prefix or another
                     // sequence.
                     for r in rest {
@@ -1314,6 +1368,103 @@ mod tests {
         assert!(!p.is_armed());
     }
 
+    /// kitty and Ghostty paste control bytes once the user confirms; the
+    /// prefix and `d` in a paste detached, and the prefix and a digit
+    /// switched.
+    #[test]
+    fn a_paste_holding_the_prefix_and_a_command_goes_through_whole() {
+        let ctrl_b = 0x02;
+        for (prefix, spellings) in [
+            (PREFIX, [&[PREFIX][..], KITTY, XTERM]),
+            (ctrl_b, [&[ctrl_b][..], b"\x1b[98;5u", b"\x1b[27;5;98~"]),
+        ] {
+            for spelled in spellings {
+                let paste = [
+                    &b"\x1b[200~one "[..],
+                    spelled,
+                    b"d two ",
+                    spelled,
+                    b"1 three ",
+                    spelled,
+                    b"\x1b[201~",
+                ]
+                .concat();
+                let mut p = Prefix::with_prefix(12, prefix);
+                assert_eq!(
+                    p.feed(&paste),
+                    vec![Step::Forward(paste.clone())],
+                    "{spelled:?}"
+                );
+                assert_eq!(p.wait(), None, "{spelled:?}");
+            }
+        }
+    }
+
+    /// Cut anywhere, the markers included. Past its start, a paste is
+    /// forwarded as it comes, with nothing held to wait for.
+    #[test]
+    fn a_paste_split_across_reads_is_still_a_paste() {
+        let start = b"\x1b[200~";
+        let paste = [&start[..], b"a", &[PREFIX], b"d\x1b[201~"].concat();
+        for cut in 1..paste.len() {
+            let mut p = Prefix::new(0);
+            let first = p.feed(&paste[..cut]);
+            if cut >= start.len() {
+                assert_eq!(forwarded(&first), &paste[..cut], "cut at {cut}");
+                assert_eq!(p.wait(), None, "cut at {cut}");
+            }
+            let second = p.feed(&paste[cut..]);
+            assert_eq!(forwarded(&[first, second].concat()), paste, "cut at {cut}");
+            assert_eq!(p.wait(), None, "cut at {cut}");
+            let steps = p.feed(&[PREFIX, b'd']);
+            assert_eq!(actions(&steps), vec![Action::Detach], "cut at {cut}");
+        }
+    }
+
+    /// In the paste's read or the next. A start inside a paste is text, and
+    /// an end marker cut short by another starts the match again.
+    #[test]
+    fn a_prefix_typed_right_after_a_paste_arms() {
+        for paste in [
+            &b"\x1b[200~text\x1b[201~"[..],
+            b"\x1b[200~a\x1b[200~b\x1b[201~",
+            b"\x1b[200~a\x1b[20\x1b[201~",
+            b"\x1b[200~a\x1b\x1b[201~",
+        ] {
+            let mut p = Prefix::new(0);
+            let typed = [paste, &[PREFIX, b'd']].concat();
+            assert_eq!(
+                p.feed(&typed),
+                vec![Step::Forward(paste.to_vec()), Step::Act(Action::Detach)],
+                "{paste:?}"
+            );
+
+            let mut p = Prefix::new(0);
+            assert_eq!(p.feed(paste), vec![Step::Forward(paste.to_vec())]);
+            assert!(p.feed(KITTY).is_empty(), "{paste:?}");
+            assert_eq!(actions(&p.feed(b"d")), vec![Action::Detach], "{paste:?}");
+        }
+    }
+
+    /// The `<prefix> d` in the paste is text whatever came before it.
+    #[test]
+    fn a_paste_ends_a_pending_prefix_or_number() {
+        let paste = b"\x1b[200~\x00d\x1b[201~";
+        let mut p = Prefix::new(12);
+        assert!(p.feed(&[PREFIX]).is_empty());
+        let replayed = [&[PREFIX][..], paste].concat();
+        assert_eq!(p.feed(paste), vec![Step::Forward(replayed)]);
+        assert_eq!(p.wait(), None);
+
+        let mut p = Prefix::new(12);
+        assert!(p.feed(&[PREFIX, b'1']).is_empty());
+        assert_eq!(
+            p.feed(paste),
+            vec![Step::Act(Action::Switch(1)), Step::Forward(paste.to_vec())]
+        );
+        assert_eq!(p.wait(), None);
+    }
+
     #[test]
     fn a_prefix_inside_a_larger_chunk_splits_correctly() {
         let mut p = Prefix::new(0);
@@ -1994,6 +2145,39 @@ mod tests {
         assert_eq!(forwarded(&next.feed(b";5A")), b"\x1b[1;5A");
     }
 
+    /// A paste read with the key that switched is the next session's: the
+    /// next machine takes the prefix and `d` in it as text, and an end
+    /// marker cut in two between the machines still ends it.
+    #[test]
+    fn a_paste_goes_on_in_another_machine() {
+        let begun = [&[PREFIX, b'1'][..], b"\x1b[200~a"].concat();
+        let rest = [&[PREFIX, b'd'][..], b"\x1b[201~"].concat();
+        let mut p = Prefix::new(9);
+        assert_eq!(
+            p.feed(&begun),
+            vec![
+                Step::Act(Action::Switch(1)),
+                Step::Forward(begun[2..].to_vec())
+            ]
+        );
+        let mut next = Prefix::new(9);
+        assert!(next.resume(p.take_held()).is_empty());
+        assert_eq!(next.wait(), None);
+        assert_eq!(
+            next.feed(&[&rest[..], &[PREFIX, b'd']].concat()),
+            vec![Step::Forward(rest), Step::Act(Action::Detach)]
+        );
+
+        let mut p = Prefix::new(9);
+        p.feed(&[&begun[..], b"\x1b[20"].concat());
+        let mut next = Prefix::new(9);
+        assert!(next.resume(p.take_held()).is_empty());
+        assert_eq!(
+            next.feed(&[&b"1~"[..], &[PREFIX, b'd']].concat()),
+            vec![Step::Forward(b"1~".to_vec()), Step::Act(Action::Detach)]
+        );
+    }
+
     /// Sessions come and go between relays.
     #[test]
     fn a_number_carried_on_is_read_against_the_sessions_now() {
@@ -2085,8 +2269,8 @@ mod tests {
     #[test]
     fn the_prefix_string_round_trips() {
         for byte in 1u8..=26 {
-            // Enter, newline, Tab and Backspace are refused by design.
-            if matches!(byte, 0x08 | 0x09 | 0x0a | 0x0d) {
+            // Ctrl-c, Backspace, Tab, newline and Enter are refused by design.
+            if matches!(byte, 0x03 | 0x08 | 0x09 | 0x0a | 0x0d) {
                 continue;
             }
             let label = prefix_label(byte);
@@ -2123,9 +2307,17 @@ mod tests {
 
     /// Allowed, as in tmux: the byte just stops reaching Neovim.
     #[test]
-    fn ctrl_c_and_ctrl_z_are_accepted_as_prefixes() {
-        assert_eq!(parse_prefix("C-c"), Ok(0x03));
+    fn ctrl_z_is_accepted_as_a_prefix() {
         assert_eq!(parse_prefix("C-z"), Ok(0x1a));
+    }
+
+    /// In any spelling, saying why.
+    #[test]
+    fn ctrl_c_is_refused_as_the_prefix() {
+        for s in ["C-c", "Ctrl-c", "ctrl-C"] {
+            let why = parse_prefix(s).expect_err(s);
+            assert!(why.contains("quits the picker"), "{s:?}: {why}");
+        }
     }
 
     /// The old default is then an ordinary key.

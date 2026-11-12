@@ -52,10 +52,11 @@ pub struct Session {
     pub name: String,
     /// Unix epoch seconds.
     pub created: u64,
-    /// The nvim server's pid: a hint, not an identity (pids are reused). `$!`
-    /// from the spawn script may not be nvim's pid, since `setsid` forks when
-    /// the caller leads a process group, so it is replaced by the server's own
-    /// answer once reachable.
+    /// The pid `scripts/spawn.sh` matched to the socket; 0 if unknown.
+    /// Matched by `--listen <sock>` in its command line, so nvim's or a
+    /// wrapper's that does not exec nvim. Set at creation and never updated.
+    /// Only a hint, as pids are reused: `scripts/kill.sh` signals it only while
+    /// it still names the socket.
     pub pid: u32,
     /// Rank: orders the listing only. The displayed number is
     /// [`SessionState::num`]. Set once at creation (one past the host's

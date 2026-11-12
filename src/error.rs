@@ -246,7 +246,8 @@ pub enum ConfigError {
 /// are one line, for the hint row, with the path as the user would type it.
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
-    /// `$NVMUX_CONFIG`, `$XDG_CONFIG_HOME` and `$HOME` are all unset or empty.
+    /// `$NVMUX_CONFIG` and `$HOME` are unset or empty, and there is no
+    /// absolute `$XDG_CONFIG_HOME`.
     #[error("not saved: there is no $HOME to keep a config file in")]
     Nowhere,
 
@@ -268,6 +269,11 @@ pub enum SaveError {
         path: PathBuf,
         settings: Vec<String>,
     },
+
+    /// The file is [`read_only`](crate::paths::read_only), so it is not
+    /// overwritten.
+    #[error("not saved: {} is read-only", crate::config::shown(.path))]
+    ReadOnly { path: PathBuf },
 
     #[error("not saved: could not write {}: {error}", crate::config::shown(.path))]
     Write {

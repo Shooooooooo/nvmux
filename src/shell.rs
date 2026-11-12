@@ -315,11 +315,21 @@ mod tests {
     /// `trailing` after it. Panics if the shell dropped that argv, which would
     /// otherwise surface as several unrelated test failures.
     fn spawn_standin(sock: &str, trailing: &[&str]) -> Child {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", STANDIN, "nvim", "--headless", "--listen", sock])
-            .args(trailing)
-            .spawn()
-            .expect("spawn a stand-in session");
+        spawn_standin_as(None, sock, trailing)
+    }
+
+    /// [`spawn_standin`], run as `uid` where given, which needs root.
+    fn spawn_standin_as(uid: Option<u32>, sock: &str, trailing: &[&str]) -> Child {
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", STANDIN, "nvim", "--headless", "--listen", sock])
+            .args(trailing);
+        if let Some(uid) = uid {
+            // Out of the test's directory, which `uid` may not enter.
+            cmd.uid(uid).gid(uid).current_dir("/");
+        }
+        let mut child = cmd.spawn().expect("spawn a stand-in session");
         let seen = cmdline_of(child.id());
         if !seen.contains(&format!("--listen {sock}")) {
             let _ = child.kill();
@@ -699,13 +709,19 @@ mod tests {
     /// `serving_pid`'s answer for `sock` from `ps` and, where there is a
     /// `/proc`, from the fallback that hosts without `ps` take.
     fn serving_pid_answers(sock: &str, tag: &str) -> Vec<(&'static str, String)> {
-        let mut answers = vec![("ps", run_script(SERVING_PID, &[sock]).stdout)];
+        answers(SERVING_PID, &[sock], tag)
+    }
+
+    /// What `script` prints for `args` with `ps` and, where there is a
+    /// `/proc`, without it.
+    fn answers(script: &str, args: &[&str], tag: &str) -> Vec<(&'static str, String)> {
+        let mut answers = vec![("ps", run_script(script, args).stdout)];
         if std::path::Path::new("/proc/self/cmdline").exists() {
             // A host without `ps` but with the usual tools.
             let bin = scratch_dir(tag);
             let path = std::env::var_os("PATH").unwrap_or_default();
             for tool in [
-                "awk", "cat", "cut", "grep", "head", "id", "sed", "sort", "tr",
+                "awk", "cat", "cut", "grep", "head", "id", "ls", "sed", "sort", "tr",
             ] {
                 let found = std::env::split_paths(&path)
                     .map(|dir| dir.join(tool))
@@ -715,8 +731,8 @@ mod tests {
                 }
             }
             let mut sh = Command::new("/bin/sh");
-            sh.arg("-s").arg(sock).env("PATH", &bin);
-            let out = crate::proc::run_feeding_stdin(&mut sh, SERVING_PID).expect("ask");
+            sh.arg("-s").args(args).env("PATH", &bin);
+            let out = crate::proc::run_feeding_stdin(&mut sh, script).expect("ask");
             let _ = std::fs::remove_dir_all(&bin);
             answers.push(("/proc", out.stdout));
         }
@@ -865,6 +881,301 @@ mod tests {
         for (how, found) in serving_pid_answers(&sock, "shell-unserved-bin") {
             assert_eq!(found, "", "{how}: nothing serves {sock}");
         }
+    }
+
+    const SERVING: &str = with_prelude!("if serving \"$1\"; then echo yes; else echo no; fi\n");
+
+    /// Another user's process can name our socket. Taken for the session, it
+    /// would keep a dead one alive and be what `kill.sh` signals. With `id`
+    /// answering another uid, a stand-in of ours plays it without root.
+    #[test]
+    fn a_process_of_another_uid_is_not_a_session() {
+        use crate::transport::protocol::{parse_kill, KillOutcome};
+
+        // Missing, as `kill.sh` refuses a runtime directory `id` disowns.
+        let dir = scratch_path("shell-theirs");
+        let arg = dir.to_string_lossy().into_owned();
+        let sock = format!("{arg}/aaaaaaaa.sock");
+        let mut held = spawn_standin(&sock, &[]);
+        let pid = held.id().to_string();
+        let other = nix::unistd::geteuid().as_raw().wrapping_add(1);
+        let as_other = |script: &str| format!("id() {{ echo {other}; }}\n{script}");
+
+        let found = serving_pid_answers(&sock, "shell-theirs-bin");
+        let snapped = answers(SERVING, &[&sock], "shell-theirs-bin");
+        let looked = answers(&as_other(SERVING_PID), &[&sock], "shell-theirs-bin");
+        let listed = answers(&as_other(SERVING), &[&sock], "shell-theirs-bin");
+        let owned = answers(&as_other(OWNS_SOCKET), &[&pid, &sock], "shell-theirs-bin");
+        // Last, as taking the stand-in ends it.
+        let out = run_script(&as_other(KILL_SCRIPT), &[&arg, "aaaaaaaa", ""]);
+        let spared = matches!(held.try_wait(), Ok(None));
+        let _ = held.kill();
+        let _ = held.wait();
+
+        for (how, found) in found {
+            assert_eq!(found.trim(), pid, "{how} must find it under our own uid");
+        }
+        // Not a socket, so only the snapshot can say yes.
+        for (how, said) in snapped {
+            assert_eq!(
+                said, "yes\n",
+                "{how}: the snapshot missed it under our own uid"
+            );
+        }
+        for (how, found) in looked {
+            assert_eq!(
+                found, "",
+                "{how} took another uid's process for the session"
+            );
+        }
+        for (how, said) in listed {
+            assert_eq!(said, "no\n", "{how}: another uid's process kept it alive");
+        }
+        for (how, said) in owned {
+            assert_eq!(
+                said, "no\n",
+                "{how}: another uid's process owned the socket"
+            );
+        }
+        let outcome = parse_kill(&out.stdout);
+        assert!(
+            matches!(outcome, Ok(KillOutcome::Absent)) && spared,
+            "kill.sh signalled another uid's process: {outcome:?}"
+        );
+    }
+
+    /// `/proc` keeps a newline in an argument, and a line after it that starts
+    /// with our uid would pass for a command line of ours.
+    #[test]
+    fn an_argument_cannot_forge_a_command_line_of_ours() {
+        let sock = scratch_sock("shell-forged");
+        let sock = sock.to_string_lossy().into_owned();
+        let forged = format!("{sock}x");
+        let other = nix::unistd::geteuid().as_raw().wrapping_add(1);
+        let mut held = spawn_standin(&sock, &[&format!("-c\n{other} --listen {forged}")]);
+        let script = format!("id() {{ echo {other}; }}\n{SERVING}");
+        let said = answers(&script, &[&forged], "shell-forged-bin");
+        let _ = held.kill();
+        let _ = held.wait();
+
+        for (how, said) in said {
+            assert_eq!(said, "no\n", "{how} read a forged line as uid {other}'s");
+        }
+    }
+
+    /// `ps` as FreeBSD and NetBSD read `-o`: all of an argument after its
+    /// first `=` is that column's header, which this drops.
+    const BSD_PS: &str = r#"ps() {
+  for bsd_arg; do
+    shift
+    case $bsd_arg in *=*) bsd_arg="${bsd_arg%%=*}=" ;; esac
+    set -- "$@" "$bsd_arg"
+  done
+  command ps "$@"
+}
+"#;
+
+    #[test]
+    fn a_session_is_found_by_the_freebsd_and_netbsd_ps() {
+        let sock = scratch_sock("shell-bsd");
+        let sock = sock.to_string_lossy().into_owned();
+        let mut held = spawn_standin(&sock, &[]);
+        let found = run_script(&format!("{BSD_PS}{SERVING_PID}"), &[&sock]).stdout;
+        let listed = run_script(&format!("{BSD_PS}{SERVING}"), &[&sock]).stdout;
+        let _ = held.kill();
+        let _ = held.wait();
+
+        assert_eq!(found.trim(), held.id().to_string(), "serving_pid missed it");
+        // Not a socket, so only the snapshot can say yes.
+        assert_eq!(listed, "yes\n", "the snapshot missed it");
+    }
+
+    /// Uid 3000000000 as `id -u` prints it, and as procps and macOS's `ps`
+    /// print it (`%d`) on our own processes.
+    const BIG_UID: &str = r#"id() { echo 3000000000; }
+ps() {
+  command ps "$@" | awk -v me="$(command id -u)" '$1 == me { sub(/[0-9]+/, "-1294967296") } { print }'
+}
+"#;
+
+    /// Compared as printed, our processes past uid 2^31-1 read as another
+    /// uid's: `kill.sh` with no recorded pid called a live session absent, and
+    /// a listing swept its files where `/proc/net/unix` could not vouch for it.
+    #[test]
+    fn a_session_is_found_under_a_uid_ps_prints_negative() {
+        let sock = scratch_sock("shell-big-uid");
+        let sock = sock.to_string_lossy().into_owned();
+        let mut held = spawn_standin(&sock, &[]);
+        let found = run_script(&format!("{BIG_UID}{SERVING_PID}"), &[&sock]).stdout;
+        let listed = run_script(&format!("{BIG_UID}{SERVING}"), &[&sock]).stdout;
+        let _ = held.kill();
+        let _ = held.wait();
+
+        assert_eq!(found.trim(), held.id().to_string(), "serving_pid missed it");
+        // Not a socket, so only the snapshot can say yes.
+        assert_eq!(listed, "yes\n", "the snapshot missed it");
+    }
+
+    /// `kill` refuses every signal here, as it does on another user's process.
+    /// Read as an exit, that would have the session called killed and its
+    /// files removed while it runs. `sleep` returns at once, to skip the wait.
+    #[test]
+    fn a_refused_signal_is_not_an_exit() {
+        use crate::transport::protocol::{parse_kill, KillOutcome};
+
+        let dir = scratch_path("shell-refusing");
+        let arg = dir.to_string_lossy().into_owned();
+        let mut held = spawn_standin(&format!("{arg}/aaaaaaaa.sock"), &[]);
+        let script = format!("kill() {{ return 1; }}\nsleep() {{ :; }}\n{KILL_SCRIPT}");
+        let out = run_script(&script, &[&arg, "aaaaaaaa", ""]);
+        let _ = held.kill();
+        let _ = held.wait();
+
+        let outcome = parse_kill(&out.stdout);
+        assert!(
+            matches!(outcome, Ok(KillOutcome::Orphaned)),
+            "{outcome:?}: {out:?}"
+        );
+    }
+
+    /// The tests run as root play [`US`] and someone else, [`THEM`].
+    const US: u32 = 65533;
+    const THEM: u32 = 65534;
+
+    /// Can this test process run others as [`US`] and [`THEM`]? Only root
+    /// can, and only where its user namespace maps both.
+    fn can_run_as_others() -> bool {
+        use std::os::unix::process::CommandExt;
+
+        let can = [US, THEM].into_iter().all(|uid| {
+            Command::new("/bin/sh")
+                .args(["-c", ":"])
+                .uid(uid)
+                .gid(uid)
+                .current_dir("/")
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+        if !can {
+            eprintln!("skipping: needs root, to run processes as other users");
+        }
+        can
+    }
+
+    /// [`run_script`], run as `uid`.
+    fn run_script_as(uid: u32, script: &str, args: &[&str]) -> Output {
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-s").args(args).uid(uid).gid(uid).current_dir("/");
+        crate::proc::run_feeding_stdin(&mut cmd, script).expect("run the script")
+    }
+
+    /// [`scratch_dir`] in /tmp, as nvmux's own runtime directories are: [`US`]
+    /// may not enter the temp dir, which can be private to root.
+    fn scratch_dir_in_tmp(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::path::Path::new("/tmp").join(format!("nvmux-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("scratch dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_dead_session_another_user_names_is_swept() {
+        if !can_run_as_others() {
+            return;
+        }
+        let dir = scratch_dir("shell-named");
+        let sock = dir.join("aaaaaaaa.sock");
+        crate::test_support::dead_socket(&sock);
+        let path = sock.to_string_lossy().into_owned();
+        let mut theirs = spawn_standin_as(Some(THEM), &path, &[]);
+        let looked = serving_pid_answers(&path, "shell-named-bin");
+        let out = run_script(LIST_SCRIPT, &[&dir.to_string_lossy()]);
+        let swept = !sock.exists();
+        let _ = theirs.kill();
+        let _ = theirs.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (how, found) in looked {
+            assert_eq!(found, "", "{how} took uid {THEM}'s process for the session");
+        }
+        let rows = crate::transport::protocol::parse_listing(&out.stdout).expect("a listing");
+        assert!(
+            rows.iter().all(|row| !row.pid_alive) && swept,
+            "uid {THEM}'s process kept a dead session: {:?}",
+            out.stdout
+        );
+    }
+
+    /// Listed first, another user's process naming our socket would be the one
+    /// signalled: as root that ends it, and as anyone else the session runs on.
+    #[test]
+    fn a_kill_ends_our_session_and_no_process_of_another_user() {
+        use crate::transport::protocol::{parse_kill, KillOutcome};
+
+        if !can_run_as_others() {
+            return;
+        }
+        for us in [US, 0] {
+            let dir = scratch_dir_in_tmp(&format!("shell-kill-as-{us}"));
+            std::os::unix::fs::chown(&dir, Some(us), Some(us)).expect("give the directory away");
+            std::fs::write(dir.join("aaaaaaaa.json"), "{}").expect("seed metadata");
+            let sock = dir.join("aaaaaaaa.sock").to_string_lossy().into_owned();
+            // First, so `ps` lists it first.
+            let mut theirs = spawn_standin_as(Some(THEM), &sock, &[]);
+            let mut ours = spawn_standin_as(Some(us), &sock, &[]);
+            let out = run_script_as(us, KILL_SCRIPT, &[&dir.to_string_lossy(), "aaaaaaaa", ""]);
+            let ended = crate::test_support::wait_until(std::time::Duration::from_secs(3), || {
+                matches!(ours.try_wait(), Ok(Some(_)))
+            });
+            let spared = matches!(theirs.try_wait(), Ok(None));
+            let kept = dir.join("aaaaaaaa.json").exists();
+            for child in [&mut ours, &mut theirs] {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let outcome = parse_kill(&out.stdout);
+            assert!(
+                matches!(outcome, Ok(KillOutcome::Killed)),
+                "as uid {us}: {outcome:?}"
+            );
+            assert!(ended, "as uid {us}: the session was left running");
+            assert!(spared, "as uid {us}: uid {THEM}'s process was ended");
+            assert!(!kept, "as uid {us}: the session's files were kept");
+        }
+    }
+
+    /// [`a_refused_signal_is_not_an_exit`] with the kernel refusing: `kill.sh`
+    /// runs as [`US`], and `id` claims [`THEM`]'s uid so the lookup takes
+    /// their process.
+    #[test]
+    fn a_process_that_refuses_our_signals_is_not_gone() {
+        use crate::transport::protocol::{parse_kill, KillOutcome};
+
+        if !can_run_as_others() {
+            return;
+        }
+        // Missing, as `kill.sh` refuses a runtime directory `id` disowns.
+        let dir = scratch_path("shell-refused");
+        let arg = dir.to_string_lossy().into_owned();
+        let mut theirs = spawn_standin_as(Some(THEM), &format!("{arg}/aaaaaaaa.sock"), &[]);
+        let script = format!("id() {{ echo {THEM}; }}\nsleep() {{ :; }}\n{KILL_SCRIPT}");
+        let out = run_script_as(US, &script, &[&arg, "aaaaaaaa", ""]);
+        let _ = theirs.kill();
+        let _ = theirs.wait();
+
+        let outcome = parse_kill(&out.stdout);
+        assert!(
+            matches!(outcome, Ok(KillOutcome::Orphaned)),
+            "{outcome:?}: {out:?}"
+        );
     }
 
     /// A bound socket no command line names: only the kernel's list can tell,

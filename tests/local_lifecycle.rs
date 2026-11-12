@@ -1172,8 +1172,10 @@ fn a_recycled_pid_neither_misfires_nor_blocks_the_kill() {
     assert!(!sock.exists(), "the socket should have been cleaned up");
     assert!(!json.exists(), "the metadata should have been cleaned up");
 
+    // Not `common::alive`: a signalled decoy stays a zombie until reaped, and
+    // `kill(pid, 0)` succeeds on one.
     assert!(
-        common::alive(decoy.id()),
+        matches!(decoy.try_wait(), Ok(None)),
         "kill.sh signalled a process that was not the session"
     );
     let _ = decoy.kill();
@@ -1411,8 +1413,8 @@ fn a_session_outlives_a_hang_up_of_the_terminal_it_was_made_in() {
     t.kill_session(&session).expect("kill");
 }
 
-/// The graceful `qa!` goes over the socket, so a stale pid must not turn a
-/// clean shutdown into a "could not kill" error.
+/// `kill.sh` must pass over a recorded pid that no longer exists and find the
+/// session by its socket.
 #[test]
 fn a_stale_pid_does_not_break_an_otherwise_normal_kill() {
     require_nvim!();
