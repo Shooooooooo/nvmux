@@ -1157,6 +1157,10 @@ impl Sheet {
 
 /// Fade `cell` `amount` of the way to the background; empty it at
 /// [`EMPTIED`] or more. A terminal-default background is kept.
+///
+/// Dim text keeps its SGR 2, so the fade meets the cells past its reach with
+/// no edge on any terminal, until its colour [`sinks`]: from there the text
+/// is left out.
 fn hush(cell: &mut Out, amount: f32, pens: &Pens, colors: &Colors) {
     if amount >= EMPTIED {
         *cell = Out::blank(pens.blank);
@@ -1164,22 +1168,39 @@ fn hush(cell: &mut Out, amount: f32, pens: &Pens, colors: &Colors) {
     }
     let keep = percent(1.0 - amount);
     let s = cell.style;
-    let toward = |c: Rgb| Color::Rgb(mix(keep, c, pens.bg));
+    let toward = |c: Rgb| mix(keep, c, pens.bg);
+    let (text, back) = (colors.visual_fg(&s), colors.visual_bg(&s));
+    let (fg, under) = (toward(text), toward(back));
+    // Not text that sinks unmixed: the terminal draws that so everywhere.
+    let sunk = s.dim && cell.text != Text::Half && sinks(fg, under) && !sinks(text, back);
+    if sunk {
+        cell.text = Text::Char(' ');
+        cell.wide = false;
+    }
     cell.style = Style {
-        fg: toward(colors.visual_fg(&s)),
+        // A line in the text's colour goes with the text.
+        fg: Color::Rgb(if sunk { under } else { fg }),
         bg: if !s.reverse && s.bg == Color::Default {
             Color::Default
         } else {
-            toward(colors.visual_bg(&s))
+            Color::Rgb(under)
         },
         sp: if s.underline == Underline::None {
             s.sp
         } else {
-            toward(colors.visual_sp(&s))
+            Color::Rgb(toward(colors.visual_sp(&s)))
         },
         reverse: false,
+        dim: s.dim && !sunk,
         ..s
     };
+}
+
+/// Whether dim `text` may be drawn no brighter than `under` in any channel:
+/// Windows Terminal draws it at half its colour, toward black whatever it
+/// stands on.
+fn sinks(text: Rgb, under: Rgb) -> bool {
+    text.0 / 2 <= under.0 && text.1 / 2 <= under.1 && text.2 / 2 <= under.2
 }
 
 /// Draw `g`: its cell fades to the background over the first half of its
@@ -2071,6 +2092,135 @@ mod tests {
             f.get(1, 83).expect("a cell").text,
             Text::Char(' '),
             "emptied under the line"
+        );
+    }
+
+    /// Light text on a background that is not black, where half a colour
+    /// near the background is darker than it.
+    fn slate() -> Colors {
+        Colors {
+            term: Palette {
+                fg: Rgb(240, 240, 240),
+                bg: Rgb(40, 40, 60),
+                ansi: crate::palette::XTERM_ANSI,
+            },
+            ..colors()
+        }
+    }
+
+    fn dim() -> Style {
+        Style {
+            dim: true,
+            ..Style::default()
+        }
+    }
+
+    fn hushed(colors: &Colors, cell: Out, amount: f32) -> Out {
+        let pens = Pens::new(Style::default(), colors, &signs());
+        let mut cell = cell;
+        hush(&mut cell, amount, &pens, colors);
+        cell
+    }
+
+    fn an_x(style: Style) -> Out {
+        Out {
+            text: Text::Char('x'),
+            style,
+            wide: false,
+        }
+    }
+
+    #[test]
+    fn dim_text_is_left_out_from_where_half_its_colour_is_past_the_background() {
+        let c = slate();
+        let far = hushed(&c, an_x(dim()), 0.5);
+        assert_eq!(far.text, Text::Char('x'));
+        assert_eq!(far.style.fg, Color::Rgb(Rgb(140, 140, 150)));
+        assert!(far.style.dim, "still the terminal's dim");
+        assert!(hushed(&c, an_x(dim()), 0.79).style.dim, "82 halves to 41");
+
+        let near = hushed(&c, an_x(dim()), 0.8);
+        assert_eq!(near.text, Text::Char(' '), "80 halves to 40");
+        assert!(!near.style.dim);
+        assert_eq!(near.style.fg, Color::Rgb(c.term.bg), "its lines with it");
+        assert_eq!(near.style.bg, Color::Default);
+        assert_eq!(
+            hushed(&c, an_x(Style::default()), 0.8).text,
+            Text::Char('x'),
+            "plain text stays"
+        );
+
+        let wide = Out {
+            text: Text::Char('字'),
+            style: dim(),
+            wide: true,
+        };
+        assert!(!hushed(&c, wide, 0.8).wide, "its right half is mended");
+        let half = Out {
+            text: Text::Half,
+            ..an_x(dim())
+        };
+        assert_eq!(hushed(&c, half, 0.8).text, Text::Half, "left to its left");
+    }
+
+    /// There the terminal draws dim text so everywhere, and cells past the
+    /// fade's reach would stand apart from it.
+    #[test]
+    fn dim_text_that_is_past_the_background_unmixed_is_faded_as_ever() {
+        let on = |fg, bg| Colors {
+            term: Palette {
+                fg,
+                bg,
+                ansi: crate::palette::XTERM_ANSI,
+            },
+            ..colors()
+        };
+        let light = on(Rgb(40, 40, 60), Rgb(240, 240, 240));
+        let grey = on(Rgb(255, 255, 255), Rgb(150, 150, 150));
+        for c in [light, grey] {
+            let near = hushed(&c, an_x(dim()), 0.9);
+            assert_eq!(near.text, Text::Char('x'), "{:?}", c.term);
+            assert!(near.style.dim);
+        }
+        let bar = Style {
+            reverse: true,
+            ..dim()
+        };
+        assert_eq!(hushed(&slate(), an_x(bar), 0.9).text, Text::Char('x'));
+    }
+
+    #[test]
+    fn dim_text_round_a_note_fades_from_the_terminals_dim_and_never_sinks() {
+        let now = Instant::now();
+        let c = slate();
+        let mut cards = Cards::default();
+        cards.apply(Command::Show(news(1)), now);
+        let mut f = frame(100, 30);
+        for cell in &mut f.cells {
+            cell.style = dim();
+        }
+        cards.paint(&mut f, Style::default(), &c, &signs(), now);
+        f.mend();
+
+        let mut left_out = 0;
+        for cell in f.cells.iter().filter(|cell| cell.style != dim()) {
+            let Color::Rgb(fg) = cell.style.fg else {
+                continue;
+            };
+            if cell.style.dim {
+                assert!(!sinks(fg, c.term.bg), "{cell:?}");
+            } else if cell.text == Text::Char(' ') && fg == c.term.bg {
+                left_out += 1;
+            }
+        }
+        assert!(left_out > 0, "beside the note");
+
+        let row = &f.cells[2 * f.width..3 * f.width];
+        let first = row.iter().find(|cell| cell.style != dim()).expect("faded");
+        assert!(first.style.dim, "no edge where the fade ends: {first:?}");
+        assert!(
+            matches!(first.style.fg, Color::Rgb(Rgb(r, _, _)) if r >= 230),
+            "{first:?}"
         );
     }
 
