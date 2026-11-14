@@ -930,8 +930,8 @@ mod tests {
     #[test]
     fn a_hyperlink_is_opened_over_its_cells_and_closed_after() {
         let mut f = frame(&["see here", "  and x "]);
-        for c in 4..8 {
-            f.cells[c].style.link = 1;
+        for cell in &mut f.cells[4..8] {
+            cell.style.link = 1;
         }
         f.cells[f.width + 6].style.link = 1;
         f.cells[f.width + 7].style.link = 1;
