@@ -74,6 +74,12 @@ const RESTORE_CURSOR: &[u8] = b"\x1b8";
 /// cell swaps which it shows: halfway, where both are equally dissolved.
 const CROSSOVER: f32 = 0.5;
 
+/// How far toward its background dim text is drawn once nvmux mixes its
+/// colour (see [`resolve`]), in place of SGR 2: Windows Terminal halves a
+/// dim colour toward black, past a background the colour is nearly at.
+/// kitty's amount, and about a halving on a dark background.
+const DIM: f32 = 0.6;
+
 /// Where a frame leaves the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cursor {
@@ -300,8 +306,9 @@ impl Laid {
 }
 
 /// A cell as a frame paints it, compared against the last frame. Keeps every
-/// attribute the parsers hold except inverse (folded into the colours), or
-/// the fade would snap shape at the end (italics dissolving upright).
+/// attribute the parsers hold except inverse and, in a mixed colour, dim
+/// (both folded into the colours, see [`resolve`]), or the fade would snap
+/// shape at the end (italics dissolving upright).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Painted {
     fg: Rgb,
@@ -2126,7 +2133,8 @@ fn standing(cell: Option<Cell>, palette: &Palette, t: f32) -> Painted {
 /// a space with no background and no line on it) get the background as
 /// foreground and no attributes, so the diff skips them; Neovim underlines
 /// blanks with written spaces, so those are glyphs. Inverse is applied here,
-/// so the terminal never inverts an interpolated pair.
+/// so the terminal never inverts an interpolated pair. So is dim once
+/// `t > 0` (see [`DIM`]); at 0 it is the terminal's, as the session drew it.
 fn resolve(cell: Option<Cell>, palette: &Palette, t: f32) -> Painted {
     let Some(cell) = cell else {
         return Painted::blank(palette);
@@ -2139,6 +2147,13 @@ fn resolve(cell: Option<Cell>, palette: &Palette, t: f32) -> Painted {
     };
     let fg = seen(cell.fgcolor()).unwrap_or(palette.fg);
     let bg = seen(cell.bgcolor());
+    let dim = cell.dim() && t <= 0.0;
+    // Before inverse, as a terminal dims the foreground it is given.
+    let fg = if cell.dim() && !dim {
+        fg.lerp(bg.unwrap_or(palette.bg), DIM)
+    } else {
+        fg
+    };
     let (fg, bg) = if cell.inverse() {
         (bg.unwrap_or(palette.bg), Some(fg))
     } else {
@@ -2160,7 +2175,7 @@ fn resolve(cell: Option<Cell>, palette: &Palette, t: f32) -> Painted {
         fg: fg.lerp(palette.bg, t),
         bg: bg.map(|b| b.lerp(palette.bg, t)),
         bold: cell.bold(),
-        dim: cell.dim(),
+        dim,
         italic: cell.italic(),
         underline: extra.underline,
         sp: seen(extra.sp).map(|sp| sp.lerp(palette.bg, t)),
@@ -2912,7 +2927,7 @@ mod tests {
     #[test]
     fn every_attribute_the_grid_holds_survives_a_fade() {
         let mut s = Shadow::new(1, 16);
-        s.feed(b"\x1b[1mb\x1b[0;2md\x1b[0;3mi\x1b[0;4mu\x1b[0;3;4mx");
+        s.feed(b"\x1b[1mb\x1b[0;3mi\x1b[0;4mu\x1b[0;3;4mx");
         s.feed(b"\x1b[0;5mk\x1b[0;8mc\x1b[0;9ms\x1b[0;11ma\x1b[0;53mo\x1b[0;3;9;53my");
         for t in [1.0, 0.5, 0.0] {
             s.invalidate();
@@ -2925,7 +2940,6 @@ mod tests {
                     .unwrap_or_else(|| panic!("{glyph:?} not painted at {t}: {cells:?}"))
             };
             assert!(sgr("b").starts_with("0;1;38;"), "bold at {t}");
-            assert!(sgr("d").starts_with("0;2;38;"), "dim at {t}");
             assert!(sgr("i").starts_with("0;3;38;"), "italic at {t}");
             assert!(sgr("u").starts_with("0;4;38;"), "underline at {t}");
             assert!(sgr("x").starts_with("0;3;4;38;"), "both at {t}");
@@ -2939,6 +2953,52 @@ mod tests {
             assert!(sgr("o").starts_with("0;53;38;"), "overline at {t}");
             assert!(sgr("y").starts_with("0;3;9;53;38;"), "three at {t}");
         }
+    }
+
+    /// Light text on a background that is not black, where a colour halved
+    /// toward black is darker than the background.
+    fn slate() -> Palette {
+        Palette {
+            fg: Rgb(240, 240, 240),
+            bg: Rgb(40, 40, 60),
+            ..palette()
+        }
+    }
+
+    #[test]
+    fn dim_is_drawn_into_a_fading_colour_and_left_to_the_terminal_at_rest() {
+        let mut s = Shadow::new(1, 8);
+        s.feed(b"\x1b[2md\x1b[0;2;7mr\x1b[0;2;38;2;200;0;0;48;2;0;0;100mc");
+        let mut at = |t| {
+            s.invalidate();
+            s.frame(t, &slate(), Cursor::Hidden)
+        };
+        assert_eq!(pen_of(&at(0.0), "d"), "0;2;38;2;240;240;240");
+        let half = at(0.5);
+        assert_eq!(pen_of(&half, "d"), "0;38;2;80;80;96", "from its dim colour");
+        assert_eq!(
+            pen_of(&half, "r"),
+            "0;38;2;40;40;60;48;2;80;80;96",
+            "reversed, its bar"
+        );
+        assert_eq!(
+            pen_of(&half, "c"),
+            "0;38;2;60;20;60;48;2;20;20;80",
+            "first toward its own background"
+        );
+        assert_eq!(pen_of(&at(1.0), "d"), "0;38;2;40;40;60", "gone, no darker");
+    }
+
+    #[test]
+    fn dim_text_behind_a_floating_screen_fades_toward_the_background() {
+        let mut s = Shadow::new(1, 4);
+        s.feed(b"\x1b[2md");
+        let beside = |_, _| Shade::Toward(0.9);
+        let dimmed = s.frame_under(&beside, Some(&slate()), &[], Cursor::Hidden);
+        assert_eq!(pen_of(&dimmed, "d"), "0;38;2;48;48;67");
+        s.invalidate();
+        let faint = s.frame_under(&|_, _| Shade::Faint, None, &[], Cursor::Hidden);
+        assert_eq!(pen_of(&faint, "d"), "0;2", "no palette: the terminal's");
     }
 
     /// Neovim underlines blanks by writing spaces; terminals never underline
